@@ -13,9 +13,9 @@ This README and [ROADMAP.md](ROADMAP.md) are working
 hypotheses, not a fixed specification. Change them when experiments or source
 inspection provide better evidence; record consequential decisions and why.
 
-## Goal and initial scope
+## Goal and current scope
 
-Build a reproducible, tested offline image tool that can:
+The implemented offline compatibility baseline can:
 
 1. Inspect a supported authenticated volume and extract its persistent IVs.
 2. Encode/decode an authenticated, independently encrypted auxiliary blob there.
@@ -23,10 +23,17 @@ Build a reproducible, tested offline image tool that can:
    changing their plaintext.
 4. Produce an image readable by unmodified Linux dm-crypt and cryptsetup.
 
-Start with disposable regular-file images, one pinned format/configuration,
-exclusive offline access, and output to a separate image. General filesystems,
-live updates, kernel changes, physical devices, and broad format compatibility
-are later possibilities, not initial requirements.
+The next priority is a small online prototype: one writable hidden file, supplied
+keys, and a read-only primary view, initially on disposable VM disks. The offline
+tool and its tests remain the compatibility reference. Broader offline hardening,
+systematic steganalysis/benchmarks, extra profiles and production deployment work
+are deferred so they do not block the online demonstration.
+
+Online access is planned, not implemented. A single backend should coordinate
+both views; independently mounting dm-crypt while editing its backing metadata
+is not a supported shortcut. Reuse the whole-carrier format and accept serialized
+full-volume commits first. See [the online prototype plan](docs/online-prototype.md)
+and [active roadmap](ROADMAP.md) for ownership, commit/recovery and test criteria.
 
 ## Running the current prototype
 
@@ -178,7 +185,7 @@ analysis. Define a conservative supported budget before calling a profile safe.
 
 ### Update and crash model
 
-Initially require a closed primary mapping and exclusive access to a cleanly
+The existing offline tool requires a closed primary mapping and exclusive access to a cleanly
 shut-down image. A filesystem mounted read-only is insufficient coordination;
 filesystem recovery, other mappings, and cached metadata can still matter.
 
@@ -194,6 +201,10 @@ writes through its supported path; arbitrary raw image edits bypass it. A dirty
 journal can replay stale tuples over edits. Initially reject dirty/unsupported
 states rather than inventing journal repair. Offline in-place writes require a
 separate reviewed protocol or supported kernel path.
+
+The online prototype must establish a coordinated owner and a minimal recovery
+path before mutating a live backing image. This work is now the priority; it does
+not require completing the deferred offline hardening program first.
 
 ## Capacity and configuration tradeoffs
 

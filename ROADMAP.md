@@ -1,119 +1,102 @@
 # Implementation roadmap
 
-This is a revisable research plan. Milestones express evidence to obtain, not
-commitments to a particular architecture. Update status and decisions as work
-progresses. A discovery that invalidates the mechanism is a useful result:
-document it and pursue a justified alternative rather than forcing this plan.
+This is a revisable research plan. Update it when evidence changes the best
+approach. The user has narrowed the offline prototype to make room for an
+online implementation; the active priorities below supersede historical next
+steps in the session notes.
 
-Current status: milestones 0-3 have initial working implementations for the
-narrow tested profile, including stock-kernel verification of a packed image.
-Milestone 4 has caught-error and process-crash tests; stronger persistence work
-and independent crypto review remain. Milestone 5 has an observed snapshot
-distinguisher but no systematic single-image steganalysis or benchmark suite.
-Next: strengthen persistence/error coverage and reproducible comparative analysis;
-do not broaden profiles or build a filesystem before reviewing these limits.
+## Scope decision
 
-Environment preflight (2026-10-18): QEMU/qemu-img 10.2.1 installed; unprivileged
-TCG startup and QMP shutdown passed. KVM access is denied to the current user,
-but is optional. Python cryptography 46.0.5 and OpenSSL 3.5.5 are available;
-a C AES-GCM compile/link/run smoke test passed. cryptsetup/integritysetup 2.8.4
-are installed. No additional host package is currently required for the first
-userspace/VM workflow. Guest image/kernel acquisition and guest DM/AEAD support
-subsequently passed; see the session handoff below.
-Use the ignored vendor/, downloads/, artifacts/, work/ and secrets/ directories
-for local dependencies and generated data. Initial repository commit 55d4074
-contains documentation and ignore rules only.
+The offline compatibility baseline is sufficient: pack/unpack works on one
+4096-byte AES-GCM/random profile, stock Linux authenticated a packed image with
+unchanged primary plaintext, and 22 tests passed. Keep this implementation and
+its tests as a reference; fix regressions and blockers, but stop expanding it
+into a hardened standalone offline product.
 
-## 0. Establish a reproducible environment
+Defer systematic steganalysis, broad benchmarks, 512-byte/alternative cipher
+profiles, complete guest dependency pinning, exhaustive offline fault injection,
+independent distro patch reconstruction, password UX, and production key-lifetime
+management. Independent cryptographic review remains outstanding; it is not a
+prerequisite for a disposable online experiment. No security claim is established
+by deferring that review.
 
-- Inventory host capabilities and choose a userspace implementation language and
-  maintained crypto library. Favor reproducibility and format correctness.
-- Set up a small disposable Linux VM for privileged integration. Pin guest image,
-  kernel, cryptsetup, crypto library, and relevant source revisions.
-- Create scripts to generate an ordinary authenticated control volume, fully
-  initialize it, cleanly close it, and collect nonsensitive configuration data.
-- Record actual cipher, IV/tag sizes, sector size, integrity mode and layout.
+Do not defer primary authentication, nonce freshness, ownership/cache coherence,
+or the minimum recovery behavior needed by actual online writes. Keep the
+single-image threat model and known snapshot distinguisher explicit.
 
-Exit: another session can reproduce the control image and stock-kernel readback
-from documented commands. Identify unsupported capabilities instead of silently
-substituting a different cipher or format.
+## Next target: a small online demonstration
 
-## 1. Prove the carrier and sector codec
+Here online means a running service exposing a writable auxiliary file, with a
+read-only primary view available through a coordinated path. No online code is
+implemented yet. The first writable mount may run with the primary view closed;
+completion of the demo includes simultaneous primary reads and hidden updates.
 
-- Inspect pinned source and format documentation; document address units, AAD,
-  tuple order, interleaving, padding, offsets, and clean-journal detection.
-- Implement read-only image inspection with strict bounds/version validation.
-- Use a supplied disposable primary volume key; defer password/keyslot support.
-- Extract IVs and authenticate/decrypt selected sectors in userspace.
-- Cross-check against kernel-generated fixtures, then scan all sectors.
+Keep one supported format, supplied high-entropy keys, one process, one hidden
+file, and disposable VM disks. Reuse the whole-carrier v1 blob: buffer edits and
+commit the whole blob on fsync/unmount. Incremental records, arbitrary primary
+writes, multiple clients, a general hidden filesystem and a kernel driver are
+not required. See [online design](docs/online-prototype.md).
 
-Exit: userspace primary plaintext exactly matches the stock mapper, and deliberate
-IV/tag/ciphertext corruption fails correctly. Unsupported layouts fail closed.
+### 1. Establish one owner and frontend contracts
 
-## 2. Demonstrate compatible IV replacement
+- Separate storage access/sector crypto from the CLI enough to reuse them in a
+  long-running service, keeping the offline regression tests passing.
+- Give one backend exclusive ownership of the backing image/device. Do not
+  permit an independent dm-crypt/loop mapping to access it during online writes.
+- First expose primary plaintext read-only and authenticated through an NBD
+  adapter in the VM. Never acknowledge primary writes. Expose hidden content as
+  one FUSE file, with clear read/write/truncate/fsync/unmount behavior.
+- Stage adapters independently if useful, but settle how reads are paused during
+  commits and how errors stop further access before implementing mutations.
 
-- Choose fresh random replacement IVs for a small set of sectors.
-- Recompute ciphertext/tags into a separate output image; input stays unchanged.
-- Open the result with unmodified Linux and compare the entire primary plaintext.
-- Exercise beginning/end boundaries, metadata interleave transitions, offsets,
-  multiple sectors, malformed images, and clean/dirty journal cases.
+Exit: primary reads match the offline verifier, write requests are rejected,
+frontend operations have testable contracts, and the backend has one owner.
+The frontend choices are provisional; revise if an alternative is simpler while
+preserving those properties.
 
-Exit: full-volume kernel authentication and identical primary plaintext, with
-only intended data/metadata regions changed. No in-place update claim yet.
+### 2. Add the minimum online commit/recovery path
 
-## 3. Define and implement the auxiliary blob
+- Keep edits in memory until an explicit flush; initially serialize every commit
+  and pause primary reads during it. Full-volume rewrites are acceptable.
+- Authenticate affected primary data, generate fresh carrier IVs, and use the
+  exact already-tested primary encryption/AAD path.
+- Implement a bounded, documented transaction/recovery scheme before mutating
+  the sole online backing image. A private external recovery journal is allowed
+  for the VM prototype; it weakens deniability and is not an on-disk-format claim.
+- Establish required persistence ordering and fail-stop behavior. After an
+  interrupted commit, recover a complete old/new state before serving either
+  view. Never replay old IVs by reencrypting changed primary plaintext.
+- Use disposable known-lineage test keys, count encryption work in tests, and
+  keep historical nonce/rollback limitations explicit.
 
-- Write a short design decision for hidden crypto and its complete serialized
-  output, record dimensions, encrypted metadata, initialization, key input, and
-  capacity calculation. Document the pseudorandomness argument and assumptions.
-- Start with high-entropy hidden keys; defer password bootstrap if necessary.
-- Specify global primary-nonce budgets, repeated-plaintext behavior, retries,
-  snapshot restoration, and clone limitations before implementing hidden writes.
-- Add pack/unpack operations on copies and authenticated record validation.
-- Test empty/max-size blobs, wrong keys, corruption, record swaps, repetition,
-  and hidden-record version reversion. Track nonce histories in test harnesses.
+Exit: fsync commits survive service restart, interrupted updates recover before
+access resumes, and no primary read returns unauthenticated or mixed data.
+Caught errors and selected process-crash boundaries are sufficient at this stage;
+physical power-loss guarantees are deferred.
 
-Exit: randomized hidden round trips preserve stock-kernel primary readback;
-capacity/overhead and unsupported workflows are explicit. No visible hidden
-format signature is introduced. Crypto/design review findings are recorded.
+### 3. Demonstrate the mounted workflow in QEMU
 
-## 4. Make copy-output operations recoverable
+- Mount the hidden file and primary filesystem read-only inside the guest. Use
+  synthetic data; do not require host root or host physical disks.
+- Add a cleanly initialized primary-filesystem fixture for the mounted demo;
+  retain the existing deterministic sector-pattern fixture for codec regressions.
+- Edit/truncate the hidden file, fsync, unmount/restart/remount, and verify its
+  contents. Exercise primary reads during commits and rejection of primary writes.
+- Check unchanged full primary plaintext and all-sector authentication after
+  commits/recovery, including a final stock-Linux readback with the service closed.
+- Inject corruption and a few commit interruptions; document blocking latency,
+  write amplification, and recovery limits without building a benchmark framework.
+- Record any additional guest dependencies and reproducible commands.
 
-- Specify output creation, exclusive access, flush/fsync, validation, publication,
-  cleanup, and recovery semantics. Avoid implicit replacement of the input.
-- Inject interrupted writes, short writes, disk-full errors and process crashes
-  at persistence boundaries. Keep partial output clearly distinguishable to the
-  operator without placing a signature in the completed IV carrier.
-- Test that failures preserve the input and cannot be reported as successful.
+Exit: a repeatable online demo, passing offline regressions and focused online
+integration tests, with honest durability/security limitations.
 
-Exit: repeatable crash tests support a precisely scoped durability claim for
-copy-output operation. Document host/guest filesystem assumptions.
+## Later, only if the online experiment justifies it
 
-## 5. Evaluate detectability and tradeoffs
-
-- Compare against matched ordinary control images, with and without primary keys.
-- Analyze carrier repetitions/correlations, complete image diffs, journal history,
-  and multiple snapshots. Include unchanged primary plaintext after reencrypting.
-- Measure 4096 versus 512-byte capacity, update latency, write amplification,
-  metadata overhead, and GCM lifetime-budget consumption.
-- Publish observed distinguishers and limitations; randomness tests are diagnostic
-  only. Reconsider the design if the target threat model is not met.
-
-Exit: reproducible evaluation with bounded claims and a justified supported
-profile, not an assertion of universal plausible deniability.
-
-## 6. Optional extensions, selected by evidence
-
-- In-place transactions: review supported dm-integrity write paths versus a
-  custom transaction protocol; solve primary tuple and multi-record atomicity.
-- Mounted auxiliary filesystem: FUSE over the established record engine.
-- Auxiliary block interface: NBD/ublk if block semantics are actually useful.
-- Kernel integration: narrowly scoped dm-crypt IV selection or a custom target
-  only if userspace cannot satisfy justified requirements.
-- More profiles, password-derived keys, redundancy, controlled primary writes,
-  or alternative nonce/mode designs, each with explicit security analysis.
-
-Do not make these prerequisites for completing the offline experiment.
+Incremental hidden records, reduced write amplification, in-device transactions,
+ordinary dm-crypt integration, kernel work, broader configurations, production
+nonce/key policy, stronger crash testing, and systematic detectability evaluation.
+These are not prerequisites for the first mounted demonstration.
 
 ## Session handoff
 
@@ -121,6 +104,22 @@ At the end of implementation sessions update this file with completed work,
 commands/checks and results, known failures, blockers, and the next concrete task.
 Add focused design notes when decisions become substantial. Never include keys,
 passwords, real-data images, or sensitive host information.
+
+### Scope revision: prioritize the online demonstration
+
+- User requested a smaller remaining offline prototype scope to make room for
+  online implementation. Existing code and tests are retained; this revision
+  changes planning/instructions only and adds docs/online-prototype.md.
+- Active milestones above supersede historical offline-hardening next steps.
+  Keep one format and whole-carrier encoding, defer broad evaluation/production
+  hardening, and build one mounted hidden file with coordinated read-only primary
+  access. Single-owner coherence and minimum online recovery are not deferred.
+- Next concrete task: inspect/refactor the storage/sector-codec boundaries for
+  a single-owner service, then prototype its primary read-only adapter in the VM.
+  Verify the guest NBD/FUSE dependencies when reaching their adapters. Do not
+  edit a backing disk behind an independent active dm-crypt mapping.
+- Validation for this revision is documentation consistency and whitespace;
+  implementation behavior is unchanged, so the existing tests were not rerun.
 
 ### 2026-10-18: control volume and read-only implementation
 

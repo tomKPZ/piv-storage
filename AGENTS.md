@@ -2,9 +2,11 @@
 
 ## Mission and authorization
 
-Continue this project autonomously toward a reproducible offline prototype that
+Continue this project autonomously toward a small online prototype that
 stores an independently encrypted auxiliary payload in persistent IVs while
-preserving stock-Linux authentication and primary plaintext. The user intends
+preserving stock-Linux authentication and primary plaintext. The existing offline
+prototype is the compatibility baseline; the user has reduced further offline
+scope to prioritize a mounted demonstration. The user intends
 future sessions to implement it without significant human direction. Unless the
 user gives a different task, inspect current state and advance the next useful
 milestone in ROADMAP.md; do not stop after merely proposing work.
@@ -18,7 +20,8 @@ security specification. Respect tool/sandbox approval requirements.
 
 1. Read README.md, ROADMAP.md, applicable nested instructions, and existing design
    notes (especially docs/development.md, docs/observed-layout.md and
-   docs/hidden-format.md). Inspect git status and relevant code before changing anything.
+   docs/hidden-format.md and docs/online-prototype.md). Inspect git status and
+   relevant code before changing anything.
 2. Determine what is actually implemented and tested. Recheck environmental
    assumptions as needed; the initial host is WSL2 without visible DM/KVM nodes.
 3. Select a bounded task with observable exit criteria. Continue through its
@@ -34,9 +37,18 @@ resolved from context/evidence, not for routine implementation decisions.
 
 ## Implementation priorities
 
-- Begin with regular-file images and an offline copy-output CLI. No host physical
-  devices, live-mounted editing, new kernel driver, or general hidden filesystem
-  in the initial implementation.
+- Preserve the offline CLI and regression tests, but advance the online milestones
+  in ROADMAP.md instead of expanding offline hardening or evaluation. Defer
+  unrelated benchmarks, alternative profiles and complete environment pinning.
+- Target one writable hidden file and a read-only primary view on disposable VM
+  storage. Reuse the whole-carrier v1 format and serialize commits initially.
+  A kernel driver, general hidden filesystem and primary writes are not required.
+- One backend must own the backing storage and coordinate both views. Never edit
+  raw metadata behind an independently active dm-crypt mapping. Authentication,
+  nonce freshness, cache coherence and minimum commit recovery remain required.
+- A private external recovery journal is allowed for the VM experiment, with
+  explicit deniability limitations. It is not permission to use real disks or
+  claim crash safety without tests. Prefer userspace frontends before kernel work.
 - Pin one ordinary supported LUKS2/dm-integrity profile before broadening support.
   Confirm actual IV/tag lengths, sector/address units, AAD, tuple layout, padding,
   offsets, journal state and replay behavior from sources and kernel fixtures.
@@ -69,8 +81,10 @@ resolved from context/evidence, not for routine implementation decisions.
   do not claim that a local collision scan solves lifetime nonce safety.
 - Raw edits bypass dm-integrity journaling. Never assume its atomicity protects
   them; reject unrecovered journal state until a supported workflow is proven.
-- Primary read-only use and exclusive offline updates are the initial model.
-  Ordinary primary writes may destroy hidden data.
+- Existing offline updates require a closed mapping. Online updates must pass
+  through a single coordinated owner with a defined commit/recovery path;
+  the primary view remains read-only. Ordinary primary writes are unsupported
+  and may destroy hidden data.
 - Hidden-record authentication, whole-record transactions, primary-sector
   atomicity and rollback resistance are separate properties.
 - No public hidden magic/header or assumed-random padding. Review pseudorandomness
