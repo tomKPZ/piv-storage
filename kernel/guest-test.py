@@ -73,7 +73,7 @@ query = (2 << 30) | (size << 16) | (ord('P') << 8)
 buf = bytearray(size)
 fcntl.ioctl(ctl, query, buf, True)
 version, length, generation, sectors, sector_size, iv, tag, tup, flags, reserved = struct.unpack(fmt, buf)
-assert (version, length, sector_size, iv, tag, tup, flags, reserved) == (1, size, 4096, 12, 16, 28, 3, 0)
+assert (version, length, sector_size, iv, tag, tup, flags, reserved) == (1, size, 4096, 12, 16, 28, 7, 0)
 assert sectors * 4096 == int(subprocess.check_output(['blockdev', '--getsize64', path]))
 assert generation > 0
 rejected(lambda: fcntl.ioctl(ctl, query + 2, buf), {errno.ENOTTY})
@@ -180,6 +180,64 @@ view = os.open('/dev/mapper/piv-view', os.O_WRONLY)
 rejected(lambda: os.pwrite(view, first, 0), {errno.EROFS, errno.EPERM})
 os.close(view)
 run('dmsetup', 'remove', '--retry', 'piv-view')
+# Prepared tuples are durable before the first apply in this sector experiment.
+from pivstore.kernel_api import KernelDevice, validate_integrity_table
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+native = KernelDevice(controls[0], path)
+validate_integrity_table(subprocess.check_output(['dmsetup', 'table', 'piv-kernel_dif'], text=True),
+                         sectors, os.stat('/dev/vdb').st_rdev, 16777216)
+rejected(native.begin, {errno.EBUSY})
+native.suspend()
+rejected(lambda: native.prepare(0, bytes.fromhex(observed['0']), os.urandom(12)), {errno.EBUSY})
+native.begin()
+rejected(lambda: fcntl.ioctl(ctl, (1 << 30) | (48 << 16) | (ord('P') << 8) | 5,
+                             bytearray(struct.pack(read_fmt, 1, 48, generation, 0, bytes(12), 0, 0, 0)), True),
+         {errno.EBUSY})
+prepared = []
+for index in selected:
+    old = bytes.fromhex(observed[str(index)])
+    new = os.urandom(12)
+    value = native.prepare(index, old, new)
+    # Independently verify the native encryption/AAD against a maintained library.
+    with open('/mnt/piv-work/volume.key', 'rb') as keyfile:
+        primary_key = keyfile.read()
+    plaintext = AESGCM(primary_key).decrypt(new, value[:4112], struct.pack('<Q', index * 8) + new)
+    assert plaintext == hashlib.shake_256(b'piv-control-v1' + index.to_bytes(8, 'little')).digest(4096)
+    prepared.append((index, old, value))
+with open('/mnt/piv-work/prepared-tuples.bin', 'wb') as journal:
+    for index, old, value in prepared:
+        journal.write(struct.pack('<Q12s', index, old) + value)
+    journal.flush()
+    os.fsync(journal.fileno())
+index, old, value = prepared[0]
+rejected(lambda: native.apply(index, bytes([9]) * 12, value), {errno.ESTALE})
+bad = bytearray(value); bad[0] ^= 1
+rejected(lambda: native.apply(index, old, bytes(bad)), {errno.EBADMSG, errno.EIO})
+nonce = os.urandom(12)
+changed = AESGCM(primary_key).encrypt(nonce, bytes(4096), struct.pack('<Q', index * 8) + nonce) + nonce
+rejected(lambda: native.apply(index, old, changed), {errno.EPERM})
+for index, old, value in prepared:
+    assert native.read_iv(index, quiesced=True) == old
+    native.apply(index, old, value)
+    native.apply(index, old, value)  # exact idempotent replay, no reencryption
+    assert native.read_iv(index, quiesced=True) == value[-12:]
+    observed[str(index)] = value[-12:].hex()
+    rejected(lambda: native.prepare(index, value[-12:], value[-12:]), {errno.EINVAL})
+p = subprocess.run(['dmsetup', 'resume', 'piv-kernel'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+assert p.returncode != 0  # transaction gate survives until explicit end
+p = subprocess.run(['dmsetup', 'message', 'piv-kernel', '0', 'key', 'wipe'],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+assert p.returncode != 0
+native.end()
+native.resume()
+assert digest() == before
+# Controller death leaves the transaction gate closed; a fresh fd adopts it.
+native.suspend(); native.begin(); native.close()
+p = subprocess.run(['dmsetup', 'resume', 'piv-kernel'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+assert p.returncode != 0
+native = KernelDevice(controls[0], path)
+native.begin(); native.end(); native.resume(); native.close()
+
 # Key wipe is allowed only while suspended; controls must remain blocked.
 run('dmsetup', 'suspend', 'piv-kernel')
 run('dmsetup', 'message', 'piv-kernel', '0', 'key', 'wipe')
@@ -223,6 +281,15 @@ for placement in placements:
     assert owner != generation
     rejected(lambda: read_iv(current, owner, placement['sector']), {errno.EBADMSG, errno.EIO})
     assert read_iv(current, owner, 1).hex() == observed['1']
+    broken = KernelDevice(glob.glob('/dev/pivctl-*')[0], path)
+    broken.suspend(); broken.begin()
+    bad_index = placement['sector']
+    old_iv = bytes.fromhex(observed[str(bad_index)])
+    rejected(lambda: broken.prepare(bad_index, old_iv, os.urandom(12)),
+             {errno.EBADMSG, errno.EIO})
+    exact = next(value for i, old, value in prepared if i == bad_index)
+    rejected(lambda: broken.apply(bad_index, old_iv, exact), {errno.EBADMSG, errno.EIO})
+    broken.close()
     run('dmsetup', 'remove', '--retry', 'piv-kernel')
     run('dmsetup', 'remove', '--retry', 'piv-kernel_dif')
     rejected(lambda: read_iv(current, owner, 1), {errno.ENODEV})
@@ -239,4 +306,4 @@ run('cryptsetup', 'close', 'piv-kernel')
 with open('/mnt/piv-work/read-results.json', 'w') as output:
     json.dump(observed, output, sort_keys=True)
 with open('/mnt/piv-work/result.txt', 'w') as output:
-    output.write('K0 and K1 authenticated IV reads/corruption/lifecycle/stock readback passed\n')
+    output.write('Kernel prepare/apply, read, corruption, lifecycle and stock readback passed\n')

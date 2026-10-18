@@ -31,22 +31,22 @@ tool and its tests remain the compatibility reference. Broader offline hardening
 systematic steganalysis/benchmarks, extra profiles and production deployment work
 are deferred so they do not block the online demonstration.
 
-One backend coordinates both views; independently mounting dm-crypt over its
-backing image is unsupported. Online updates reuse the whole-carrier format and
-block reads while preparing a verified image and atomically replacing the backing
-path. This first implementation requires a regular file on a local filesystem;
-direct block-device/in-place updates are deferred. See
-[online usage and recovery](docs/online-implementation.md),
-[the prototype plan](docs/online-prototype.md), and [active roadmap](ROADMAP.md).
+Two coordinated online backends are implemented. The regular-file backend uses
+whole-image replacement, a read-only NBD primary export and FUSE. The native
+backend uses an opt-in dm-crypt extension, a read-only device-mapper primary view,
+and the same one-file FUSE interface. It authenticates and reencrypts unchanged
+primary sectors through the existing dm-integrity target, without raw metadata
+edits or full-image replacement. An encrypted external recovery journal and
+persistent nonce reservations support interrupted whole-record updates.
 
-A device-backed kernel phase has begun with a small opt-in dm-crypt
-extension that reuses native primary crypto/integrity I/O, keeping FUSE and hidden
-encryption in userspace. A separate device-mapper target is the fallback.
-[The investigation](docs/kernel-backend.md) separates source findings, single-sector
-experiments and the required whole-record recovery gate. The query/filter
-scaffold, authenticated one-sector IV reads and guest build harness are in
-[kernel/](kernel/README.md). Carrier replacement and kernel-backed hidden commits remain unimplemented; current
-payload commands still require regular-file backing.
+The native prototype milestones K0–K3 are complete on the pinned disposable
+Debian QEMU guest. See [native build/run instructions](kernel/README.md),
+[implemented protocol and recovery limits](docs/kernel-implementation.md),
+[regular-file usage](docs/online-implementation.md), and [test evidence](ROADMAP.md).
+Neither backend supports ordinary primary writes. Native setup deliberately
+rejects arbitrary host devices and requires private recovery state on guest root
+ext4. External state is observable evidence and is required for interrupted-update
+recovery; this is not a deniability guarantee.
 
 ## Running the current prototype
 
@@ -96,8 +96,9 @@ for dependencies, provenance limitations, artifacts, and the observed 9p failure
 
 Only one narrow profile is accepted: LUKS2 with one ordinary dynamic AES-GCM/random
 segment, zero IV tweak, 4096-byte sectors, an integrity v4 superblock with fixed
-padding, 28-byte tuples, 32768-sector interleaving, and an empty, unencrypted,
-un-MACed journal. Other profiles are rejected. LUKS2 header validation/selection
+padding, 28-byte tuples, 32768-sector interleaving, and an unencrypted,
+un-MACed journal. Offline image commands require an empty journal; native setup
+uses stock dm-integrity replay before authenticated carrier access. Other profiles are rejected. LUKS2 header validation/selection
 is delegated to cryptsetup; the primary volume key is supplied separately.
 `verify` authenticates every primary sector and prints its SHA-256 digest without
 writing plaintext. `extract-ivs` copies IV bytes in logical-sector order without
@@ -126,7 +127,7 @@ if one does not exist. The guest mounts a primary filesystem read-only through
 NBD and a single hidden file through FUSE, edits/truncates/fsyncs it, restarts,
 and independently checks the final primary through stock Linux. See the online
 usage document for manual commands, session-budget limits and recovery caveats.
-The API/CLI is experimental: raw block devices, arbitrary editors requiring
+The regular-file API/CLI is experimental: raw block devices, arbitrary editors requiring
 rename/create operations, ordinary primary writes, and production durability are
 outside scope. `serve --initialize` starts empty and replaces any existing hidden
 payload on its next flush; omit it when reopening an existing hidden record.
@@ -236,9 +237,9 @@ journal can replay stale tuples over edits. Initially reject dirty/unsupported
 states rather than inventing journal repair. Offline in-place writes require a
 separate reviewed protocol or supported kernel path.
 
-The online prototype must establish a coordinated owner and a minimal recovery
-path before mutating a live backing image. This work is now the priority; it does
-not require completing the deferred offline hardening program first.
+The native backend now implements coordinated ownership and external roll-forward
+recovery. Its tested ordering and remaining failure assumptions are documented
+in docs/kernel-implementation.md; they do not establish hardware power-loss safety.
 
 ## Capacity and configuration tradeoffs
 

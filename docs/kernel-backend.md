@@ -1,11 +1,10 @@
 # Kernel backend investigation and proposed next phase
 
-Status: K0 passed in artifacts/kernel-008; authenticated one-sector IV reads
-passed in artifacts/kernel-read-002. The opt-in query/filter scaffold, authenticated
-one-sector IV read and exact guest module build harness are in [kernel/](../kernel/README.md). No carrier-write
-operation exists yet. The working userspace FUSE/NBD backend remains the reference.
-This document distinguishes observed Linux behavior from proposed interfaces;
-the latter must change if the VM experiments contradict them.
+Status: the K0–K3 prototype is implemented and tested. This document preserves
+the investigation and original design gates; current protocol, ordering and
+limitations are in [implementation notes](kernel-implementation.md), with
+[reproduction instructions](../kernel/README.md) and evidence in ROADMAP.md.
+The selected extension remained contained, so a separate target was unnecessary.
 
 ## Recommendation
 
@@ -129,7 +128,7 @@ all control I/O completes; do not assume an open fd keeps a DM table alive.
 PIV_READ_IV now reads one ciphertext sector and its complete tuple through the
 existing lower target, then calls the same native AEAD conversion helper used
 by ordinary reads. It returns only an authenticated IV, with fixed request sizes,
-owner/index validation and no control write path. The final guest experiment
+owner/index validation and no write in that initial read-only slice. Native writes were subsequently added as PREPARE/APPLY. The final guest experiment
 passed boundary reads, ciphertext/tag/IV corruption rejection, coordinated reads
 with suspend/resume, key-wipe rejection, removal lifetime checks, stock full-volume
 readback and independent offline IV comparison. See kernel/README.md and the
@@ -139,8 +138,8 @@ Unlike the original query-only snapshot, this operation borrows crypt_config
 under a mutex for the duration of synchronous I/O. Presuspend drains/blocks it;
 dtr invalidates the pointer under that same mutex before freeing native state.
 This is not a design for asynchronous mutation workqueues or whole-record commits.
-Lower journal mode validation, request-local replacement, primary-I/O exclusion
-and durable completion are still gates before any kernel mutation operation.
+Those subsequent mutation gates now pass the selected prototype tests; see the
+implementation notes for lower validation, exclusion and durable completion.
 
 ## Userspace setup compatibility
 
@@ -150,7 +149,7 @@ stock status/close/reload workflows cannot be assumed to manage the opted-in
 stack. The harness uses dmsetup to remove the owner and its known lower mapping,
 then restores stock dm-crypt for ordinary cryptsetup activation. This is a runtime
 tooling limitation, not an on-disk format change. Add opt-in setup/teardown
-integration before K3; do not hide the flag in table status to fool old parsers.
+integration (now implemented for K3); do not hide the flag in table status to fool old parsers.
 The reviewed libdevmapper.c/setup.c files are now pinned in the source manifest.
 
 ## Atomicity and recovery gates

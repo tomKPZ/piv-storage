@@ -51,8 +51,44 @@ def main():
                          help='Start empty; replaces any existing hidden payload on flush')
     service.add_argument('--max-sector-encryptions', type=int, default=1 << 20,
                          help='Per-session ceiling; does not track historical key usage')
+    kernel = sub.add_parser('serve-kernel', help='Experimental pinned-QEMU native primary and hidden FUSE file')
+    kernel.add_argument('--device', type=Path, default=Path('/dev/vdb'))
+    kernel.add_argument('--key-file', type=Path, required=True)
+    kernel.add_argument('--hidden-key-file', type=Path, required=True)
+    kernel.add_argument('--state-directory', type=Path, required=True)
+    kernel.add_argument('--mountpoint', type=Path, required=True)
+    kernel.add_argument('--name', default='piv-native')
+    kernel.add_argument('--initialize', action='store_true')
     args = parser.parse_args()
     try:
+        if args.action == 'serve-kernel':
+            from .kernel_owner import GuestOwner
+            from .kernel_store import KernelStore
+            from .fuse_frontend import mount
+            with args.hidden_key_file.open('rb') as stream:
+                hidden_key = stream.read(33)
+            if len(hidden_key) != 32:
+                raise ValueError('Hidden key must contain exactly 32 bytes')
+            owner = GuestOwner(args.device, args.key_file, args.name)
+            try:
+                with KernelStore(owner.device, args.state_directory, hidden_key, owner.uuid,
+                                 initialize=args.initialize) as store:
+                    primary = owner.presentation()
+                    fsname = 'pivstore-kernel-' + owner.uuid
+                    # The UUID/global lock prove no live controller owns this mount.
+                    existing = subprocess.run(['findmnt', '-n', '-o', 'SOURCE', '--mountpoint',
+                                               str(args.mountpoint.absolute())],
+                                              stdout=subprocess.PIPE, text=True)
+                    if existing.returncode == 0:
+                        if existing.stdout.strip() != fsname:
+                            raise ValueError('Mountpoint belongs to a different filesystem')
+                        subprocess.run(['fusermount3', '-uz', str(args.mountpoint)], check=True)
+                    args.mountpoint.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    print('Native read-only primary: ' + str(primary), flush=True)
+                    mount(store, args.mountpoint, fsname=fsname)
+            finally:
+                owner.close()
+            return 0
         if args.action == 'serve':
             from .online import OnlineStore
             from .nbd import PrimaryServer
@@ -119,7 +155,7 @@ def main():
                 result = {'primary_sha256': image.verify(key),
                           'authenticated_sectors': image.layout.sectors}
         print(json.dumps(result, indent=2))
-    except (UnsupportedImage, OSError, ValueError, TimeoutError, subprocess.TimeoutExpired) as exc:
+    except (UnsupportedImage, OSError, ValueError, TimeoutError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
         print(f'pivstore: {exc}', file=sys.stderr)
         return 1
     return 0

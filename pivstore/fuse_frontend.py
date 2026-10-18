@@ -98,9 +98,9 @@ class HiddenFile(pyfuse3.Operations):
         return None
 
 
-def mount(store, mountpoint):
+def mount(store, mountpoint, *, fsname='pivstore'):
     options = set(pyfuse3.default_options)
-    options.add('fsname=pivstore')
+    options.add('fsname=' + fsname)
     pyfuse3.init(HiddenFile(store), str(mountpoint), options)
     try:
         trio.run(pyfuse3.main)

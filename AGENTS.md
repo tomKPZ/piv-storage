@@ -44,7 +44,8 @@ resolved from context/evidence, not for routine implementation decisions.
 - Target one writable hidden file and a read-only primary view on disposable VM
   storage. Reuse the whole-carrier v1 format and serialize commits initially.
   A general hidden filesystem and primary writes are not required. The first
-  mounted demo is complete; the next kernel-backend phase is in ROADMAP.md.
+  mounted and native kernel demos are complete. Read the latest ROADMAP.md
+  handoff and docs/kernel-implementation.md before choosing further work.
 - One backend must own the backing storage and coordinate both views. Never edit
   raw metadata behind an independently active dm-crypt mapping. Authentication,
   nonce freshness, cache coherence and minimum commit recovery remain required.
@@ -57,16 +58,18 @@ resolved from context/evidence, not for routine implementation decisions.
   lock, replace the canonical path, and fsync its parent. Reuse this simpler path
   as the reference/fallback during kernel work. Never delete the stable
   .pivstore.lock sidecar on shutdown or recover from orphan staging copies.
-- For the kernel phase, prefer a small opt-in dm-crypt extension over copying the
-  driver into a separate target. Start with matching guest build provenance,
-  query-only binary control and one-sector IV replacement through the existing
-  dm-integrity bio path. Source findings and uncertainties are recorded in
-  docs/kernel-backend.md. Never assume private IV hooks are an external module API.
+- The native backend is a contained opt-in dm-crypt extension, not a new target.
+  Preserve authenticated PREPARE, exact-tuple APPLY and suspend/controller lifetime
+  gates. Persist nonce reservations before encryption and the complete encrypted
+  recovery journal before mutation. Authenticate all recovery ciphertext before
+  parsing metadata or replay. Never regenerate tuples on uncertain completion.
+  Use kernel/README.md to reproduce the K0–K3 tests. Do not claim the external
+  state provides deniability or detects disk-and-state rollback.
 - Build/load experimental kernel code only in disposable guests with matched
   source/config/symbol versions. Do not install host modules or force-load an
   ABI-mismatched module. Keep normal primary mutations rejected while arranging
   authorized lower-layer writes. Sector journaling does not make the v1 record
-  atomic; require the record-recovery gate before kernel-backed FUSE fsync.
+  atomic; preserve the implemented external record-recovery protocol for FUSE fsync.
 - Pin one ordinary supported LUKS2/dm-integrity profile before broadening support.
   Confirm actual IV/tag lengths, sector/address units, AAD, tuple layout, padding,
   offsets, journal state and replay behavior from sources and kernel fixtures.

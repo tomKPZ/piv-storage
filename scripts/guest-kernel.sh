@@ -12,7 +12,10 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get -o Acquire::Retries=2 update
 apt-get -y --no-install-recommends install \
   linux-headers-6.12.113+deb13-amd64=6.12.113-1 gcc-14 make patch \
-  cryptsetup-bin=2:2.7.5-2 libcryptsetup12=2:2.7.5-2 python3
+  cryptsetup-bin=2:2.7.5-2 libcryptsetup12=2:2.7.5-2 python3 python3-cryptography
+mkdir -p /opt/piv-code/pivstore
+mount -t 9p -o trans=virtio,version=9p2000.L,ro pivcode /opt/piv-code/pivstore
+export PYTHONPATH=/opt/piv-code
 mkdir /root/piv-module
 tar -xf scaffold.tar -C /root/piv-module
 cd /root/piv-module

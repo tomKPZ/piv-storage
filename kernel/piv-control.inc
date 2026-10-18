@@ -11,8 +11,15 @@ struct piv_control {
 	struct mutex lock;
 	bool live;
 	bool blocked;
+	bool activated;
+	bool resuming;
+	bool transaction;
+	bool failed;
+	u32 encryptions;
+	struct file *controller;
 	struct crypt_config *cc;
 	struct piv_query profile;
+	struct piv_devices devices;
 	char name[40];
 };
 
@@ -35,83 +42,232 @@ static int piv_open(struct inode *inode, struct file *file)
 static int piv_release(struct inode *inode, struct file *file)
 {
 	struct piv_control *p = file->private_data;
+	mutex_lock(&p->lock);
+	if (p->controller == file)
+		p->controller = NULL;
+	mutex_unlock(&p->lock);
 	kref_put(&p->refs, piv_free);
 	return 0;
 }
 
-/* Caller holds p->lock across lower I/O and crypto; dtr/presuspend drain it.
- * Read through the SAME lower integrity target, carrying one complete tuple.
- * Decrypt only into a private page and return no plaintext, including on error.
- */
-static int piv_read_iv(struct piv_control *p, struct piv_read_iv *out)
+struct piv_sector {
+	struct dm_crypt_io io;
+	struct page *page;
+	struct bio *bio;
+	u8 original[PIV_TUPLE_BYTES];
+};
+
+static void piv_sector_free(struct crypt_config *cc, struct piv_sector *s)
 {
-	struct crypt_config *cc = p->cc;
-	struct dm_crypt_io *io = NULL;
-	struct aead_request *req = NULL;
-	struct page *page = NULL;
-	struct bio *bio = NULL;
-	struct bvec_iter saved;
+	if (!s)
+		return;
+	if (s->bio)
+		bio_put(s->bio);
+	if (s->page) {
+		memzero_explicit(page_address(s->page), PAGE_SIZE);
+		__free_page(s->page);
+	}
+	kfree_sensitive(s->io.integrity_metadata);
+	kfree_sensitive(s);
+}
+
+static int piv_bio(struct crypt_config *cc, struct piv_sector *s, blk_opf_t op)
+{
+	if (s->bio)
+		bio_put(s->bio);
+	s->bio = bio_alloc(cc->dev->bdev, 1, op, GFP_NOIO);
+	if (!s->bio)
+		return -ENOMEM;
+	s->bio->bi_iter.bi_sector = cc->start + s->io.sector;
+	if (bio_add_page(s->bio, s->page, cc->sector_size, 0) != cc->sector_size)
+		return -ENOMEM;
+	return dm_crypt_integrity_io_alloc(&s->io, s->bio);
+}
+
+static int piv_crypto(struct crypt_config *cc, struct piv_sector *s,
+		      const u8 *iv)
+{
+	struct aead_request *req;
 	DECLARE_CRYPTO_WAIT(wait);
-	int ret = -ENOMEM;
+	int ret;
 
-	if (out->version != 1 || out->size != sizeof(*out) ||
-	    memchr_inv(out->iv, 0, sizeof(out->iv)) ||
-	    memchr_inv(out->reserved, 0, sizeof(out->reserved)))
-		return -EINVAL;
-	if (out->generation != p->profile.generation)
-		return -ESTALE;
-	if (out->sector >= p->profile.sectors)
-		return -ERANGE;
-	if (p->blocked || !test_bit(DM_CRYPT_KEY_VALID, &cc->flags))
-		return -EBUSY;
-
-	io = kzalloc(sizeof(*io), GFP_NOIO);
-	page = alloc_page(GFP_NOIO | __GFP_ZERO);
-	if (!io || !page)
-		goto done;
-	io->cc = cc;
-	io->sector = out->sector << cc->sector_shift;
-	io->integrity_metadata = kzalloc(cc->tuple_size, GFP_NOIO);
-	if (!io->integrity_metadata)
-		goto done;
-	bio = bio_alloc(cc->dev->bdev, 1, REQ_OP_READ, GFP_NOIO);
-	if (!bio)
-		goto done;
-	bio->bi_iter.bi_sector = cc->start + io->sector;
-	if (bio_add_page(bio, page, cc->sector_size, 0) != cc->sector_size)
-		goto done;
-	ret = dm_crypt_integrity_io_alloc(io, bio);
-	if (ret)
-		goto done;
-	saved = bio->bi_iter;
-	ret = submit_bio_wait(bio);
-	if (ret)
-		goto done;
-	/* Lower drivers may advance the bio; crypto iterates the original sector. */
-	bio->bi_iter = saved;
-	crypt_convert_init(cc, &io->ctx, bio, bio, io->sector);
+	crypt_convert_init(cc, &s->io.ctx, s->bio, s->bio, s->io.sector);
 	req = mempool_alloc(&cc->req_pool, GFP_NOIO);
 	aead_request_set_tfm(req, any_tfm_aead(cc));
-	aead_request_set_callback(req,
-		CRYPTO_TFM_REQ_MAY_BACKLOG,
-		crypto_req_done, &wait);
-	ret = crypto_wait_req(crypt_convert_block_aead(cc, &io->ctx, req, 0), &wait);
+	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG, crypto_req_done, &wait);
+	ret = crypto_wait_req(crypt_convert_block_aead_iv(cc, &s->io.ctx, req, 0, iv), &wait);
+	mempool_free(req, &cc->req_pool);
+	return ret;
+}
+
+/* Caller holds lifecycle lock. Plaintext lives only in a private wiped page. */
+static int piv_load(struct crypt_config *cc, u64 index, struct piv_sector **out)
+{
+	struct piv_sector *s;
+	struct bvec_iter saved;
+	int ret = -ENOMEM;
+
+	s = kzalloc(sizeof(*s), GFP_NOIO);
+	if (!s)
+		return ret;
+	s->io.cc = cc;
+	s->io.sector = index << cc->sector_shift;
+	s->io.integrity_metadata = kzalloc(cc->tuple_size, GFP_NOIO);
+	s->page = alloc_page(GFP_NOIO | __GFP_ZERO);
+	if (!s->io.integrity_metadata || !s->page)
+		goto bad;
+	ret = piv_bio(cc, s, REQ_OP_READ);
+	if (ret)
+		goto bad;
+	saved = s->bio->bi_iter;
+	ret = submit_bio_wait(s->bio);
+	if (ret)
+		goto bad;
+	s->bio->bi_iter = saved;
+	memcpy(s->original, page_address(s->page), 4096);
+	memcpy(s->original + 4096, s->io.integrity_metadata, 28);
+	ret = piv_crypto(cc, s, NULL);
+	if (ret)
+		goto bad;
+	*out = s;
+	return 0;
+bad:
+	piv_sector_free(cc, s);
+	return ret;
+}
+
+static int piv_identity(struct piv_control *p, u32 version, u32 size,
+			u64 generation, u64 sector, unsigned int expected_size)
+{
+	if (version != 1 || size != expected_size)
+		return -EINVAL;
+	if (generation != p->profile.generation)
+		return -ESTALE;
+	if (sector >= p->profile.sectors)
+		return -ERANGE;
+	if (!p->activated || !test_bit(DM_CRYPT_KEY_VALID, &p->cc->flags))
+		return -EBUSY;
+	return 0;
+}
+
+static bool piv_quiesced(struct piv_control *p)
+{
+	return p->blocked && !p->resuming &&
+		test_bit(DM_CRYPT_SUSPENDED, &p->cc->flags);
+}
+
+static int piv_read_iv(struct piv_control *p, struct piv_read_iv *out, bool quiesced)
+{
+	struct piv_sector *s = NULL;
+	int ret;
+
+	ret = piv_identity(p, out->version, out->size, out->generation,
+			   out->sector, sizeof(*out));
+	if (ret)
+		return ret;
+	if (memchr_inv(out->iv, 0, sizeof(out->iv)) ||
+	    memchr_inv(out->reserved, 0, sizeof(out->reserved)))
+		return -EINVAL;
+	if (quiesced ? !piv_quiesced(p) : p->blocked)
+		return -EBUSY;
+	ret = piv_load(p->cc, out->sector, &s);
 	if (!ret)
-		memcpy(out->iv, io->integrity_metadata + cc->integrity_tag_size,
-		       sizeof(out->iv));
+		memcpy(out->iv, s->original + 4112, 12);
+	piv_sector_free(p->cc, s);
+	return ret;
+}
+
+static int piv_update(struct piv_control *p, struct file *file,
+		      struct piv_update *u, bool prepare)
+{
+	struct crypt_config *cc = p->cc;
+	struct piv_sector *old = NULL, *candidate = NULL;
+	int ret;
+
+	ret = piv_identity(p, u->version, u->size, u->generation,
+			   u->sector, sizeof(*u));
+	if (ret)
+		return ret;
+	if (u->reserved || (u->flags && (prepare || u->flags != PIV_APPLY_DEFER_FLUSH)))
+		return -EINVAL;
+	if (!piv_quiesced(p) || !p->transaction || p->controller != file)
+		return -EBUSY;
+	if (p->failed)
+		return -EIO;
+	if (prepare && memchr_inv(u->tuple, 0, 4112))
+		return -EINVAL;
+	ret = piv_load(cc, u->sector, &old);
+	if (ret)
+		goto done;
+	/* Exact replay is safe even after an unacknowledged successful write. */
+	if (!prepare && !memcmp(old->original, u->tuple, PIV_TUPLE_BYTES)) {
+		ret = u->flags ? 0 : blkdev_issue_flush(cc->dev->bdev);
+		goto io_done;
+	}
+	if (memcmp(old->original + 4112, u->expected_iv, 12)) {
+		ret = -ESTALE;
+		goto done;
+	}
+	if (!memcmp(u->tuple + 4112, u->expected_iv, 12)) {
+		ret = -EINVAL;
+		goto done;
+	}
+	if (prepare) {
+		if (p->encryptions >= (1U << 20)) {
+			ret = -EDQUOT;
+			goto done;
+		}
+		ret = piv_bio(cc, old, REQ_OP_WRITE);
+		if (ret)
+			goto done;
+		p->encryptions++;
+		ret = piv_crypto(cc, old, u->tuple + 4112);
+		if (!ret) {
+			memcpy(u->tuple, page_address(old->page), 4096);
+			memcpy(u->tuple + 4096, old->io.integrity_metadata, 28);
+		}
+		goto done;
+	}
+	/* Authenticate the supplied tuple and enforce identical primary plaintext. */
+	candidate = kzalloc(sizeof(*candidate), GFP_NOIO);
+	if (!candidate) {
+		ret = -ENOMEM;
+		goto done;
+	}
+	candidate->io.cc = cc;
+	candidate->io.sector = old->io.sector;
+	candidate->page = alloc_page(GFP_NOIO);
+	candidate->io.integrity_metadata = kmemdup(u->tuple + 4096, 28, GFP_NOIO);
+	if (!candidate->page || !candidate->io.integrity_metadata) {
+		ret = -ENOMEM;
+		goto done;
+	}
+	memcpy(page_address(candidate->page), u->tuple, 4096);
+	ret = piv_bio(cc, candidate, REQ_OP_READ);
+	if (ret)
+		goto done;
+	ret = piv_crypto(cc, candidate, NULL);
+	if (ret)
+		goto done;
+	if (memcmp(page_address(candidate->page), page_address(old->page), 4096)) {
+		ret = -EPERM;
+		goto done;
+	}
+	/* Submit exact precomputed ciphertext plus tag/IV through lower journaling. */
+	memcpy(page_address(old->page), u->tuple, 4096);
+	memcpy(old->io.integrity_metadata, u->tuple + 4096, 28);
+	ret = piv_bio(cc, old, REQ_OP_WRITE | REQ_SYNC | (u->flags ? 0 : REQ_FUA));
+	if (ret)
+		goto done;
+	ret = submit_bio_wait(old->bio);
+	if (!ret && !u->flags)
+		ret = blkdev_issue_flush(cc->dev->bdev);
+io_done:
+	if (ret)
+		p->failed = true;
 done:
-	if (req)
-		mempool_free(req, &cc->req_pool);
-	if (bio)
-		bio_put(bio);
-	if (page) {
-		memzero_explicit(page_address(page), PAGE_SIZE);
-		__free_page(page);
-	}
-	if (io) {
-		kfree_sensitive(io->integrity_metadata);
-		kfree(io);
-	}
+	piv_sector_free(cc, candidate);
+	piv_sector_free(cc, old);
 	return ret;
 }
 
@@ -120,34 +276,92 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	struct piv_control *p = file->private_data;
 	struct piv_read_iv read;
 	struct piv_query profile;
+	struct piv_update *update = NULL;
+	bool updating = cmd == PIV_PREPARE || cmd == PIV_APPLY;
+	unsigned int noio;
 	long ret = 0;
 
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
-	if (cmd != PIV_QUERY && cmd != PIV_READ_IV)
+	if (cmd != PIV_QUERY && cmd != PIV_DEVICES && cmd != PIV_READ_IV && cmd != PIV_READ_QUIESCED &&
+	    cmd != PIV_BEGIN && cmd != PIV_END && cmd != PIV_SYNC && !updating)
 		return -ENOTTY;
-	if (cmd == PIV_READ_IV &&
-	    copy_from_user(&read, (void __user *)arg, sizeof(read)))
+	if (updating) {
+		update = memdup_user((void __user *)arg, sizeof(*update));
+		if (IS_ERR(update))
+			return PTR_ERR(update);
+	} else if (cmd != PIV_QUERY && cmd != PIV_DEVICES &&
+		   copy_from_user(&read, (void __user *)arg, sizeof(read))) {
 		return -EFAULT;
+	}
 	mutex_lock(&p->lock);
+	noio = memalloc_noio_save();
 	if (!p->live)
 		ret = -ENODEV;
-	else if (cmd == PIV_READ_IV) {
-		unsigned int noio = memalloc_noio_save();
-
-		ret = piv_read_iv(p, &read);
-		memalloc_noio_restore(noio);
-	}
-	else
+	else if (updating)
+		ret = piv_update(p, file, update, cmd == PIV_PREPARE);
+	else if (cmd == PIV_READ_IV || cmd == PIV_READ_QUIESCED)
+		ret = piv_read_iv(p, &read, cmd == PIV_READ_QUIESCED);
+	else if (cmd == PIV_QUERY || cmd == PIV_DEVICES)
 		profile = p->profile;
-	mutex_unlock(&p->lock);
-	/* Never fault userspace pages while holding the target/lifecycle mutex. */
-	if (!ret) {
-		if (cmd == PIV_READ_IV)
-			ret = copy_to_user((void __user *)arg, &read, sizeof(read)) ? -EFAULT : 0;
-		else
-			ret = copy_to_user((void __user *)arg, &profile, sizeof(profile)) ? -EFAULT : 0;
+	else {
+		ret = piv_identity(p, read.version, read.size, read.generation,
+				   read.sector, sizeof(read));
+		if (!ret && (read.sector || memchr_inv(read.iv, 0, 12) ||
+			     memchr_inv(read.reserved, 0, sizeof(read.reserved))))
+			ret = -EINVAL;
+		if (!ret && (!piv_quiesced(p) || p->failed))
+			ret = p->failed ? -EIO : -EBUSY;
+		if (!ret && cmd == PIV_BEGIN) {
+			if (p->controller && p->controller != file)
+				ret = -EBUSY;
+			else {
+				p->transaction = true;
+				p->controller = file;
+			}
+		} else if (!ret) {
+			if (!p->transaction || p->controller != file)
+				ret = -EPERM;
+			else {
+				ret = blkdev_issue_flush(p->cc->dev->bdev);
+				if (!ret && cmd == PIV_END) {
+					p->transaction = false;
+					p->controller = NULL;
+				} else if (ret)
+					p->failed = true;
+			}
+		}
 	}
+	memalloc_noio_restore(noio);
+	mutex_unlock(&p->lock);
+	if (!ret) {
+		if (cmd == PIV_DEVICES)
+			ret = copy_to_user((void __user *)arg, &p->devices, sizeof(p->devices)) ? -EFAULT : 0;
+		else if (cmd == PIV_QUERY)
+			ret = copy_to_user((void __user *)arg, &profile, sizeof(profile)) ? -EFAULT : 0;
+		else if (cmd == PIV_READ_IV || cmd == PIV_READ_QUIESCED)
+			ret = copy_to_user((void __user *)arg, &read, sizeof(read)) ? -EFAULT : 0;
+		else if (cmd == PIV_PREPARE)
+			ret = copy_to_user((void __user *)arg, update, sizeof(*update)) ? -EFAULT : 0;
+	}
+	kfree_sensitive(update);
+	return ret;
+}
+
+static int piv_preresume(struct dm_target *ti)
+{
+	struct crypt_config *cc = ti->private;
+	struct piv_control *p = cc->piv_control;
+	int ret = 0;
+	if (!p)
+		return 0;
+	mutex_lock(&p->lock);
+	if (p->failed || p->transaction ||
+	    !test_bit(DM_CRYPT_KEY_VALID, &cc->flags))
+		ret = -EBUSY;
+	else
+		p->resuming = true;
+	mutex_unlock(&p->lock);
 	return ret;
 }
 
@@ -160,6 +374,7 @@ static void piv_presuspend(struct dm_target *ti)
 		return;
 	mutex_lock(&p->lock);
 	p->blocked = true;
+	p->resuming = false;
 	mutex_unlock(&p->lock);
 }
 
@@ -171,6 +386,8 @@ static void piv_unblock(struct dm_target *ti)
 		return;
 	mutex_lock(&p->lock);
 	p->blocked = false;
+	p->activated = true;
+	p->resuming = false;
 	mutex_unlock(&p->lock);
 }
 
@@ -217,7 +434,13 @@ static int piv_register(struct crypt_config *cc, struct dm_target *ti)
 		.sectors = ti->len >> cc->sector_shift,
 		.sector_size = cc->sector_size, .iv_size = cc->iv_size,
 		.tag_size = cc->integrity_tag_size, .tuple_size = cc->tuple_size,
-		.flags = PIV_QUERY_LOWER_WRITE | PIV_QUERY_PRIMARY_FILTER,
+		.flags = PIV_QUERY_LOWER_WRITE | PIV_QUERY_PRIMARY_FILTER | PIV_QUERY_MUTATION,
+	};
+	p->devices = (struct piv_devices) {
+		.owner_major = MAJOR(disk_devt(dm_disk(dm_table_get_md(ti->table)))),
+		.owner_minor = MINOR(disk_devt(dm_disk(dm_table_get_md(ti->table)))),
+		.lower_major = MAJOR(cc->dev->bdev->bd_dev),
+		.lower_minor = MINOR(cc->dev->bdev->bd_dev),
 	};
 	snprintf(p->name, sizeof(p->name), "pivctl-%llu",
 		 (unsigned long long)p->profile.generation);

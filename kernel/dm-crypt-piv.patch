@@ -13,39 +13,81 @@
 @@ -157,0 +166,2 @@
 +	bool piv_enabled;
 +	struct piv_control *piv_control;
-@@ -2793,0 +2804,2 @@
+@@ -1343 +1353 @@
+-static int crypt_convert_block_aead(struct crypt_config *cc,
++static int crypt_convert_block_aead_iv(struct crypt_config *cc,
+@@ -1346 +1356 @@
+-				     unsigned int tag_offset)
++				     unsigned int tag_offset, const u8 *requested_iv)
+@@ -1399 +1409,4 @@
+-			r = cc->iv_gen_ops->generator(cc, org_iv, dmreq);
++			if (requested_iv)
++				memcpy(org_iv, requested_iv, cc->iv_size);
++			else
++				r = cc->iv_gen_ops->generator(cc, org_iv, dmreq);
+@@ -1442,0 +1456,7 @@
++}
++
++static int crypt_convert_block_aead(struct crypt_config *cc,
++				    struct convert_context *ctx,
++				    struct aead_request *req, unsigned int tag_offset)
++{
++	return crypt_convert_block_aead_iv(cc, ctx, req, tag_offset, NULL);
+@@ -2793,0 +2814,2 @@
 +#include "piv-control.inc"
 +
-@@ -2801,0 +2814,2 @@
+@@ -2801,0 +2824,2 @@
 +
 +	piv_unregister(cc);
-@@ -3183 +3197 @@
+@@ -3183 +3207 @@
 -		{0, 9, "Invalid number of feature args"},
 +		{0, 10, "Invalid number of feature args"},
-@@ -3205 +3219,3 @@
+@@ -3205 +3229,3 @@
 -		if (!strcasecmp(opt_string, "allow_discards"))
 +		if (!strcasecmp(opt_string, "piv_control"))
 +			cc->piv_enabled = true;
 +		else if (!strcasecmp(opt_string, "allow_discards"))
-@@ -3510,0 +3527,4 @@
+@@ -3510,0 +3537,4 @@
 +	ret = piv_register(cc, ti);
 +	if (ret)
 +		goto bad;
 +
-@@ -3524,0 +3545,6 @@
+@@ -3524,0 +3555,6 @@
 +
 +	/* Filter before the preflush/discard bypass, including WRITE|PREFLUSH. */
 +	if (cc->piv_enabled && bio_op(bio) != REQ_OP_READ &&
 +	    !(bio_op(bio) == REQ_OP_WRITE && !bio->bi_iter.bi_size &&
 +	      (bio->bi_opf & REQ_PREFLUSH)))
 +		return DM_MAPIO_KILL;
-@@ -3624,0 +3651 @@
+@@ -3624,0 +3661 @@
 +		num_feature_args += cc->piv_enabled;
-@@ -3636,0 +3664,2 @@
+@@ -3636,0 +3674,2 @@
 +			if (cc->piv_enabled)
 +				DMEMIT(" piv_control");
-@@ -3714,0 +3744 @@
+@@ -3707 +3746 @@
+-	return 0;
++	return piv_preresume(ti);
+@@ -3714,0 +3754 @@
 +	piv_unblock(ti);
-@@ -3802,0 +3833,2 @@
+@@ -3721 +3761 @@
+-static int crypt_message(struct dm_target *ti, unsigned int argc, char **argv,
++static int crypt_message_inner(struct dm_target *ti, unsigned int argc, char **argv,
+@@ -3761,0 +3802,15 @@
++static int crypt_message(struct dm_target *ti, unsigned int argc, char **argv,
++			 char *result, unsigned int maxlen)
++{
++	struct crypt_config *cc = ti->private;
++	struct piv_control *p = cc->piv_control;
++	int ret;
++	if (!p)
++		return crypt_message_inner(ti, argc, argv, result, maxlen);
++	mutex_lock(&p->lock);
++	ret = (p->transaction || p->resuming) ? -EBUSY :
++		crypt_message_inner(ti, argc, argv, result, maxlen);
++	mutex_unlock(&p->lock);
++	return ret;
++}
++
+@@ -3802,0 +3858,2 @@
 +	.presuspend = piv_presuspend,
 +	.presuspend_undo = piv_unblock,

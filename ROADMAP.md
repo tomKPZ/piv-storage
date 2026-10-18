@@ -104,7 +104,7 @@ reads, full primary hashes and final independent stock-Linux authentication.
 Exit: a repeatable online demo, passing offline regressions and focused online
 integration tests, with honest durability/security limitations.
 
-## Kernel backend phase (K0 complete; K1 authenticated reads implemented)
+## Kernel backend phase (K0–K3 prototype complete)
 
 Recommendation: start with an opt-in extension to the pinned dm-crypt source,
 keeping hidden crypto/FUSE in userspace and reusing the current mapping's primary
@@ -139,9 +139,11 @@ behavior with it enabled, working metadata queries, and verified build provenanc
 
 ### K1. One-sector IV replacement through the native integrity path
 
-Status: authenticated one-sector IV reads implemented and tested in
-artifacts/kernel-read-002; replacement remains open. The read ioctl uses the
-existing lower integrity bio path and native AEAD helper.
+Status: complete in artifacts/kernel-update-002. PREPARE authenticates the old
+sector and returns a request-local native encryption; APPLY authenticates both
+versions, checks identical primary plaintext, and submits exact tuples through
+the same integrity target. Independent Python and stock-kernel readback passed,
+including boundary sectors and corrupt-original refusal.
 
 - Authenticate/read a complete old sector tuple through the lower integrity
   device, apply a request-local supplied IV, and reencrypt identical plaintext.
@@ -156,6 +158,14 @@ Exit: paired sector updates with identical full primary plaintext, native
 integrity handling and no whole-image replacement. No whole-record commit claim.
 
 ### K2. Concurrency, target lifetime and whole-record recovery gate
+
+Status: prototype gate passed. Persistent encrypted nonce reservations precede
+encryption; a sealed external exact-tuple journal precedes mutation. Controller
+adoption, idempotent replay, suspend/resume/key gates, actual VM interruption with
+nonempty native journal replay, and journal-write EIO recovery were exercised.
+The supported concurrency model serializes primary access across commits.
+KASAN/lockdep, allocation injection and exhaustive race testing remain deferred;
+this milestone does not claim general kernel hardening.
 
 - Serialize updates with primary I/O initially. Test controller death, stale
   generations, suspend/remove/reload/key-wipe, workqueue/allocation/I/O failures
@@ -172,6 +182,11 @@ recovery decision. If this is too large, retain the kernel work as a sector proo
 and keep payload commits on the working userspace backend.
 
 ### K3. Connect the existing FUSE service to the optional kernel backend
+
+Status: complete in artifacts/kernel-online-002. serve-kernel provides strict
+guest setup, native read-only primary access and the existing hidden FUSE file.
+Mounted write/truncate/fsync, controller death during fsync, stale-mount restart,
+concurrent primary reads, primary write rejection and stock readback passed.
 
 - Keep the hidden codec and file interface; add a capability-checked kernel
   adapter and use the same extended dm-crypt owner for native read-only primary
@@ -193,20 +208,15 @@ transactions, broad upstream/cryptsetup integration, broader configurations, pro
 nonce/key policy, stronger crash testing, and systematic detectability evaluation.
 These are not prerequisites for the first mounted demonstration.
 
-## Next focused task
+## Completion and future work
 
-Complete K1 with a request-local one-sector IV replacement, using the now-tested
-read/authentication path. First establish lower journal mode/recovery validation,
-primary-I/O coordination and flush/FUA semantics. Read-only control tests do not
-establish mutation safety. Require expected-old-IV and owner checks, freshly
-generated test IVs, failure reporting and stock readback. Keep FUSE on the working
-regular-file backend until K2 whole-record recovery is satisfied.
-
-Mounted-service crash cleanup remains a bounded integration task before K3:
-stale FUSE mounts, NBD connections and Unix sockets need explicit cleanup after
-process death. Do not delete the stable owner lock or recover from staging images.
-It need not block the K0/K1 kernel experiments. Avoid resuming deferred broad
-offline hardening instead of these focused online/kernel tasks.
+The requested offline, online and native kernel prototype is implemented and
+verified within its documented disposable-guest scope. No required implementation
+milestone remains. Reproduce the native tests with kernel/README.md before
+changing its protocol or persistence ordering. Future work should choose a
+specific deferred research/hardening question rather than expand scope silently.
+The regular-file backend retains its separately documented cleanup limitations;
+these do not block the completed native demonstration.
 
 ## Session handoff
 
@@ -474,3 +484,63 @@ passwords, real-data images, or sensitive host information.
   IV/owner checks and native data+metadata submission/flush. Preserve current
   authenticated-read/lifecycle regressions. K1 is incomplete until that update
   passes independent stock readback; K2 still gates all kernel-backed FUSE fsync.
+
+### 2026-10-18: native update, recovery and mounted prototype completed
+
+- Committed the preceding authenticated-read slice as 9d2295f. Implemented
+  bounded PREPARE/APPLY, BEGIN/END/SYNC, request-local nonce override, exact-tuple
+  replay, fail-stop device errors and pending-transaction resume/key gates.
+  Lower writes carry integrity metadata through the existing target; no raw
+  active-stack edits, full-image replacement, host modules or forced loads.
+- Added kernel_api/owner/store and encrypted recovery.py. Setup validates the
+  pinned profile, static superblock, lower journal table, device identities and
+  holders. Stable UUID/state locks exclude other controllers. Only the RO wrapper
+  exposes primary data. Native state must live on private guest root ext4.
+- External nonce reservations are persisted BEFORE encryption; sealed exact-tuple
+  journals are published BEFORE writes. Recovery authenticates the complete
+  immutable journal before parsing metadata or applying anything. Sync every32
+  sectors and final END precede acknowledgment. Orphan staging files are ignored;
+  publication uses atomic rename, avoiding the earlier two-hardlink crash gap.
+  Missing/corrupt state fails closed. Historical pre-adoption nonce use remains
+  unknown; the 2^20 reservation limit is not a total primary-key lifetime proof.
+- artifacts/kernel-update-002 passed native boundary/negative/lifecycle tests,
+  including refusal of separately corrupted original ciphertext/tag/IV for reads,
+  PREPARE and APPLY. Stock and host authenticated all28,244 primary sectors;
+  original SHA256 b54b4937b0a9539574c7525d1634b3052cbb3836ca8d46211bb1cf03e4aaf1c4.
+- artifacts/kernel-online-002 passed direct and mounted updates, controller kill
+  during mounted fsync, restart roll-forward, idle stale-FUSE cleanup, concurrent
+  read-only primary file/block reads and primary write rejection. Stock and host
+  full primary SHA256 was
+  3f2dac5061b1febe70c35742fcc287c8672634cd72a637469a4c5b0508b6bb44;
+  host unpack matched the expected23-byte synthetic payload. The earlier online-001
+  was stopped after an invalid mount-ID readiness test waited despite service
+  restart; readiness now requires a successful payload read. It is not a passing run.
+- artifacts/kernel-power-002 passed actual QEMU SIGKILL with a delayed write in
+  flight after at least96 applied entries and durable external WAL. Before replay,
+  the offline parser rejected the nonempty integrity journal. Reboot replayed
+  stock dm-integrity and the external journal. A subsequent dm-flakey journal-write
+  EIO failed closed, then repair/recreation/replay recovered the35-byte payload.
+  Stock and host full authentication/hash and hidden-payload comparison passed.
+  power-001 also passed the experiment. Host page cache survives QEMU death;
+  these are not host-power-loss or exhaustive torn-write tests. Device-error
+  recovery requires stack recreation; automatic rebuild under a mounted primary
+  filesystem is outside scope. Healthy controller-death recovery reuses its stack.
+- Builds retain the exact Debian6.12.113-1 source/headers/symbol provenance and
+  6.12.113+deb13-amd64 guest from K0. No unexpected BUG/Oops/WARNING/KASAN
+  diagnostics were found in final online/power logs; unsigned-module taint,
+  deliberately blocked resume and injected EIO are expected.
+- Final host suite:41 tests passed with ResourceWarning errors enabled using
+  PIV_FIXTURE=artifacts/control-003. New tests cover crash boundaries, replay
+  without reencryption, corrupted/wrong-key state, reservation budgets/abandonment,
+  ownership, strict lower tables and state filesystem policy. Final validation-only
+  refinements (UUID canonicalization, authenticate-before-metadata parsing and
+  root-ext4 state policy) followed the frozen VM snapshots and passed host tests;
+  the final streaming journal also authenticated/validated all28,244 real native
+  tuples at full fixture size on the host;
+  do not describe those snapshots as byte-identical to the final Python package.
+- See docs/kernel-implementation.md for actual protocol/order/limitations and
+  kernel/README.md for reproduction. No new host installation, root privileges
+  or additional tools are needed. All disks/keys/downloads remain ignored.
+  Prototype complete; independent crypto review, systematic deniability analysis,
+  production rollback/key policy, incremental records and exhaustive kernel/crash
+  hardening remain deliberately deferred, not implied by the successful demo.

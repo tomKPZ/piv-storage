@@ -88,6 +88,9 @@ def run(args):
     share = run_dir / "share"
     share.mkdir(mode=0o700)
     shutil.copyfile(args.script, share / "task.sh")
+    if args.power_cut_script:
+        shutil.copyfile(args.power_cut_script, share / 'reboot-task.sh')
+        os.chmod(share / 'reboot-task.sh', 0o600)
     for path in args.share_file:
         destination = share / path.name
         if destination.exists():
@@ -115,7 +118,10 @@ def run(args):
                "-display", "none", "-serial", "stdio", "-monitor", "none",
                "-no-reboot"]
     if args.code:
-        command.extend(['-virtfs', f'local,path={ROOT / "pivstore"},mount_tag=pivcode,security_model=none,readonly=on'])
+        frozen_code = run_dir / 'code' / 'pivstore'
+        shutil.copytree(ROOT / 'pivstore', frozen_code,
+                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+        command.extend(['-virtfs', f'local,path={frozen_code},mount_tag=pivcode,security_model=none,readonly=on'])
     # QEMU option strings use commas as separators.
     if "," in str(run_dir):
         raise ValueError("Run directory cannot contain a comma")
@@ -140,7 +146,6 @@ def run(args):
         console.expect(rb"Password:")
         console.send(password + "\n")
         console.expect(rb"root@[^\r\n]*[#$] ")
-        password = None
         console.buffer = b""
         # First-boot prompts can echo credentials. Log only after login completes.
         with (run_dir / "console.log").open("wb") as log:
@@ -150,10 +155,43 @@ def run(args):
                          "mount -t 9p -o trans=virtio,version=9p2000.L pivwork /mnt/piv-work "
                          "&& bash /mnt/piv-work/task.sh; "
                          "rc=$?; printf '\\nPIV_TASK_DONE=%s\\n' \"$rc\"; sync; poweroff\n")
-            match = console.expect(rb"\nPIV_TASK_DONE=(\d+)[\r\n]")
-            code = int(match.group(1))
+            match = console.expect(rb"\n(?:PIV_TASK_DONE=(\d+)[\r\n]|PIV_POWER_CUT[\r\n])")
             console.log = None
+        if match.group(1) is None:
+            if not args.power_cut_script:
+                raise RuntimeError('Unexpected guest power-cut request')
+            deadline = console.deadline
+            process.kill()
+            process.wait(timeout=20)
+            console.close()
+            process.stdin.close()
+            process.stdout.close()
+            (run_dir / 'power-cut.json').write_text(json.dumps({
+                'mechanism': 'SIGKILL QEMU with delayed guest write in flight',
+                'host_page_cache_survives': True, 'host_power_loss_tested': False}) + '\n')
+            print('QEMU killed at requested device-I/O boundary; rebooting same disks', flush=True)
+            process = subprocess.Popen(command, stdin=subprocess.PIPE,
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            console = Console(process, deadline)
+            console.expect(rb'login:')
+            console.send('root\n')
+            console.expect(rb'Password:')
+            console.send(password + '\n')
+            console.expect(rb'root@[^\r\n]*[#$] ')
+            console.buffer = b''
+            with (run_dir / 'reboot-console.log').open('wb') as log:
+                console.log = log
+                console.send("stty -echo; mkdir -p /mnt/piv-work; "
+                             "mount -t 9p -o trans=virtio,version=9p2000.L pivwork /mnt/piv-work "
+                             "&& bash /mnt/piv-work/reboot-task.sh; "
+                             "rc=$?; printf '\\nPIV_TASK_DONE=%s\\n' \"$rc\"; sync; poweroff\n")
+                match = console.expect(rb'\nPIV_TASK_DONE=(\d+)[\r\n]')
+                console.log = None
+        password = None
+        code = int(match.group(1))
         process.wait(timeout=60)
+        if args.power_cut_script and not (run_dir / 'power-cut.json').exists() and code == 0:
+            raise RuntimeError('Expected power cut was not requested')
         if process.returncode != 0 or code != 0:
             raise RuntimeError(f"Guest task failed: task={code}, QEMU={process.returncode}; see {run_dir}")
         print(f"Guest task passed; artifacts: {share}", flush=True)
@@ -166,6 +204,8 @@ def run(args):
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
+        process.stdin.close()
+        process.stdout.close()
 
 
 def main():
@@ -175,6 +215,8 @@ def main():
     task = sub.add_parser("run")
     task.add_argument("--script", type=Path, required=True)
     task.add_argument("--run-dir", type=Path, required=True)
+    task.add_argument('--power-cut-script', type=Path,
+                      help='Reboot same disks after PIV_POWER_CUT and execute this follow-up')
     task.add_argument("--data-image", type=Path,
                       help="Copy this image into the guest data disk; never attach it directly")
     task.add_argument("--share-file", type=Path, action='append', default=[])
