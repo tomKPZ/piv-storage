@@ -1,0 +1,17 @@
+[
+  {
+    "filename": "dm-crypt-v6.12.113.c",
+    "url": "https://raw.githubusercontent.com/gregkh/linux/v6.12.113/drivers/md/dm-crypt.c",
+    "sha256": "5bc8fa46f16a8c977c795eef8b9a41231b70b3eacb0fa4666b500d70b4442991"
+  },
+  {
+    "filename": "dm-integrity-v6.12.113.c",
+    "url": "https://raw.githubusercontent.com/gregkh/linux/v6.12.113/drivers/md/dm-integrity.c",
+    "sha256": "03e261d4d65bc5599f3551598d6086f60bd9b6e11852e397ebf997ea89d27c6e"
+  },
+  {
+    "filename": "cryptsetup-integrity-v2.7.5.c",
+    "url": "https://raw.githubusercontent.com/mbroz/cryptsetup/v2.7.5/lib/integrity/integrity.c",
+    "sha256": "710198ef907de9f648110a1e2c4c5cd422e6be2ea3208abae77c00822e892706"
+  }
+]

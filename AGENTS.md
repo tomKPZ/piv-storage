@@ -17,7 +17,8 @@ security specification. Respect tool/sandbox approval requirements.
 ## Start and finish each session
 
 1. Read README.md, ROADMAP.md, applicable nested instructions, and existing design
-   notes. Inspect git status and relevant code before changing anything.
+   notes (especially docs/development.md, docs/observed-layout.md and
+   docs/hidden-format.md). Inspect git status and relevant code before changing anything.
 2. Determine what is actually implemented and tested. Recheck environmental
    assumptions as needed; the initial host is WSL2 without visible DM/KVM nodes.
 3. Select a bounded task with observable exit criteria. Continue through its
@@ -45,6 +46,15 @@ resolved from context/evidence, not for routine implementation decisions.
   all offsets, sizes and arithmetic before reading or writing.
 - Prefer supplied high-entropy keys initially; avoid implementing keyslot or
   password bootstrap machinery before the mechanism is established.
+- Current implementation is Python with cryptography and the host cryptsetup CLI.
+  Reproduce integration with scripts/vm.py and scripts/guest-control.sh; use
+  scripts/guest-verify.sh for an existing output image. Read the documented 9p
+  failure before changing the VM storage path. Tests use PIV_FIXTURE pointing
+  to a successful control run; never use failed runs as trusted fixtures.
+- The v1 hidden blob rewrites the entire carrier using a fresh salted derived
+  ChaCha20-Poly1305 key. Do not interpret its design argument as independent
+  cryptographic review. Primary nonce history/budgets are not enforced by the CLI;
+  preserve and make explicit the disposable-lineage limitation.
 
 ## Invariants to preserve
 

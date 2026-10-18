@@ -1,0 +1,2 @@
+# Tested host cryptographic implementation; use a virtualenv if installation is needed.
+cryptography==46.0.5

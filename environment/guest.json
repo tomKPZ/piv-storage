@@ -1,0 +1,8 @@
+{
+  "build": "20261017-2634",
+  "url": "https://cloud.debian.org/images/cloud/trixie/20261017-2634/debian-13-nocloud-amd64-20261017-2634.qcow2",
+  "filename": "debian-13-nocloud-amd64-20261017-2634.qcow2",
+  "sha512": "401ffd04907291b3af4fd9832b38fa16ac92e83cdb21a954f76a72d2b2d0daa6f6fc98a596f52a2616c0a3f11fd8f47138da8f5667b7f15f0a4bbc5f5bd0df26",
+  "checksum_source": "https://cloud.debian.org/images/cloud/trixie/20261017-2634/SHA512SUMS",
+  "note": "Checksum pinned from Debian HTTPS publication; detached signature verification is not implemented. Guest package additions are recorded per run, not yet snapshot-pinned."
+}

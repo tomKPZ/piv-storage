@@ -4,8 +4,12 @@ Research prototype for storing an independently encrypted auxiliary payload in
 the persistent random IVs of a Linux authenticated encrypted block volume,
 while preserving the primary volume's plaintext and authentication.
 
-**Status:** design only. No implementation, compatibility claim, or deniability
-guarantee exists yet. This README and [ROADMAP.md](ROADMAP.md) are working
+**Status:** an initial offline pack/unpack prototype is implemented, including
+inspection, IV extraction, primary authentication and copy-output updates.
+Stock Linux authenticated both random-IV replacements and a packed image without
+changing primary plaintext. This is a research prototype, not a production
+storage format or a deniability guarantee.
+This README and [ROADMAP.md](ROADMAP.md) are working
 hypotheses, not a fixed specification. Change them when experiments or source
 inspection provide better evidence; record consequential decisions and why.
 
@@ -23,6 +27,68 @@ Start with disposable regular-file images, one pinned format/configuration,
 exclusive offline access, and output to a separate image. General filesystems,
 live updates, kernel changes, physical devices, and broad format compatibility
 are later possibilities, not initial requirements.
+
+## Running the current prototype
+
+The current host uses Python 3 with the maintained `cryptography` library and
+the installed cryptsetup CLI. Python was chosen because these are already
+available and support small, inspectable format/crypto code without a new
+toolchain. Tested library version is in requirements.txt. Run from this checkout:
+
+```sh
+python3 scripts/fetch_sources.py
+python3 scripts/vm.py prepare
+python3 scripts/vm.py run --script scripts/guest-control.sh --run-dir artifacts/control-003
+python3 -m pivstore inspect artifacts/control-003/control.img
+python3 -m pivstore verify artifacts/control-003/control.img --volume-key-file artifacts/control-003/share/volume.key
+python3 -m pivstore extract-ivs artifacts/control-003/control.img --output artifacts/control-003/carrier.bin
+PIV_FIXTURE=artifacts/control-003 python3 -m unittest discover -v
+```
+
+To create a synthetic hidden blob in a new image (use a new destination/key name
+if any example path already exists):
+
+```sh
+mkdir -p secrets
+python3 -m pivstore keygen --output secrets/hidden.key
+python3 -m pivstore pack artifacts/control-003/control.img --output artifacts/packed.img --payload path/to/synthetic-payload --volume-key-file artifacts/control-003/share/volume.key --hidden-key-file secrets/hidden.key
+python3 -m pivstore unpack artifacts/packed.img --output artifacts/recovered-payload --hidden-key-file secrets/hidden.key
+python3 -m pivstore verify artifacts/packed.img --volume-key-file artifacts/control-003/share/volume.key
+```
+
+`pack` authenticates the input, rewrites the entire carrier with freshly randomized
+hidden encryption, verifies the complete primary output, and publishes a separate
+private image. It never replaces an existing destination or edits the input.
+`unpack` requires only the hidden key. The prototype v1 format uses a random
+32-byte salt, HKDF-SHA256 and ChaCha20-Poly1305 with all framing/padding inside
+encryption. Read [the format and its assumptions](docs/hidden-format.md) before
+changing it. At the tested size, usable hidden capacity is 338,864 bytes.
+Every update rewrites all 28,244 primary sectors; incremental records are deferred.
+
+Use disposable known-lineage images only: the CLI cannot establish historical
+GCM nonce usage, enforce a primary-key lifetime budget, or make clone branches
+and rollback safe. Cryptographic review and stronger persistence evaluation
+remain outstanding. Python does not guarantee erasure of key/plaintext buffers.
+
+Choose a fresh run directory if that path exists. The VM runner needs no host
+root; it uses software emulation by default. See [development instructions](docs/development.md)
+for dependencies, provenance limitations, artifacts, and the observed 9p failure.
+
+Only one narrow profile is accepted: LUKS2 with one ordinary dynamic AES-GCM/random
+segment, zero IV tweak, 4096-byte sectors, an integrity v4 superblock with fixed
+padding, 28-byte tuples, 32768-sector interleaving, and an empty, unencrypted,
+un-MACed journal. Other profiles are rejected. LUKS2 header validation/selection
+is delegated to cryptsetup; the primary volume key is supplied separately.
+`verify` authenticates every primary sector and prints its SHA-256 digest without
+writing plaintext. `extract-ivs` copies IV bytes in logical-sector order without
+authenticating the primary data; its output must not exist, and a failed run may
+leave a partial output. Copy-output publication has process-crash tests, but
+hardware power-loss durability has not been established.
+
+The validated control volume has 28,244 primary sectors, 115,687,424 primary
+bytes, and 338,928 gross carrier bytes. Both stock Linux and the userspace
+verifier produced the same full primary plaintext digest. See the
+[observed layout](docs/observed-layout.md) for details and evidence.
 
 ## Proposed mechanism
 
@@ -205,7 +271,8 @@ TCG startup/QMP shutdown smoke tests passed. /dev/kvm exists but this user canno
 access it; software emulation works without root. KVM group access is an optional
 performance improvement. libcryptsetup and libargon2 were not found via
 pkg-config; neither is required for the initial supplied-key userspace path.
-Guest boot and authenticated block-device support remain to be verified.
+Guest boot and authenticated block-device support subsequently passed using the
+pinned Debian environment described in docs/development.md.
 Recheck this inventory before relying on it.
 
 Use vendor/ for pinned external source checkouts, downloads/ for downloaded guest
