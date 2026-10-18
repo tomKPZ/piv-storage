@@ -21,7 +21,7 @@ security specification. Respect tool/sandbox approval requirements.
 1. Read README.md, ROADMAP.md, applicable nested instructions, and existing design
    notes (especially docs/development.md, docs/observed-layout.md and
    docs/hidden-format.md, docs/online-prototype.md and
-   docs/online-implementation.md). Inspect git status and
+   docs/online-implementation.md and docs/kernel-backend.md). Inspect git status and
    relevant code before changing anything.
 2. Determine what is actually implemented and tested. Recheck environmental
    assumptions as needed; the initial host is WSL2 without visible DM/KVM nodes.
@@ -43,18 +43,30 @@ resolved from context/evidence, not for routine implementation decisions.
   unrelated benchmarks, alternative profiles and complete environment pinning.
 - Target one writable hidden file and a read-only primary view on disposable VM
   storage. Reuse the whole-carrier v1 format and serialize commits initially.
-  A kernel driver, general hidden filesystem and primary writes are not required.
+  A general hidden filesystem and primary writes are not required. The first
+  mounted demo is complete; the next kernel-backend phase is in ROADMAP.md.
 - One backend must own the backing storage and coordinate both views. Never edit
   raw metadata behind an independently active dm-crypt mapping. Authentication,
   nonce freshness, cache coherence and minimum commit recovery remain required.
 - A private external recovery journal is allowed for the VM experiment, with
   explicit deniability limitations. It is not permission to use real disks or
-  claim crash safety without tests. Prefer userspace frontends before kernel work.
+  claim crash safety without tests. Keep the existing userspace file/hidden-codec
+  interface while investigating the kernel backend.
 - The first online backend uses regular-file image replacement, not in-place
   writes: prepare/verify/fsync a copy, hold old/new inode locks plus a stable path
   lock, replace the canonical path, and fsync its parent. Reuse this simpler path
-  before considering block-device transactions. Never delete the stable
+  as the reference/fallback during kernel work. Never delete the stable
   .pivstore.lock sidecar on shutdown or recover from orphan staging copies.
+- For the kernel phase, prefer a small opt-in dm-crypt extension over copying the
+  driver into a separate target. Start with matching guest build provenance,
+  query-only binary control and one-sector IV replacement through the existing
+  dm-integrity bio path. Source findings and uncertainties are recorded in
+  docs/kernel-backend.md. Never assume private IV hooks are an external module API.
+- Build/load experimental kernel code only in disposable guests with matched
+  source/config/symbol versions. Do not install host modules or force-load an
+  ABI-mismatched module. Keep normal primary mutations rejected while arranging
+  authorized lower-layer writes. Sector journaling does not make the v1 record
+  atomic; require the record-recovery gate before kernel-backed FUSE fsync.
 - Pin one ordinary supported LUKS2/dm-integrity profile before broadening support.
   Confirm actual IV/tag lengths, sector/address units, AAD, tuple layout, padding,
   offsets, journal state and replay behavior from sources and kernel fixtures.

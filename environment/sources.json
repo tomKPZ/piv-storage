@@ -13,5 +13,20 @@
     "filename": "cryptsetup-integrity-v2.7.5.c",
     "url": "https://raw.githubusercontent.com/mbroz/cryptsetup/v2.7.5/lib/integrity/integrity.c",
     "sha256": "710198ef907de9f648110a1e2c4c5cd422e6be2ea3208abae77c00822e892706"
+  },
+  {
+    "filename": "dm-table-v6.12.113.c",
+    "url": "https://raw.githubusercontent.com/gregkh/linux/v6.12.113/drivers/md/dm-table.c",
+    "sha256": "c6d2f765926f28d584803126aebe926685fee94a2884c6dc9be4233977101829"
+  },
+  {
+    "filename": "device-mapper-v6.12.113.h",
+    "url": "https://raw.githubusercontent.com/gregkh/linux/v6.12.113/include/linux/device-mapper.h",
+    "sha256": "09b13e869318b26bfac8b259a9fc44cc303dd5eb486840dc1b3d8f64f6ecbd3a"
+  },
+  {
+    "filename": "dm-v6.12.113.c",
+    "url": "https://raw.githubusercontent.com/gregkh/linux/v6.12.113/drivers/md/dm.c",
+    "sha256": "0510b5221751585ba852255d6312656188c422c93b1f1c038d9dcc46541b143c"
   }
 ]

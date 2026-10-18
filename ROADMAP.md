@@ -104,21 +104,96 @@ reads, full primary hashes and final independent stock-Linux authentication.
 Exit: a repeatable online demo, passing offline regressions and focused online
 integration tests, with honest durability/security limitations.
 
-## Later, only if the online experiment justifies it
+## Kernel backend phase (investigated; not implemented)
 
-Incremental hidden records, reduced write amplification, in-device transactions,
-ordinary dm-crypt integration, kernel work, broader configurations, production
+Recommendation: start with an opt-in extension to the pinned dm-crypt source,
+keeping hidden crypto/FUSE in userspace and reusing the current mapping's primary
+key, AEAD/AAD and integrity-bio machinery. A custom target is a fallback if that
+extension cannot remain contained; do not duplicate the driver before testing
+the smaller path. See [investigation and design gates](docs/kernel-backend.md).
+
+This phase targets disposable guest block devices and native primary reads,
+without the userspace NBD path or full-image rename. It does not make v1 hidden
+updates incremental, or make an entire blob atomic merely by using dm-integrity.
+Keep the regular-file backend as the working fallback.
+
+### K0. Matching module build and query-only control scaffold
+
+- Obtain exact Debian guest source/headers, config and Module.symvers; compare
+  relevant distro patches to our reviewed Linux 6.12.113 files. Build/load only
+  inside the disposable guest. If an exact module build is not viable, use a
+  matched test kernel/modules build; never force ABI-mismatched modules to load.
+- Add an explicit opt-in mode and bounded binary query endpoint tied to a live
+  target. The reviewed IV hooks are private and are not a loadable plugin API;
+  the existing text DM message API is not a bulk carrier transport.
+- Prove primary mutation rejection and lower dm-integrity write access can
+  coexist. Prototype a write-capable filtered owner with read-only presentation
+  if needed; ordinary --readonly activation is not assumed sufficient.
+
+Exit: unmodified behavior with the feature disabled, correct read-only primary
+behavior with it enabled, working metadata queries, and verified build provenance.
+
+### K1. One-sector IV replacement through the native integrity path
+
+- Authenticate/read a complete old sector tuple through the lower integrity
+  device, apply a request-local supplied IV, and reencrypt identical plaintext.
+- Submit ciphertext plus metadata through that same journaled dm-integrity
+  instance. Do not edit raw layout offsets or use global "next IV" state.
+- Use bounded requests, validate indices/expected old IVs, and establish actual
+  flush/FUA completion semantics. Reuse loaded key state without key-read APIs.
+- Test first/last/interleave-boundary sectors, malformed requests and corrupted
+  old tuples, then close the patched stack and verify with stock Linux/Python.
+
+Exit: paired sector updates with identical full primary plaintext, native
+integrity handling and no whole-image replacement. No whole-record commit claim.
+
+### K2. Concurrency, target lifetime and whole-record recovery gate
+
+- Serialize updates with primary I/O initially. Test controller death, stale
+  generations, suspend/remove/reload/key-wipe, workqueue/allocation/I/O failures
+  and invalid requests; use lockdep/KASAN configurations where available.
+- Inject device/VM failures around actual journal commit/replay, not just kill
+  the controller while kernel work continues. Record virtual cache assumptions.
+- Design and test recoverable multi-sector blob commits before enabling hidden
+  fsync through this backend. An external private recovery journal is allowed
+  for experiments, with identity/integrity/ordering and explicit exposure limits.
+  Recovery may need exact tuple replay; it must not reencrypt with stale IVs.
+
+Exit: bounded concurrency/lifetime behavior and an explicit, tested record-level
+recovery decision. If this is too large, retain the kernel work as a sector proof
+and keep payload commits on the working userspace backend.
+
+### K3. Connect the existing FUSE service to the optional kernel backend
+
+- Keep the hidden codec and file interface; add a capability-checked kernel
+  adapter and use the same extended dm-crypt owner for native read-only primary
+  access. No separate raw writer or independently active primary mapping.
+- Repeat mounted write/truncate/fsync, recovery and concurrent-read tests on
+  disposable guest disks. Preserve stock-kernel readback and the existing backend.
+- Resolve mounted frontend crash cleanup as part of this integrated lifecycle.
+
+Exit: a working optional device-backed demo with honest record-recovery limits;
+no claim of general kernel ABI compatibility, production durability or deniability.
+
+## Later, only if the experiments justify it
+
+Incremental hidden records, reduced write amplification, in-device whole-record
+transactions, broad upstream/cryptsetup integration, broader configurations, production
 nonce/key policy, stronger crash testing, and systematic detectability evaluation.
 These are not prerequisites for the first mounted demonstration.
 
 ## Next focused task
 
-Exercise abrupt termination of the mounted service and document/automate bounded
-frontend cleanup/reconnection in the VM. Backend publication crash tests already
-pass; stale FUSE mounts, NBD connections and Unix sockets currently need explicit
-cleanup after process death. Do not delete the stable owner lock or recover from
-staging images. Keep further work directed at this online lifecycle, not deferred
-offline expansion. Direct block-device/in-place support remains a later choice.
+Begin K0 by establishing an exact guest module-build source/header/ABI path,
+then implement query-only control and the read-only/lower-write access spike.
+The user requested investigation and a roadmap addition in the current turn;
+no kernel build or implementation was performed during that investigation.
+
+Mounted-service crash cleanup remains a bounded integration task before K3:
+stale FUSE mounts, NBD connections and Unix sockets need explicit cleanup after
+process death. Do not delete the stable owner lock or recover from staging images.
+It need not block the K0/K1 kernel experiments. Avoid resuming deferred broad
+offline hardening instead of these focused online/kernel tasks.
 
 ## Session handoff
 
@@ -126,6 +201,28 @@ At the end of implementation sessions update this file with completed work,
 commands/checks and results, known failures, blockers, and the next concrete task.
 Add focused design notes when decisions become substantial. Never include keys,
 passwords, real-data images, or sensitive host information.
+
+### 2026-10-18: kernel backend investigation
+
+- User requested investigation and roadmap integration, not implementation in
+  this turn. Recommended a small opt-in dm-crypt patch first; separate target is
+  a fallback with explicit refactoring/maintenance tradeoffs.
+- Inspected pinned dm-crypt/dm-integrity source, DM target callback definitions
+  and ioctl dispatch. Added three SHA-256-pinned source references to the fetch
+  manifest and docs/kernel-backend.md with evidence, hypotheses and test gates.
+- Important findings: IV hooks are private; caller-supplied IV updates need an
+  explicit request path; read-only primary presentation must coexist with a
+  write-capable lower integrity target; sector tuple journaling is not whole-blob
+  atomicity. Bulk/control transport and table lifetime need a deliberate design.
+- Confirmed host build tools (make, cc/ld, bison, flex, bc, pahole) and guest config
+  DM_CRYPT=m, DM_INTEGRITY=m, BLK_DEV_INTEGRITY=y, KEYS=y, MODVERSIONS=y.
+  Exact headers/Module.symvers and distro-source compatibility are not verified.
+- No package installation, full checkout, kernel build, module load or runtime
+  implementation change. Validate this revision with source checksums, JSON and
+  documentation consistency/whitespace, not a claim of new runtime test coverage.
+- Next concrete task: K0 build-provenance and query/control/access-mode spike
+  in QEMU. Retain regular-file atomic replacement as a working fallback; do not
+  wire full-carrier FUSE commits into sector writes before K2 recovery is solved.
 
 ### 2026-10-18: first online implementation
 

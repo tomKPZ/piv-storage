@@ -39,6 +39,13 @@ direct block-device/in-place updates are deferred. See
 [online usage and recovery](docs/online-implementation.md),
 [the prototype plan](docs/online-prototype.md), and [active roadmap](ROADMAP.md).
 
+A device-backed kernel phase is now planned: first test a small opt-in dm-crypt
+extension that reuses native primary crypto/integrity I/O, keeping FUSE and hidden
+encryption in userspace. A separate device-mapper target is the fallback.
+[The investigation](docs/kernel-backend.md) separates source findings, single-sector
+experiments and the required whole-record recovery gate. No kernel extension is
+implemented or built yet; current commands still require regular-file backing.
+
 ## Running the current prototype
 
 The current host uses Python 3 with the maintained `cryptography` library and
