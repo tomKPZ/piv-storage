@@ -20,7 +20,8 @@ security specification. Respect tool/sandbox approval requirements.
 
 1. Read README.md, ROADMAP.md, applicable nested instructions, and existing design
    notes (especially docs/development.md, docs/observed-layout.md and
-   docs/hidden-format.md and docs/online-prototype.md). Inspect git status and
+   docs/hidden-format.md, docs/online-prototype.md and
+   docs/online-implementation.md). Inspect git status and
    relevant code before changing anything.
 2. Determine what is actually implemented and tested. Recheck environmental
    assumptions as needed; the initial host is WSL2 without visible DM/KVM nodes.
@@ -49,6 +50,11 @@ resolved from context/evidence, not for routine implementation decisions.
 - A private external recovery journal is allowed for the VM experiment, with
   explicit deniability limitations. It is not permission to use real disks or
   claim crash safety without tests. Prefer userspace frontends before kernel work.
+- The first online backend uses regular-file image replacement, not in-place
+  writes: prepare/verify/fsync a copy, hold old/new inode locks plus a stable path
+  lock, replace the canonical path, and fsync its parent. Reuse this simpler path
+  before considering block-device transactions. Never delete the stable
+  .pivstore.lock sidecar on shutdown or recover from orphan staging copies.
 - Pin one ordinary supported LUKS2/dm-integrity profile before broadening support.
   Confirm actual IV/tag lengths, sector/address units, AAD, tuple layout, padding,
   offsets, journal state and replay behavior from sources and kernel fixtures.

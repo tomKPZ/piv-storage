@@ -83,6 +83,14 @@ hidden-payload pack. The whole-record hidden format is in docs/hidden-format.md.
 files, not the complete Debian-patched kernel source. Inspect distro changes if
 behavior differs. A full Linux checkout is unnecessary for the initial review.
 
+## Online integration
+
+See docs/online-implementation.md for the single-owner FUSE/NBD service and
+scripts/guest-online.sh for its disposable mounted test. Use `scripts/vm.py run
+--code` to share the package source read-only; online backing images live on guest
+ext4. Additional FUSE/NBD packages are installed only in the guest. The offline
+commands above remain the stock-kernel compatibility baseline.
+
 ## Observed infrastructure failure
 
 The first control attempt used a guest loop device backed by a writable file on

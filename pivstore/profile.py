@@ -16,8 +16,7 @@ import struct
 import subprocess
 import uuid
 
-from cryptography.exceptions import InvalidTag
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from .sector import SectorCodec
 
 
 class UnsupportedImage(ValueError):
@@ -114,25 +113,28 @@ def validate_segment(metadata):
 
 
 class Image(AbstractContextManager):
-    def __init__(self, path):
+    def __init__(self, path, *, exclusive=False):
         self.fd = os.open(Path(path), os.O_RDONLY | os.O_NOFOLLOW)
         try:
             info = os.fstat(self.fd)
             if not stat.S_ISREG(info.st_mode):
                 raise UnsupportedImage('Only regular-file images are supported')
-            fcntl.flock(self.fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            fcntl.flock(self.fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
             self.initial_stat = info
             self.size = info.st_size
             # Use the held descriptor so path replacement cannot make cryptsetup
             # inspect a different file. No activation or keyslot unlock occurs.
+            # In exclusive mode we already hold the lock. Suppress cryptsetup's
+            # second, incompatible shared lock through a separately opened fd.
+            options = ['--disable-locks'] if exclusive else []
             result = subprocess.run([
-                'cryptsetup', 'luksDump', '--dump-json-metadata',
+                'cryptsetup', *options, 'luksDump', '--dump-json-metadata',
                 f'/proc/self/fd/{self.fd}'], pass_fds=(self.fd,),
                 capture_output=True, text=True, timeout=30)
             if result.returncode:
                 raise UnsupportedImage('cryptsetup rejected LUKS2 metadata')
             uuid_result = subprocess.run([
-                'cryptsetup', 'luksUUID', f'/proc/self/fd/{self.fd}'],
+                'cryptsetup', *options, 'luksUUID', f'/proc/self/fd/{self.fd}'],
                 pass_fds=(self.fd,), capture_output=True, text=True, timeout=30)
             if uuid_result.returncode:
                 raise UnsupportedImage('cryptsetup rejected LUKS UUID')
@@ -182,20 +184,13 @@ class Image(AbstractContextManager):
             yield self.read(12, tag_offset + 16)
 
     def verify(self, key):
-        if len(key) != 32:
-            raise ValueError('This profile requires a 32-byte primary volume key')
-        cipher = AESGCM(key)
+        codec = SectorCodec(key)
         digest = hashlib.sha256()
         for index in range(self.layout.sectors):
             data_offset, tag_offset = self.layout.offsets(index)
             ciphertext = self.read(4096, data_offset)
             metadata = self.read(28, tag_offset)
-            tag, iv = metadata[:16], metadata[16:]
-            aad = struct.pack('<Q', index * 8) + iv
-            try:
-                plaintext = cipher.decrypt(iv, ciphertext + tag, aad)
-            except InvalidTag:
-                raise UnsupportedImage(f'Primary authentication failed at sector {index}') from None
+            plaintext = codec.decrypt(index, ciphertext, metadata)
             digest.update(plaintext)
         return digest.hexdigest()
 
@@ -211,4 +206,10 @@ class Image(AbstractContextManager):
             if exc_type is None:
                 self.check_unchanged()
         finally:
+            self.close()
+
+    def close(self):
+        """Release ownership; callers that mutate/replace an image manage checks."""
+        if self.fd is not None:
             os.close(self.fd)
+            self.fd = None

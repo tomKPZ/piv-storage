@@ -10,6 +10,8 @@
 *.img
 *.qcow2
 *.raw
+*.pivstore.lock
+.pivstore-commit-*/
 /.env
 /.venv/
 

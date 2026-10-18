@@ -24,12 +24,13 @@ Do not defer primary authentication, nonce freshness, ownership/cache coherence,
 or the minimum recovery behavior needed by actual online writes. Keep the
 single-image threat model and known snapshot distinguisher explicit.
 
-## Next target: a small online demonstration
+## First online demonstration (implemented)
 
 Here online means a running service exposing a writable auxiliary file, with a
-read-only primary view available through a coordinated path. No online code is
-implemented yet. The first writable mount may run with the primary view closed;
-completion of the demo includes simultaneous primary reads and hidden updates.
+read-only primary view available through a coordinated path. The regular-file
+implementation now passes the mounted demo, including simultaneous primary reads
+and hidden updates. Its shared-codec offline regressions and nine new online
+tests pass (31 total). See docs/online-implementation.md for actual limitations.
 
 Keep one supported format, supplied high-entropy keys, one process, one hidden
 file, and disposable VM disks. Reuse the whole-carrier v1 blob: buffer edits and
@@ -38,6 +39,9 @@ writes, multiple clients, a general hidden filesystem and a kernel driver are
 not required. See [online design](docs/online-prototype.md).
 
 ### 1. Establish one owner and frontend contracts
+
+Status: implemented and tested with a stable path lock plus inode locks,
+authenticated read-only NBD, and a direct-I/O single-file FUSE adapter.
 
 - Separate storage access/sector crypto from the CLI enough to reuse them in a
   long-running service, keeping the offline regression tests passing.
@@ -55,6 +59,11 @@ The frontend choices are provisional; revise if an alternative is simpler while
 preserving those properties.
 
 ### 2. Add the minimum online commit/recovery path
+
+Status: implemented for local regular files. Prepare/verify/fsync a whole-image
+copy, atomically replace its canonical path under the owner lock, and fsync the
+parent directory before acknowledgment. This simpler path needs no new in-place
+journal. Backend SIGKILL tests reopen the complete old/new canonical image.
 
 - Keep edits in memory until an explicit flush; initially serialize every commit
   and pause primary reads during it. Full-volume rewrites are acceptable.
@@ -75,6 +84,10 @@ Caught errors and selected process-crash boundaries are sufficient at this stage
 physical power-loss guarantees are deferred.
 
 ### 3. Demonstrate the mounted workflow in QEMU
+
+Status: artifacts/online-002 passed the mounted ext4/FUSE/NBD workflow, clean
+restart/remount, actual primary-write rejection, concurrent uncached primary
+reads, full primary hashes and final independent stock-Linux authentication.
 
 - Mount the hidden file and primary filesystem read-only inside the guest. Use
   synthetic data; do not require host root or host physical disks.
@@ -98,12 +111,65 @@ ordinary dm-crypt integration, kernel work, broader configurations, production
 nonce/key policy, stronger crash testing, and systematic detectability evaluation.
 These are not prerequisites for the first mounted demonstration.
 
+## Next focused task
+
+Exercise abrupt termination of the mounted service and document/automate bounded
+frontend cleanup/reconnection in the VM. Backend publication crash tests already
+pass; stale FUSE mounts, NBD connections and Unix sockets currently need explicit
+cleanup after process death. Do not delete the stable owner lock or recover from
+staging images. Keep further work directed at this online lifecycle, not deferred
+offline expansion. Direct block-device/in-place support remains a later choice.
+
 ## Session handoff
 
 At the end of implementation sessions update this file with completed work,
 commands/checks and results, known failures, blockers, and the next concrete task.
 Add focused design notes when decisions become substantial. Never include keys,
 passwords, real-data images, or sensitive host information.
+
+### 2026-10-18: first online implementation
+
+- Committed the requested scope revision as fbb7ff3. The user subsequently
+  authorized committing the online implementation described below.
+- Extracted SectorCodec and a held-image copy writer shared by offline and online
+  paths. The offline 22-test baseline still passes. Exclusive inspection suppresses
+  cryptsetup's secondary metadata lock while retaining our own held inode lock;
+  otherwise the child process would block against its owner's exclusive lock.
+- Added OnlineStore, Unix-socket read-only NBD and one-file pyfuse3 adapters, plus
+  the serve CLI. Writes/truncation buffer in memory; fsync/flush commits the whole
+  record. One owner serializes reads/commits and fails closed after uncertainty.
+- Chose local regular-file atomic replacement instead of in-place transactions:
+  leave the current image intact until a verified/fsynced replacement is ready,
+  lock it, rename it, and fsync the parent. Raw devices are unsupported. This
+  avoids inventing an external undo/redo journal for the first mounted demo.
+- Added in-process IV history and a conservative per-session sector-encryption
+  ceiling. Neither is persistent lifetime accounting; previous sessions, clones
+  and rollback remain outside the trusted disposable-lineage assumptions.
+- Added nine host online tests: ownership across replacement, buffered sparse
+  write/truncate/reopen, read/write bounds, budget rejection, concurrent reads
+  waiting for commit, authentication fail-stop, post-publication errors, SIGKILL
+  at prepared/published/durable boundaries, and NBD protocol/write rejection.
+  Full suite passed: PIV_FIXTURE=artifacts/control-003 python3 -W
+  error::ResourceWarning -m unittest discover -v (31 tests).
+- Added scripts/guest-online.sh and vm.py --code read-only package export. Guest
+  backing files live on local ext4. FUSE/NBD/crypto dependencies were installed
+  only inside the disposable guest; no new host packages or host root were needed.
+- artifacts/online-001 mounted and committed successfully, then failed a test
+  assumption that writable open itself must fail. Linux allowed that open while
+  maintaining read-only state. Revised the test to attempt an actual write.
+- artifacts/online-002 passed: hidden write/truncate/fsync during concurrent
+  primary file and uncached block reads; actual primary-write rejection; clean
+  service restart and hidden recovery; independent stock mapper verification.
+  All four full primary hashes match:
+  0f9245ced1686784b11da37e8bdb60d02aaa7d4a76f9152d35831652b6402eef.
+  Host verification authenticated all 28,244 exported final-image sectors and
+  recovered the same 20-byte synthetic hidden payload.
+- Tested guest additions: pyfuse3 3.4.0, Trio 0.29.0, cryptography 43.0.0,
+  nbd-client 3.26.1 and fuse3 3.17.2. Exact Debian package versions are recorded in
+  artifacts/online-002/share/packages.tsv. Host crypto remains 46.0.5.
+- See docs/online-implementation.md for ordering, capacity, process-crash versus
+  power-loss scope, lock/staging exposure and manual use. Next focused task is
+  mounted crash cleanup/reconnection, not another format or kernel driver.
 
 ### Scope revision: prioritize the online demonstration
 

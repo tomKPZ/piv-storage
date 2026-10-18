@@ -3,11 +3,9 @@
 import os
 from pathlib import Path
 import secrets
-import struct
 import tempfile
 
-from cryptography.exceptions import InvalidTag
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from .sector import SectorCodec
 
 from .profile import Image, UnsupportedImage
 
@@ -46,63 +44,61 @@ def randomize_copy(source, output, key, sectors):
 
 def rewrite_copy(source, output, key, make_plan):
     """Validate all input/output primary data and publish an exclusive copy."""
-    if len(key) != 32:
-        raise ValueError('This profile requires a 32-byte primary volume key')
-    cipher = AESGCM(key)
+    with Image(source) as original:
+        return rewrite_open_image(original, output, key, make_plan)
+
+
+def rewrite_open_image(original, output, key, make_plan):
+    """Copy a held, locked Image; ownership and closing remain with its caller."""
+    codec = SectorCodec(key)
     output = Path(output)
     if output.exists() or output.is_symlink():
         raise FileExistsError('Output must not exist')
-    with Image(source) as original:
-        expected = original.verify(key)
-        # This catches current-image collisions only, not historical nonce reuse.
-        used = set(original.iv_slots())
-        if len(used) != original.layout.sectors:
-            raise UnsupportedImage('Repeated current primary IV; refusing to write')
-        plan = make_plan(original, used)
-        if not plan:
-            raise ValueError('Empty update plan')
-        for index, iv in plan.items():
-            if not 0 <= index < original.layout.sectors or len(iv) != 12:
-                raise ValueError('Invalid update plan')
-        if len(set(plan.values())) != len(plan) or used.intersection(plan.values()):
-            raise ValueError('Update plan repeats a current or replacement primary IV')
-        fd, temporary_name = tempfile.mkstemp(prefix='.pivstore-', suffix='.partial',
-                                               dir=output.parent)
-        temporary = Path(temporary_name)
+    expected = original.verify(key)
+    # This catches current-image collisions only, not historical nonce reuse.
+    used = set(original.iv_slots())
+    if len(used) != original.layout.sectors:
+        raise UnsupportedImage('Repeated current primary IV; refusing to write')
+    plan = make_plan(original, used)
+    if not plan:
+        raise ValueError('Empty update plan')
+    for index, iv in plan.items():
+        if not 0 <= index < original.layout.sectors or len(iv) != 12:
+            raise ValueError('Invalid update plan')
+    if len(set(plan.values())) != len(plan) or used.intersection(plan.values()):
+        raise ValueError('Update plan repeats a current or replacement primary IV')
+    fd, temporary_name = tempfile.mkstemp(prefix='.pivstore-', suffix='.partial',
+                                           dir=output.parent)
+    temporary = Path(temporary_name)
+    try:
+        position = 0
+        while position < original.size:
+            data = original.read(min(1024 * 1024, original.size - position), position)
+            write_exact(fd, data, position)
+            position += len(data)
+        for index, iv in sorted(plan.items()):
+            data_offset, tag_offset = original.layout.offsets(index)
+            ciphertext = original.read(4096, data_offset)
+            metadata = original.read(28, tag_offset)
+            plaintext = codec.decrypt(index, ciphertext, metadata)
+            encrypted, metadata = codec.encrypt(index, plaintext, iv)
+            write_exact(fd, encrypted, data_offset)
+            write_exact(fd, metadata, tag_offset)
+        with Image(temporary) as candidate:
+            if candidate.verify(key) != expected:
+                raise UnsupportedImage('Output primary plaintext differs from input')
+        original.check_unchanged()
+        os.fsync(fd)
+        # A same-filesystem hard link atomically publishes without replacing
+        # an existing name. Filesystems without hard links are unsupported.
+        os.link(temporary, output)
+        temporary.unlink()
+        directory = os.open(output.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            position = 0
-            while position < original.size:
-                data = original.read(min(1024 * 1024, original.size - position), position)
-                write_exact(fd, data, position)
-                position += len(data)
-            for index, iv in sorted(plan.items()):
-                data_offset, tag_offset = original.layout.offsets(index)
-                ciphertext = original.read(4096, data_offset)
-                metadata = original.read(28, tag_offset)
-                old_iv = metadata[16:]
-                try:
-                    plaintext = cipher.decrypt(old_iv, ciphertext + metadata[:16],
-                                               struct.pack('<Q', index * 8) + old_iv)
-                except InvalidTag:
-                    raise UnsupportedImage(f'Primary authentication failed at sector {index}') from None
-                encrypted = cipher.encrypt(iv, plaintext, struct.pack('<Q', index * 8) + iv)
-                write_exact(fd, encrypted[:4096], data_offset)
-                write_exact(fd, encrypted[4096:] + iv, tag_offset)
-            with Image(temporary) as candidate:
-                if candidate.verify(key) != expected:
-                    raise UnsupportedImage('Output primary plaintext differs from input')
-            original.check_unchanged()
-            os.fsync(fd)
-            # A same-filesystem hard link atomically publishes without replacing
-            # an existing name. Filesystems without hard links are unsupported.
-            os.link(temporary, output)
-            temporary.unlink()
-            directory = os.open(output.parent, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+            os.fsync(directory)
         finally:
-            os.close(fd)
-            temporary.unlink(missing_ok=True)
-        return {'primary_sha256': expected, 'rewritten_sector_count': len(plan)}
+            os.close(directory)
+    finally:
+        os.close(fd)
+        temporary.unlink(missing_ok=True)
+    return {'primary_sha256': expected, 'rewritten_sector_count': len(plan)}

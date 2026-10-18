@@ -41,8 +41,39 @@ def main():
     extraction.add_argument('image', type=Path)
     extraction.add_argument('--output', type=Path, required=True)
     extraction.add_argument('--hidden-key-file', type=Path, required=True)
+    service = sub.add_parser('serve', help='Run coordinated read-only NBD and one hidden FUSE file')
+    service.add_argument('image', type=Path)
+    service.add_argument('--volume-key-file', type=Path, required=True)
+    service.add_argument('--hidden-key-file', type=Path, required=True)
+    service.add_argument('--socket', type=Path, required=True)
+    service.add_argument('--mountpoint', type=Path, required=True)
+    service.add_argument('--initialize', action='store_true',
+                         help='Start empty; replaces any existing hidden payload on flush')
+    service.add_argument('--max-sector-encryptions', type=int, default=1 << 20,
+                         help='Per-session ceiling; does not track historical key usage')
     args = parser.parse_args()
     try:
+        if args.action == 'serve':
+            from .online import OnlineStore
+            from .nbd import PrimaryServer
+            try:
+                from .fuse_frontend import mount
+            except ImportError as exc:
+                raise ValueError('Online mounting needs pyfuse3 and trio (guest packages)') from exc
+            with args.volume_key_file.open('rb') as stream:
+                primary_key = stream.read(33)
+            with args.hidden_key_file.open('rb') as stream:
+                hidden_key = stream.read(33)
+            with OnlineStore(args.image, primary_key, hidden_key,
+                             initialize=args.initialize,
+                             max_sector_encryptions=args.max_sector_encryptions) as store:
+                server = PrimaryServer(args.socket, store)
+                server.start()
+                try:
+                    mount(store, args.mountpoint)
+                finally:
+                    server.stop()
+            return 0
         if args.action == 'keygen':
             fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, 'wb') as stream:

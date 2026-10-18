@@ -1,8 +1,10 @@
 # Small online prototype
 
-Status: plan only. The user reduced further offline prototype scope to make room
-for online implementation. The working offline codec, whole-carrier format and
-stock-Linux tests remain the reference. This plan is provisional.
+Status: a single-owner backend, read-only NBD export and one-file FUSE frontend
+are implemented. The user reduced further offline scope to prioritize this demo.
+The working offline codec, whole-carrier format and stock-Linux tests remain the
+reference. This plan is provisional; see docs/online-implementation.md for the
+actual regular-file commit/recovery contract.
 
 ## User-visible target
 
@@ -21,9 +23,9 @@ format is required.
 
 ## Provisional architecture
 
-One userspace backend exclusively owns the backing image/device and holds both
-keys while serving updates. Candidate frontends are NBD for authenticated primary
-reads and FUSE for one hidden file. Develop and test these in the guest; do not
+One userspace backend exclusively owns a regular-file backing image and holds
+both keys while serving updates. The implemented frontends are NBD for
+authenticated primary reads and FUSE for one hidden file. Test them in the guest; do not
 require host root or physical devices. Confirm actual guest dependencies during
 implementation rather than installing toolchains speculatively.
 
@@ -34,18 +36,23 @@ them while committing and resume only after a complete consistent state exists.
 Reject primary writes at the block frontend. Perform stock dm-crypt compatibility
 checks after stopping the service and closing its backing storage.
 
-This requires refactoring storage access: the current Image API accepts regular
-files and checks their stability, and the current writer publishes copies. Those
-APIs are references, not an already functioning live backend. Keep their strict
-offline behavior while adding a distinct owned online path.
+The shared sector codec and held-image copy writer now support a distinct owned
+online path while preserving strict offline behavior. The owner uses a stable
+path lock plus inode locks and serializes commits/reads. Block devices remain
+deferred: whole-image preparation followed by atomic rename is the simpler first
+commit mechanism. The image must live on the guest's local filesystem, not 9p.
 
 ## Minimum mutation/recovery contract
 
-In-place tuple updates and a whole-carrier auxiliary record need a transaction
-boundary. Establish the protocol before enabling writes to the sole backing
-image. Do not assume dm-integrity journaling covers userspace writes.
+In-place tuple updates would need a new transaction protocol. The implemented
+regular-file prototype instead leaves the current image intact until a fully
+authenticated/fsynced replacement is ready, atomically replaces its path, then
+fsyncs the parent directory before acknowledging. Restart authenticates the
+canonical old/new complete image, never a staging copy. Do not assume
+dm-integrity journaling covers userspace writes.
 
-A private external recovery journal is permitted initially. Specify its contents,
+A private external recovery journal remains permitted if later device-backed work
+requires it; the current regular-file approach does not need one. Specify its contents,
 identity binding, persistence ordering, commit marker, startup recovery and error
 behavior. It must not store keys or primary plaintext. It can contain encrypted
 sector tuples and reveal update history; its presence weakens deniability. A

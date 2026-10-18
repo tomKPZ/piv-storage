@@ -114,6 +114,8 @@ def run(args):
                "-virtfs", f"local,path={share},mount_tag=pivwork,security_model=none",
                "-display", "none", "-serial", "stdio", "-monitor", "none",
                "-no-reboot"]
+    if args.code:
+        command.extend(['-virtfs', f'local,path={ROOT / "pivstore"},mount_tag=pivcode,security_model=none,readonly=on'])
     # QEMU option strings use commas as separators.
     if "," in str(run_dir):
         raise ValueError("Run directory cannot contain a comma")
@@ -176,6 +178,7 @@ def main():
     task.add_argument("--data-image", type=Path,
                       help="Copy this image into the guest data disk; never attach it directly")
     task.add_argument("--share-file", type=Path, action='append', default=[])
+    task.add_argument("--code", action='store_true', help='Export package source read-only to the guest')
     task.add_argument("--accel", choices=("tcg", "kvm"), default="tcg")
     task.add_argument("--timeout", type=int, default=1200)
     args = parser.parse_args()

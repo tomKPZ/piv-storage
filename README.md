@@ -6,6 +6,8 @@ while preserving the primary volume's plaintext and authentication.
 
 **Status:** an initial offline pack/unpack prototype is implemented, including
 inspection, IV extraction, primary authentication and copy-output updates.
+An online service now provides a read-only NBD primary export and one writable
+FUSE hidden file, using serialized whole-image replacement for regular files.
 Stock Linux authenticated both random-IV replacements and a packed image without
 changing primary plaintext. This is a research prototype, not a production
 storage format or a deniability guarantee.
@@ -23,17 +25,19 @@ The implemented offline compatibility baseline can:
    changing their plaintext.
 4. Produce an image readable by unmodified Linux dm-crypt and cryptsetup.
 
-The next priority is a small online prototype: one writable hidden file, supplied
-keys, and a read-only primary view, initially on disposable VM disks. The offline
+The current online target is one writable hidden file, supplied keys, and a
+read-only primary view on disposable VM storage. The offline
 tool and its tests remain the compatibility reference. Broader offline hardening,
 systematic steganalysis/benchmarks, extra profiles and production deployment work
 are deferred so they do not block the online demonstration.
 
-Online access is planned, not implemented. A single backend should coordinate
-both views; independently mounting dm-crypt while editing its backing metadata
-is not a supported shortcut. Reuse the whole-carrier format and accept serialized
-full-volume commits first. See [the online prototype plan](docs/online-prototype.md)
-and [active roadmap](ROADMAP.md) for ownership, commit/recovery and test criteria.
+One backend coordinates both views; independently mounting dm-crypt over its
+backing image is unsupported. Online updates reuse the whole-carrier format and
+block reads while preparing a verified image and atomically replacing the backing
+path. This first implementation requires a regular file on a local filesystem;
+direct block-device/in-place updates are deferred. See
+[online usage and recovery](docs/online-implementation.md),
+[the prototype plan](docs/online-prototype.md), and [active roadmap](ROADMAP.md).
 
 ## Running the current prototype
 
@@ -96,6 +100,27 @@ The validated control volume has 28,244 primary sectors, 115,687,424 primary
 bytes, and 338,928 gross carrier bytes. Both stock Linux and the userspace
 verifier produced the same full primary plaintext digest. See the
 [observed layout](docs/observed-layout.md) for details and evidence.
+
+## Running the online demonstration
+
+The QEMU runner installs FUSE/NBD dependencies inside the guest and exports the
+package source read-only. No additional host package or host root is required.
+Use disposable input: this integration script creates a new primary filesystem
+on a copied volume and deliberately discards any incoming hidden payload.
+
+```sh
+python3 scripts/vm.py run --code --script scripts/guest-online.sh --data-image artifacts/control-003/control.img --share-file artifacts/control-003/share/passphrase.key --share-file artifacts/control-003/share/volume.key --share-file artifacts/control-003/hidden.key --run-dir artifacts/online-002 --timeout 1500
+```
+
+Choose a fresh run directory and generate a disposable hidden.key with `keygen`
+if one does not exist. The guest mounts a primary filesystem read-only through
+NBD and a single hidden file through FUSE, edits/truncates/fsyncs it, restarts,
+and independently checks the final primary through stock Linux. See the online
+usage document for manual commands, session-budget limits and recovery caveats.
+The API/CLI is experimental: raw block devices, arbitrary editors requiring
+rename/create operations, ordinary primary writes, and production durability are
+outside scope. `serve --initialize` starts empty and replaces any existing hidden
+payload on its next flush; omit it when reopening an existing hidden record.
 
 ## Proposed mechanism
 
