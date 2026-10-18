@@ -1,7 +1,8 @@
 # Kernel backend investigation and proposed next phase
 
-Status: source investigation and plan only. No kernel code has been changed,
-built or loaded. The working userspace FUSE/NBD backend remains the reference.
+Status: K0 implemented and tested in artifacts/kernel-008. The opt-in query/filter scaffold and exact
+guest module build harness are in [kernel/](../kernel/README.md). No carrier-write
+operation exists yet. The working userspace FUSE/NBD backend remains the reference.
 This document distinguishes observed Linux behavior from proposed interfaces;
 the latter must change if the VM experiments contradict them.
 
@@ -31,8 +32,9 @@ solve whole-record recovery, track lifetime nonces, or improve snapshot deniabil
 ## Findings from pinned Linux 6.12.113
 
 The reviewed upstream files are SHA-256 pinned in environment/sources.json.
-They match the version family used by the Debian guest, but full Debian patch
-equivalence and module ABI compatibility have not been established.
+The K0 source staging also checks Debian 6.12.113-1 orig equality and rejects
+distro patches mentioning either compiled source file. Exact guest headers and
+symbol versions, rather than only the upstream version string, are used for builds.
 
 - `crypt_iv_random_gen` generates fresh bytes on normal writes. The private
   `crypt_iv_operations` table is selected inside dm-crypt; ordinary write syscalls
@@ -52,7 +54,7 @@ equivalence and module ABI compatibility have not been established.
   target `prepare_ioctl` callback routes ioctls toward a lower block device; it
   is not a generic per-target binary command dispatcher with a userspace buffer.
 
-These are source observations, not evidence that a working extension exists.
+These observations do not establish a working carrier-update path.
 The documented dm-integrity journal couples data and integrity metadata, but
 does not expose a general transaction spanning our full auxiliary record.
 The current fixture has seven journal sections with 32 encryption-sector entries
@@ -81,9 +83,10 @@ Read-only presentation must not accidentally make the lower integrity device
 unwritable for authorized internal operations. Current dm-crypt obtains its
 lower-device access mode from its table. Resolve this explicitly in the first
 spike: a write-capable owner with a hard primary-mutation filter and read-only
-upper wrapper is a candidate. Reject primary writes inside the owner even if an
-administrator changes the upper read-only flag. Never rely only on filesystem
-mount options. Ordinary cryptsetup --readonly activation is not yet assumed to
+upper wrapper is a candidate. Reject primary write bios inside the owner even if an administrator changes the upper
+read-only flag. Keep the writable owner private: its bio filter cannot prevent
+buffered writes from first dirtying its page cache. The read-only wrapper is
+required for the primary interface, independently of read-only filesystem mounts. Ordinary cryptsetup --readonly activation is not yet assumed to
 create the required lower stack.
 
 For an internal replacement: read ciphertext and its entire metadata tuple
@@ -119,6 +122,17 @@ held by the caller. Internal bios must go to the lower device rather than recurs
 through the primary target. Test controller exit, target suspend/remove/reload,
 key wipe, pending work and module lifetime together. Hold target references until
 all control I/O completes; do not assume an open fd keeps a DM table alive.
+
+## Userspace setup compatibility
+
+The pinned cryptsetup 2.7.5 `_dm_target_query_crypt` parser rejects unknown
+optional table tokens, including our experimental `piv_control`. Consequently
+stock status/close/reload workflows cannot be assumed to manage the opted-in
+stack. The harness uses dmsetup to remove the owner and its known lower mapping,
+then restores stock dm-crypt for ordinary cryptsetup activation. This is a runtime
+tooling limitation, not an on-disk format change. Add opt-in setup/teardown
+integration before K3; do not hide the flag in table status to fool old parsers.
+The reviewed libdevmapper.c/setup.c files are now pinned in the source manifest.
 
 ## Atomicity and recovery gates
 
@@ -181,10 +195,13 @@ backend available as a working fallback and retain stock-kernel readback tests.
 
 Host make, C compiler/linker, bison, flex, bc and pahole were found during this
 investigation. The guest config has DM_CRYPT=m, DM_INTEGRITY=m,
-BLK_DEV_INTEGRITY=y, KEYS=y, and MODVERSIONS=y. Exact matching headers,
-Module.symvers and distro source/build prerequisites still need verification.
+BLK_DEV_INTEGRITY=y, KEYS=y, and MODVERSIONS=y. Matching Debian headers,
+Module.symvers and the guest build/load path were verified in K0. The config
+comparison permits only four exact Debian packaging additions; no forced load
+or full kernel build was needed.
 Download source/build artifacts into ignored vendor/, downloads/ and artifacts/.
-No system packages were installed and no kernel build was started for this note.
+The investigation itself installed no packages. K0 now installs build dependencies
+inside the disposable guest; see kernel/README.md for source/build provenance.
 Load/test only inside disposable QEMU guests; no host module installation or real
 device access. Do not make either backend claim production safety or deniability.
 
@@ -197,3 +214,5 @@ device access. Do not make either backend claim production safety or deniability
 - [dm-crypt documentation](https://docs.kernel.org/admin-guide/device-mapper/dm-crypt.html)
 - [dm-integrity documentation](https://docs.kernel.org/admin-guide/device-mapper/dm-integrity.html)
 - [Block integrity documentation](https://docs.kernel.org/block/data-integrity.html)
+- [Pinned cryptsetup active-table parser](https://github.com/mbroz/cryptsetup/blob/v2.7.5/lib/libdevmapper.c)
+- [Pinned cryptsetup lifecycle code](https://github.com/mbroz/cryptsetup/blob/v2.7.5/lib/setup.c)

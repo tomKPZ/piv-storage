@@ -28,5 +28,15 @@
     "filename": "dm-v6.12.113.c",
     "url": "https://raw.githubusercontent.com/gregkh/linux/v6.12.113/drivers/md/dm.c",
     "sha256": "0510b5221751585ba852255d6312656188c422c93b1f1c038d9dcc46541b143c"
+  },
+  {
+    "filename": "cryptsetup-libdevmapper-v2.7.5.c",
+    "url": "https://raw.githubusercontent.com/mbroz/cryptsetup/v2.7.5/lib/libdevmapper.c",
+    "sha256": "50a4c5d318a1df95855b8436271e90f82c1f714523f1696cb31fb018cbc7670f"
+  },
+  {
+    "filename": "cryptsetup-setup-v2.7.5.c",
+    "url": "https://raw.githubusercontent.com/mbroz/cryptsetup/v2.7.5/lib/setup.c",
+    "sha256": "5e38a32f20fa8208bd913f5bc1b7a39b8643827d7da7b94a23a15db0a1c72fa6"
   }
 ]

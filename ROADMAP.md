@@ -104,7 +104,7 @@ reads, full primary hashes and final independent stock-Linux authentication.
 Exit: a repeatable online demo, passing offline regressions and focused online
 integration tests, with honest durability/security limitations.
 
-## Kernel backend phase (investigated; not implemented)
+## Kernel backend phase (K0 complete; K1 next)
 
 Recommendation: start with an opt-in extension to the pinned dm-crypt source,
 keeping hidden crypto/FUSE in userspace and reusing the current mapping's primary
@@ -118,6 +118,10 @@ updates incremental, or make an entire blob atomic merely by using dm-integrity.
 Keep the regular-file backend as the working fallback.
 
 ### K0. Matching module build and query-only control scaffold
+
+Status: implemented and tested in artifacts/kernel-008. Exact guest module
+build/load, query authorization/lifetime, primary mutation rejection and stock
+readback passed. See kernel/README.md for reproduction and limits.
 
 - Obtain exact Debian guest source/headers, config and Module.symvers; compare
   relevant distro patches to our reviewed Linux 6.12.113 files. Build/load only
@@ -170,6 +174,9 @@ and keep payload commits on the working userspace backend.
   access. No separate raw writer or independently active primary mapping.
 - Repeat mounted write/truncate/fsync, recovery and concurrent-read tests on
   disposable guest disks. Preserve stock-kernel readback and the existing backend.
+- Add explicit setup/teardown tooling or cryptsetup integration: its stock
+  active-table parser rejects the experimental piv_control flag. Keep correct
+  table status rather than hiding the flag to bypass old parsers.
 - Resolve mounted frontend crash cleanup as part of this integrated lifecycle.
 
 Exit: a working optional device-backed demo with honest record-recovery limits;
@@ -184,10 +191,10 @@ These are not prerequisites for the first mounted demonstration.
 
 ## Next focused task
 
-Begin K0 by establishing an exact guest module-build source/header/ABI path,
-then implement query-only control and the read-only/lower-write access spike.
-The user requested investigation and a roadmap addition in the current turn;
-no kernel build or implementation was performed during that investigation.
+Begin K1 with authenticated lower-integrity tuple reads before adding any
+replacement operation. Validate the lower journal mode/recovery state explicitly;
+K0 validates crypto/profile shape, not LUKS metadata or journal configuration. The current kernel code has no carrier read/write command; keep FUSE
+on the working regular-file backend until the record-recovery gate is satisfied.
 
 Mounted-service crash cleanup remains a bounded integration task before K3:
 stale FUSE mounts, NBD connections and Unix sockets need explicit cleanup after
@@ -348,3 +355,69 @@ passwords, real-data images, or sensitive host information.
   composition and conservative primary-key lifetime policy before expanding use.
   Also consider snapshot-pinned guest APT dependencies and independent review of
   the Debian source patch equivalence. Keep unknown/recoverable journals rejected.
+
+### 2026-10-18: kernel K0 implementation started
+
+- Committed the preceding investigation/roadmap as 5eadf73 at the user's request.
+  Added an opt-in dm-crypt patch, fixed-layout query UAPI, refcounted misc control
+  device, primary bio mutation filter and guest-only build/test harness. No
+  carrier read/replacement command or kernel-backed FUSE commit exists yet.
+- Pinned Debian 6.12.113-1 source archives. The orig dm-crypt matches our reviewed
+  upstream source byte-for-byte; distro patches do not mention dm-crypt.c or its
+  dm-audit.h dependency. The reproducible staging script checks these facts.
+- Build dependencies are installed only inside fresh QEMU TCG guests. Use exact
+  Debian headers/Module.symvers and GCC 14; never force-load or install on host.
+- artifacts/kernel-001 stopped at compilation because no_llseek was removed;
+  removed that obsolete callback. artifacts/kernel-002 compiled the module, then
+  stopped at an overly strict boot/header config comparison. Debian headers add
+  exactly four salt/signing entries absent from /boot/config. Added an exact
+  allowlist check; a deliberate unrelated config change is correctly rejected.
+- The primary needs a read-only wrapper above the write-capable private owner.
+  The owner's bio filter alone cannot stop buffered writes dirtying its page
+  cache before bio rejection. The guest test uses aligned direct writes against
+  the owner and buffered writes against the read-only wrapper separately.
+- Existing userspace regressions passed all 31 tests, with ResourceWarnings
+  treated as errors. Source staging/reconstruction, Python compilation, shell
+  syntax and whitespace checks passed. Guest execution results follow below.
+- artifacts/kernel-003 built and loaded successfully and passed the ordinary-mode
+  full read/write/hash checks. Its table-reload harness then failed ENOKEY:
+  cryptsetup's keyring reference was unavailable in the separate dmsetup process.
+  Use --disable-keyring for this disposable test activation and keep table/key
+  bytes in process memory and stdin, never argv/logs. The control exposes no keys.
+  Require the read-only-owner negative test to fail with EINVAL, not just any
+  unrelated error, so this provisioning failure cannot masquerade as success.
+- artifacts/kernel-004 was invalidated by editing its 9p-shared task.sh while Bash
+  was executing it; it stopped with a malformed command before compilation.
+  Do not modify a running guest's task file. Subsequent runs use frozen inputs.
+- artifacts/kernel-005 passed profile/query authorization, bad-command/pointer,
+  lower write-mode and direct-write rejection checks. Its read-only wrapper
+  correctly returned EPERM for a buffered write; adjusted the harness to accept
+  EPERM or EROFS and explicitly verify the wrapper's read-only flag.
+- Further pinned-source review found stock cryptsetup 2.7.5 rejects unknown
+  active-table tokens. The opted-in stack uses explicit dmsetup owner/lower
+  teardown; K3 now includes setup-tool integration. This does not change the
+  stopped volume's stock-readable format. Do not omit the opt-in token from
+  kernel table status merely to bypass that parser.
+- artifacts/kernel-006 reached read-only wrapper teardown, where removal raced
+  a temporary device opener and returned EBUSY. Use dmsetup's bounded --retry
+  removal for owner/wrapper/lower teardown (as opposed to forced or deferred
+  removal); keep open-control lifetime assertions and stock readback afterward.
+- artifacts/kernel-007 reproduced the transient wrapper EBUSY without retry.
+- artifacts/kernel-008 passed the complete frozen-input guest workflow: matched
+  module build/load; ordinary-mode primary write/read/hash; EINVAL on read-only
+  owner setup; 48-byte profile queries; 0600/CAP_SYS_ADMIN checks including a
+  privilege-dropped inherited fd; bad command/pointer rejection; writable lower
+  device plus primary direct-write/discard/zero rejection; read-only wrapper
+  buffered-write rejection; bounded teardown retry; ENODEV on an open control
+  after target removal; module unload blocked until control close; stock module
+  restoration and full primary hash/authentication readback. QEMU exited zero.
+- Guest kernel remains 6.12.113+deb13-amd64, headers/kbuild 6.12.113-1, GCC
+  14.2.0-19. Module.symvers SHA-256 is
+  3422bf655efdd33b193614b1f081f50932e9952d539bd8b6c4888f4ccf815b5a.
+  Configs, module info/binary, packages, dmesg and result are in the private run
+  share. No BUG/Oops/WARNING was found; unsigned-module taint is expected. This
+  was not a KASAN/lockdep run, concurrency stress or power-loss test.
+- All kernel implementation changes after 5eadf73 remain uncommitted. No new host
+  packages/privileges were needed. Next: K1 bounded authenticated tuple/IV reads,
+  then one-sector replacement through that same lower integrity target; do not
+  connect FUSE commits before K2 whole-record recovery.

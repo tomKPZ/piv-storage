@@ -1,0 +1,12 @@
+[
+  {
+    "filename": "linux_6.12.113.orig.tar.xz",
+    "sha256": "2efc477744741f5d580a199ee79c251abb01f899759c621d1af0c3d361380821",
+    "url": "https://security.debian.org/debian-security/pool/updates/main/l/linux/linux_6.12.113.orig.tar.xz"
+  },
+  {
+    "filename": "linux_6.12.113-1.debian.tar.xz",
+    "sha256": "e2d62aaf6d3771dce7116feea9c419b47d6bbf8cb957153896fbbc276f2a54f9",
+    "url": "https://security.debian.org/debian-security/pool/updates/main/l/linux/linux_6.12.113-1.debian.tar.xz"
+  }
+]
