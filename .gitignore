@@ -1,0 +1,28 @@
+# Local source checkouts, downloads, and disposable experiment artifacts.
+/vendor/
+/downloads/
+/artifacts/
+/work/
+
+# Local keys and machine-specific configuration; never store real data here.
+/secrets/
+/.env
+/.venv/
+
+# Build and test output.
+/build/
+/dist/
+/target/
+*.egg-info/
+__pycache__/
+*.py[cod]
+/.pytest_cache/
+/.mypy_cache/
+/.ruff_cache/
+/.coverage
+/htmlcov/
+
+# Editor temporary files.
+*.swp
+*.swo
+*~

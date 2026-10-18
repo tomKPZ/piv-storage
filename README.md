@@ -1,0 +1,247 @@
+# Persistent-IV auxiliary storage
+
+Research prototype for storing an independently encrypted auxiliary payload in
+the persistent random IVs of a Linux authenticated encrypted block volume,
+while preserving the primary volume's plaintext and authentication.
+
+**Status:** design only. No implementation, compatibility claim, or deniability
+guarantee exists yet. This README and [ROADMAP.md](ROADMAP.md) are working
+hypotheses, not a fixed specification. Change them when experiments or source
+inspection provide better evidence; record consequential decisions and why.
+
+## Goal and initial scope
+
+Build a reproducible, tested offline image tool that can:
+
+1. Inspect a supported authenticated volume and extract its persistent IVs.
+2. Encode/decode an authenticated, independently encrypted auxiliary blob there.
+3. Reencrypt affected primary sectors using the primary volume key without
+   changing their plaintext.
+4. Produce an image readable by unmodified Linux dm-crypt and cryptsetup.
+
+Start with disposable regular-file images, one pinned format/configuration,
+exclusive offline access, and output to a separate image. General filesystems,
+live updates, kernel changes, physical devices, and broad format compatibility
+are later possibilities, not initial requirements.
+
+## Proposed mechanism
+
+The primary stack is filesystem -> dm-crypt AEAD -> dm-integrity -> device.
+The candidate configuration is LUKS2, AES-256-GCM with random persistent IVs,
+4096-byte encryption sectors, 96-bit IVs, and 128-bit authentication tags.
+Confirm the exact cryptsetup syntax and resulting parameters on the pinned
+test versions before publishing executable setup instructions.
+
+For each sector i, primary encryption conceptually computes:
+
+    (ciphertext_i, tag_i) = AEAD(primary_key, IV_i, plaintext_i, AAD_i)
+
+The auxiliary ciphertext supplies the stored IV bytes. To change those bytes,
+authenticate/decrypt the existing primary sector, select the new IV, and
+recompute its ciphertext and tag. Never change only the IV. The current Linux
+AEAD path authenticates a little-endian sector value and the original IV as
+associated data; reproduce the exact version-specific address/offset semantics,
+not an assumed logical sector number.
+
+Ordinary AES-XTS volumes generally derive tweaks from addresses and have no
+equivalent persistent random-IV channel. Authentication tags are constrained by
+primary authentication and are not free payload space. Extra tuple padding is
+not presumed available: the current dm-crypt AEAD path zero-fills unused bytes.
+
+### Format inspection and primary crypto
+
+First pin and record kernel/cryptsetup versions and source revisions. Establish:
+
+- LUKS2 header selection, segment offsets, cipher parameters and sector units.
+- dm-integrity superblock, tuple ordering, interleaving, padding, journal state,
+  and mapping from logical sectors to ciphertext and IV/tag locations.
+- AES key length, actual IV length, tag length, exact AAD serialization, and
+  distinction between 512-byte addressing units and encryption sectors.
+
+Use existing cryptographic libraries. Do not implement AES, GCM, a password KDF,
+or a new AEAD primitive. Separate the format reader, primary-sector codec,
+carrier mapping, hidden-record codec, and transactional image writer.
+Reject unsupported variants explicitly, validate bounds and arithmetic, and
+authenticate original sectors before accepting or modifying their plaintext.
+Do not parse password keyslots initially: use an explicitly supplied primary
+volume key through a protected input mechanism. Never expose keys in process
+arguments, logs, fixtures, or repository files.
+
+### Auxiliary record format
+
+Treat concatenated IV slots as a byte-addressable carrier. Begin with fixed-size
+records spanning many sectors and a single auxiliary blob. Define a versioned
+format only after a crypto/design review. It needs:
+
+- Independent hidden key material and domain-separated subkeys where needed.
+- Fresh randomized encryption on every rewritten record, including repeated
+  plaintext; ordinary deterministic mapping of payload bytes to IVs is unsafe.
+- Integrity covering record identity, ordering, lengths, and transaction state.
+- Random-looking external encoding: no public magic, fixed header, clear length,
+  or recognizable padding in the IV carrier.
+- Space accounting for nonce/randomization material, tags, encrypted metadata,
+  commit records, padding, and any redundancy.
+- Explicit initialization and unused-space rules, and a documented policy for
+  rollback, retries, record relocation, and restoring old images.
+
+Do not assume every secure encryption format has pseudorandom serialized output.
+Select and document a vetted construction whose complete encoding fits the
+carrier threat model. A randomized AEAD record is a candidate, not a settled
+choice. Hidden authentication gives a key-guess verifier, so password-derived
+keys need an appropriate memory-hard KDF and a salt/bootstrap design that does
+not introduce a visible signature. A supplied high-entropy hidden key is an
+acceptable first milestone.
+
+### Nonce safety
+
+GCM nonce uniqueness is global per primary key, not per sector. Different AAD
+or a different sector address does not cure nonce reuse. Never restore earlier
+carrier IVs and reencrypt changed primary data under them. Unchanged records
+should remain untouched. Specify retry behavior and snapshot/clone handling
+before enabling updates; initial tooling may reject workflows it cannot make
+safe. Instrument nonce histories in test runs without claiming that a production
+tool can reconstruct all historical nonces from the current image.
+
+For independent uniform 96-bit nonces, collision probability is approximately
+q(q-1)/2^97 after q encryptions under a key. NIST SP 800-38D section 8.3 limits
+the random-IV construction to 2^32 invocations per key. At 4096-byte sectors that
+is 16 TiB of cumulative encryption; at 512 bytes it is 2 TiB. Initialization,
+ordinary primary writes, and auxiliary updates all consume this budget. These
+are upper bounds, not recommended lifetime targets or a complete GCM security
+analysis. Define a conservative supported budget before calling a profile safe.
+
+### Update and crash model
+
+Initially require a closed primary mapping and exclusive access to a cleanly
+shut-down image. A filesystem mounted read-only is insufficient coordination;
+filesystem recovery, other mappings, and cached metadata can still matter.
+
+The first writer creates a separate complete output image and never edits its
+input. Report success only after validation and the documented durability steps.
+This avoids requiring an in-place transaction scheme for the first experiment.
+Do not claim atomic publication until filesystem rename/fsync semantics and
+crash tests establish it.
+
+Later in-place work must preserve the ciphertext/IV/tag tuple and transact hidden
+records spanning multiple primary sectors. dm-integrity journaling protects
+writes through its supported path; arbitrary raw image edits bypass it. A dirty
+journal can replay stale tuples over edits. Initially reject dirty/unsupported
+states rather than inventing journal repair. Offline in-place writes require a
+separate reviewed protocol or supported kernel path.
+
+## Capacity and configuration tradeoffs
+
+For primary logical capacity V, sector size S, and 12 IV bytes per sector,
+gross carrier capacity is floor(V/S) * 12.
+
+| Encryption sector | Gross fraction of primary capacity | Per 1 TiB primary |
+| --- | --- | --- |
+| 4096 bytes | 0.293% | 3 GiB |
+| 512 bytes | 2.344% | 24 GiB |
+
+Actual auxiliary capacity is smaller after hidden-format overhead. Physical
+device capacity must also accommodate LUKS/integrity metadata and journal space.
+Smaller sectors provide eight times the carrier capacity but eight times the
+GCM invocations per full-volume write and more primary metadata overhead.
+
+Linux's ordinary gcm(aes) interface uses 96-bit IVs. A 128-bit nonce is not a
+simple setting for this implementation; the 128-bit GCM tag is separate. Larger
+metadata tuples do not automatically enlarge the IV. Alternative modes or
+custom formats must be evaluated separately for security, compatibility, and
+how unusual their visible configuration is. Establish an ordinary control
+configuration before optimizing capacity.
+
+## Limitations and threat model
+
+Target the narrow case of a completed single image examined without the hidden
+key, potentially with the primary key disclosed. The primary encrypted volume
+itself is visible; the intended secret is the presence/content of the auxiliary
+payload. Uniform-looking IVs alone do not prove deniability.
+
+- Multiple snapshots or live write monitoring can expose changed primary
+  ciphertext/IV/tag tuples whose decrypted primary plaintext is unchanged.
+- Journals, backups, snapshots, SSD remapping, swap, crash dumps, logs, tools,
+  shell history, and memory can preserve evidence or keys.
+- Primary writes regenerate IVs and can destroy auxiliary records. First support
+  offline auxiliary updates and primary read-only use; do not promise survival
+  of arbitrary primary writes.
+- Authentication detects corruption, not necessarily freshness. Same-address
+  rollback may authenticate; rollback resistance needs trusted external state
+  or a different explicit assumption.
+- Compromise of the primary key permits destruction or replacement of carrier
+  bytes. Hidden authentication can detect changes, not prevent erasure.
+- Hidden writes amplify into primary-sector rewrites. Crash consistency,
+  lifetime GCM limits, and physical-device behavior constrain practical use.
+- A recognizable configuration or installed tool can weaken a plausible cover
+  story even when the carrier bytes pass statistical checks.
+
+Do not use the prototype for valuable data or describe it as proven deniable
+encryption. Statistical tests find some mistakes; they cannot establish
+cryptographic indistinguishability or erase historical evidence.
+
+## Test approach
+
+Use pure userspace image tests first, then stock-kernel integration inside a
+disposable QEMU/KVM VM. Verify complete primary plaintext hashes before/after,
+all-sector authentication, hidden round trips, rejection of malformed formats,
+wrong keys, corruption, record swaps, repeated writes, and version rollback.
+Compare AAD/crypto outputs against kernel-generated fixtures rather than only
+testing a codec against itself. Inject crashes at persistence boundaries and
+test ordinary and dirty journal states. Compare modified images to matched
+ordinary control volumes, including snapshot and journal differences.
+
+VM snapshots are useful test artifacts, not evidence of realistic power-loss
+durability. Later test storage ordering and real hardware only when justified.
+Keep test keys disposable, images outside version control, and small fixtures
+reproducible. See [ROADMAP.md](ROADMAP.md) for milestones and exit criteria.
+
+## Tools and environment
+
+Updated inspection (2026-10-18): WSL2 kernel 6.18.33.2-microsoft-standard-WSL2;
+QEMU/qemu-img 10.2.1, cryptsetup/integritysetup 2.8.4, Python cryptography
+46.0.5, OpenSSL development libraries 3.5.5, git, a C compiler, make, pkg-config,
+curl, wget, xz and cpio are available. OpenSSL AES-GCM compile/link/run and QEMU
+TCG startup/QMP shutdown smoke tests passed. /dev/kvm exists but this user cannot
+access it; software emulation works without root. KVM group access is an optional
+performance improvement. libcryptsetup and libargon2 were not found via
+pkg-config; neither is required for the initial supplied-key userspace path.
+Guest boot and authenticated block-device support remain to be verified.
+Recheck this inventory before relying on it.
+
+Use vendor/ for pinned external source checkouts, downloads/ for downloaded guest
+assets, artifacts/ or work/ for generated images/results, and secrets/ for local
+test key files. These directories are ignored by git. Keep provenance manifests
+and reproduction scripts in tracked directories instead.
+
+Needed before kernel integration:
+
+- QEMU system emulator and qemu-img, plus a reproducible Linux guest image with
+  root access and cryptsetup/dm-integrity support. KVM is optional; software
+  emulation is adequate for small correctness tests.
+- Guest kernel with device mapper, dm-crypt, dm-integrity, AES/GCM and loop-device
+  support; filesystem tools appropriate to the selected test filesystem.
+- Exact source files or pinned checkouts for the guest kernel and cryptsetup,
+  plus the relevant LUKS2 format documentation. A full Linux checkout/build
+  toolchain is unnecessary until kernel modification is justified.
+- A maintained userspace crypto library and its development dependencies.
+  Choose the implementation language after inspecting available libraries;
+  install Rust/Cargo only if that choice calls for it.
+- Network/package access for guest images, source and dependencies, sufficient
+  disk space for disposable copies, and permission for guest execution.
+
+No host raw-device access, FUSE, custom kernel, or native driver is needed for
+the first userspace prototype. Host device-mapper access is optional if all
+privileged integration work runs in the guest.
+
+## References
+
+These describe upstream behavior, not a verified profile for this project.
+Pin source revisions and preserve experimental findings during implementation.
+
+- [Linux dm-crypt documentation](https://docs.kernel.org/admin-guide/device-mapper/dm-crypt.html)
+- [Linux dm-integrity documentation](https://docs.kernel.org/admin-guide/device-mapper/dm-integrity.html)
+- [dm-crypt source](https://github.com/torvalds/linux/blob/master/drivers/md/dm-crypt.c)
+- [Linux GCM source](https://github.com/torvalds/linux/blob/master/crypto/gcm.c)
+- [Linux GCM constants](https://github.com/torvalds/linux/blob/master/include/crypto/gcm.h)
+- [cryptsetup source and documentation](https://gitlab.com/cryptsetup/cryptsetup)
+- [NIST SP 800-38D](https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-38d.pdf)
