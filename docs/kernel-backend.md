@@ -1,7 +1,8 @@
 # Kernel backend investigation and proposed next phase
 
-Status: K0 implemented and tested in artifacts/kernel-008. The opt-in query/filter scaffold and exact
-guest module build harness are in [kernel/](../kernel/README.md). No carrier-write
+Status: K0 passed in artifacts/kernel-008; authenticated one-sector IV reads
+passed in artifacts/kernel-read-002. The opt-in query/filter scaffold, authenticated
+one-sector IV read and exact guest module build harness are in [kernel/](../kernel/README.md). No carrier-write
 operation exists yet. The working userspace FUSE/NBD backend remains the reference.
 This document distinguishes observed Linux behavior from proposed interfaces;
 the latter must change if the VM experiments contradict them.
@@ -122,6 +123,24 @@ held by the caller. Internal bios must go to the lower device rather than recurs
 through the primary target. Test controller exit, target suspend/remove/reload,
 key wipe, pending work and module lifetime together. Hold target references until
 all control I/O completes; do not assume an open fd keeps a DM table alive.
+
+## Implemented authenticated-read slice of K1
+
+PIV_READ_IV now reads one ciphertext sector and its complete tuple through the
+existing lower target, then calls the same native AEAD conversion helper used
+by ordinary reads. It returns only an authenticated IV, with fixed request sizes,
+owner/index validation and no control write path. The final guest experiment
+passed boundary reads, ciphertext/tag/IV corruption rejection, coordinated reads
+with suspend/resume, key-wipe rejection, removal lifetime checks, stock full-volume
+readback and independent offline IV comparison. See kernel/README.md and the
+roadmap handoff for exact commands and remaining test limits.
+
+Unlike the original query-only snapshot, this operation borrows crypt_config
+under a mutex for the duration of synchronous I/O. Presuspend drains/blocks it;
+dtr invalidates the pointer under that same mutex before freeing native state.
+This is not a design for asynchronous mutation workqueues or whole-record commits.
+Lower journal mode validation, request-local replacement, primary-I/O exclusion
+and durable completion are still gates before any kernel mutation operation.
 
 ## Userspace setup compatibility
 

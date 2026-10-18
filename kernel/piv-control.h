@@ -3,7 +3,7 @@
 #define PIV_CONTROL_H
 #include <linux/ioctl.h>
 #include <linux/types.h>
-/* Experimental, query-only ABI. No key or carrier access. */
+/* Experimental ABI. No key or primary plaintext export. */
 struct piv_query {
 	__u32 version;
 	__u32 size;
@@ -19,4 +19,14 @@ struct piv_query {
 #define PIV_QUERY_LOWER_WRITE 1
 #define PIV_QUERY_PRIMARY_FILTER 2
 #define PIV_QUERY _IOR('P', 0, struct piv_query)
+/* One authenticated carrier IV. Input iv/reserved must be zero. */
+struct piv_read_iv {
+	__u32 version;
+	__u32 size;
+	__u64 generation;
+	__u64 sector; /* encryption-sector index */
+	__u8 iv[12];
+	__u32 reserved[3];
+};
+#define PIV_READ_IV _IOWR('P', 1, struct piv_read_iv)
 #endif

@@ -1,9 +1,10 @@
-# Experimental dm-crypt backend: K0
+# Experimental dm-crypt backend: K0 and authenticated IV reads
 
 This is an opt-in patch to Linux 6.12.113 dm-crypt, not a standalone IV plugin.
-It adds a query-only character device and rejects ordinary primary mutations.
-It does **not** read or replace carrier IVs, commit hidden records, or connect to
-FUSE. The existing regular-file backend remains the working payload backend.
+It adds a privileged character device for profile queries and authenticated
+one-sector IV reads, and rejects ordinary primary mutations. It does **not**
+replace IVs, commit hidden records, or connect to FUSE. The existing regular-file
+backend remains the working payload backend.
 
 Use only a disposable guest. Never install this module on the host, force-load
 it, or point the harness at real storage. Loading an unsigned experimental module
@@ -15,16 +16,19 @@ From the repository root, after obtaining the ordinary control fixture:
 
 ```sh
 python3 scripts/fetch_sources.py
-python3 scripts/fetch_kernel.py vendor/kernel-build/k0
+python3 scripts/fetch_kernel.py vendor/kernel-build/k1-read
 # This directory must not already exist.
-tar -cf artifacts/scaffold.tar -C vendor/kernel-build/k0 .
+tar -cf artifacts/scaffold.tar -C vendor/kernel-build/k1-read .
+python3 kernel/read-fixture.py artifacts/control-003/control.img > artifacts/read-layout.json
 python3 scripts/vm.py run --script scripts/guest-kernel.sh \
   --run-dir artifacts/kernel-next \
   --data-image artifacts/control-003/control.img \
   --share-file artifacts/scaffold.tar --share-file kernel/guest-test.py \
-  --share-file kernel/check-config.py \
+  --share-file kernel/check-config.py --share-file artifacts/read-layout.json \
   --share-file artifacts/control-003/share/passphrase.key \
   --share-file artifacts/control-003/share/expected.sha256 --timeout 1200
+python3 kernel/read-fixture.py artifacts/kernel-next/control.img \
+  artifacts/kernel-next/share/read-results.json
 ```
 
 The source archives are SHA-256 pinned in environment/kernel-sources.json, using
@@ -79,29 +83,59 @@ wrapper prevents that buffering; the guest tests the filter with aligned direct
 I/O separately from buffered write rejection on the wrapper.
 
 `/dev/pivctl-<generation>` is mode0600. Open and every ioctl require CAP_SYS_ADMIN.
-The only command is PIV_QUERY from piv-control.h: a fixed 48-byte output struct
+PIV_QUERY from piv-control.h returns a fixed 48-byte output struct
 with version, length, generation, encryption-sector count, profile sizes and two
 flags. Flag1 means the owner's lower access mode includes WRITE; flag2 means the
-primary mutation filter is enabled. No key, IV or hidden data is returned.
+primary mutation filter is enabled. This query returns no key or carrier data.
 Unknown commands fail ENOTTY; invalid output pointers fail EFAULT. The fixed
 layout has no embedded pointers and implements compat-pointer translation; the
 current guest test exercises only 64-bit userspace.
 
-The control object holds an immutable nonsecret snapshot, not a crypt_config
-pointer. Target destruction marks it dead before misc deregistration; open
-handles retain refcounted storage, return ENODEV and pin the module until close.
-Linux misc_open's mutex serializes its open callback with deregistration. Query
-may finish just before invalidation; it is not an I/O reservation. Generation
-counts only this module instance and resets after reload; it is not a persistent
-volume identity or a future mutation authorization token. A device node and table
-token reveal the experimental feature to a running-system observer.
+PIV_READ_IV is a fixed 48-byte input/output request: version1, size48,
+generation, encryption-sector index, IV12 and three reserved u32 words. The IV
+and reserved input fields must be zero. It returns the IV only after reading
+ciphertext and its full 28-byte tuple through the existing lower target and
+successfully decrypting/authenticating with crypt_convert_block_aead. The native
+helper supplies sector_LE64/IV AAD and uses the already-loaded transform; the
+control does not export keys or primary plaintext. Decrypted data stays in a
+private page that is wiped before release. Failed validation/authentication does
+not copy a result to userspace. This operation submits READ bios only.
+
+Version/size/reserved mismatches fail EINVAL, owner mismatch ESTALE, out-of-range
+indices ERANGE, suspended/not-ready state EBUSY, and removed targets ENODEV.
+Lower I/O errors and AEAD errors propagate (typically EIO/EBADMSG). Bad userspace
+pointers fail EFAULT. A copy-out fault can happen after a successful read; reads
+have no nonce or mutation side effects, so this is not a write retry protocol.
+Capability checks apply independently to both commands, including passed fds.
+No explicit capability bit for reads exists yet: older K0 modules return ENOTTY
+for PIV_READ_IV. The experimental interface is not a stable cross-version ABI.
+
+The control keeps a refcounted object with an immutable profile snapshot and a
+borrowed crypt_config pointer protected by a mutex. It holds that mutex during
+one synchronous lower read and crypto completion. Presuspend acquires the same
+mutex, drains any control operation and blocks new reads before DM proceeds;
+resume/suspend-undo unblock it. Key changes require the existing suspended state,
+so a key wipe cannot run alongside an admitted control read. Initial controls
+are blocked until activation resumes the target. Target destruction acquires
+the mutex, invalidates/clears the pointer, and only then tears down crypt state.
+Opened handles survive as dead objects and pin the module, not the DM table.
+User copies happen outside this lifecycle lock. Explicit allocations use
+GFP_NOIO, and admitted control I/O runs inside a memalloc_noio scope with the
+same crypto callback flags used by ordinary dm-crypt.
+
+Primary reads may proceed concurrently because this control path never writes.
+The mutex provides no synchronization with a hypothetical future mutation path
+until that path is designed. A stalled lower device may stall a read, suspend or
+removal; bounded request size is not an I/O timeout guarantee. Generation is
+module-instance-local, not a persistent volume identity or historical nonce log.
+Runtime nodes/table tokens expose the feature to a running-system observer.
 
 ## Next gate
 
-K1 needs bounded authenticated tuple reads and request-local IV replacement using
-the same lower dm-integrity instance. It must establish data/metadata pairing,
-I/O synchronization and flush completion. This scaffold's snapshot lifetime does
-not solve the lifetime of future asynchronous crypto or control I/O. K2 must then
+Authenticated one-sector reads implement the first part of K1. K1 still needs
+request-local IV replacement using the same lower dm-integrity instance. It must establish data/metadata pairing,
+I/O synchronization and flush completion. The current synchronous control lifetime does not establish safety for future
+mutation workqueues, transactions or primary-I/O exclusion. K2 must then
 resolve whole-record recovery before kernel-backed hidden fsync is enabled.
 See docs/kernel-backend.md and ROADMAP.md.
 
@@ -118,3 +152,12 @@ no BUG/Oops/WARNING; unsigned-module taint was expected. No KASAN/lockdep,
 32-bit compat, stress or device-crash test was performed. Existing userspace
 regressions also passed all 31 tests. These results establish K0, not IV updates
 or hidden-record recovery.
+
+The initial K1 read experiment in artifacts/kernel-read-001 also passed boundary
+reads, malformed requests, suspend/key-wipe checks, three closed-stack corruption
+cases and final stock readback. Kernel-returned IVs matched the independent
+userspace layout parser afterward. artifacts/kernel-read-002 passed the final version with a no-I/O allocation scope
+and handshaked continuous reads during three suspend/resume cycles. Its IVs also
+matched the offline parser; all 31 userspace regression tests passed. These are
+basic synchronous lifecycle tests, not K2 fault injection, lockdep/KASAN or a
+proof of mutation concurrency safety.

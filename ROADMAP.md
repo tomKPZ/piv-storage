@@ -104,7 +104,7 @@ reads, full primary hashes and final independent stock-Linux authentication.
 Exit: a repeatable online demo, passing offline regressions and focused online
 integration tests, with honest durability/security limitations.
 
-## Kernel backend phase (K0 complete; K1 next)
+## Kernel backend phase (K0 complete; K1 authenticated reads implemented)
 
 Recommendation: start with an opt-in extension to the pinned dm-crypt source,
 keeping hidden crypto/FUSE in userspace and reusing the current mapping's primary
@@ -138,6 +138,10 @@ Exit: unmodified behavior with the feature disabled, correct read-only primary
 behavior with it enabled, working metadata queries, and verified build provenance.
 
 ### K1. One-sector IV replacement through the native integrity path
+
+Status: authenticated one-sector IV reads implemented and tested in
+artifacts/kernel-read-002; replacement remains open. The read ioctl uses the
+existing lower integrity bio path and native AEAD helper.
 
 - Authenticate/read a complete old sector tuple through the lower integrity
   device, apply a request-local supplied IV, and reencrypt identical plaintext.
@@ -191,10 +195,12 @@ These are not prerequisites for the first mounted demonstration.
 
 ## Next focused task
 
-Begin K1 with authenticated lower-integrity tuple reads before adding any
-replacement operation. Validate the lower journal mode/recovery state explicitly;
-K0 validates crypto/profile shape, not LUKS metadata or journal configuration. The current kernel code has no carrier read/write command; keep FUSE
-on the working regular-file backend until the record-recovery gate is satisfied.
+Complete K1 with a request-local one-sector IV replacement, using the now-tested
+read/authentication path. First establish lower journal mode/recovery validation,
+primary-I/O coordination and flush/FUA semantics. Read-only control tests do not
+establish mutation safety. Require expected-old-IV and owner checks, freshly
+generated test IVs, failure reporting and stock readback. Keep FUSE on the working
+regular-file backend until K2 whole-record recovery is satisfied.
 
 Mounted-service crash cleanup remains a bounded integration task before K3:
 stale FUSE mounts, NBD connections and Unix sockets need explicit cleanup after
@@ -421,3 +427,50 @@ passwords, real-data images, or sensitive host information.
   packages/privileges were needed. Next: K1 bounded authenticated tuple/IV reads,
   then one-sector replacement through that same lower integrity target; do not
   connect FUSE commits before K2 whole-record recovery.
+
+### 2026-10-18: K1 authenticated-read milestone
+
+- Committed K0 as 81ff43c at the user's request. This session's new read operation
+  and accompanying documentation/tests remain uncommitted.
+- Added PIV_READ_IV: one 48-byte fixed-layout request with version/size, generation,
+  encryption-sector index, zero input IV and zero reserved words. Validate all
+  fields/bounds before I/O; return only IV12 after successful native AEAD auth.
+  No primary key/plaintext export and no control write operation exists.
+- Read ciphertext plus tuple through the existing lower target, using native
+  dm_crypt_integrity_io_alloc and crypt_convert_block_aead with the already-loaded
+  transform. Wait for asynchronous crypto completion, wipe the private data page,
+  and release buffers. Use GFP_NOIO, a memalloc_noio scope and stock crypto flags.
+- Control holds its lifecycle mutex while borrowing cc for synchronous I/O. New
+  presuspend hooks drain/block reads; resume/undo unblock. Key wiping occurs only
+  after suspension and cannot race admitted reads. Dtr invalidates the pointer
+  before freeing crypto state. Userspace copies occur outside this mutex. Query
+  remains an immutable snapshot. This does not solve future mutation concurrency.
+- artifacts/kernel-read-001 built/loaded and passed the first read implementation.
+  artifacts/kernel-read-002 passed the refined version with deterministic overlap
+  between a continuous reader and three suspend/resume cycles. Both passed clean
+  reads at 0, 1, 4095, 4096 and 28243; repeated reads; malformed version/size/IV/
+  reserved fields; stale generations; oversized indices; bad pointers; dropped
+  privilege; suspended/key-wiped rejection; removed-fd behavior and module pins.
+- Both runs rejected separately corrupted ciphertext, tag and IV on sector4096.
+  Raw flips/restores happened only on the CLOSED guest-owned disk, never behind
+  an active mapping. A healthy neighbor authenticated after each failed request;
+  failed ioctls left their output buffers unchanged. Restored disks passed full
+  stock dm-crypt readback with the original expected primary SHA-256. No control
+  write was tested or implemented.
+- kernel/read-fixture.py generates nonsecret corruption offsets and independently
+  compares returned IVs afterward via pivstore's offline layout parser. Both
+  runs' returned IVs matched; final source/archive/input comparisons passed.
+  The first run needed scaffold.tar added to its share before the task started
+  because the initial archive basename was scaffold-k1.tar. The final run uses
+  the documented scaffold.tar basename and frozen inputs.
+- Final guest dmesg had no BUG/Oops/WARNING/KASAN diagnostics; unsigned-module
+  taint and deliberately rejected key-wiped resume were expected. No lockdep,
+  KASAN, allocation/device fault injection or active-I/O removal stress was run.
+  The 31 existing Python tests passed with ResourceWarnings treated as errors;
+  compilation, shell syntax and whitespace checks passed. No host installation,
+  kernel load, root access or additional tools were needed.
+- Next concrete task: validate the lower journal configuration and recovery
+  assumptions, then add request-local one-sector IV replacement with expected-old
+  IV/owner checks and native data+metadata submission/flush. Preserve current
+  authenticated-read/lifecycle regressions. K1 is incomplete until that update
+  passes independent stock readback; K2 still gates all kernel-backed FUSE fsync.

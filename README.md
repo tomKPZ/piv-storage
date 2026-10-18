@@ -44,8 +44,8 @@ extension that reuses native primary crypto/integrity I/O, keeping FUSE and hidd
 encryption in userspace. A separate device-mapper target is the fallback.
 [The investigation](docs/kernel-backend.md) separates source findings, single-sector
 experiments and the required whole-record recovery gate. The query/filter
-scaffold and guest build harness are in [kernel/](kernel/README.md). Carrier
-replacement and kernel-backed hidden commits remain unimplemented; current
+scaffold, authenticated one-sector IV reads and guest build harness are in
+[kernel/](kernel/README.md). Carrier replacement and kernel-backed hidden commits remain unimplemented; current
 payload commands still require regular-file backing.
 
 ## Running the current prototype

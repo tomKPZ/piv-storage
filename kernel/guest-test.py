@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Guest-only K0 test. DM tables containing test keys stay in process memory."""
+"""Guest-only K0/K1 authenticated-read test. DM tables containing test keys stay in process memory."""
 import errno
 import fcntl
 import glob
 import hashlib
+import json
+import time
 import mmap
 import os
 import struct
@@ -74,14 +76,87 @@ version, length, generation, sectors, sector_size, iv, tag, tup, flags, reserved
 assert (version, length, sector_size, iv, tag, tup, flags, reserved) == (1, size, 4096, 12, 16, 28, 3, 0)
 assert sectors * 4096 == int(subprocess.check_output(['blockdev', '--getsize64', path]))
 assert generation > 0
-rejected(lambda: fcntl.ioctl(ctl, query + 1, buf), {errno.ENOTTY})
+rejected(lambda: fcntl.ioctl(ctl, query + 2, buf), {errno.ENOTTY})
 rejected(lambda: fcntl.ioctl(ctl, query, 0), {errno.EFAULT})
+read_fmt = '=IIQQ12sIII'
+read_size = struct.calcsize(read_fmt)
+read_command = (3 << 30) | (read_size << 16) | (ord('P') << 8) | 1
+
+
+def read_iv(fd, owner, index, **changes):
+    fields = dict(version=1, size=read_size, generation=owner, sector=index,
+                  iv=bytes(12), r0=0, r1=0, r2=0)
+    fields.update(changes)
+    request = bytearray(struct.pack(read_fmt, *fields.values()))
+    original = bytes(request)
+    try:
+        fcntl.ioctl(fd, read_command, request, True)
+    except OSError:
+        assert request == original, 'failed read changed output buffer'
+        raise
+    result = struct.unpack(read_fmt, request)
+    assert result[:4] == tuple(fields.values())[:4]
+    assert result[5:] == (0, 0, 0)
+    return result[4]
+
+
+selected = (0, 1, 4095, 4096, sectors - 1)
+observed = {str(i): read_iv(ctl, generation, i).hex() for i in selected}
+assert read_iv(ctl, generation, 4096).hex() == observed['4096']
+for changes in ({'version': 0}, {'size': 0}, {'iv': bytes([1]) * 12}, {'r2': 1}):
+    rejected(lambda: read_iv(ctl, generation, 0, **changes), {errno.EINVAL})
+for index in (sectors, 2**64 - 1):
+    rejected(lambda: read_iv(ctl, generation, index), {errno.ERANGE})
+rejected(lambda: read_iv(ctl, generation + 1, 0), {errno.ESTALE})
+rejected(lambda: fcntl.ioctl(ctl, read_command, 0), {errno.EFAULT})
+run('dmsetup', 'suspend', 'piv-kernel')
+rejected(lambda: read_iv(ctl, generation, 0), {errno.EBUSY})
+run('dmsetup', 'resume', 'piv-kernel')
+assert read_iv(ctl, generation, 0).hex() == observed['0']
+# Handshake guarantees the child is reading before the suspend cycles begin.
+started_r, started_w = os.pipe()
+stop_r, stop_w = os.pipe()
+os.set_blocking(stop_r, False)
+pid = os.fork()
+if pid == 0:
+    os.close(started_r)
+    os.close(stop_w)
+    try:
+        assert read_iv(ctl, generation, 1).hex() == observed['1']
+        os.write(started_w, b'1')
+        os.close(started_w)
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            try:
+                if os.read(stop_r, 1):
+                    os._exit(0)
+            except BlockingIOError:
+                pass
+            try:
+                assert read_iv(ctl, generation, 1).hex() == observed['1']
+            except OSError as exc:
+                assert exc.errno == errno.EBUSY
+        os._exit(1)
+    except BaseException:
+        os._exit(1)
+os.close(started_w)
+os.close(stop_r)
+assert os.read(started_r, 1) == b'1'
+os.close(started_r)
+for _ in range(3):
+    run('dmsetup', 'suspend', 'piv-kernel')
+    run('dmsetup', 'resume', 'piv-kernel')
+os.write(stop_w, b'1')
+os.close(stop_w)
+assert os.waitpid(pid, 0)[1] == 0
+
 pid = os.fork()
 if pid == 0:
     try:
         os.setgid(65534)
         os.setuid(65534)
         rejected(lambda: fcntl.ioctl(ctl, query, buf), {errno.EPERM})
+        rejected(lambda: read_iv(ctl, generation, 0), {errno.EPERM})
         os._exit(0)
     except BaseException:
         os._exit(1)
@@ -105,19 +180,63 @@ view = os.open('/dev/mapper/piv-view', os.O_WRONLY)
 rejected(lambda: os.pwrite(view, first, 0), {errno.EROFS, errno.EPERM})
 os.close(view)
 run('dmsetup', 'remove', '--retry', 'piv-view')
+# Key wipe is allowed only while suspended; controls must remain blocked.
+run('dmsetup', 'suspend', 'piv-kernel')
+run('dmsetup', 'message', 'piv-kernel', '0', 'key', 'wipe')
+rejected(lambda: read_iv(ctl, generation, 0), {errno.EBUSY})
+p = subprocess.run(['dmsetup', 'resume', 'piv-kernel'],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+assert p.returncode != 0
 # Existing fd must not keep the target alive or dereference its freed cc.
 # Stock cryptsetup's table parser does not recognize the opt-in token.
 run('dmsetup', 'remove', '--retry', 'piv-kernel')
 run('dmsetup', 'remove', '--retry', 'piv-kernel_dif')
 rejected(lambda: fcntl.ioctl(ctl, query, buf), {errno.ENODEV})
+rejected(lambda: read_iv(ctl, generation, 0), {errno.ENODEV})
 assert not glob.glob('/dev/pivctl-*')
 # The open control pins the module until release.
 p = subprocess.run(['rmmod', 'dm_crypt'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 assert p.returncode != 0
 os.close(ctl)
+# Corrupt only the closed guest-owned disk, never underneath a live mapping.
+placements = json.load(open('/mnt/piv-work/read-layout.json'))['corruption']
+for placement in placements:
+    raw = os.open('/dev/vdb', os.O_RDWR)
+    old = os.pread(raw, 1, placement['offset'])
+    assert os.pwrite(raw, bytes([old[0] ^ 1]), placement['offset']) == 1
+    os.fsync(raw)
+    os.close(raw)
+    run('cryptsetup', 'open', '--disable-keyring', '--key-file',
+        '/mnt/piv-work/passphrase.key', '/dev/vdb', 'piv-kernel')
+    fields = subprocess.check_output(['dmsetup', 'table', '--showkeys', 'piv-kernel'], text=True).split()
+    fields[8] = str(int(fields[8]) + 1)
+    fields.append('piv_control')
+    run('dmsetup', 'suspend', 'piv-kernel')
+    run('dmsetup', 'reload', 'piv-kernel', input=' '.join(fields) + '\n', text=True)
+    run('dmsetup', 'resume', 'piv-kernel')
+    del fields
+    run('udevadm', 'settle')
+    current = os.open(glob.glob('/dev/pivctl-*')[0], os.O_RDONLY)
+    profile = bytearray(size)
+    fcntl.ioctl(current, query, profile, True)
+    owner = struct.unpack(fmt, profile)[2]
+    assert owner != generation
+    rejected(lambda: read_iv(current, owner, placement['sector']), {errno.EBADMSG, errno.EIO})
+    assert read_iv(current, owner, 1).hex() == observed['1']
+    run('dmsetup', 'remove', '--retry', 'piv-kernel')
+    run('dmsetup', 'remove', '--retry', 'piv-kernel_dif')
+    rejected(lambda: read_iv(current, owner, 1), {errno.ENODEV})
+    os.close(current)
+    raw = os.open('/dev/vdb', os.O_RDWR)
+    assert os.pwrite(raw, old, placement['offset']) == 1
+    os.fsync(raw)
+    os.close(raw)
 run('rmmod', 'dm_crypt')
 run('modprobe', 'dm_crypt')
 run('cryptsetup', 'open', '--readonly', '--key-file', '/mnt/piv-work/passphrase.key', '/dev/vdb', 'piv-kernel')
 assert digest() == before
 run('cryptsetup', 'close', 'piv-kernel')
-open('/mnt/piv-work/result.txt', 'w').write('K0 query/filter/lifetime and stock readback passed\n')
+with open('/mnt/piv-work/read-results.json', 'w') as output:
+    json.dump(observed, output, sort_keys=True)
+with open('/mnt/piv-work/result.txt', 'w') as output:
+    output.write('K0 and K1 authenticated IV reads/corruption/lifecycle/stock readback passed\n')

@@ -1,45 +1,51 @@
 --- a/dm-crypt.c
 +++ b/dm-crypt.c
-@@ -9,0 +10,6 @@
+@@ -9,0 +10,7 @@
 +
 +#include <linux/miscdevice.h>
 +#include <linux/kref.h>
 +#include <linux/uaccess.h>
 +#include <linux/compat.h>
++#include <linux/sched/mm.h>
 +#include "piv-control.h"
-@@ -156,0 +163 @@
+@@ -156,0 +164 @@
 +struct piv_control;
-@@ -157,0 +165,2 @@
+@@ -157,0 +166,2 @@
 +	bool piv_enabled;
 +	struct piv_control *piv_control;
-@@ -2793,0 +2803,2 @@
+@@ -2793,0 +2804,2 @@
 +#include "piv-control.inc"
 +
-@@ -2801,0 +2813,2 @@
+@@ -2801,0 +2814,2 @@
 +
 +	piv_unregister(cc);
-@@ -3183 +3196 @@
+@@ -3183 +3197 @@
 -		{0, 9, "Invalid number of feature args"},
 +		{0, 10, "Invalid number of feature args"},
-@@ -3205 +3218,3 @@
+@@ -3205 +3219,3 @@
 -		if (!strcasecmp(opt_string, "allow_discards"))
 +		if (!strcasecmp(opt_string, "piv_control"))
 +			cc->piv_enabled = true;
 +		else if (!strcasecmp(opt_string, "allow_discards"))
-@@ -3510,0 +3526,4 @@
+@@ -3510,0 +3527,4 @@
 +	ret = piv_register(cc, ti);
 +	if (ret)
 +		goto bad;
 +
-@@ -3524,0 +3544,6 @@
+@@ -3524,0 +3545,6 @@
 +
 +	/* Filter before the preflush/discard bypass, including WRITE|PREFLUSH. */
 +	if (cc->piv_enabled && bio_op(bio) != REQ_OP_READ &&
 +	    !(bio_op(bio) == REQ_OP_WRITE && !bio->bi_iter.bi_size &&
 +	      (bio->bi_opf & REQ_PREFLUSH)))
 +		return DM_MAPIO_KILL;
-@@ -3624,0 +3650 @@
+@@ -3624,0 +3651 @@
 +		num_feature_args += cc->piv_enabled;
-@@ -3636,0 +3663,2 @@
+@@ -3636,0 +3664,2 @@
 +			if (cc->piv_enabled)
 +				DMEMIT(" piv_control");
+@@ -3714,0 +3744 @@
++	piv_unblock(ti);
+@@ -3802,0 +3833,2 @@
++	.presuspend = piv_presuspend,
++	.presuspend_undo = piv_unblock,
