@@ -170,5 +170,10 @@ The encoded salt/ciphertext/tag is expected to look random under the primitive
 assumptions in [the format notes](docs/hidden-format.md). Layout compatibility
 and statistical tests are not a deniability proof. Multiple snapshots, ordinary
 journal traces, write amplification, memory, installed software, keys and other
-host artifacts remain explicit limitations. See [roadmap](ROADMAP.md) for results
+host artifacts remain explicit limitations. [Matched ordinary-Linux controls](docs/detectability.md)
+show that the current prototype's extra reencryption is visible under a known
+primary workload: AES/4096 changed 192 IVs where ordinary writes changed 7.
+Ordinary whole-group rewrites matched those 192 positions too, so this footprint
+alone does not establish hidden payload existence. These results provide no
+multi-snapshot/workload-observing deniability guarantee. See [roadmap](ROADMAP.md) for results
 and next work, and [observed layout](docs/observed-layout.md) for source evidence.

@@ -124,6 +124,12 @@ data. Verify full primary hashes/authentication, corruption rejection, hidden
 round trips and nonce behavior. Add meaningful boundary/error/crash tests as
 features require them. Compare against matched ordinary controls for detectability.
 
+Matched controls live in scripts/guest-controls.sh and scripts/analyze_controls.py.
+Use pristine stock fixtures, distinguish same-workload writes from deliberate
+ordinary reencryption controls, and exclude native initialization only explicitly.
+Live journal samples are not atomic; byte statistics are descriptive, not a
+security acceptance test. Retain observed snapshot/I/O distinctions in claims.
+
 Keep correctness, crash safety and deniability claims separate. Multiple snapshots,
 journals, memory and host artifacts are explicit limitations. Statistical tests
 cannot prove indistinguishability. If experiments contradict the intended threat

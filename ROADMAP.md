@@ -58,12 +58,17 @@ Concurrent public lifecycle and explicit flush/FUA trace regressions are now
 implemented and verified on AES4096 and AEGIS512; see the final handoff. A
 lockdep/KASAN kernel audit and broader scheduling/storage coverage remain open.
 
-Next build reproducible matched ordinary-Linux controls for detectability:
-compare layout, IV encodings, journal/write footprints and snapshot changes
-under the same primary workload, recording observable differences and limits.
-Statistical agreement cannot prove deniability. Profile remaining per-sector
-read/setup overhead before choosing another optimization. Any cross-bio
-coalescing, crash guarantee or in-carrier redundancy needs separate evidence.
+Matched ordinary-Linux controls now quantify layout, IV, journal and snapshot
+behavior on AES4096 and AEGIS512. The native known-workload footprint differs
+from ordinary requested writes; ordinary whole-group rewrites can match its
+changed-IV positions. See docs/detectability.md; no multi-snapshot/workload
+observing deniability or single-snapshot statistical proof follows.
+
+Next perform a source-led security/threat-model review of the whole encoding,
+nonce budgets and supported claims, distinguishing internal analysis from the
+still-outstanding independent cryptographic review. Profile remaining per-sector
+read/setup overhead before another optimization. Any cross-bio coalescing,
+crash guarantee or in-carrier redundancy needs separate evidence.
 
 Further work: detectability against matched ordinary controls, independent
 cryptographic review, debug-kernel/lifecycle stress, explicit budget/rekey tooling,
@@ -733,3 +738,66 @@ or error assertions were relaxed to turn them into passes.
 Limits: bounded workload and pinned normal kernel, not lockdep/KASAN or broad
 scheduler/hardware coverage. Successful ordered kernel flush returns do not
 prove physical persistence, hidden-record atomicity or rollback resistance.
+
+
+## Session handoff: matched ordinary controls (2026-10-19)
+
+Implemented scripts/guest-controls.sh, kernel/guest-controls-test.py, shared
+read-only scripts/control_metrics.py and scripts/analyze_controls.py. Three
+sequential arms restore one pristine stock fixture only to guest /dev/vdb with
+all holders closed. Stock writes and stock whole-group same-data refresh never
+load/use dm-piv. Native initializes hidden zeros before its own closed baseline,
+then applies the same primary-sector/4k/16k/same-data requests. The second stock
+control encodes no hidden data and tests whether extra reencryption uniquely
+implies payload existence. Fresh evolving CRNG state is never reset despite
+intentionally reused synthetic key/UUID; these are not independent samples.
+
+Both controls-4096-001 (original control-003 stock fixture) and controls-512-001
+(original AEGIS512 stock fixture) PASSED. Complete stock Linux authentication,
+equal primary outputs and preserved native hidden zeros passed in each. Reused
+production module/source stage remain batch-native-4096-001 and batch-001. No
+runtime driver, format, key handling or persistent state changes were made.
+
+Host analysis independently authenticated all six closed before/after images
+per profile, checked every plaintext byte against the deterministic workload,
+matched supported geometry and exact LUKS prefixes, and verified native hidden
+records. Each AES image had 28,244 sectors; each AEGIS image had 213,008. Native
+hidden checks covered 301,056 / 3,028,992 bytes. Current IVs were distinct in every
+after image; no historical uniqueness claim follows. Final reports are ignored
+artifacts/controls-4096-001/analysis.json and controls-512-001/analysis.json.
+
+Snapshot evidence:
+- AES4096: all arms changed 6 plaintext sectors; stock changed 7 IVs, native 192.
+  Stock-refresh matched the EXACT 192 native IV positions. Same-plaintext
+  reencryption was 1 stock versus 186 native/stock-refresh sectors.
+- AEGIS512: all arms changed 41 plaintext sectors; stock changed 42 IVs, native 144.
+  Stock-refresh matched the EXACT 144 native IV positions. Same-plaintext
+  reencryption was 1 stock versus 103 native/stock-refresh sectors.
+
+Physical-vdb traces had no overruns. Journal queued-write bytes (stock /
+stock-refresh / native) were 540,672 / 1,216,512 / 2,973,696 for AES and
+180,224 / 405,504 / 585,728 for AEGIS. These are bounded-window submissions, not
+media bytes or exact amplification; background propagation may occur at close.
+Non-atomic live journal samples contained 7/192/67 entries for AES, 42/180/253 for
+AEGIS; all 7/23 sections were commit-ID-consistent. Earlier journal history,
+repeated writes and setup/checkpoint activity affect those counts. The observer
+never replays or treats its samples as authenticated/atomic recovery information.
+
+Full-IV and 32/528/16 encoding-position byte summaries report bit frequency,
+empirical entropy, chi-square and compression with NO p-values or security
+acceptance threshold. See docs/detectability.md for numerical results, observer
+capabilities, scope and reproduction. The README now states the measured
+known-workload snapshot distinction. Ordinary whole-group refresh matching one
+feature does not make the native workload identical to ordinary requested writes,
+nor does it show that hidden data can be uniquely detected. No broad single-image
+or multi-snapshot deniability claim is warranted by this experiment.
+
+Host 37 tests passed without skips (AES4096 fixture, optional AEGIS reference,
+ResourceWarning errors). Four new tests cover statistics, trace device/region
+classification, primary alignment and torn/truncated journal exclusion. Python
+compilation, shell syntax and git diff --check passed. Both final guest logs had
+no unexpected kernel BUG/Oops/WARNING or compiler diagnostics. Native inputs and
+shared metric source match the frozen runs; the analyzed images were read-only.
+No host installs/root/modules, real disks, large toolchains or new kernel build.
+This bounded assessment is complete. Next: source-led security/threat-model
+review, with independent cryptographic review still explicitly outstanding.
