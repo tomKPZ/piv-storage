@@ -20,7 +20,8 @@ security specification. Respect tool/sandbox approval requirements.
 
 1. Read README.md, ROADMAP.md, applicable nested instructions, and existing design
    notes (especially docs/development.md, docs/observed-layout.md and
-   docs/hidden-format.md, docs/native-blocks.md and docs/kernel-backend.md). Inspect
+   docs/hidden-format.md, docs/native-blocks.md, docs/native-faults.md and
+   docs/kernel-backend.md). Inspect
    git status and relevant code before changing anything.
 2. Determine what is actually implemented and tested. Recheck environmental
    assumptions as needed; the initial host is WSL2 without visible DM/KVM nodes.

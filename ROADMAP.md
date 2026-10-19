@@ -5,6 +5,23 @@ approach. The user has narrowed the offline prototype to make room for an
 online implementation; the active priorities below supersede historical next
 steps in the session notes.
 
+## Native failure handling: selected cases complete
+
+Completed and verified in artifacts/native-fault-002: real lower-device write EIO
+(dm-flakey) and
+independent root-ext4 ENOSPC (temporary guest-only allocation) for decoy and
+hidden requests. The tests require direct-I/O rejection on both failed views, explicit
+stack teardown/recreate, authenticated exact replay without nonce allocation,
+no primary tuple mutation before a failed WAL append, successful fresh writes
+after recovery, stock full-primary verification and independent host comparison
+against the exact requested changes. Do not infer hardware durability or all
+fsync-error behavior from these cases. Record actual outcomes in the handoff.
+
+Next: safe log compaction preserving ALL historical reservations, including
+failed/abandoned transactions; then write batching, lifecycle/debug-kernel
+testing and broader geometry/deployment. Do not broaden deployment before the
+native persistence path has meaningful error coverage.
+
 ## Current migration: two native writable block devices
 
 The user clarified the intended interface: configure a backing device and key
@@ -827,3 +844,62 @@ subsequent deletion of unused journal base methods leaves every invoked ledger/
 sparse recovery method AST-identical to the frozen version. The unused legacy read-only wrapper creation method was also removed; wrapper
 cleanup remains to reject/remove old mappings safely. Other later package changes
 are descriptive docstrings only. Changes are uncommitted.
+
+
+## Session handoff: native storage failures (2026-10-18)
+
+- User authorized proceeding with native failure testing after cleanup commit
+  4baab80. Added guest-dual-fault.py/.sh, an independent host verifier
+  scripts/check_native_fault.py and docs/native-faults.md. No kernel changes,
+  failure hooks, additional host tools or host privileges were needed.
+- The four cases inject real dm-flakey write EIO and independent guest-root ext4
+  log ENOSPC, each through decoy and hidden requests. Public reads/writes and raw
+  tuple comparisons use O_DIRECT to bypass caches. Check that BOTH views reject
+  direct reads/writes after failure, then repair the environment and explicitly
+  remove/recreate the complete failed owner/lower stack. Do not infer that cached
+  filesystem reads are globally invalidated or automatically rebuild mounted FSs.
+- Device-write EIO happens at native integrity journal submission AFTER durable
+  WAL. The failed request rolls forward on reopen; EIO is not rollback. Recovery
+  uses exact saved tuples and no new primary nonce. ENOSPC append failures occur
+  before primary apply. Direct reads of every primary ciphertext/tag/IV tuple
+  matched before/after; partial WAL tails were truncated, while durable nonce
+  reservations remained spent. Each recovered stack accepted a same-data hidden
+  write, spending exactly 64 fresh IVs and preserving decoy plaintext.
+- artifacts/native-fault-001 passed both device cases but stopped on a harness
+  assertion that f_bfree must be zero. Even a 4 KiB fallocate can return ENOSPC
+  with filesystem-internal free/reserved blocks still reported. The filler was
+  removed in finally. This run is NOT an overall pass. Final script logs the
+  free/available counts and requires the actual target write to fail; no error
+  check was weakened. It also uses direct raw-disk reads and a guest guard.
+- artifacts/native-fault-002 passed all four cases; runner task/QEMU exit zero.
+  Device EIO reservations: 56,948 -> 56,980 (decoy), 57,044 -> 57,108 (hidden).
+  Log ENOSPC reservations: 57,172 -> 57,204 (decoy), 57,268 -> 57,332 (hidden).
+  EACH reopen kept the post-fault count exactly. Four successful hidden retries
+  each added 64, producing final 57,396 reservations. ENOSPC returned errno28;
+  its incomplete WAL tails were 2,600/1,404 bytes. The allocator observed 4,096
+  free blocks and zero available blocks; primary tuple hashes stayed unchanged.
+- Stock Linux and independent host verification passed all 28,244 sectors and
+  all 281,600 hidden bytes. Host computed expected primary from the original
+  plaintext plus exactly one planned 4 KiB replacement, rather than trusting the
+  guest's post-replay digest. Final primary SHA256:
+  2a9b441ce9b2b866cf933d5e1c70a798acbeaa8115e0a313a4663f6689143a7c.
+  All 153 native frames authenticated with no pending WAL/trailing bytes. Initial
+  history was a subset of final history; current IVs were unique and members.
+  Evidence: share/fault-results.json and host-verification.json in that run.
+- VM used coherent closed dual-final-007/share/dual-final.img + native.log.
+  Frozen guest test and Python package match current sources byte-for-byte;
+  module scaffold is byte-exact dual-007/current C, pinned Debian 6.12.113-1,
+  guest 6.12.113+deb13-amd64, GCC14.2.0-19 and cryptsetup2:2.7.5-2. No unexpected
+  compiler warnings, BUG/Oops/WARNING/KASAN or alignment diagnostics. Intentional
+  integrity-journal EIO and failed-view Buffer I/O errors are expected evidence.
+- Existing 24 host tests passed with PIV_FIXTURE=artifacts/control-003 and
+  ResourceWarning errors, without skips. Python compilation, guest-shell syntax,
+  whitespace and frozen-source comparisons passed. Changes remain uncommitted.
+- Scope is selected real write/append failures, not exhaustive persistence safety.
+  Arbitrary full-write/fsync/DONE failures, bad full frames, ENOMEM, lifecycle
+  races, debug-kernel checks, state loss/rollback and hardware power loss remain
+  open. Complete unauthentic frames are still rejected. Existing external-state,
+  nonce-lineage, deniability and write-amplification limitations are unchanged.
+  Next bounded milestone: design/test safe native-log compaction without dropping
+  any historical reservations; include crash/append failure tests at its new
+  persistence boundaries. Compaction does not reset the per-key nonce budget.

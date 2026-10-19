@@ -192,7 +192,9 @@ No new host dependency or root access is needed.
 
 The final validation also exercises wrong-key rejection, missing/empty adopted
 history rejection, invalid userspace seed pointers and fresh initialization.
-Seed copying happens before taking the owner mutex. Native device/root-log fault
-injection, exhaustive lifecycle races, lockdep/KASAN and hardware power loss
-remain untested; older control-backend fault tests do not establish these native
-properties. See the latest roadmap handoff for exact passing artifacts.
+Seed copying happens before taking the owner mutex. Native lower-device write EIO and root-ext4 log ENOSPC now have direct-I/O
+fail-stop, replay and nonce-history tests; see [storage error experiments](native-faults.md).
+An EIO request with durable WAL can be rolled forward on reopen; failed writes
+are not promised rollback. Arbitrary log fsync errors, completion-frame failures,
+exhaustive lifecycle races, lockdep/KASAN and hardware power loss remain untested.
+Older control-backend tests do not establish these properties. See the latest roadmap handoff for exact passing artifacts.

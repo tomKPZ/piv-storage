@@ -57,8 +57,9 @@ PIV_FIXTURE=artifacts/control-003 python3 -W error::ResourceWarning -m unittest 
 
 Other retained commands are keygen, extract-ivs and close-blocks. Extraction
 outputs must not already exist. See [development and fixture creation](docs/development.md),
-[record format](docs/incremental-records.md), [observed layout](docs/observed-layout.md)
-and [test results/handoff](ROADMAP.md). Only native backend and diagnostic tests
+[record format](docs/incremental-records.md), [observed layout](docs/observed-layout.md),
+[storage-error experiments](docs/native-faults.md) and [test results/handoff](ROADMAP.md).
+Only native backend and diagnostic tests
 remain active; retired frontends' tests and guest scripts were removed with them.
 
 Only one narrow profile is accepted: LUKS2 with one ordinary dynamic AES-GCM/random
