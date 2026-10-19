@@ -9,6 +9,7 @@ import stat
 import subprocess
 import uuid
 
+from .format import PRIMARY_PROFILES
 from .kernel_api import KernelDevice, dm, validate_integrity_table
 from .profile import parse_superblock, validate_segment
 
@@ -44,6 +45,8 @@ class GuestOwner:
         guest_guard(self.source, allow_test_stack)
         metadata = json.loads(crypt('luksDump', '--dump-json-metadata', self.source).stdout)
         self.offset = validate_segment(metadata)
+        self.encryption = metadata['segments']['0']['encryption']
+        self.mapping_cipher = PRIMARY_PROFILES[self.encryption][1]
         self.uuid = str(uuid.UUID(crypt('luksUUID', self.source).stdout.strip()))
         self.raw_device = self.source.stat().st_rdev
         directory = Path('/run/pivstore')
@@ -81,7 +84,7 @@ class GuestOwner:
                                          self.layout.journal_sections * self.layout.journal_section_sectors)
                 # Key-containing table is kept in memory and sent only through stdin.
                 fields = dm('table', '--showkeys', name).stdout.split()
-                if fields[2:4] != ['crypt', 'capi:gcm(aes)-random']:
+                if fields[2:4] != ['crypt', self.mapping_cipher]:
                     raise ValueError('Unexpected primary mapping cipher')
                 fields[8] = str(int(fields[8]) + 1)
                 fields.append('piv_control')
@@ -116,6 +119,8 @@ class GuestOwner:
             raise
 
     def validate(self):
+        if dm('table', self.name).stdout.split()[2:4] != ['crypt', self.mapping_cipher]:
+            raise ValueError('Primary mapping cipher differs from LUKS metadata')
         if (self.device.sectors, self.device.sector_size) != (self.layout.sectors, self.layout.sector_size):
             raise ValueError('Native geometry differs from supported superblock')
         table = dm('table', self.lower_name).stdout

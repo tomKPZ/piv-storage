@@ -1,7 +1,7 @@
 """Read-only LUKS2/dm-integrity profile, cross-checked with stock Linux fixtures.
 
 LUKS2 header checksums and redundant-header selection are delegated to cryptsetup.
-Only the no-journal-crypto, fixed-padding, 512/4096-byte AES-GCM profiles are accepted.
+Only the no-journal-crypto, fixed-padding, 512/4096-byte AES-GCM and ChaCha20-Poly1305 profiles are accepted.
 """
 
 from contextlib import AbstractContextManager
@@ -15,6 +15,8 @@ import stat
 import struct
 import subprocess
 import uuid
+
+from .format import PRIMARY_PROFILES
 
 
 
@@ -103,11 +105,12 @@ def validate_segment(metadata):
                 'sector_size', 'integrity'}
     if not isinstance(segment, dict) or set(segment) != expected:
         raise UnsupportedImage('Unsupported segment fields')
-    if (segment['type'], segment['size'], segment['iv_tweak'],
-            segment['encryption']) != (
-                'crypt', 'dynamic', '0', 'aes-gcm-random') or segment['sector_size'] not in (512, 4096):
+    encryption = segment['encryption']
+    if (not isinstance(encryption, str) or encryption not in PRIMARY_PROFILES or
+            (segment['type'], segment['size'], segment['iv_tweak']) !=
+            ('crypt', 'dynamic', '0') or segment['sector_size'] not in (512, 4096)):
         raise UnsupportedImage('Unsupported primary encryption profile')
-    if segment['integrity'] != {'type': 'aead', 'journal_encryption': 'none',
+    if segment['integrity'] != {'type': PRIMARY_PROFILES[encryption][0], 'journal_encryption': 'none',
                                 'journal_integrity': 'none'}:
         raise UnsupportedImage('Unsupported integrity/journal algorithms')
     value = segment['offset']
@@ -148,6 +151,7 @@ class Image(AbstractContextManager):
                 offset = validate_segment(metadata)
             except (json.JSONDecodeError, TypeError, KeyError) as exc:
                 raise UnsupportedImage('Invalid LUKS2 segment metadata') from exc
+            self.encryption = metadata['segments']['0']['encryption']
             self.layout = parse_superblock(self.read(4096, offset), offset, self.size)
             if self.layout.sector_size != metadata['segments']['0']['sector_size']:
                 raise UnsupportedImage('LUKS and integrity sector sizes disagree')
@@ -180,7 +184,7 @@ class Image(AbstractContextManager):
                             raise UnsupportedImage('Nonempty journal: recover with stock Linux first')
 
     def summary(self):
-        return {**asdict(self.layout), 'uuid': self.uuid, 'primary_sectors': self.layout.sectors,
+        return {**asdict(self.layout), 'uuid': self.uuid, 'encryption': self.encryption, 'primary_sectors': self.layout.sectors,
                 'gross_carrier_bytes': self.layout.sectors * 12,
                 'journal': 'validated empty; no replay implemented'}
 
@@ -192,7 +196,7 @@ class Image(AbstractContextManager):
 
     def verify(self, key):
         from .sector import SectorCodec
-        codec = SectorCodec(key, self.layout.sector_size)
+        codec = SectorCodec(key, self.layout.sector_size, self.encryption)
         digest = hashlib.sha256()
         for index in range(self.layout.sectors):
             data_offset, tag_offset = self.layout.offsets(index)

@@ -39,8 +39,9 @@ assert os.uname().release == '6.12.113+deb13-amd64'
 assert subprocess.check_output(['findmnt', '-n', '-o', 'FSTYPE', '/mnt/piv-work']).strip() == b'9p'
 path = '/dev/mapper/piv-kernel'
 assert not glob.glob('/dev/pivctl-*')
-sector_size = json.loads(subprocess.check_output(
-    ['cryptsetup', 'luksDump', '--dump-json-metadata', '/dev/vdb'], text=True))['segments']['0']['sector_size']
+segment = json.loads(subprocess.check_output(
+    ['cryptsetup', 'luksDump', '--dump-json-metadata', '/dev/vdb'], text=True))['segments']['0']
+sector_size = segment['sector_size']
 expected_sector_size = sector_size
 factor = sector_size // 512
 boundary = 32768 // factor
@@ -187,7 +188,8 @@ os.close(view)
 run('dmsetup', 'remove', '--retry', 'piv-view')
 # Prepared tuples are durable before the first apply in this sector experiment.
 from pivstore.kernel_api import KernelDevice, validate_integrity_table
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
+algorithm = {'aes-gcm-random': AESGCM, 'chacha20-random': ChaCha20Poly1305}[segment['encryption']]
 native = KernelDevice(controls[0], path)
 validate_integrity_table(subprocess.check_output(['dmsetup', 'table', 'piv-kernel_dif'], text=True),
                          sectors, os.stat('/dev/vdb').st_rdev, 16777216, sector_size,
@@ -211,7 +213,7 @@ for index in selected:
     # Independently verify the native encryption/AAD against a maintained library.
     with open('/mnt/piv-work/volume.key', 'rb') as keyfile:
         primary_key = keyfile.read()
-    plaintext = AESGCM(primary_key).decrypt(new, value[:sector_size] + value[4096:4112], struct.pack('<Q', index * factor) + new)
+    plaintext = algorithm(primary_key).decrypt(new, value[:sector_size] + value[4096:4112], struct.pack('<Q', index * factor) + new)
     assert plaintext == hashlib.shake_256(b'piv-control-v1' + index.to_bytes(8, 'little')).digest(sector_size)
     prepared.append((index, old, value))
 with open('/mnt/piv-work/prepared-tuples.bin', 'wb') as journal:
@@ -228,7 +230,7 @@ rejected(lambda: native.apply(index, bytes([9]) * 12, value), {errno.ESTALE})
 bad = bytearray(value); bad[0] ^= 1
 rejected(lambda: native.apply(index, old, bytes(bad)), {errno.EBADMSG, errno.EIO})
 nonce = os.urandom(12)
-encrypted = AESGCM(primary_key).encrypt(nonce, bytes(sector_size), struct.pack('<Q', index * factor) + nonce)
+encrypted = algorithm(primary_key).encrypt(nonce, bytes(sector_size), struct.pack('<Q', index * factor) + nonce)
 changed = encrypted[:sector_size].ljust(4096, b'\0') + encrypted[sector_size:] + nonce
 rejected(lambda: native.apply(index, old, changed), {errno.EPERM})
 for index, old, value in prepared:
@@ -245,7 +247,7 @@ nonce = os.urandom(12)
 rejected(lambda: native.prepare_primary(0, old, old, bytes(sector_size)), {errno.EINVAL})
 rejected(lambda: native.prepare_primary(0, os.urandom(12), nonce, bytes(sector_size)), {errno.ESTALE})
 changed = native.prepare_primary(0, old, nonce, bytes(sector_size))
-assert AESGCM(primary_key).decrypt(nonce, changed[:sector_size] + changed[4096:4112], struct.pack('<Q', 0) + nonce) == bytes(sector_size)
+assert algorithm(primary_key).decrypt(nonce, changed[:sector_size] + changed[4096:4112], struct.pack('<Q', 0) + nonce) == bytes(sector_size)
 rejected(lambda: native.apply(0, old, changed), {errno.EPERM})
 bad = bytearray(changed); bad[4096] ^= 1
 rejected(lambda: native.apply_primary(0, old, bytes(bad)), {errno.EBADMSG, errno.EIO})

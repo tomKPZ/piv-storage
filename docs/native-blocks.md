@@ -49,6 +49,15 @@ active/views/failed/version (u32). Counters are volatile; invalidations count gr
 completed invalid-marker requests, not durable lifetime history.
 No user paths or file descriptors enter the native persistence path.
 
+The primary cipher whitelist includes capi:gcm(aes)-random and
+capi:rfc7539(chacha20,poly1305)-random, both with 32-byte keys, 12-byte stored IVs
+and 16-byte tags. The pinned dm-crypt AEAD helper handles either transform with
+AAD LE64(address_in_512_byte_units) || IV12. Setup checks the actual owner table
+against the validated LUKS cipher on creation and reuse. The independent verifier
+selects AESGCM or ChaCha20Poly1305 from the same validated public metadata; setup
+continues to require only the Python standard library. The control ABI and v3
+hidden encoding are unchanged.
+
 QUERY reports the primary sector size and encryption-sector count. Primary
 control tuples remain 4124 bytes: ciphertext[S], zero padding up to 4096, tag16,
 IV12. The padding exists only in RAM/control messages; on disk the ciphertext is

@@ -7,6 +7,10 @@ Capacity is floor(primary_sectors/48)*512. Incomplete tail primary sectors carry
 no hidden block and receive ordinary fresh random IVs on coordinated writes.
 Primary sector size is 512 or 4096 bytes; it changes the primary span of one
 record (24 KiB or 192 KiB), not its encoding or logical hidden-block size.
+Both supported primary ciphers (AES-GCM and ChaCha20-Poly1305) supply the same
+12-byte carrier slots. The independently keyed hidden AEAD and context are
+unchanged; volume identity and geometry bind the records, and the native owner
+authenticates primary data under the selected primary cipher before access.
 
 ```
 carrier[576] = salt[32] || ciphertext[528] || Poly1305_tag[16]

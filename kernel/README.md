@@ -2,6 +2,7 @@
 
 The experimental module extends dm-crypt and registers paired piv-view targets
 sharing one crypt owner, hidden-record crypto, stateless record authentication.
+Primary encryption supports AES-GCM and ChaCha20-Poly1305 with stored random IVs.
 See [native interface and end-to-end tests](../docs/native-blocks.md).
 The userspace FUSE/NBD adapters have been removed; their historical test results
 remain in ROADMAP.md and Git history. Authenticated sector controls remain for

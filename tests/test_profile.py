@@ -66,9 +66,23 @@ class SegmentTests(unittest.TestCase):
                           'journal_integrity': 'none'}}}}
 
     def test_supported_segment(self):
-        for size in (512, 4096):
-            self.metadata['segments']['0']['sector_size'] = size
-            self.assertEqual(validate_segment(self.metadata), 16777216)
+        for cipher, integrity in (('aes-gcm-random', 'aead'), ('chacha20-random', 'poly1305')):
+            for size in (512, 4096):
+                segment = self.metadata['segments']['0']
+                segment['encryption'] = cipher
+                segment['integrity']['type'] = integrity
+                segment['sector_size'] = size
+                self.assertEqual(validate_segment(self.metadata), 16777216)
+
+    def test_reject_mismatched_cipher_and_integrity(self):
+        for cipher, integrity in (('aes-gcm-random', 'poly1305'), ('chacha20-random', 'aead'),
+                                  ('chacha20-plain64', 'poly1305'),
+                                  ('chacha20-poly1305-random', 'aead'), ([], 'aead')):
+            metadata = copy.deepcopy(self.metadata)
+            metadata['segments']['0']['encryption'] = cipher
+            metadata['segments']['0']['integrity']['type'] = integrity
+            with self.subTest(cipher=cipher, integrity=integrity), self.assertRaises(UnsupportedImage):
+                validate_segment(metadata)
 
     def test_reject_alternative_layouts(self):
         for key, value in (('iv_tweak', '8'), ('sector_size', 2048),

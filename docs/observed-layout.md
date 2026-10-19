@@ -113,3 +113,30 @@ These formulas were checked against the pinned v6.12.113 dm-integrity source
 (calculate_journal_section_size/calculate_device_limits) and the independently
 generated stock fixtures. Format defaults depend on geometry and versions;
 the two fixtures do not establish arbitrary-profile support.
+
+## Stock ChaCha20-Poly1305 profiles
+
+artifacts/chacha-control-4096-001 and chacha-control-512-001 use the same pinned
+kernel/cryptsetup and shared generator, with --cipher chacha20-random,
+--integrity poly1305 and --key-size 256. Both passed stock full-primary readback
+and independent cryptography ChaCha20Poly1305 authentication of every sector.
+Their deterministic primary hashes match the same-sector-size AES fixtures
+above by construction; their keys, UUIDs and encrypted raw images are different.
+
+LUKS records encryption=chacha20-random, integrity.type=poly1305, with no journal
+crypto. Cryptsetup maps this to capi:rfc7539(chacha20,poly1305)-random with
+external AEAD integrity. Stored metadata remain tag16 || IV12; AAD remains
+LE64(primary_sector_index * primary_sector_size/512) || IV12. Capacities,
+superblock fields, journal strides, interleave offsets and lower integrity-table
+options exactly match the AES fixture of each sector size. No carrier geometry
+or hidden-record encoding change is needed.
+
+The mappings and tuple sizing were checked against the pinned cryptsetup
+cipher_dm2c and INTEGRITY_tag_size implementations. Linux's rfc7539 template
+uses a 12-byte IV and a 16-byte authentication tag; it is distinct from the
+8-byte-IV rfc7539esp template, which this prototype does not accept. Both native
+primary crypto paths reuse pinned dm-crypt; userspace verification selects the
+maintained AESGCM or ChaCha20Poly1305 primitive only after validating the exact
+LUKS cipher/integrity combination. Active owner tables are checked against that
+selection on setup and reuse. Neither profile changes the hidden nonce policy
+or its documented limits.

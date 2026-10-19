@@ -2,8 +2,8 @@
 
 Research prototype exposing two writable Linux device-mapper devices: a decoy
 volume and an independently encrypted hidden volume carried in the decoy's
-persistent AES-GCM IVs. Both devices expose plaintext block I/O and support their
-own filesystem. Setup exits; the kernel owns subsequent I/O.
+persistent random IVs (AES-GCM or ChaCha20-Poly1305). Both devices expose
+plaintext block I/O and support their own filesystem. Setup exits; the kernel owns subsequent I/O.
 
 The current architecture has **no external persistent metadata, nonce ledger or
 recovery file**. It retains the ordinary LUKS2/dm-integrity layout and journal.
@@ -26,8 +26,9 @@ python3 -m pivstore open-blocks --device /dev/vdb \
 ```
 
 This returns /dev/mapper/piv-native-decoy and /dev/mapper/piv-native-hidden.
-Both 512- and 4096-byte primary encryption sectors are supported, detected from
-LUKS metadata without an activation flag. Both public devices use 512-byte logical
+AES-GCM and ChaCha20-Poly1305 primary encryption support both 512- and 4096-byte
+sectors. Activation detects the cipher and geometry from LUKS metadata without
+an override flag. Both public devices use 512-byte logical
 blocks. For our 128 MiB disk fixtures:
 
 | Primary sector size | Decoy bytes | Hidden bytes |
@@ -88,17 +89,30 @@ toward the real per-key lifetime budget. Manage that budget externally.
 2^32 invocations represent 16 TiB at 4096 bytes per encryption or 2 TiB at 512 bytes, including rewrite amplification. These are primary encryption bytes,
 not application-write allowances. A 512-byte hidden write reencrypts 192 KiB of
 primary data with 4096-byte sectors (384 times as many bytes), or 24 KiB with
-512-byte sectors (48 times), before ordinary journal overhead. GCM also has per-message and
+512-byte sectors (48 times), before ordinary journal overhead. Each primary AEAD also has per-message and
 aggregate security constraints; collision probability alone is not a full bound.
 Never rely on snapshot-restored RNG state or replay cached encryption plans.
 
 ## Disk format and diagnostics
 
-Supported profile: one LUKS2 AES-GCM/random segment, zero IV tweak, 512- or 4096-byte
-primary sectors, 96-bit IVs, 128-bit primary tags, integrity v4 fixed padding,
+Supported profiles: one LUKS2 AES-GCM/random or ChaCha20-Poly1305/random segment,
+zero IV tweak, 512- or 4096-byte primary sectors, 96-bit IVs, 128-bit primary tags, integrity v4 fixed padding,
 28-byte metadata tuples, 32768-sector interleaving (512-byte units) and an unencrypted/un-MACed
 stock journal. Native activation delegates journal replay to Linux. Offline
 image diagnostics reject a dirty journal and unsupported geometry.
+
+Stock cryptsetup selections (when formatting a new volume) are:
+
+| Primary cipher | Cipher option | Integrity option | Primary key |
+| --- | --- | --- | --- |
+| AES-GCM | `--cipher aes-gcm-random` | `--integrity aead` | 256 bits |
+| ChaCha20-Poly1305 | `--cipher chacha20-random` | `--integrity poly1305` | 256 bits |
+
+Both use the same 12-byte IV/16-byte tag layout and have the same carrier
+capacity and probabilistic nonce-collision limits. Hidden records continue to
+use their independent ChaCha20-Poly1305 keys regardless of the primary cipher.
+Selecting a different primary cipher requires a newly formatted volume; there
+is no in-place cipher conversion command in this prototype.
 
 ```sh
 python3 -m pivstore inspect artifacts/control-003/control.img

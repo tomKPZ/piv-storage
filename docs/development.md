@@ -41,6 +41,19 @@ python3 scripts/vm.py run --script scripts/guest-control-512.sh \
   --share-file scripts/guest-control.sh --run-dir artifacts/control-512-next --timeout 1800
 ```
 
+For ChaCha20-Poly1305, use scripts/guest-control-chacha.sh (4096-byte sectors)
+or scripts/guest-control-chacha-512.sh, also sharing scripts/guest-control.sh:
+
+```sh
+python3 scripts/vm.py run --script scripts/guest-control-chacha-512.sh \
+  --share-file scripts/guest-control.sh --run-dir artifacts/chacha-control-512-next --timeout 1800
+```
+
+These use --cipher chacha20-random --integrity poly1305 --key-size 256. Native
+activation and independent diagnostics detect the profile from LUKS metadata.
+The explicit wrappers select only formatting options; all control generation
+and stock readback checks share the same body.
+
 Each profile writes distinct deterministic synthetic plaintext
 to every primary sector, closes the mapping, reopens it read-only using stock
 cryptsetup, and hashes every primary byte. Password-keyslot PBKDF2 uses a very low

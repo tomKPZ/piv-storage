@@ -3,17 +3,20 @@
 import struct
 
 from cryptography.exceptions import InvalidTag
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 
 
 class SectorCodec:
-    def __init__(self, key, sector_size=4096):
+    def __init__(self, key, sector_size=4096, encryption='aes-gcm-random'):
         if len(key) != 32:
             raise ValueError('This profile requires a 32-byte primary volume key')
         if sector_size not in (512, 4096):
             raise ValueError('Unsupported primary sector size')
         self.sector_size = sector_size
-        self.cipher = AESGCM(key)
+        algorithms = {'aes-gcm-random': AESGCM, 'chacha20-random': ChaCha20Poly1305}
+        if encryption not in algorithms:
+            raise ValueError('Unsupported primary cipher')
+        self.cipher = algorithms[encryption](key)
 
     def decrypt(self, index, ciphertext, metadata):
         if len(ciphertext) != self.sector_size or len(metadata) != 28:

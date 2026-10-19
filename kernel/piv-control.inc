@@ -513,14 +513,15 @@ static int piv_register(struct crypt_config *cc, struct dm_target *ti)
 		return 0;
 	/* Pin the existing tested crypto profile; this is not a general API. */
 	if (!crypt_integrity_aead(cc) || cc->iv_gen_ops != &crypt_iv_random_ops ||
-	    strcmp(cc->cipher_string, "capi:gcm(aes)-random") ||
+	    (strcmp(cc->cipher_string, "capi:gcm(aes)-random") &&
+	     strcmp(cc->cipher_string, "capi:rfc7539(chacha20,poly1305)-random")) ||
 	    cc->key_size != 32 || (cc->sector_size != 512 && cc->sector_size != 4096) ||
 	    cc->iv_size != 12 || cc->integrity_iv_size != 12 ||
 	    cc->integrity_tag_size != 16 || cc->tuple_size != 28 ||
 	    cc->iv_offset || cc->start ||
 	    test_bit(CRYPT_IV_LARGE_SECTORS, &cc->cipher_flags) ||
 	    !(dm_table_get_mode(ti->table) & BLK_OPEN_WRITE)) {
-		ti->error = "piv_control requires the tested writable-owner GCM profile";
+		ti->error = "piv_control requires the tested writable-owner AEAD profile";
 		return -EINVAL;
 	}
 	p = kzalloc(sizeof(*p), GFP_KERNEL);

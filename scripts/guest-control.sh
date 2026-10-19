@@ -15,6 +15,12 @@ apt-get -y --no-install-recommends install \
 test "$(uname -r)" = 6.12.113+deb13-amd64
 PIV_SECTOR_SIZE=${PIV_SECTOR_SIZE:-4096}
 case "$PIV_SECTOR_SIZE" in 512|4096) ;; *) exit 1;; esac
+PIV_PRIMARY_CIPHER=${PIV_PRIMARY_CIPHER:-aes-gcm-random}
+case "$PIV_PRIMARY_CIPHER" in
+    aes-gcm-random) primary_integrity=aead ;;
+    chacha20-random) primary_integrity=poly1305 ;;
+    *) exit 1 ;;
+esac
 modprobe dm_integrity
 modprobe dm_crypt
 
@@ -27,8 +33,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cryptsetup luksFormat --batch-mode --type luks2 --cipher aes-gcm-random \
-    --key-size 256 --sector-size "$PIV_SECTOR_SIZE" --integrity aead \
+cryptsetup luksFormat --batch-mode --type luks2 --cipher "$PIV_PRIMARY_CIPHER" \
+    --key-size 256 --sector-size "$PIV_SECTOR_SIZE" --integrity "$primary_integrity" \
     --pbkdf pbkdf2 --pbkdf-force-iterations 1000 \
     --volume-key-file volume.key --key-file passphrase.key "$device"
 cryptsetup open --key-file passphrase.key "$device" piv-control

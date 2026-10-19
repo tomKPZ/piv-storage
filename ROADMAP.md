@@ -23,8 +23,9 @@ Implemented in this working tree:
   separation; all tuples prepared in RAM then applied through stock integrity.
 - Simplified setup and independent v3 decoder; legacy codecs, bootstrap,
   recovery/compaction modules and obsolete state-protocol tests removed.
-- Primary encryption sectors of 512 or 4096 bytes, including geometry-aware
-  native I/O, journal/layout parsing, controls and independent diagnostics.
+- AES-GCM and ChaCha20-Poly1305 primary profiles at 512 or 4096 bytes per
+  sector, including geometry-aware native I/O, journal/layout parsing, controls
+  and independent diagnostics.
 - Updated interface/security documentation. Results below distinguish tested behavior from untested guarantees.
 
 Exit criteria (all passed):
@@ -239,3 +240,87 @@ ordinary 4096-byte decoy write may refresh one group eight times. Tests perform
 repeated full-volume comparisons, so allow the documented 3600-second VM timeout.
 Capacity/budget tradeoffs are in README; no throughput, hardware crash durability,
 strict historical nonce safety or deniability guarantee was added.
+
+## Session handoff: ChaCha20-Poly1305 primary encryption
+
+The user requested ChaCha20-Poly1305 primary support alongside AES-GCM. Accepted
+LUKS profiles are aes-gcm-random/integrity aead and chacha20-random/integrity
+poly1305, both with 32-byte primary keys, 12-byte IVs, 16-byte tags and 512- or
+4096-byte encryption sectors. Kernel registration whitelists the two exact
+Crypto API specs; the primary encryption/decryption helpers remain the pinned
+dm-crypt implementation. No native ABI, carrier mapping, hidden v3 bytes or
+external persistence changes were introduced.
+
+A standard-library-only profile map validates LUKS cipher/integrity pairs and
+binds the active owner table to that selection, including reuse. The independent
+codec explicitly chooses AESGCM or ChaCha20Poly1305 without a fallback. Inspect
+reports the encryption name. The shared stock-fixture generator now has explicit
+ChaCha wrappers for both sector sizes; focused kernel tests independently select
+the maintained library primitive from the fixture metadata.
+
+Stock chacha-control-4096-001 and chacha-control-512-001 passed Linux readback and
+independent whole-primary authentication. Their layouts/capacities match the
+same-size AES fixtures. All 24 host tests passed separately against each of the
+four ordinary controls, with ResourceWarning errors enabled and no skips. New
+coverage rejects mismatched cipher/integrity selections, wrong-cipher decode,
+address/key/ciphertext/tag/IV changes and unknown-algorithm fallback. Native
+setup still passes the Python -S/no-cryptography dependency check.
+
+artifacts/chacha-aes-kernel-001 built the matched new module and passed the AES
+sector/control/lifecycle/corruption suite and stock final primary readback.
+
+artifacts/chacha-kernel-512-001 also built the matched module and passed the
+ChaCha sector/control suite, including direct library comparison of prepared
+kernel ciphertext/AAD, primary write/restore, padding/corruption rejection,
+interleave-boundary reads, controller death, stale handles, key wipe and stock
+final readback. Independent host verification authenticated all 214,800 final
+primary sectors with the original fixture hash; kernel-returned IVs matched
+independent raw offsets. The shared module source and controls work for both
+primary algorithms without a separate encryption implementation.
+
+artifacts/chacha-power-4096-001 cut QEMU at 32/48 changed current/committed IVs,
+rebooted through stock replay, and passed primary preservation, local hidden EIO
+isolation, unchanged other blocks, invalid-marker preservation and targeted
+repair. Stock readback and independent host verification authenticated all
+28,244 primary sectors and all 301,056 hidden bytes after repair, with distinct
+current IVs. This tests the new primary AEAD under VM interruption; hardware
+power loss and whole-hidden-record crash recovery remain unclaimed.
+
+artifacts/chacha-native-4096-001 passed the full paired writable-device suite:
+uninitialized/damaged/wrong-key isolation and repair, invalid-marker preservation,
+changed decoy writes across carrier/metadata boundaries and at the device tail,
+hidden preservation/last-block rewrite, concurrent ext4/ext2, clean reopen and
+stock full-primary readback. Independent host verification authenticated all
+28,244 primary sectors and decoded all 301,056 hidden bytes against guest oracles;
+all current IVs were distinct. Hidden updates retained the original decoy hash
+before intentional filesystem writes.
+
+artifacts/chacha-early-4096-001 passed actual initramfs/RAM-root activation and
+read/write/restore of both devices, with no persistent OS filesystem attached,
+no external metadata and Python -S without cryptography. Independent host
+primary/hidden verification passed afterward. Existing explicit crypto modules
+in the shared initramfs builder were sufficient; no new bootstrap dependency
+was needed for the primary ChaCha profile.
+
+artifacts/chacha-native-512-001 passed the equivalent full paired-device suite
+at 512-byte primary sectors, including boundary/tail mutations and exact restore,
+secret preservation/repair/wrong-key isolation, concurrent ext4/ext2 and clean
+reopen. Stock Linux authenticated every final primary sector. Independent host
+verification matched all 214,800 primary sectors and 2,291,200 hidden bytes to
+the guest oracles, with distinct current IVs. The shared test body and kernel
+source were unchanged between the 4096- and 512-byte native runs.
+
+artifacts/chacha-early-512-001 passed the same actual RAM-root activation and
+read/write/restore checks at 512-byte primary sectors; independent host
+primary/hidden verification passed afterward. Both primary sector sizes now
+have full native/filesystem, stock compatibility, independent decoder and
+RAM-root evidence for ChaCha20-Poly1305. The new module also retained AES control
+compatibility; both AES stock fixtures passed the expanded host suite.
+
+Python compilation, changed-shell syntax and git diff --check passed. Completed
+guest runs contain no unexpected kernel BUG/Oops/WARNING diagnostics. No extra
+host tools, host root privileges or host module loading were needed. The source
+matches the frozen package/module inputs used in the VMs. Changes are left
+uncommitted. Next priorities remain direct lower-device EIO/fail-stop/recreate
+coverage and bounded batching; no additional crash, nonce-history, rollback,
+general-host or deniability guarantee was introduced by cipher support.
