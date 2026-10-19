@@ -82,3 +82,34 @@ calculate_device_limits, get_data_sector, get_metadata_sector_and_offset,
 init_journal, replay_journal, and dm_integrity_postsuspend. Debian patch
 equivalence has not been established by full source comparison; independent
 kernel readback provides the current behavioral check.
+
+## Stock 512-byte profile
+
+artifacts/control-512-001 uses the same pinned kernel and cryptsetup, with
+--sector-size 512 and otherwise the same formatting options. Its stock full
+primary readback agrees with the independent codec:
+b49cb8f2559a3acf6d265ded9aab425f28e3488dcf68885f25fd5942c5eee5b2.
+The 128 MiB raw image contains 214,800 primary sectors (109,977,600 bytes),
+providing 4,475 complete hidden records (2,291,200 logical hidden bytes).
+
+The superblock differs in log2_sectors_per_block=0, journal_sections=23 and
+provided_data_sectors=214800. Journal entries are 48 bytes, ten per header
+sector; each section occupies 88 addressing sectors. Initial space is
+8 + 23*88 = 2032 sectors. A metadata run occupies 1792 sectors. The stock
+integrity table omits block_size:512 (the default), reports journal_sectors:2024
+and buffer_sectors:128. For 4096-byte sectors those values are block_size:4096,
+journal_sectors:1848 and buffer_sectors:32. The smaller buffer in the latter
+profile results from alignment to its metadata run, not a custom test option.
+
+For either profile let f=primary_sector_size/512. Journal entry size is
+round_up(8 + 8*f + 28, 8), section size is 8 + 8*f*floor(504/entry_size), and
+metadata-run size is round_up(28*(32768/f), 4096)/512. Use the actual superblock
+journal-section count to compute initial space. Replace 8 by f, 1856 by the
+computed initial space and 224 by the metadata-run size in the offset formula
+above. AAD remains LE64(i*f) || IV12. The parser checks LUKS/superblock sector-size
+agreement before accepting an image.
+
+These formulas were checked against the pinned v6.12.113 dm-integrity source
+(calculate_journal_section_size/calculate_device_limits) and the independently
+generated stock fixtures. Format defaults depend on geometry and versions;
+the two fixtures do not establish arbitrary-profile support.

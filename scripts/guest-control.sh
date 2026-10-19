@@ -13,6 +13,8 @@ apt-get -o Acquire::Retries=2 update
 apt-get -y --no-install-recommends install \
     cryptsetup-bin=2:2.7.5-2 libcryptsetup12=2:2.7.5-2 python3
 test "$(uname -r)" = 6.12.113+deb13-amd64
+PIV_SECTOR_SIZE=${PIV_SECTOR_SIZE:-4096}
+case "$PIV_SECTOR_SIZE" in 512|4096) ;; *) exit 1;; esac
 modprobe dm_integrity
 modprobe dm_crypt
 
@@ -26,21 +28,23 @@ cleanup() {
 trap cleanup EXIT
 
 cryptsetup luksFormat --batch-mode --type luks2 --cipher aes-gcm-random \
-    --key-size 256 --sector-size 4096 --integrity aead \
+    --key-size 256 --sector-size "$PIV_SECTOR_SIZE" --integrity aead \
     --pbkdf pbkdf2 --pbkdf-force-iterations 1000 \
     --volume-key-file volume.key --key-file passphrase.key "$device"
 cryptsetup open --key-file passphrase.key "$device" piv-control
 size=$(blockdev --getsize64 /dev/mapper/piv-control)
-python3 - "$size" <<'PY'
+python3 - "$size" "$PIV_SECTOR_SIZE" <<'PY'
 import hashlib
 import sys
 
 size = int(sys.argv[1])
+sector = int(sys.argv[2])
 digest = hashlib.sha256()
 with open('/dev/mapper/piv-control', 'wb', buffering=0) as out:
-    for index in range(size // 4096):
-        # Deterministic, distinct sector contents; never actual user data.
-        block = hashlib.shake_256(b'piv-control-v1' + index.to_bytes(8, 'little')).digest(4096)
+    for start in range(0, size // sector, 1024):
+        # Batch writes while retaining deterministic, distinct sector contents.
+        block = b''.join(hashlib.shake_256(b'piv-control-v1' + index.to_bytes(8, 'little')).digest(sector)
+                         for index in range(start, min(start + 1024, size // sector)))
         if out.write(block) != len(block):
             raise RuntimeError('short primary write')
         digest.update(block)

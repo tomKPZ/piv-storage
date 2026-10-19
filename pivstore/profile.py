@@ -1,7 +1,7 @@
 """Read-only LUKS2/dm-integrity profile, cross-checked with stock Linux fixtures.
 
 LUKS2 header checksums and redundant-header selection are delegated to cryptsetup.
-Only the no-journal-crypto, fixed-padding, 4096-byte AES-GCM profile is accepted.
+Only the no-journal-crypto, fixed-padding, 512/4096-byte AES-GCM profiles are accepted.
 """
 
 from contextlib import AbstractContextManager
@@ -39,15 +39,20 @@ class Layout:
     def sectors(self):
         return self.primary_bytes // self.sector_size
 
+    @property
+    def journal_entry_bytes(self):
+        return ((8 + 8 * (self.sector_size // 512) + 28 + 7) // 8) * 8
+
     def offsets(self, index):
         if not 0 <= index < self.sectors:
             raise IndexError('Primary sector out of range')
-        sector512 = index * 8
+        factor = self.sector_size // 512
+        sector512 = index * factor
         area, offset = divmod(sector512, self.interleave_sectors)
         base = self.integrity_offset + (self.initial_sectors + area * (
             self.interleave_sectors + self.metadata_run_sectors)) * 512
         return (base + (self.metadata_run_sectors + offset) * 512,
-                base + (offset // 8) * 28)
+                base + (offset // factor) * 28)
 
 
 def read_exact(fd, length, offset, limit):
@@ -64,23 +69,23 @@ def parse_superblock(header, offset, file_size):
         raise UnsupportedImage('Incomplete integrity superblock')
     magic, version, interleave, tuple_size, sections, provided, flags, block = (
         struct.unpack_from('<8sBBHIQIB', header))
-    if (magic, version, interleave, tuple_size, flags, block) != (
-            b'integrt\0', 4, 15, 28, 8, 3):
+    if (magic, version, interleave, tuple_size, flags) != (
+            b'integrt\0', 4, 15, 28, 8) or block not in (0, 3):
         raise UnsupportedImage('Unsupported integrity superblock profile')
     if offset < 32768 or offset % 4096 or offset + 4096 > file_size:
         raise UnsupportedImage('Invalid integrity offset')
-    if not 1 <= sections <= 4096 or provided <= 0 or provided % 8:
+    factor = 1 << block
+    if not 1 <= sections <= 4096 or provided <= 0 or provided % factor:
         raise UnsupportedImage('Invalid integrity dimensions')
-    # calculate_journal_section_size: round_up(8 + 8*8 + 28, 8) = 104.
-    # 504 usable bytes per journal sector, eight header sectors per section.
-    section_sectors = (504 // 104) * 8 * 8 + 8
+    # Pinned Linux: header address8 + saved data-sector tails8*factor + tuple28.
+    entry_bytes = ((8 + 8 * factor + 28 + 7) // 8) * 8
+    section_sectors = (504 // entry_bytes) * 8 * factor + 8
     initial = 8 + section_sectors * sections
-    # Fixed metadata padding is 4096 bytes. 28 * (32768/8) is already aligned.
-    metadata_run = ((28 * 4096 + 4095) // 4096) * 8
+    metadata_run = ((28 * (32768 // factor) + 4095) // 4096) * 8
     layout = Layout(offset, provided * 512, sections, section_sectors,
-                    initial, metadata_run)
+                    initial, metadata_run, sector_size=512 * factor)
     data, tag = layout.offsets(layout.sectors - 1)
-    if data + 4096 > file_size or tag + 28 > file_size:
+    if data + layout.sector_size > file_size or tag + 28 > file_size:
         raise UnsupportedImage('Primary extents exceed image size')
     return layout
 
@@ -99,8 +104,8 @@ def validate_segment(metadata):
     if not isinstance(segment, dict) or set(segment) != expected:
         raise UnsupportedImage('Unsupported segment fields')
     if (segment['type'], segment['size'], segment['iv_tweak'],
-            segment['encryption'], segment['sector_size']) != (
-                'crypt', 'dynamic', '0', 'aes-gcm-random', 4096):
+            segment['encryption']) != (
+                'crypt', 'dynamic', '0', 'aes-gcm-random') or segment['sector_size'] not in (512, 4096):
         raise UnsupportedImage('Unsupported primary encryption profile')
     if segment['integrity'] != {'type': 'aead', 'journal_encryption': 'none',
                                 'journal_integrity': 'none'}:
@@ -144,6 +149,8 @@ class Image(AbstractContextManager):
             except (json.JSONDecodeError, TypeError, KeyError) as exc:
                 raise UnsupportedImage('Invalid LUKS2 segment metadata') from exc
             self.layout = parse_superblock(self.read(4096, offset), offset, self.size)
+            if self.layout.sector_size != metadata['segments']['0']['sector_size']:
+                raise UnsupportedImage('LUKS and integrity sector sizes disagree')
             self.check_empty_journal()
         except BaseException:
             os.close(self.fd)
@@ -167,8 +174,9 @@ class Image(AbstractContextManager):
                     raise UnsupportedImage('Invalid/torn or unsupported journal section')
                 base_id = current
                 if index < 8:
-                    for entry in range(4):
-                        if data[entry * 104 + 4:entry * 104 + 8] != b'\xff' * 4:
+                    stride = layout.journal_entry_bytes
+                    for entry in range(504 // stride):
+                        if data[entry * stride + 4:entry * stride + 8] != b'\xff' * 4:
                             raise UnsupportedImage('Nonempty journal: recover with stock Linux first')
 
     def summary(self):
@@ -184,11 +192,11 @@ class Image(AbstractContextManager):
 
     def verify(self, key):
         from .sector import SectorCodec
-        codec = SectorCodec(key)
+        codec = SectorCodec(key, self.layout.sector_size)
         digest = hashlib.sha256()
         for index in range(self.layout.sectors):
             data_offset, tag_offset = self.layout.offsets(index)
-            ciphertext = self.read(4096, data_offset)
+            ciphertext = self.read(self.layout.sector_size, data_offset)
             metadata = self.read(28, tag_offset)
             plaintext = codec.decrypt(index, ciphertext, metadata)
             digest.update(plaintext)

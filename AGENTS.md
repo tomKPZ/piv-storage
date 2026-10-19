@@ -65,7 +65,7 @@ resolved from context/evidence, not for routine implementation decisions.
   source/config/symbol matches. Never install host modules or touch real disks.
   scripts/fetch_kernel.py stages the COMPLETE module including dm-audit.h;
   kernel/prepare.py alone stages only the patch and is insufficient for a build.
-- Pin one supported profile: LUKS2 AES-GCM/random, 4096-byte sectors, 12-byte IV,
+- Supported profiles: LUKS2 AES-GCM/random, 512- or 4096-byte sectors, 12-byte IV,
   16-byte tag, integrity v4 fixed padding and ordinary journal. Validate geometry,
   AAD, extents and arithmetic. Offline diagnostics reject dirty journals; native
   setup delegates replay to Linux before authenticated access.

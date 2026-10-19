@@ -9,11 +9,12 @@ from pivstore.profile import Image
 
 with Image(Path(sys.argv[1])) as image:
     if len(sys.argv) == 2:
-        data, tag = image.layout.offsets(4096)
+        boundary = 32768 // (image.layout.sector_size // 512)
+        data, tag = image.layout.offsets(boundary)
         print(json.dumps({'corruption': [
-            {'sector': 4096, 'offset': data},
-            {'sector': 4096, 'offset': tag},
-            {'sector': 4096, 'offset': tag + 16}]}))
+            {'sector': boundary, 'offset': data},
+            {'sector': boundary, 'offset': tag},
+            {'sector': boundary, 'offset': tag + 16}]}))
     else:
         expected = json.loads(Path(sys.argv[2]).read_text())
         for index, value in expected.items():

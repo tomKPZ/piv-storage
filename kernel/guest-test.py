@@ -39,10 +39,15 @@ assert os.uname().release == '6.12.113+deb13-amd64'
 assert subprocess.check_output(['findmnt', '-n', '-o', 'FSTYPE', '/mnt/piv-work']).strip() == b'9p'
 path = '/dev/mapper/piv-kernel'
 assert not glob.glob('/dev/pivctl-*')
+sector_size = json.loads(subprocess.check_output(
+    ['cryptsetup', 'luksDump', '--dump-json-metadata', '/dev/vdb'], text=True))['segments']['0']['sector_size']
+expected_sector_size = sector_size
+factor = sector_size // 512
+boundary = 32768 // factor
 # Feature disabled: stock writes still work (rewrite the same synthetic plaintext).
 fd = os.open(path, os.O_RDWR)
-first = os.pread(fd, 4096, 0)
-assert os.pwrite(fd, first, 0) == 4096
+first = os.pread(fd, sector_size, 0)
+assert os.pwrite(fd, first, 0) == sector_size
 os.fsync(fd)
 os.close(fd)
 before = digest()
@@ -73,8 +78,8 @@ query = (2 << 30) | (size << 16) | (ord('P') << 8)
 buf = bytearray(size)
 fcntl.ioctl(ctl, query, buf, True)
 version, length, generation, sectors, sector_size, iv, tag, tup, flags, reserved = struct.unpack(fmt, buf)
-assert (version, length, sector_size, iv, tag, tup, flags, reserved) == (1, size, 4096, 12, 16, 28, 15, 0)
-assert sectors * 4096 == int(subprocess.check_output(['blockdev', '--getsize64', path]))
+assert (version, length, sector_size, iv, tag, tup, flags, reserved) == (1, size, expected_sector_size, 12, 16, 28, 15, 0)
+assert sectors * sector_size == int(subprocess.check_output(['blockdev', '--getsize64', path]))
 assert generation > 0
 rejected(lambda: fcntl.ioctl(ctl, query + 2, buf), {errno.ENOTTY})
 rejected(lambda: fcntl.ioctl(ctl, query, 0), {errno.EFAULT})
@@ -100,9 +105,9 @@ def read_iv(fd, owner, index, **changes):
     return result[4]
 
 
-selected = (0, 1, 4095, 4096, sectors - 1)
+selected = (0, 1, boundary - 1, boundary, sectors - 1)
 observed = {str(i): read_iv(ctl, generation, i).hex() for i in selected}
-assert read_iv(ctl, generation, 4096).hex() == observed['4096']
+assert read_iv(ctl, generation, boundary).hex() == observed[str(boundary)]
 for changes in ({'version': 0}, {'size': 0}, {'iv': bytes([1]) * 12}, {'r2': 1}):
     rejected(lambda: read_iv(ctl, generation, 0, **changes), {errno.EINVAL})
 for index in (sectors, 2**64 - 1):
@@ -174,7 +179,7 @@ os.close(fd)
 assert digest() == before
 # The presentation also rejects buffered writes before they can dirty page cache.
 run('dmsetup', 'create', '--readonly', 'piv-view',
-    input=f'0 {sectors * 8} linear {path} 0\n', text=True)
+    input=f'0 {sectors * factor} linear {path} 0\n', text=True)
 assert subprocess.check_output(['blockdev', '--getro', '/dev/mapper/piv-view']).strip() == b'1'
 view = os.open('/dev/mapper/piv-view', os.O_WRONLY)
 rejected(lambda: os.pwrite(view, first, 0), {errno.EROFS, errno.EPERM})
@@ -185,7 +190,8 @@ from pivstore.kernel_api import KernelDevice, validate_integrity_table
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 native = KernelDevice(controls[0], path)
 validate_integrity_table(subprocess.check_output(['dmsetup', 'table', 'piv-kernel_dif'], text=True),
-                         sectors, os.stat('/dev/vdb').st_rdev, 16777216)
+                         sectors, os.stat('/dev/vdb').st_rdev, 16777216, sector_size,
+                         int(subprocess.check_output(['dmsetup', 'table', 'piv-kernel_dif'], text=True).split('journal_sectors:')[1].split()[0]))
 assert native.read_primary_sector(0) == first
 rejected(lambda: native.read_primary_sector(sectors), {errno.ERANGE})
 rejected(lambda: native.prepare_primary(0, bytes.fromhex(observed['0']), os.urandom(12), first), {errno.EBUSY})
@@ -205,8 +211,8 @@ for index in selected:
     # Independently verify the native encryption/AAD against a maintained library.
     with open('/mnt/piv-work/volume.key', 'rb') as keyfile:
         primary_key = keyfile.read()
-    plaintext = AESGCM(primary_key).decrypt(new, value[:4112], struct.pack('<Q', index * 8) + new)
-    assert plaintext == hashlib.shake_256(b'piv-control-v1' + index.to_bytes(8, 'little')).digest(4096)
+    plaintext = AESGCM(primary_key).decrypt(new, value[:sector_size] + value[4096:4112], struct.pack('<Q', index * factor) + new)
+    assert plaintext == hashlib.shake_256(b'piv-control-v1' + index.to_bytes(8, 'little')).digest(sector_size)
     prepared.append((index, old, value))
 with open('/mnt/piv-work/prepared-tuples.bin', 'wb') as journal:
     for index, old, value in prepared:
@@ -214,11 +220,16 @@ with open('/mnt/piv-work/prepared-tuples.bin', 'wb') as journal:
     journal.flush()
     os.fsync(journal.fileno())
 index, old, value = prepared[0]
+if sector_size == 512:
+    assert not any(value[512:4096])
+    bad = bytearray(value); bad[512] = 1
+    rejected(lambda: native.apply(index, old, bytes(bad)), {errno.EINVAL})
 rejected(lambda: native.apply(index, bytes([9]) * 12, value), {errno.ESTALE})
 bad = bytearray(value); bad[0] ^= 1
 rejected(lambda: native.apply(index, old, bytes(bad)), {errno.EBADMSG, errno.EIO})
 nonce = os.urandom(12)
-changed = AESGCM(primary_key).encrypt(nonce, bytes(4096), struct.pack('<Q', index * 8) + nonce) + nonce
+encrypted = AESGCM(primary_key).encrypt(nonce, bytes(sector_size), struct.pack('<Q', index * factor) + nonce)
+changed = encrypted[:sector_size].ljust(4096, b'\0') + encrypted[sector_size:] + nonce
 rejected(lambda: native.apply(index, old, changed), {errno.EPERM})
 for index, old, value in prepared:
     assert native.read_iv(index, quiesced=True) == old
@@ -231,10 +242,10 @@ for index, old, value in prepared:
 # changed plaintext. Legacy hidden APPLY must still refuse that exact candidate.
 old = bytes.fromhex(observed['0'])
 nonce = os.urandom(12)
-rejected(lambda: native.prepare_primary(0, old, old, bytes(4096)), {errno.EINVAL})
-rejected(lambda: native.prepare_primary(0, os.urandom(12), nonce, bytes(4096)), {errno.ESTALE})
-changed = native.prepare_primary(0, old, nonce, bytes(4096))
-assert AESGCM(primary_key).decrypt(nonce, changed[:4112], struct.pack('<Q', 0) + nonce) == bytes(4096)
+rejected(lambda: native.prepare_primary(0, old, old, bytes(sector_size)), {errno.EINVAL})
+rejected(lambda: native.prepare_primary(0, os.urandom(12), nonce, bytes(sector_size)), {errno.ESTALE})
+changed = native.prepare_primary(0, old, nonce, bytes(sector_size))
+assert AESGCM(primary_key).decrypt(nonce, changed[:sector_size] + changed[4096:4112], struct.pack('<Q', 0) + nonce) == bytes(sector_size)
 rejected(lambda: native.apply(0, old, changed), {errno.EPERM})
 bad = bytearray(changed); bad[4096] ^= 1
 rejected(lambda: native.apply_primary(0, old, bytes(bad)), {errno.EBADMSG, errno.EIO})
@@ -311,7 +322,7 @@ for placement in placements:
     broken.suspend(); broken.begin()
     bad_index = placement['sector']
     old_iv = bytes.fromhex(observed[str(bad_index)])
-    rejected(lambda: broken.prepare_primary(bad_index, old_iv, os.urandom(12), bytes(4096)),
+    rejected(lambda: broken.prepare_primary(bad_index, old_iv, os.urandom(12), bytes(sector_size)),
              {errno.EBADMSG, errno.EIO})
     rejected(lambda: broken.prepare(bad_index, old_iv, os.urandom(12)),
              {errno.EBADMSG, errno.EIO})

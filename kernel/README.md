@@ -5,7 +5,9 @@ sharing one crypt owner, hidden-record crypto, stateless record authentication.
 See [native interface and end-to-end tests](../docs/native-blocks.md).
 The userspace FUSE/NBD adapters have been removed; their historical test results
 remain in ROADMAP.md and Git history. Authenticated sector controls remain for
-focused kernel regression tests.
+focused kernel regression tests. Both 512- and 4096-byte primary encryption
+sectors are supported; the tests derive sector and interleave boundaries from
+the selected stock fixture.
 
 Build/load ONLY inside the pinned disposable guest, never on the host or real
 disks. Source/header/config/symbol versions must match; do not force-load a module.

@@ -26,7 +26,15 @@ python3 -m pivstore open-blocks --device /dev/vdb \
 ```
 
 This returns /dev/mapper/piv-native-decoy and /dev/mapper/piv-native-hidden.
-The fixture capacities are 115,687,424 and 301,056 bytes respectively.
+Both 512- and 4096-byte primary encryption sectors are supported, detected from
+LUKS metadata without an activation flag. Both public devices use 512-byte logical
+blocks. For our 128 MiB disk fixtures:
+
+| Primary sector size | Decoy bytes | Hidden bytes |
+| --- | ---: | ---: |
+| 4096 | 115,687,424 | 301,056 |
+| 512 | 109,977,600 | 2,291,200 |
+
 The hidden volume is already encrypted underneath its block interface. Setup
 never creates filesystems. **--initialize destroys all existing hidden contents**
 and writes authenticated zeros, while preserving every decoy plaintext byte.
@@ -76,19 +84,19 @@ its replaced IVs. There is **no historical collision detection**. For q uniforml
 random primary IVs under one key, collision probability is approximately
 q(q-1)/2^97. A 2^32 per-owner encryption cap is only a diagnostic guard: reopening
 resets it, and all stock writes, retries, failed preparations and clones count
-toward the real per-key lifetime budget. Manage that budget externally. At 4096
-bytes per encryption, 2^32 invocations represent 16 TiB including rewrite
-amplification, not 16 TiB of application writes. A 512-byte hidden write
-reencrypts 192 KiB of primary data (384 times as many bytes), before ordinary
-journal overhead. GCM also has per-message and
+toward the real per-key lifetime budget. Manage that budget externally.
+2^32 invocations represent 16 TiB at 4096 bytes per encryption or 2 TiB at 512 bytes, including rewrite amplification. These are primary encryption bytes,
+not application-write allowances. A 512-byte hidden write reencrypts 192 KiB of
+primary data with 4096-byte sectors (384 times as many bytes), or 24 KiB with
+512-byte sectors (48 times), before ordinary journal overhead. GCM also has per-message and
 aggregate security constraints; collision probability alone is not a full bound.
 Never rely on snapshot-restored RNG state or replay cached encryption plans.
 
 ## Disk format and diagnostics
 
-Supported profile: one LUKS2 AES-GCM/random segment, zero IV tweak, 4096-byte
+Supported profile: one LUKS2 AES-GCM/random segment, zero IV tweak, 512- or 4096-byte
 primary sectors, 96-bit IVs, 128-bit primary tags, integrity v4 fixed padding,
-28-byte metadata tuples, 32768-sector interleaving and an unencrypted/un-MACed
+28-byte metadata tuples, 32768-sector interleaving (512-byte units) and an unencrypted/un-MACed
 stock journal. Native activation delegates journal replay to Linux. Offline
 image diagnostics reject a dirty journal and unsupported geometry.
 
@@ -106,12 +114,14 @@ only after success; no primary key is needed. verify authenticates the complete
 primary image and prints its plaintext hash. extract-ivs performs no primary
 verification. Keys belong in private files, never command arguments or commits.
 
-Gross IV carrier capacity is 12/4096 of primary capacity. The v3 payload fraction
-is 512/(48*4096), approximately 0.2604%, excluding incomplete tail groups.
-512-byte primary encryption sectors would increase gross capacity eightfold but
-are unsupported here. Increasing IV lengths or changing ordinary format defaults
-would change the control profile and potentially make the configuration unusual.
-We retain the tested stock 4096/96-bit-IV profile.
+Gross IV carrier capacity is 12/S of primary capacity for encryption-sector size
+S. The v3 payload fraction is 512/(48*S): approximately 0.2604% with 4096-byte
+sectors or 2.0833% with 512-byte sectors, excluding incomplete tail groups.
+Smaller primary sectors require more ordinary tag/IV metadata, reducing decoy
+capacity on a fixed raw disk. Each profile retains stock cryptsetup's layout,
+96-bit IVs and 128-bit tags; changing sector size requires a newly formatted
+volume, not an activation switch. Increasing IV lengths would change the control
+profile and potentially make the configuration unusual.
 
 The encoded salt/ciphertext/tag is expected to look random under the primitive
 assumptions in [the format notes](docs/hidden-format.md). Layout compatibility

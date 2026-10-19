@@ -155,8 +155,9 @@ static int pn_write(struct piv_control *p, bool hidden, u64 offset, const u8 *da
  struct pn_entry *entries = kvcalloc(PN_MAX_ENTRIES, sizeof(*entries), GFP_NOIO);
  struct piv_update *u = kzalloc(sizeof(*u), GFP_NOIO);
  u8 *ivs = kmalloc(PN_MAX_ENTRIES * 12, GFP_NOIO);
- u64 first = hidden ? offset / PN_DATA : offset / 4096 / PN_GROUP;
- u64 last = hidden ? (offset + bytes - 1) / PN_DATA : (offset + bytes - 1) / 4096 / PN_GROUP;
+ u64 unit = p->profile.sector_size;
+ u64 first = hidden ? offset / PN_DATA : offset / unit / PN_GROUP;
+ u64 last = hidden ? (offset + bytes - 1) / PN_DATA : (offset + bytes - 1) / unit / PN_GROUP;
  u64 index, total_groups = p->profile.sectors / PN_GROUP;
  u32 g = 0, count = 0, i, j, attempt;
  int r = -ENOMEM;
@@ -178,8 +179,8 @@ static int pn_write(struct piv_control *p, bool hidden, u64 offset, const u8 *da
    memcpy(e->old, rec->old + j * 12, 12);
   }
  }
- if (!hidden) for (index = max_t(u64, offset / 4096, total_groups * PN_GROUP);
-                  index <= (offset + bytes - 1) / 4096; index++) {
+ if (!hidden) for (index = max_t(u64, offset / unit, total_groups * PN_GROUP);
+                  index <= (offset + bytes - 1) / unit; index++) {
   struct piv_sector *s = NULL;
   struct pn_entry *e;
   if (count == PN_MAX_ENTRIES) { r = -E2BIG; goto done; }
@@ -207,15 +208,15 @@ static int pn_write(struct piv_control *p, bool hidden, u64 offset, const u8 *da
  u->version = 1; u->size = sizeof(*u); u->generation = p->profile.generation;
  /* Prepare every tuple before the first mutation. No external WAL/replay. */
  for (i = 0; i < count; i++) {
-  u64 sector = le64_to_cpu(entries[i].sector), start = sector * 4096;
-  bool primary = !hidden && start < offset + bytes && start + 4096 > offset;
+  u64 sector = le64_to_cpu(entries[i].sector), start = sector * unit;
+  bool primary = !hidden && start < offset + bytes && start + unit > offset;
   memset(u->tuple, 0, sizeof(u->tuple)); u->sector = sector;
   memcpy(u->expected_iv, entries[i].old, 12); memcpy(u->tuple + 4112, ivs + i * 12, 12);
   if (primary) {
    struct piv_sector *s = NULL;
-   u64 lo = max(start, offset), hi = min(start + 4096, offset + bytes);
+   u64 lo = max(start, offset), hi = min(start + unit, offset + bytes);
    r = piv_load(p->cc, sector, &s); if (r) goto done;
-   memcpy(u->tuple, page_address(s->page), 4096); piv_sector_free(p->cc, s);
+   memcpy(u->tuple, page_address(s->page), unit); piv_sector_free(p->cc, s);
    memcpy(u->tuple + lo - start, data + lo - offset, hi - lo);
    entries[i].primary = cpu_to_le32(1);
   }
@@ -247,7 +248,7 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
      s->context_length > 120 || !s->context_length || (s->flags & ~1U) ||
      memchr_inv(s->reserved, 0, sizeof(s->reserved))) return -EINVAL;
  if (p->native || !piv_quiesced(p) || !p->transaction || p->controller != controller || p->failed) return -EBUSY;
- if (p->profile.sectors < PN_GROUP || p->profile.sectors > 65536) return -EINVAL;
+ if (p->profile.sectors < PN_GROUP || p->profile.sectors > (256ULL * 1024 * 1024) / p->profile.sector_size) return -EINVAL;
  n = kzalloc(sizeof(*n), GFP_NOIO); if (!n) return -ENOMEM;
  memcpy(n->key, s->key, 32); memcpy(n->context, s->context, s->context_length);
  n->context_length = s->context_length;
@@ -281,7 +282,7 @@ bad:
 
 static int pn_read(struct piv_control *p, bool hidden, u64 offset, u8 *data, u32 bytes)
 {
- u64 unit = hidden ? PN_DATA : 4096, first = offset / unit, last = (offset + bytes - 1) / unit, i;
+ u64 unit = hidden ? PN_DATA : p->profile.sector_size, first = offset / unit, last = (offset + bytes - 1) / unit, i;
  u8 *record = hidden ? kmalloc(PN_CARRIER + PN_DATA, GFP_NOIO) : NULL;
  int r = 0;
  if (hidden && !record) return -ENOMEM;
@@ -331,8 +332,8 @@ static void pn_worker(struct work_struct *work)
 	if (!bytes && (bio_op(bio) == REQ_OP_FLUSH || (bio->bi_opf & REQ_PREFLUSH))) {
 		r = blkdev_issue_flush(p->cc->dev->bdev);
 	} else {
-		u64 limit = w->hidden ? p->native->hidden_bytes : p->profile.sectors * 4096;
-		if (!bytes || bytes > (w->hidden ? 512 : 4096) || (w->offset & 511) ||
+		u64 limit = w->hidden ? p->native->hidden_bytes : p->profile.sectors * p->profile.sector_size;
+		if (!bytes || bytes > (w->hidden ? 512 : p->profile.sector_size) || (w->offset & 511) ||
 		    (bytes & 511) || w->offset > limit || bytes > limit - w->offset) { r = -EINVAL; goto done; }
 		buffer = kmalloc(bytes, GFP_NOIO);
 		if (!buffer) { r = -ENOMEM; goto done; }
@@ -384,13 +385,13 @@ static int pn_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	mutex_lock(&found->lock);
 	if (!found->live || !found->native || !found->native->ready || found->native->failed ||
 	    disk_devt(v->owner->bdev->bd_disk) != MKDEV(found->devices.owner_major, found->devices.owner_minor) ||
-	    ti->begin || ti->len != (v->hidden ? found->native->hidden_bytes / 512 : found->profile.sectors * 8) ||
+	    ti->begin || ti->len != (v->hidden ? found->native->hidden_bytes / 512 : found->profile.sectors * (found->profile.sector_size / 512)) ||
 	    (found->native->views & (v->hidden ? 2 : 1))) r = -EINVAL;
 	else { found->native->views |= v->hidden ? 2 : 1; r = 0; }
 	mutex_unlock(&found->lock);
 	if (r) { dm_put_device(ti, v->owner); goto free_ref; }
 	ti->private = v; ti->num_flush_bios = 1;
-	r = dm_set_target_max_io_len(ti, v->hidden ? 1 : 8);
+	r = dm_set_target_max_io_len(ti, v->hidden ? 1 : found->profile.sector_size / 512);
 	if (!r) return 0;
 	mutex_lock(&found->lock); found->native->views &= ~(v->hidden ? 2 : 1); mutex_unlock(&found->lock);
 	dm_put_device(ti, v->owner);
@@ -409,13 +410,15 @@ static void pn_dtr(struct dm_target *ti)
 static int pn_iterate(struct dm_target *ti, iterate_devices_callout_fn fn, void *data)
 {
 	struct pn_view *v = ti->private;
-	return fn(ti, v->owner, 0, v->p->profile.sectors * 8, data);
+	return fn(ti, v->owner, 0, v->p->profile.sectors * (v->p->profile.sector_size / 512), data);
 }
 static void pn_hints(struct dm_target *ti, struct queue_limits *limits)
 {
-	/* This target performs its own authenticated 4KiB RMW and may expose 512B. */
-	limits->logical_block_size = 512; limits->physical_block_size = 4096;
-	limits->io_min = 4096; limits->dma_alignment = 511;
+	struct pn_view *v = ti->private;
+	/* Authenticated primary-sector RMW permits 512-byte logical requests. */
+	limits->logical_block_size = 512;
+	limits->physical_block_size = v->p->profile.sector_size;
+	limits->io_min = v->p->profile.sector_size; limits->dma_alignment = 511;
 }
 static void pn_status(struct dm_target *ti, status_type_t type, unsigned int flags, char *result, unsigned int maxlen)
 {

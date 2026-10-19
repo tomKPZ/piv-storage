@@ -23,6 +23,8 @@ Implemented in this working tree:
   separation; all tuples prepared in RAM then applied through stock integrity.
 - Simplified setup and independent v3 decoder; legacy codecs, bootstrap,
   recovery/compaction modules and obsolete state-protocol tests removed.
+- Primary encryption sectors of 512 or 4096 bytes, including geometry-aware
+  native I/O, journal/layout parsing, controls and independent diagnostics.
 - Updated interface/security documentation. Results below distinguish tested behavior from untested guarantees.
 
 Exit criteria (all passed):
@@ -48,8 +50,10 @@ conflicting names. Add direct-I/O lower-device failure coverage for both views u
 semantics. Confirm teardown/recreation after fail-stop and local hidden repair;
 do not import the removed exact-transaction recovery expectations.
 
-Then consider bounded batching to reduce the current 48-primary-sector rewrite
-per hidden block or intersecting decoy write. Preserve fresh entropy, whole-block
+Then consider bounded batching to reduce repeated 48-primary-sector rewrites
+for adjacent decoy sectors (especially eight 512-byte sectors in a 4096-byte
+write), and per-sector read/setup overhead. Each hidden block still needs its
+whole carrier group refreshed. Preserve fresh entropy, whole-block
 authentication, correct flush/FUA completion and primary integrity. Any new
 crash guarantee or in-carrier redundancy is a separate design decision.
 
@@ -147,3 +151,91 @@ The first sector run failed when a pending udev probe held the deliberately
 key-wiped owner open. The retained test now drains probes from asynchronous
 resume before key wipe; all original teardown assertions remain. No driver,
 crypto or disk-format changes were made. Next roadmap priorities are unchanged.
+
+## Session handoff: 512-byte primary sectors
+
+The user requested 512-byte primary encryption sectors alongside the existing
+4096-byte profile. Hidden logical blocks remain 512 bytes in 48 IVs. LUKS,
+integrity superblock, queried owner, native I/O and hidden context must agree on
+the primary sector size. Journal parsing now derives the saved-tail count,
+entry stride, section size and metadata-run size from that geometry. The
+512-byte table omits block_size (stock default) and uses buffer_sectors:128;
+4096 uses explicit block_size:4096 and buffer_sectors:32. No disk padding,
+external state, IV-length change or new hidden encoding was introduced.
+
+Implementation includes geometry-aware primary crypto/controls, native views,
+setup/validation, independent verifier and all shared guest tests. Fixed control
+messages retain zero padding to 4096 in RAM only; malformed padding is rejected.
+Native setup's former 65,536-sector test cap is now 256 MiB of primary bytes;
+the public guest guard remains one disposable 128 MiB disk. A sector-size change
+requires a new stock volume, not reinterpretation of existing data.
+
+Stock fixture artifacts/control-512-001 passed full kernel readback and all-sector
+independent verification. Its primary capacity is 109,977,600 bytes in 214,800
+sectors; hidden capacity is 2,291,200 bytes. The 4096 fixture stays unchanged.
+Both fixtures passed all 21 host tests with ResourceWarning errors enabled,
+including interleave boundaries, journal header entries, corruption, wrong keys,
+truncation and both lower-table profiles. Native tests now exercise changed
+512-byte-aligned decoy writes across carrier/metadata boundaries and at the end
+of the device, compare surrounding bytes, preserve hidden data and restore with
+fresh encryption. The final hidden block is also rewritten/read/restored.
+
+Focused artifacts/sector512-kernel-001 built the matched module and passed
+PREPARE/APPLY, primary mutation/restore, zero-padding rejection, independently
+checked kernel AES-GCM/AAD, corruption at the interleave boundary, stale handles,
+suspend/controller death/key wipe, and stock full-primary readback. Independent
+host authentication of all 214,800 final sectors retained the original stock
+fixture hash; returned IVs agree with offline raw offsets.
+
+artifacts/sector4096-native-001 passed the expanded dual-filesystem tests and
+stock readback using the new module. Independent host verification authenticated
+all 28,244 primary sectors and decoded all 301,056 hidden bytes against the guest
+oracles, with all current IVs distinct. The new 512-byte stock fixture does not
+need a different hidden codec or external state.
+
+artifacts/sector4096-early-001 also passed actual RAM-root activation and
+read/write/restore of both views, with no persistent root disk or external
+metadata. Independent primary/hidden verification passed afterward.
+The first native attempt (sector512-native-001) built successfully but rejected
+the lower table because its frozen userspace still required buffer_sectors:32.
+The retained validator accepts the observed stock 128 for 512-byte sectors;
+sector512-native-002 and the focused test use that correction. The failed run
+is not a successful native fixture; its reviewed module build is reused.
+
+artifacts/sector512-power-001 observed 32/48 changed current/committed IVs,
+SIGKILLed QEMU, and rebooted the same disk through stock journal replay. The
+partially updated hidden block returned EIO; the other 4,474 blocks stayed exact,
+decoy data stayed unchanged, invalid-marker preservation passed, and a direct
+whole-block write repaired the affected block. Stock readback and independent
+host verification afterward authenticated all 214,800 primary sectors and all
+2,291,200 hidden bytes with no duplicate CURRENT IVs. This remains VM interruption
+with host page cache surviving, not hardware power-loss evidence.
+
+artifacts/sector512-early-001 passed actual RAM-root activation and full
+read/write/restore on both devices, using the closed repaired power-test fixture.
+No persistent OS filesystem or external metadata was attached. Inputs came from
+the unmodified shared builder in sector512-early-build-001; its primary oracle is
+the power test's renamed digest. Independent host primary/hidden verification
+passed afterward. Both sector sizes retain early-boot support.
+
+artifacts/sector512-native-002 passed the expanded full native suite: original
+primary hash after hidden initialization/updates, direct boundary/tail writes
+and exact restore, final hidden-block rewrite, uninitialized/damaged/wrong-key
+EIO isolation, encrypted invalid markers and targeted repair, concurrent ext4
+and ext2, clean reopen and full stock-Linux primary authentication. Independent
+host verification authenticated all 214,800 final primary sectors and decoded
+all 2,291,200 hidden bytes against the guest oracles; all current IVs were unique.
+The new module also passed the equivalent 4096-byte native regression above.
+
+Both profiles passed RAM-root tests. Python compilation, changed-shell syntax
+and git diff --check passed. Successful current guest logs contain no unexpected
+kernel BUG/Oops/WARNING diagnostics. No additional host installations, host root privileges or
+host modules were required. Changes are intentionally uncommitted.
+
+Next priorities remain lower-device EIO/fail-stop/recreate coverage and bounded
+batching. The 512-byte profile exposes the current per-sector processing cost:
+setup and full logical-volume reads authenticate many more sectors, and an
+ordinary 4096-byte decoy write may refresh one group eight times. Tests perform
+repeated full-volume comparisons, so allow the documented 3600-second VM timeout.
+Capacity/budget tradeoffs are in README; no throughput, hardware crash durability,
+strict historical nonce safety or deniability guarantee was added.

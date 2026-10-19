@@ -45,14 +45,14 @@ def open_blocks(source, key_file, hidden_key, *, name='piv-native', initialize=F
         if native_status(owner.device)['active']:
             raise FileExistsError('Native block views are already active')
         identity = context(SimpleNamespace(uuid=owner.uuid, layout=SimpleNamespace(
-            primary_bytes=owner.device.sectors * 4096, sector_size=4096)))
+            primary_bytes=owner.device.sectors * owner.device.sector_size, sector_size=owner.device.sector_size)))
         owner.device.validate()
         owner.device.suspend(); owner.device.begin()
         native_setup(owner.device, hidden_key, identity, initialize=initialize)
         adopted = True
         owner.device.resume()
         status = native_status(owner.device)
-        for role, sectors in (('decoy', owner.device.sectors * 8), ('hidden', status['hidden_bytes'] // 512)):
+        for role, sectors in (('decoy', owner.device.sectors * (owner.device.sector_size // 512)), ('hidden', status['hidden_bytes'] // 512)):
             mapping = name + '-' + role
             dm('create', mapping, input=f'0 {sectors} piv-view /dev/mapper/{name} {owner.device.generation} {role}\n')
             created.append(mapping)

@@ -66,6 +66,8 @@ class GuestOwner:
                                                self.offset, 128 * 1024 * 1024)
             finally:
                 os.close(raw)
+            if self.layout.sector_size != metadata['segments']['0']['sector_size']:
+                raise ValueError('LUKS and integrity sector sizes disagree')
             existing = dm('info', name, check=False).returncode == 0
             if not existing:
                 holders = Path(f'/sys/dev/block/{os.major(self.raw_device)}:{os.minor(self.raw_device)}/holders')
@@ -74,8 +76,9 @@ class GuestOwner:
                 crypt('open', '--disable-keyring', '--key-file', passphrase_file, self.source, name)
                 created = True
                 owner_size = int(subprocess.check_output(['blockdev', '--getsize64', '/dev/mapper/' + name]))
-                validate_integrity_table(dm('table', self.lower_name).stdout, owner_size // 4096,
-                                         self.raw_device, self.offset)
+                validate_integrity_table(dm('table', self.lower_name).stdout, owner_size // self.layout.sector_size,
+                                         self.raw_device, self.offset, self.layout.sector_size,
+                                         self.layout.journal_sections * self.layout.journal_section_sectors)
                 # Key-containing table is kept in memory and sent only through stdin.
                 fields = dm('table', '--showkeys', name).stdout.split()
                 if fields[2:4] != ['crypt', 'capi:gcm(aes)-random']:
@@ -113,12 +116,14 @@ class GuestOwner:
             raise
 
     def validate(self):
-        if self.device.sectors != self.layout.sectors:
+        if (self.device.sectors, self.device.sector_size) != (self.layout.sectors, self.layout.sector_size):
             raise ValueError('Native geometry differs from supported superblock')
         table = dm('table', self.lower_name).stdout
         if table != self.lower_table:
             raise ValueError('Lower integrity mapping changed outside owner')
-        validate_integrity_table(table, self.device.sectors, self.raw_device, self.offset)
+        validate_integrity_table(table, self.device.sectors, self.raw_device, self.offset,
+                                 self.layout.sector_size,
+                                 self.layout.journal_sections * self.layout.journal_section_sectors)
         lower = Path('/dev/mapper/' + self.lower_name).stat().st_rdev
         if lower != self.device.lower_device:
             raise ValueError('Native control bound to unexpected lower device')

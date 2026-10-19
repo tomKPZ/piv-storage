@@ -27,23 +27,27 @@ def dm(*args, input=None, check=True):
     return result
 
 
-def validate_integrity_table(table, sectors, raw_device, offset):
+def validate_integrity_table(table, sectors, raw_device, offset, sector_size=4096, journal_sectors=1848):
     words = table.split()
-    if (len(words) < 8 or words[:3] != ['0', str(sectors * 8), 'integrity'] or
+    if (len(words) < 8 or words[:3] != ['0', str(sectors * (sector_size // 512)), 'integrity'] or
             words[3:7] != [f'{os.major(raw_device)}:{os.minor(raw_device)}',
                            str(offset // 512), '28', 'J'] or
             int(words[7]) != len(words) - 8):
         raise ValueError('Unsupported lower integrity mapping')
     options = words[8:]
-    required = {'block_size:4096', 'interleave_sectors:32768', 'buffer_sectors:32',
+    required = {'interleave_sectors:32768', f'buffer_sectors:{128 if sector_size == 512 else 32}',
                 'journal_watermark:50', 'commit_time:10000', 'fix_padding'}
-    if len(options) != 7 or not required.issubset(options):
+    if sector_size == 4096:
+        required.add('block_size:4096')
+    elif sector_size != 512:
+        raise ValueError('Unsupported lower sector size')
+    if len(options) != len(required) + 1 or not required.issubset(options):
         raise ValueError('Unsupported lower integrity options')
     extra = set(options) - required
     if len(extra) != 1 or not next(iter(extra)).startswith('journal_sectors:'):
         raise ValueError('Unsupported lower integrity journal')
     journal = int(next(iter(extra)).split(':')[1])
-    if journal != 1848:
+    if journal != journal_sectors:
         raise ValueError('Unsupported lower integrity journal size')
 
 
@@ -62,7 +66,7 @@ class KernelDevice:
             data = bytearray(QUERY.size)
             fcntl.ioctl(self.fd, command(0, QUERY.size, 2), data, True)
             v, size, self.generation, self.sectors, sector, iv, tag, tup, flags, reserved = QUERY.unpack(data)
-            if (v, size, sector, iv, tag, tup, reserved) != (1, 48, 4096, 12, 16, 28, 0) or flags not in (7, 15):
+            if (v, size, iv, tag, tup, reserved) != (1, 48, 12, 16, 28, 0) or sector not in (512, 4096) or flags not in (7, 15):
                 raise ValueError('Unsupported kernel control/profile')
             devices = bytearray(16)
             fcntl.ioctl(self.fd, command(7, 16, 2), devices, True)
@@ -71,6 +75,7 @@ class KernelDevice:
             if not stat.S_ISBLK(info.st_mode) or info.st_rdev != os.makedev(major, minor):
                 raise ValueError('Control is bound to a different owner')
             self.lower_device = os.makedev(low_major, low_minor)
+            self.sector_size = sector
             self.flags = flags
             self.validate_callback = None
         except BaseException:
@@ -129,13 +134,13 @@ class KernelDevice:
         data = bytearray(UPDATE.pack(1, UPDATE.size, self.generation, index,
                                     bytes(12), 0, bytes(4124), 0))
         fcntl.ioctl(self.fd, command(9, UPDATE.size), data, True)
-        return UPDATE.unpack(data)[6][:4096]
+        return UPDATE.unpack(data)[6][:self.sector_size]
 
     def prepare_primary(self, index, old_iv, new_iv, plaintext):
-        if len(plaintext) != 4096 or len(old_iv) != 12 or len(new_iv) != 12:
+        if len(plaintext) != self.sector_size or len(old_iv) != 12 or len(new_iv) != 12:
             raise ValueError('Invalid primary preparation')
         data = bytearray(UPDATE.pack(1, UPDATE.size, self.generation, index,
-                                    old_iv, 0, plaintext + bytes(16) + new_iv, 0))
+                                    old_iv, 0, plaintext.ljust(4096, b'\0') + bytes(16) + new_iv, 0))
         fcntl.ioctl(self.fd, command(10, UPDATE.size), data, True)
         value = UPDATE.unpack(data)[6]
         if value[-12:] != new_iv:

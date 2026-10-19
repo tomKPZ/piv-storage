@@ -137,7 +137,7 @@ static int piv_load(struct crypt_config *cc, u64 index, struct piv_sector **out)
 	if (ret)
 		goto bad;
 	s->bio->bi_iter = saved;
-	memcpy(s->original, page_address(s->page), 4096);
+	memcpy(s->original, page_address(s->page), cc->sector_size);
 	memcpy(s->original + 4096, s->io.integrity_metadata, 28);
 	ret = piv_crypto(cc, s, NULL);
 	if (ret)
@@ -201,6 +201,9 @@ static int piv_update(struct piv_control *p, struct file *file,
 			   u->sector, sizeof(*u));
 	if (ret)
 		return ret;
+	/* Fixed-size control tuples pad unused data bytes in RAM only. */
+	if (memchr_inv(u->tuple + cc->sector_size, 0, 4096 - cc->sector_size))
+		return -EINVAL;
 	if (u->reserved || (u->flags && (prepare || u->flags != PIV_APPLY_DEFER_FLUSH)))
 		return -EINVAL;
 	if (!internal && (!piv_quiesced(p) || !p->transaction || p->controller != file))
@@ -235,10 +238,10 @@ static int piv_update(struct piv_control *p, struct file *file,
 			goto done;
 		p->encryptions++;
 		if (primary)
-			memcpy(page_address(old->page), u->tuple, 4096);
+			memcpy(page_address(old->page), u->tuple, cc->sector_size);
 		ret = piv_crypto(cc, old, u->tuple + 4112);
 		if (!ret) {
-			memcpy(u->tuple, page_address(old->page), 4096);
+			memcpy(u->tuple, page_address(old->page), cc->sector_size);
 			memcpy(u->tuple + 4096, old->io.integrity_metadata, 28);
 		}
 		goto done;
@@ -251,25 +254,25 @@ static int piv_update(struct piv_control *p, struct file *file,
 	}
 	candidate->io.cc = cc;
 	candidate->io.sector = old->io.sector;
-	candidate->page = alloc_page(GFP_NOIO);
+	candidate->page = alloc_page(GFP_NOIO | __GFP_ZERO);
 	candidate->io.integrity_metadata = kmemdup(u->tuple + 4096, 28, GFP_NOIO);
 	if (!candidate->page || !candidate->io.integrity_metadata) {
 		ret = -ENOMEM;
 		goto done;
 	}
-	memcpy(page_address(candidate->page), u->tuple, 4096);
+	memcpy(page_address(candidate->page), u->tuple, cc->sector_size);
 	ret = piv_bio(cc, candidate, REQ_OP_READ);
 	if (ret)
 		goto done;
 	ret = piv_crypto(cc, candidate, NULL);
 	if (ret)
 		goto done;
-	if (!primary && memcmp(page_address(candidate->page), page_address(old->page), 4096)) {
+	if (!primary && memcmp(page_address(candidate->page), page_address(old->page), cc->sector_size)) {
 		ret = -EPERM;
 		goto done;
 	}
 	/* Submit exact precomputed ciphertext plus tag/IV through lower journaling. */
-	memcpy(page_address(old->page), u->tuple, 4096);
+	memcpy(page_address(old->page), u->tuple, cc->sector_size);
 	memcpy(old->io.integrity_metadata, u->tuple + 4096, 28);
 	ret = piv_bio(cc, old, REQ_OP_WRITE | REQ_SYNC | (u->flags ? 0 : REQ_FUA));
 	if (ret)
@@ -300,7 +303,7 @@ static int piv_checkpoint(struct crypt_config *cc)
 	ret = piv_load(cc, 0, &s);
 	if (ret)
 		return ret;
-	memcpy(page_address(s->page), s->original, 4096);
+	memcpy(page_address(s->page), s->original, cc->sector_size);
 	memcpy(s->io.integrity_metadata, s->original + 4096, 28);
 	ret = piv_bio(cc, s, REQ_OP_WRITE | REQ_SYNC | REQ_FUA);
 	if (!ret)
@@ -391,7 +394,7 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		if (!ret)
 			ret = piv_load(p->cc, update->sector, &sector);
 		if (!ret) {
-			memcpy(update->tuple, page_address(sector->page), 4096);
+			memcpy(update->tuple, page_address(sector->page), p->profile.sector_size);
 			memcpy(update->tuple + 4112, sector->original + 4112, 12);
 		}
 		piv_sector_free(p->cc, sector);
@@ -511,7 +514,7 @@ static int piv_register(struct crypt_config *cc, struct dm_target *ti)
 	/* Pin the existing tested crypto profile; this is not a general API. */
 	if (!crypt_integrity_aead(cc) || cc->iv_gen_ops != &crypt_iv_random_ops ||
 	    strcmp(cc->cipher_string, "capi:gcm(aes)-random") ||
-	    cc->key_size != 32 || cc->sector_size != 4096 ||
+	    cc->key_size != 32 || (cc->sector_size != 512 && cc->sector_size != 4096) ||
 	    cc->iv_size != 12 || cc->integrity_iv_size != 12 ||
 	    cc->integrity_tag_size != 16 || cc->tuple_size != 28 ||
 	    cc->iv_offset || cc->start ||

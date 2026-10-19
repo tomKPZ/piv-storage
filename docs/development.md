@@ -33,7 +33,15 @@ from Debian's HTTPS checksum list; detached-signature verification has not been
 implemented. Package downloads use the guest's normal APT signature verification.
 
 The test formats /dev/vdb as LUKS2 AES-256-GCM/random with 4096-byte encryption
-sectors and AEAD integrity. It writes distinct deterministic synthetic plaintext
+sectors and AEAD integrity by default. To create the separate stock 512-byte
+fixture, run:
+
+```sh
+python3 scripts/vm.py run --script scripts/guest-control-512.sh \
+  --share-file scripts/guest-control.sh --run-dir artifacts/control-512-next --timeout 1800
+```
+
+Each profile writes distinct deterministic synthetic plaintext
 to every primary sector, closes the mapping, reopens it read-only using stock
 cryptsetup, and hashes every primary byte. Password-keyslot PBKDF2 uses a very low
 iteration count solely to accelerate disposable tests. This is not a recommended

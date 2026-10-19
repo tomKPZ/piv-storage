@@ -53,7 +53,7 @@ class KernelFixtureTests(FixtureCase):
             before = hashlib.file_digest(stream, 'sha256').digest()
         with Image(self.path) as image:
             self.assertEqual(image.verify(self.key), self.expected)
-            self.assertEqual(image.layout.sectors, 28244)
+            self.assertEqual(image.layout.primary_bytes, int((self.fixture / 'share/primary-size.txt').read_text()))
         with self.path.open('rb') as stream:
             after = hashlib.file_digest(stream, 'sha256').digest()
         self.assertEqual(before, after)
@@ -61,8 +61,9 @@ class KernelFixtureTests(FixtureCase):
     def test_carrier_extraction_order(self):
         with Image(self.path) as image:
             carrier = b''.join(image.iv_slots())
-            self.assertEqual(len(carrier), 338928)
-            for index in (0, 4095, 4096, image.layout.sectors - 1):
+            self.assertEqual(len(carrier), image.layout.sectors * 12)
+            for index in (0, 32768 // (image.layout.sector_size // 512) - 1,
+                              32768 // (image.layout.sector_size // 512), image.layout.sectors - 1):
                 _, offset = image.layout.offsets(index)
                 self.assertEqual(carrier[index * 12:(index + 1) * 12],
                                  image.read(12, offset + 16))
@@ -75,7 +76,8 @@ class KernelFixtureTests(FixtureCase):
     def test_ciphertext_tag_and_iv_corruption_at_boundaries(self):
         with Image(self.path) as image:
             positions = [(index, image.layout.offsets(index))
-                         for index in (0, 4095, 4096, image.layout.sectors - 1)]
+                         for index in (0, 32768 // (image.layout.sector_size // 512) - 1,
+                              32768 // (image.layout.sector_size // 512), image.layout.sectors - 1)]
         for index, (data, metadata) in positions:
             for kind, offset in [('ciphertext', data), ('tag', metadata), ('IV', metadata + 16)]:
                 with self.subTest(index=index, kind=kind), self.changed(offset):
@@ -86,7 +88,10 @@ class KernelFixtureTests(FixtureCase):
     def test_torn_and_nonempty_journals_rejected(self):
         with Image(self.path) as image:
             journal = image.layout.integrity_offset + 4096
-        for kind, offset in [('nonempty entry', journal + 4), ('commit ID', journal + 504)]:
+            last_entry = (504 // image.layout.journal_entry_bytes - 1) * image.layout.journal_entry_bytes
+        for kind, offset in [('nonempty entry', journal + 4),
+                             ('last header entry', journal + last_entry + 4),
+                             ('commit ID', journal + 504)]:
             with self.subTest(kind=kind), self.changed(offset):
                 with self.assertRaises(UnsupportedImage):
                     Image(self.path)

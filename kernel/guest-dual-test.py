@@ -24,7 +24,9 @@ def setup(initialize=False):
     result = subprocess.run(args, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     value = json.loads(result.stdout)
-    assert value['hidden_bytes'] == 301056
+    primary_bytes = int(subprocess.check_output(['blockdev', '--getsize64', DECOY]))
+    sector_size = json.loads(crypt('luksDump', '--dump-json-metadata', '/dev/vdb').stdout)['segments']['0']['sector_size']
+    assert value['hidden_bytes'] == primary_bytes // sector_size // 48 * 512
     assert value['decoy'] == DECOY and value['hidden'] == HIDDEN
     return value
 
@@ -52,7 +54,8 @@ os.close(fd); page.close()
 close()
 print('Uninitialized hidden EIO isolation and individual repair passed', flush=True)
 print('Creating two native writable DM devices', flush=True)
-setup(True)
+geometry = setup(True)
+capacity = geometry['hidden_bytes']
 assert subprocess.check_output(['blockdev', '--getro', HIDDEN]).strip() == b'0'
 assert subprocess.check_output(['blockdev', '--getro', DECOY]).strip() == b'0'
 owner = GuestOwner('/dev/vdb', W / 'passphrase.key')
@@ -67,18 +70,53 @@ else:
     raise AssertionError('Legacy primary control escaped native ownership')
 owner.close()
 # Native hidden decryption returns a fixed zero-filled raw block volume.
-assert Path(HIDDEN).read_bytes() == bytes(301056)
+assert Path(HIDDEN).read_bytes() == bytes(capacity)
 fd = os.open(HIDDEN, os.O_RDWR)
 value = hashlib.shake_256(b'native-hidden-block-partial').digest(1700)
 assert os.pwrite(fd, value, 511) == len(value)
 os.fsync(fd); os.close(fd)
-assert Path(HIDDEN).read_bytes() == bytes(511) + value + bytes(301056 - 511 - len(value))
+assert Path(HIDDEN).read_bytes() == bytes(511) + value + bytes(capacity - 511 - len(value))
 # A decoy write affecting those IV records must preserve the logical hidden data.
 before_hidden = Path(HIDDEN).read_bytes()
 fd = os.open(DECOY, os.O_RDWR)
 old = os.pread(fd, 4096, 32 * 4096)
 os.pwrite(fd, old, 32 * 4096); os.fsync(fd); os.close(fd)
 assert Path(HIDDEN).read_bytes() == before_hidden
+# Exercise actual changed decoy data across carrier and metadata boundaries,
+# including the incomplete carrier tail when present. Restore with fresh IVs.
+primary_size = int(subprocess.check_output(['blockdev', '--getsize64', DECOY]))
+sector_size = json.loads(crypt('luksDump', '--dump-json-metadata', '/dev/vdb').stdout)['segments']['0']['sector_size']
+positions = (48 * sector_size - 512, 32768 * 512 - 512, primary_size - 512)
+fd = os.open(DECOY, os.O_RDWR | os.O_DIRECT)
+for position in positions:
+    length = min(1024, primary_size - position)
+    start = max(0, position - 512)
+    span = min(length + 1024, primary_size - start)
+    page = mmap.mmap(-1, span)
+    assert os.preadv(fd, [page], start) == span
+    original = page[:]
+    patch = mmap.mmap(-1, length); patch[:] = b'Z' * length
+    assert os.pwritev(fd, [patch], position) == length
+    os.fsync(fd)
+    assert os.preadv(fd, [page], start) == span
+    expected = bytearray(original)
+    expected[position - start:position - start + length] = patch[:]
+    assert page[:] == expected
+    assert Path(HIDDEN).read_bytes() == before_hidden
+    page[:] = original
+    assert os.pwritev(fd, [page], start) == span
+    os.fsync(fd); page.close(); patch.close()
+os.close(fd)
+assert Path(HIDDEN).read_bytes() == before_hidden
+# Include the last hidden block, and restore it before filesystem tests.
+fd = os.open(HIDDEN, os.O_RDWR | os.O_DIRECT)
+page = mmap.mmap(-1, 512); page[:] = b'T' * 512
+assert os.pwritev(fd, [page], capacity - 512) == 512
+os.fsync(fd)
+assert Path(HIDDEN).read_bytes() == before_hidden[:-512] + b'T' * 512
+page[:] = before_hidden[-512:]
+assert os.pwritev(fd, [page], capacity - 512) == 512
+os.fsync(fd); os.close(fd); page.close()
 close(); setup()
 assert Path(HIDDEN).read_bytes() == before_hidden
 print('Native block RMW, hidden preservation and reopen passed', flush=True)

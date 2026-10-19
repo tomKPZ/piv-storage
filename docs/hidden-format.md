@@ -5,12 +5,14 @@ logical primary-sector order. Hidden block i uses primary sectors 48*i through
 48*i+47. There is no header record, allocator, length field or public magic.
 Capacity is floor(primary_sectors/48)*512. Incomplete tail primary sectors carry
 no hidden block and receive ordinary fresh random IVs on coordinated writes.
+Primary sector size is 512 or 4096 bytes; it changes the primary span of one
+record (24 KiB or 192 KiB), not its encoding or logical hidden-block size.
 
 ```
 carrier[576] = salt[32] || ciphertext[528] || Poly1305_tag[16]
 plaintext[528] = "PIVBLK03"[8] || state_LE64[8] || data[512]
 context = "pivstore/volume/v3\0" || canonical_UUID_ASCII || NUL
-          || LE64(primary_bytes) || LE64(4096)
+          || LE64(primary_bytes) || LE64(primary_sector_size)
 AAD = context || "/block/" || LE64(hidden_block_index)
 subkey = HKDF-SHA256(hidden_key, salt, info=AAD, length=32)
 ciphertext, tag = ChaCha20Poly1305(subkey, nonce=12 zero bytes, plaintext, AAD)

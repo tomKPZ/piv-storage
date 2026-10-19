@@ -34,8 +34,10 @@ journal_bytes = layout.journal_sections * layout.journal_section_sectors * 512
 journal = mmap.mmap(-1, journal_bytes)
 known_ids = {0x1111111111111111, 0x2222222222222222, 0x3333333333333333, 0x4444444444444444}
 def committed_new_ivs():
-    # Pinned no-MAC journal: 8 header sectors, 4 entries/header, each entry
-    # sector_LE64 + eight saved end-of-sector words + tag16 + IV12 + padding4.
+    # Pinned no-MAC journal: address8, saved tails8 per 512-byte data unit, tuple28.
+    factor = layout.sector_size // 512
+    stride = layout.journal_entry_bytes
+    iv_at = 8 + factor * 8 + 16
     assert os.preadv(raw, [journal], journal_base) == journal_bytes
     changed = set()
     for section in range(layout.journal_sections):
@@ -44,12 +46,12 @@ def committed_new_ivs():
                for i in range(layout.journal_section_sectors)}
         if len(ids) != 1 or not ids.issubset(known_ids): continue
         for header in range(8):
-            for entry in range(4):
-                at = section_base + header * 512 + entry * 104
+            for entry in range(504 // stride):
+                at = section_base + header * 512 + entry * stride
                 sector = int.from_bytes(journal[at:at + 8], 'little')
-                if sector % 8 or sector >= 48 * 8: continue
-                index = sector // 8
-                if journal[at + 88:at + 100] != before[index]: changed.add(index)
+                if sector % factor or sector >= 48 * factor: continue
+                index = sector // factor
+                if journal[at + iv_at:at + iv_at + 12] != before[index]: changed.add(index)
     return changed
 old = (w / 'expected-hidden-volume').read_bytes()
 new = b'partial-record power cut'.ljust(512, b'!')

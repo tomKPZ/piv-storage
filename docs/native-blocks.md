@@ -23,10 +23,16 @@ owner lock. Runtime ownership locks use /run, which may be tmpfs.
 The private crypt mapping rejects ordinary bios while native ownership is active.
 Public piv-view map callbacks queue bounded work to an ordered reclaim-capable
 workqueue. Work runs under the shared lock and NOIO allocation scope. Hidden bios
-are split to 512 bytes, decoy bios to 4096 bytes. Decoy writes use authenticated
-4096-byte RMW. No discard or write-zeroes bypass is advertised. Writes finish with
+are split to 512 bytes, decoy bios to the primary encryption-sector size
+(512 or 4096 bytes). Decoy writes use authenticated primary-sector RMW. No
+discard or write-zeroes bypass is advertised. Writes finish with
 a lower-device flush, including FUA requests; flush bios also reach the lower
-journal. Suspend/removal uses DM references and generation binding.
+journal. Suspend/removal uses DM references and generation binding. The current
+backend processes one primary encryption sector per work item: a 4096-byte decoy
+write on the 512-byte profile can refresh the same carrier group eight times.
+Opening authenticates the full primary volume sector by sector. Smaller sectors
+therefore add substantial request/setup overhead; bounded batching remains future
+work, even though each individual hidden write rewrites fewer primary bytes.
 
 On a write, authenticate the complete affected carrier groups, preserve valid
 hidden data (or mark unavailable data invalid), generate fresh encodings and
@@ -42,6 +48,13 @@ STATUS is 48 bytes: generation, hidden_bytes, encryptions, invalidations (u64),
 active/views/failed/version (u32). Counters are volatile; invalidations count group writes in successfully
 completed invalid-marker requests, not durable lifetime history.
 No user paths or file descriptors enter the native persistence path.
+
+QUERY reports the primary sector size and encryption-sector count. Primary
+control tuples remain 4124 bytes: ciphertext[S], zero padding up to 4096, tag16,
+IV12. The padding exists only in RAM/control messages; on disk the ciphertext is
+exactly S bytes and the integrity tuple remains 28 bytes. Nonzero control padding
+is rejected. The native test cap is 256 MiB of primary bytes, rather than a
+sector-count cap; public setup still restricts the raw guest disk to 128 MiB.
 
 Uninitialized/damaged blocks need a full 512-byte direct-I/O write for targeted
 repair. Buffered sub-page writes may first read a 4096-byte page containing
@@ -78,7 +91,10 @@ python3 scripts/vm.py run --code --script scripts/guest-stateless.sh \
   --share-file artifacts/control-003/hidden.key --timeout 3600
 ```
 
-Create the ordinary control fixture using docs/development.md if absent. The
+Create the ordinary control fixture using docs/development.md if absent.
+For the 512-byte profile, use control-512-001/control.img and that fixture's
+passphrase.key instead; hidden.key is an independently generated 32-byte test key.
+The same guest tests derive their geometry from LUKS and the queried owner. The
 script builds only the matched module inside the VM, records package/config
 provenance, exercises both filesystems and reopens with stock Linux for full
 primary readback. No host module, root privileges or extra host packages are

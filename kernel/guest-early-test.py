@@ -12,8 +12,8 @@ assert not Path('/var/lib/pivstore').exists()
 root_mount = next(line for line in mounts.splitlines() if line.split()[1] == '/')
 assert root_mount.split()[2] in ('rootfs', 'tmpfs', 'ramfs')
 value = open_blocks('/dev/vdb', '/piv/passphrase.key', Path('/piv/hidden.key').read_bytes())
-assert value['hidden_bytes'] == 301056
 expected = Path('/piv/expected-hidden-volume').read_bytes()
+assert value['hidden_bytes'] == len(expected)
 assert Path(value['hidden']).read_bytes() == expected
 fd = os.open(value['hidden'], os.O_RDWR)
 old = os.pread(fd, 512, 0)
