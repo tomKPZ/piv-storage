@@ -85,6 +85,8 @@ def main():
         print(json.dumps(result, indent=2))
     except (UnsupportedImage, OSError, ValueError, TimeoutError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
         print(f'pivstore: {exc}', file=sys.stderr)
+        for note in getattr(exc, '__notes__', ()):
+            print(f'pivstore: {note}', file=sys.stderr)
         return 1
     return 0
 

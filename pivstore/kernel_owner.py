@@ -10,7 +10,7 @@ import subprocess
 import uuid
 
 from .format import PRIMARY_PROFILES
-from .kernel_api import KernelDevice, dm, validate_integrity_table
+from .kernel_api import KernelDevice, dm, mapping_identity, remove_mapping, validate_integrity_table
 from .profile import parse_superblock, validate_segment
 
 
@@ -37,6 +37,8 @@ class GuestOwner:
     def __init__(self, source, passphrase_file, name='piv-native', *, allow_test_stack=False):
         self.lock_fd = None
         self.device = None
+        self.created = False
+        self.mappings = {}
         self.name = name
         self.lower_name = name + '_dif'
         self.source = Path(source)
@@ -54,7 +56,6 @@ class GuestOwner:
         info = directory.lstat()
         if not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o077:
             raise ValueError('Invalid global owner-lock directory')
-        created = False
         try:
             self.lock_fd = os.open(directory / (self.uuid + '.lock'),
                                    os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -75,11 +76,19 @@ class GuestOwner:
                 raise ValueError('LUKS and integrity sector sizes disagree')
             existing = dm('info', name, check=False).returncode == 0
             if not existing:
+                if mapping_identity(self.lower_name) is not None:
+                    raise FileExistsError('Lower mapping name is already in use')
                 holders = Path(f'/sys/dev/block/{os.major(self.raw_device)}:{os.minor(self.raw_device)}/holders')
                 if list(holders.iterdir()):
                     raise ValueError('Disposable device already has an independent mapping')
-                crypt('open', '--disable-keyring', '--key-file', passphrase_file, self.source, name)
-                created = True
+                self.created = True
+                try:
+                    crypt('open', '--disable-keyring', '--key-file', passphrase_file, self.source, name)
+                finally:
+                    # A command can fail after the kernel created a mapping.
+                    self.capture_created()
+                if len(self.mappings) != 2:
+                    raise ValueError('Created mapping identity is missing')
                 owner_size = int(subprocess.check_output(['blockdev', '--getsize64', '/dev/mapper/' + name]))
                 validate_integrity_table(dm('table', self.lower_name).stdout, owner_size // self.layout.sector_size,
                                          self.raw_device, self.offset, self.layout.sector_size,
@@ -99,6 +108,9 @@ class GuestOwner:
             expected_uuid = 'CRYPT-LUKS2-' + self.uuid.replace('-', '') + '-' + name
             if dm('info', '-c', '--noheadings', '-o', 'uuid', name).stdout.strip() != expected_uuid:
                 raise ValueError('Mapping does not belong to this disposable LUKS volume')
+            if not self.mappings:
+                self.mappings = {mapping: mapping_identity(mapping)
+                                 for mapping in (self.name, self.lower_name)}
             dm('mknodes', name)
             owner_path = '/dev/mapper/' + name
             matches = []
@@ -115,12 +127,33 @@ class GuestOwner:
             self.lower_table = dm('table', self.lower_name).stdout
             self.device.validate_callback = self.validate
             self.validate()
-        except BaseException:
-            if created:
-                dm('remove', '--retry', name, check=False)
-                dm('remove', '--retry', self.lower_name, check=False)
+        except BaseException as error:
+            if self.created:
+                try:
+                    self.remove()
+                except BaseException as cleanup:
+                    error.add_note(f'Private mapping cleanup incomplete: {cleanup}')
             self.close()
             raise
+
+    def capture_created(self):
+        expected = 'CRYPT-LUKS2-' + self.uuid.replace('-', '') + '-' + self.name
+        for mapping in (self.name, self.lower_name):
+            identity = mapping_identity(mapping)
+            if identity is None:
+                continue
+            if mapping == self.name:
+                if identity[2] != expected:
+                    continue
+            else:
+                words = dm('table', mapping).stdout.split()
+                if (not identity[2].startswith('CRYPT-INTEGRITY-') or
+                        not identity[2].endswith('-' + self.lower_name) or len(words) < 7 or
+                        words[2:5] != ['integrity',
+                            f'{os.major(self.raw_device)}:{os.minor(self.raw_device)}',
+                            str(self.offset // 512)]):
+                    continue
+            self.mappings[mapping] = identity
 
     def validate(self):
         if dm('table', self.name).stdout.split()[2:4] != ['piv-crypt', self.mapping_cipher]:
@@ -146,8 +179,8 @@ class GuestOwner:
         if self.device is not None:
             self.device.close()
         for name in (self.name, self.lower_name):
-            if dm('info', name, check=False).returncode == 0:
-                dm('remove', '--retry', name)
+            if name in self.mappings:
+                remove_mapping(name, self.mappings[name])
 
     def close(self):
         if self.device is not None:

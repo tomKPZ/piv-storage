@@ -46,13 +46,11 @@ Exit criteria (all passed):
 
 ## Next bounded work
 
-After this milestone, address evidence from fault/early-boot experiments first.
-Improve failed-setup cleanup of private mappings without touching unrelated
-conflicting names. Add direct-I/O lower-device failure coverage for both views under the new
-semantics. Confirm teardown/recreation after fail-stop and local hidden repair;
-do not import the removed exact-transaction recovery expectations.
+Failure handling and mapping cleanup are implemented; see the final handoff
+for direct-I/O fault, ownership and boot regression evidence. Preserve that
+coverage when changing the I/O path.
 
-Then consider bounded batching to reduce repeated full-carrier-group rewrites
+Next assess bounded batching to reduce repeated full-carrier-group rewrites
 for adjacent decoy sectors (especially eight 512-byte sectors in a 4096-byte
 write), and per-sector read/setup overhead. Each hidden block still needs its
 whole carrier group refreshed. Preserve fresh entropy, whole-block
@@ -491,3 +489,72 @@ Python compilation, changed-shell syntax and git diff --check passed. A fresh
 patch-only stage reproduced every tested source byte (the complete build stage
 also supplies dm-audit.h). Corrected guest logs have no unexpected compiler or
 kernel BUG/Oops/WARNING/kobject diagnostics. Separation is implemented and tested.
+
+
+## Session handoff: failure handling and cleanup
+
+Frontend exception cleanup now captures actual created mapping identities, even
+when cryptsetup or public-view creation reports an error after kernel creation.
+Public views receive volatile unique DM UUIDs. Cleanup removes only this attempt's
+resources, preserves the original exception and reports cleanup failures as notes.
+It skips an extra native checkpoint; stock lower teardown can still flush journal
+state. Close validates BOTH public bindings before removing either, supports idle
+owners, and refuses unrelated replacements. Open preserves existing idle/active
+owners. No kernel, crypto, on-disk format or ABI change was necessary.
+
+New scripts/guest-faults.sh and kernel/guest-fault-test.py use pinned dm-flakey
+below dm-integrity. Coverage includes four conflicting setup names, post-cryptsetup
+failure, before/during/after native setup, failures after each public creation,
+existing owners and unrelated replacement at close. All four lower read/write
+fault combinations exercise direct public I/O, sticky shared fail-stop after
+restoring storage, teardown/recreation, full-primary and hidden verification.
+Only the affected hidden block may require direct repair. Separate tests confirm
+local hidden EIO, invalid-marker preservation and repair without global failure.
+Final stock authentication and custom-module unload check compatibility/leaks;
+an unrelated stock encrypted filesystem stays mounted and writable throughout.
+
+Host suite: 30 tests passed without skips on AES4096 and AEGIS512, with
+ResourceWarning errors enabled. New tests cover changed identities, partial view
+creation and preservation of original errors when cleanup fails. Python compilation,
+changed-shell syntax and git diff --check passed. Source pin now includes the
+Linux 6.12.113 dm-flakey error feature definitions.
+
+Executed AES4096 faults-4096-004 passed all cases. Read faults spent zero primary
+encryptions; write faults spent 48 each. No hidden repairs were needed in these
+four injected failures. Independent final verification authenticated all 28,244
+primary sectors and matched all 301,056 hidden bytes; current IVs were distinct.
+Primary hash: e745a517d7eef8d46faa53fcdb9e732c0fe3da40e66e2bc228797eb40251065c.
+cleanup-early-build-001 packaged current stdlib-only setup; cleanup-early-001
+passed actual RAM-root activation, both writable views and teardown/custom unload.
+Independent full primary/hidden verification matched the same input oracles.
+Neither early boot required a persistent OS disk.
+
+AEGIS512 faults-512-002 also passed all setup, ownership, four lower-I/O and
+local-repair cases. Read faults spent zero encryptions; each write fault spent
+36. No hidden repairs were needed after the four storage faults. Independent
+verification authenticated all 213,008 primary sectors and matched all 3,028,992
+hidden bytes, with distinct current IVs. Primary hash:
+e42c7683a69cdfcf4bbf0fbca32de0f9bd6c15e950aaf2d79a714cc60054019a.
+Both final fault runs preserved the mounted writable stock encrypted sentinel
+and unloaded dm_piv successfully. Final fault/early logs contained no unexpected
+BUG/Oops/WARNING diagnostics. Expected injected EIO/journal errors and unsigned
+out-of-tree module taint messages are not treated as unexpected failures.
+This fault matrix covers AES4096 and AEGIS512, not every supported cipher/geometry.
+
+Test development: faults-4096-001 exposed a missing test restore default;
+faults-4096-002 raced a udev probe during manual foreign-view replacement. Retained
+tests drain udev and retry removals. faults-4096-003 demonstrated that direct
+sector 0 reads can be served from dm-integrity's cached setup checkpoint despite
+a lower read fault. A lower fault alone is not an observed owner I/O error.
+Final tests select cold carrier record 10, witness the raw read fault and require
+failed writes to spend fresh encryptions. Obsolete faults-512-001 was stopped.
+These failed/obsolete runs are not successful fixtures.
+
+Remaining limits: cleanup is best effort under busy mappings, process death or
+privileged external races; it is not rollback or atomic initialization. Tests
+restore the fault source before teardown/recreation. Failures during a healthy
+close checkpoint may require a close retry after fixing storage. This is injected
+EIO coverage, not hardware power-loss/durability proof or hidden crash recovery.
+Next: bounded batching/per-sector overhead, then broader lifecycle/debug-kernel
+stress and matched-control detectability work. No host installs/modules, root or
+real-device operations were used. Module/source pins remain separate-002.

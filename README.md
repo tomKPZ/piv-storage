@@ -54,6 +54,11 @@ python3 -m pivstore close-blocks --device /dev/vdb \
   --key-file /mnt/piv-work/passphrase.key
 ```
 
+A failed setup attempts to remove only its own mappings. Conflicting names are
+preserved, and cleanup failures are reported with the original error. Close also
+validates both view mappings before removal and can release an idle private owner.
+Cleanup releases resources; it does not roll back a partial initialization.
+
 A stock, uninitialized carrier can be opened without initialization: decoy I/O
 works, hidden reads return EIO, and full hidden-block writes initialize individual
 blocks. Repair of an unavailable block should use a complete 512-byte direct-I/O

@@ -12,9 +12,21 @@ device, serialization lock and record cipher. They expose plaintext logical I/O;
 there is no userspace I/O service or persistent state file. Existing mounted
 stock mappings are not converted into paired volumes by loading this module.
 
-A failed setup can leave private mappings behind. In this disposable prototype,
-tear down that stack or discard the guest before retrying; never work around
-it by creating an overlapping independent mapping.
+Setup tracks mappings created by its attempt, including commands that fail after
+kernel creation. Failed setup removes matching view UUIDs, then the newly created
+owner/lower mappings after checking their captured device numbers and UUIDs. It
+does not checkpoint native records during exception cleanup. Normal lower-target
+teardown may still drain the stock journal. Cleanup never rolls back disk writes;
+a failed --initialize can leave hidden contents changed or unavailable.
+
+An existing active stack is preserved when another open is rejected. An existing
+idle private owner must first be removed with close-blocks. Close checks BOTH
+public view tables, owner generation and device binding before removing either
+name, and refuses unrelated mappings. It can also remove a validated idle owner.
+A changed mapping identity is not deleted. Cleanup errors are reported alongside
+the original error; busy resources or process/VM death can still require explicit
+teardown. Do not manipulate the same stack concurrently with external dmsetup
+commands; these checks do not protect against a racing privileged administrator.
 
 Setup remains privileged and intentionally restricted to QEMU, the pinned
 6.12.113+deb13-amd64 guest and disposable 128 MiB /dev/vdb. It invokes cryptsetup

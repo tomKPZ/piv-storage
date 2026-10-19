@@ -27,6 +27,27 @@ def dm(*args, input=None, check=True):
     return result
 
 
+def mapping_identity(name):
+    """DM UUID plus device number, without reading any key-containing table."""
+    result = dm('info', '-c', '--noheadings', '--separator', ',',
+                '-o', 'major,minor,uuid', name, check=False)
+    if result.returncode:
+        return None
+    fields = tuple(word.strip() for word in result.stdout.strip().split(','))
+    if len(fields) != 3 or not fields[0].isdigit() or not fields[1].isdigit():
+        raise ValueError('Invalid mapping identity')
+    return fields
+
+
+def remove_mapping(name, identity):
+    current = mapping_identity(name)
+    if current is None:
+        return
+    if current != identity:
+        raise ValueError(f'Refusing to remove changed mapping {name}')
+    dm('remove', '--retry', name)
+
+
 def validate_integrity_table(table, sectors, raw_device, offset, sector_size=4096, journal_sectors=1848, tuple_size=28):
     if tuple_size not in (28, 32):
         raise ValueError('Unsupported lower tuple size')

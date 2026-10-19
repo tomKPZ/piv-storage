@@ -48,5 +48,10 @@
     "filename": "aegis128-core-v6.12.113.c",
     "url": "https://raw.githubusercontent.com/gregkh/linux/v6.12.113/crypto/aegis128-core.c",
     "sha256": "c5bcf3568ec6a0f690cec08215f924e60ea75b67994ee1f4d4e5e5f75ae6cd2d"
+  },
+  {
+    "filename": "dm-flakey-v6.12.113.c",
+    "url": "https://raw.githubusercontent.com/gregkh/linux/v6.12.113/drivers/md/dm-flakey.c",
+    "sha256": "0ce325fba3ccf6212ba3018ca15c74a7576995c2324d3b0ce377a1bda684fe60"
   }
 ]
