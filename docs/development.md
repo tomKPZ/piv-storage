@@ -122,3 +122,38 @@ Root cause has not been established. Do not infer an AEAD failure from it.
 The revised harness attaches the host raw file directly as a virtio block disk.
 Use 9p only for scripts and small result files, not loop-backed block workloads.
 Failed run artifacts remain ignored and must not be used as golden fixtures.
+
+## Original AEGIS-128 diagnostics
+
+Use scripts/guest-control-aegis.sh or guest-control-aegis-512.sh, sharing the
+same guest-control.sh body. They select --cipher aegis128-random --integrity aead
+--key-size 128. This is Linux's original AEGIS-128, not AEGIS-128L. Native
+activation needs no additional userspace cryptography library.
+
+Python cryptography and modern libaegis do not implement the original variant.
+The optional independent diagnostic oracle uses the AES-NI implementation from
+SUPERCOP revision 200cd30ca1f501463bd5cdd3da115a20d688d8fb, SHA-256 pinned in
+environment/sources.json. This historical reference is test instrumentation,
+not a new production crypto dependency or an implementation maintained here.
+Actual primary I/O uses the maintained pinned Linux crypto implementation.
+The wrapper accepts only our sector sizes, checks authentication before returning
+plaintext and wipes its output buffer on success/failure; it does not promise
+complete reference-stack/Python key erasure. Only use disposable synthetic keys.
+
+On an x86 host with AES-NI and an existing C compiler:
+
+```sh
+python3 scripts/fetch_sources.py
+python3 scripts/build_aegis_reference.py vendor/aegis-reference-next
+export PIV_AEGIS_REFERENCE="$PWD/vendor/aegis-reference-next/libaegis128-reference.so"
+PIV_FIXTURE=artifacts/aegis-control-4096-next python3 -W error::ResourceWarning -m unittest discover -v
+python3 -m pivstore verify artifacts/aegis-control-4096-next/control.img \
+  --volume-key-file artifacts/aegis-control-4096-next/share/volume.key
+```
+
+No host root or installed crypto package is required for this helper. The library
+path is an explicit trusted diagnostic input; never point it at untrusted code.
+Native open/close, hidden extraction and initramfs activation do not load it.
+For the focused guest sector test, additionally share this library as
+libaegis128-reference.so; QEMU's max CPU provides AES-NI. Full paired-device,
+interruption and early-boot tests use kernel crypto alone.

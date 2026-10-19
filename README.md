@@ -2,7 +2,7 @@
 
 Research prototype exposing two writable Linux device-mapper devices: a decoy
 volume and an independently encrypted hidden volume carried in the decoy's
-persistent random IVs (AES-GCM or ChaCha20-Poly1305). Both devices expose
+persistent random IVs (AES-GCM, ChaCha20-Poly1305 or original AEGIS-128). Both devices expose
 plaintext block I/O and support their own filesystem. Setup exits; the kernel owns subsequent I/O.
 
 The current architecture has **no external persistent metadata, nonce ledger or
@@ -26,15 +26,17 @@ python3 -m pivstore open-blocks --device /dev/vdb \
 ```
 
 This returns /dev/mapper/piv-native-decoy and /dev/mapper/piv-native-hidden.
-AES-GCM and ChaCha20-Poly1305 primary encryption support both 512- and 4096-byte
+All three primary ciphers support both 512- and 4096-byte
 sectors. Activation detects the cipher and geometry from LUKS metadata without
 an override flag. Both public devices use 512-byte logical
 blocks. For our 128 MiB disk fixtures:
 
-| Primary sector size | Decoy bytes | Hidden bytes |
-| --- | ---: | ---: |
-| 4096 | 115,687,424 | 301,056 |
-| 512 | 109,977,600 | 2,291,200 |
+| Primary cipher | Sector bytes | Decoy bytes | Hidden bytes |
+| --- | ---: | ---: | ---: |
+| AES-GCM / ChaCha20-Poly1305 | 4096 | 115,687,424 | 301,056 |
+| AES-GCM / ChaCha20-Poly1305 | 512 | 109,977,600 | 2,291,200 |
+| AEGIS-128 | 4096 | 115,572,736 | 400,896 |
+| AEGIS-128 | 512 | 109,060,096 | 3,028,992 |
 
 The hidden volume is already encrypted underneath its block interface. Setup
 never creates filesystems. **--initialize destroys all existing hidden contents**
@@ -63,14 +65,15 @@ no legacy decoder, bootstrap, compaction command, FUSE/NBD or offline writer.
 
 ## Integrity and crash limits
 
-Each 512-byte hidden block has one authentication tag and occupies 48 primary IVs.
+Each 512-byte hidden block has one authentication tag and occupies 48 primary IVs
+for AES-GCM/ChaCha20-Poly1305 or 36 for AEGIS-128.
 Every hidden update freshly encodes its whole block; every overlapping decoy
 write refreshes affected hidden records before reencrypting primary sectors.
 Original primary data is authenticated before modification. Only requested decoy
 bytes may change. Authentication binds hidden blocks to their address and volume.
 
 The stock dm-integrity journal protects individual primary ciphertext/tag/IV
-updates. It does **not** make a 48-sector hidden update atomic. Power loss or
+updates. It does **not** make a multi-sector hidden update atomic. Power loss or
 storage errors can leave a hidden block unreadable; no cross-sector recovery,
 rollback protection, redundancy or hidden filesystem recovery is promised.
 A whole hidden block authenticates before any of its bytes are returned. This
@@ -79,25 +82,29 @@ rollback or a mixture of independently valid blocks from different times.
 Primary I/O/authentication failures stop the shared owner; remove and recreate
 the stack after fixing the underlying fault. Hidden unavailability alone does not.
 
-Primary 96-bit IV uniqueness is probabilistic. Every encoding uses fresh seeded
+Primary IV uniqueness is probabilistic (96 bits for AES-GCM/ChaCha20-Poly1305;
+128 bits for AEGIS-128). Every encoding uses fresh seeded
 kernel randomness, with rejection of duplicates within the proposed update and
 its replaced IVs. There is **no historical collision detection**. For q uniformly
 random primary IVs under one key, collision probability is approximately
-q(q-1)/2^97. A 2^32 per-owner encryption cap is only a diagnostic guard: reopening
+q(q-1)/2^97 for 96-bit IVs, or q(q-1)/2^129 for 128-bit IVs. A 2^32 per-owner
+encryption cap is only a diagnostic guard: reopening
 resets it, and all stock writes, retries, failed preparations and clones count
 toward the real per-key lifetime budget. Manage that budget externally.
 2^32 invocations represent 16 TiB at 4096 bytes per encryption or 2 TiB at 512 bytes, including rewrite amplification. These are primary encryption bytes,
-not application-write allowances. A 512-byte hidden write reencrypts 192 KiB of
+not application-write allowances. For AES/ChaCha, a 512-byte hidden write reencrypts 192 KiB of
 primary data with 4096-byte sectors (384 times as many bytes), or 24 KiB with
-512-byte sectors (48 times), before ordinary journal overhead. Each primary AEAD also has per-message and
+512-byte sectors (48 times), before ordinary journal overhead.
+AEGIS-128 rewrites 144 KiB (288 times) or 18 KiB (36 times), respectively. Each primary AEAD also has per-message and
 aggregate security constraints; collision probability alone is not a full bound.
 Never rely on snapshot-restored RNG state or replay cached encryption plans.
 
 ## Disk format and diagnostics
 
-Supported profiles: one LUKS2 AES-GCM/random or ChaCha20-Poly1305/random segment,
-zero IV tweak, 512- or 4096-byte primary sectors, 96-bit IVs, 128-bit primary tags, integrity v4 fixed padding,
-28-byte metadata tuples, 32768-sector interleaving (512-byte units) and an unencrypted/un-MACed
+Supported profiles: one LUKS2 AES-GCM/random, ChaCha20-Poly1305/random or
+AEGIS-128/random segment, zero IV tweak, 512- or 4096-byte primary sectors,
+128-bit primary tags, integrity v4 fixed padding, 28-byte metadata tuples
+(96-bit IV) or AEGIS-128's stock 32-byte tuples (128-bit IV), 32768-sector interleaving (512-byte units) and an unencrypted/un-MACed
 stock journal. Native activation delegates journal replay to Linux. Offline
 image diagnostics reject a dirty journal and unsupported geometry.
 
@@ -107,10 +114,15 @@ Stock cryptsetup selections (when formatting a new volume) are:
 | --- | --- | --- | --- |
 | AES-GCM | `--cipher aes-gcm-random` | `--integrity aead` | 256 bits |
 | ChaCha20-Poly1305 | `--cipher chacha20-random` | `--integrity poly1305` | 256 bits |
+| Original AEGIS-128 | `--cipher aegis128-random` | `--integrity aead` | 128 bits |
 
-Both use the same 12-byte IV/16-byte tag layout and have the same carrier
+AES-GCM and ChaCha20-Poly1305 use the same 12-byte IV/16-byte tag layout and have the same carrier
 capacity and probabilistic nonce-collision limits. Hidden records continue to
 use their independent ChaCha20-Poly1305 keys regardless of the primary cipher.
+Linux `aegis128` is the original five-state algorithm, **not AEGIS-128L**. Its
+16-byte IVs and 16-byte tags are ordinary cryptsetup defaults for that cipher.
+The selected cipher is visible in LUKS metadata; compare detectability against
+a matched ordinary volume using that same cipher, not against an AES volume.
 Selecting a different primary cipher requires a newly formatted volume; there
 is no in-place cipher conversion command in this prototype.
 
@@ -123,19 +135,23 @@ python3 -m pivstore unpack artifacts/stateless-004/share/dual-final.img \
 PIV_FIXTURE=artifacts/control-003 python3 -W error::ResourceWarning -m unittest discover -v
 ```
 
+For AEGIS-128 primary verification, build the pinned optional x86 AES-NI
+[diagnostic reference](docs/development.md#original-aegis-128-diagnostics).
+Native activation, early boot and hidden extraction do not need that library.
+
 unpack authenticates all hidden blocks and publishes a new private output file
 only after success; no primary key is needed. verify authenticates the complete
 primary image and prints its plaintext hash. extract-ivs performs no primary
 verification. Keys belong in private files, never command arguments or commits.
 
-Gross IV carrier capacity is 12/S of primary capacity for encryption-sector size
-S. The v3 payload fraction is 512/(48*S): approximately 0.2604% with 4096-byte
-sectors or 2.0833% with 512-byte sectors, excluding incomplete tail groups.
+Gross IV carrier capacity is IV_bytes/S of primary capacity for encryption-sector size
+S. The v3 payload fraction is 512/(group*S), excluding incomplete tail groups.
+For 48-sector groups this is 0.2604% at 4096 bytes or 2.0833% at 512 bytes;
+AEGIS-128's 36-sector groups yield 0.3472% or 2.7778%.
 Smaller primary sectors require more ordinary tag/IV metadata, reducing decoy
 capacity on a fixed raw disk. Each profile retains stock cryptsetup's layout,
-96-bit IVs and 128-bit tags; changing sector size requires a newly formatted
-volume, not an activation switch. Increasing IV lengths would change the control
-profile and potentially make the configuration unusual.
+cipher-specific IV size and 128-bit tags; changing sector size requires a newly formatted
+volume, not an activation switch. Do not override a cipher's normal IV size to increase capacity.
 
 The encoded salt/ciphertext/tag is expected to look random under the primitive
 assumptions in [the format notes](docs/hidden-format.md). Layout compatibility

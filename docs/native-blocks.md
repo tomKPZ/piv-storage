@@ -50,19 +50,22 @@ completed invalid-marker requests, not durable lifetime history.
 No user paths or file descriptors enter the native persistence path.
 
 The primary cipher whitelist includes capi:gcm(aes)-random and
-capi:rfc7539(chacha20,poly1305)-random, both with 32-byte keys, 12-byte stored IVs
-and 16-byte tags. The pinned dm-crypt AEAD helper handles either transform with
-AAD LE64(address_in_512_byte_units) || IV12. Setup checks the actual owner table
+capi:rfc7539(chacha20,poly1305)-random (32-byte keys, 12-byte stored IVs),
+and capi:aegis128-random (16-byte key, 16-byte IV). All use 16-byte tags. The pinned dm-crypt AEAD helper handles either transform with
+AAD LE64(address_in_512_byte_units) || IV. Setup checks the actual owner table
 against the validated LUKS cipher on creation and reuse. The independent verifier
-selects AESGCM or ChaCha20Poly1305 from the same validated public metadata; setup
-continues to require only the Python standard library. The control ABI and v3
-hidden encoding are unchanged.
+selects AESGCM, ChaCha20Poly1305 or the pinned diagnostic AEGIS-128 reference from the same validated public metadata; setup
+continues to require only the Python standard library. The v3 hidden encoding is unchanged; AEGIS groups contain 36 primary sectors
+instead of 48. No persistent format is added outside the IVs.
 
 QUERY reports the primary sector size and encryption-sector count. Primary
-control tuples remain 4124 bytes: ciphertext[S], zero padding up to 4096, tag16,
-IV12. The padding exists only in RAM/control messages; on disk the ciphertext is
-exactly S bytes and the integrity tuple remains 28 bytes. Nonzero control padding
-is rejected. The native test cap is 256 MiB of primary bytes, rather than a
+controls use version 2; old control requests are rejected. QUERY/READ remain
+48 bytes; UPDATE is 4176 bytes. Its tuple is 4128 bytes: ciphertext[S], zero
+padding up to 4096, tag16, IV[12 or 16], zero padding up to 16 IV bytes. Expected
+IV fields likewise have zero padding up to 16 bytes. All nonzero padding is
+rejected. Padding exists only in RAM, never on disk. The integrity tuple is
+28 or 32 bytes according to the validated primary profile. Native SETUP/STATUS
+retain ABI 3, separate from the primary-sector controls. The native test cap is 256 MiB of primary bytes, rather than a
 sector-count cap; public setup still restricts the raw guest disk to 128 MiB.
 
 Uninitialized/damaged blocks need a full 512-byte direct-I/O write for targeted
@@ -122,7 +125,7 @@ python3 scripts/early_vm.py \
 
 The initramfs includes synthetic test credentials and must stay private/ignored.
 It supplies Python's standard library, cryptsetup/dmsetup, decompression libraries
-for kmod and all required crypto modules. It mounts only RAM/pseudo filesystems.
+for kmod and all required crypto modules, including aegis128. It mounts only RAM/pseudo filesystems.
 Activation runs with Python -S; Python cryptography is needed only for independent
 offline diagnostics. early_vm.py copies the data image and attaches a blank disk
 solely to preserve the /dev/vdb test guard. It never attaches an OS/root disk.

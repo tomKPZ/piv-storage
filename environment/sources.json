@@ -38,5 +38,15 @@
     "filename": "cryptsetup-setup-v2.7.5.c",
     "url": "https://raw.githubusercontent.com/mbroz/cryptsetup/v2.7.5/lib/setup.c",
     "sha256": "5e38a32f20fa8208bd913f5bc1b7a39b8643827d7da7b94a23a15db0a1c72fa6"
+  },
+  {
+    "filename": "aegis128-supercop.c",
+    "url": "https://raw.githubusercontent.com/jedisct1/supercop/200cd30ca1f501463bd5cdd3da115a20d688d8fb/crypto_aead/aegis128/aesni/encrypt.c",
+    "sha256": "bfab58c1ed928c7319c7367b99b9b4cade690dd2d55134156c67c016ccae2c3d"
+  },
+  {
+    "filename": "aegis128-core-v6.12.113.c",
+    "url": "https://raw.githubusercontent.com/gregkh/linux/v6.12.113/crypto/aegis128-core.c",
+    "sha256": "c5bcf3568ec6a0f690cec08215f924e60ea75b67994ee1f4d4e5e5f75ae6cd2d"
   }
 ]

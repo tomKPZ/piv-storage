@@ -5,14 +5,13 @@
  */
 /* Positive internal sentinel: -ENODATA may also mean a block medium error. */
 #define PN_UNAVAILABLE 1
-#define PN_GROUP 48
 #define PN_DATA 512
 #define PN_CARRIER 576
 #define PN_MAX_ENTRIES 96
 struct pn_entry {
  __le64 sector;
  __le32 primary;
- u8 old[12], tuple[4124];
+ u8 old[16], tuple[PIV_TUPLE_BYTES];
 } __packed;
 struct piv_native {
  struct crypto_aead *record_cipher;
@@ -124,12 +123,12 @@ static int pn_record(struct piv_native *n, u64 index, u8 *carrier,
 /* Authenticate primary data before accepting its carrier, even for replacement. */
 static int pn_carrier(struct piv_control *p, u64 index, u8 *carrier)
 {
- u32 j;
- for (j = 0; j < PN_GROUP; j++) {
+ u32 j, iv = p->profile.iv_size, group = PN_CARRIER / iv;
+ for (j = 0; j < group; j++) {
   struct piv_sector *s = NULL;
-  int r = piv_load(p->cc, index * PN_GROUP + j, &s);
+  int r = piv_load(p->cc, index * group + j, &s);
   if (r) return r;
-  memcpy(carrier + j * 12, s->original + 4112, 12);
+  memcpy(carrier + j * iv, s->original + 4112, iv);
   piv_sector_free(p->cc, s);
  }
  return 0;
@@ -154,11 +153,12 @@ static int pn_write(struct piv_control *p, bool hidden, u64 offset, const u8 *da
  struct pn_group *groups = kcalloc(2, sizeof(*groups), GFP_NOIO);
  struct pn_entry *entries = kvcalloc(PN_MAX_ENTRIES, sizeof(*entries), GFP_NOIO);
  struct piv_update *u = kzalloc(sizeof(*u), GFP_NOIO);
- u8 *ivs = kmalloc(PN_MAX_ENTRIES * 12, GFP_NOIO);
+ u8 *ivs = kmalloc(PN_MAX_ENTRIES * 16, GFP_NOIO);
+ u32 iv = p->profile.iv_size, group = PN_CARRIER / iv;
  u64 unit = p->profile.sector_size;
- u64 first = hidden ? offset / PN_DATA : offset / unit / PN_GROUP;
- u64 last = hidden ? (offset + bytes - 1) / PN_DATA : (offset + bytes - 1) / unit / PN_GROUP;
- u64 index, total_groups = p->profile.sectors / PN_GROUP;
+ u64 first = hidden ? offset / PN_DATA : offset / unit / group;
+ u64 last = hidden ? (offset + bytes - 1) / PN_DATA : (offset + bytes - 1) / unit / group;
+ u64 index, total_groups = p->profile.sectors / group;
  u32 g = 0, count = 0, i, j, attempt;
  int r = -ENOMEM;
  if (!groups || !entries || !u || !ivs) goto done;
@@ -173,20 +173,20 @@ static int pn_write(struct piv_control *p, bool hidden, u64 offset, const u8 *da
    if (r == PN_UNAVAILABLE) { rec->invalid = true; r = 0; }
    if (r) goto done;
   }
-  for (j = 0; j < PN_GROUP; j++) {
+  for (j = 0; j < group; j++) {
    struct pn_entry *e = &entries[count++];
-   e->sector = cpu_to_le64(index * PN_GROUP + j);
-   memcpy(e->old, rec->old + j * 12, 12);
+   e->sector = cpu_to_le64(index * group + j);
+   memcpy(e->old, rec->old + j * iv, iv);
   }
  }
- if (!hidden) for (index = max_t(u64, offset / unit, total_groups * PN_GROUP);
+ if (!hidden) for (index = max_t(u64, offset / unit, total_groups * group);
                   index <= (offset + bytes - 1) / unit; index++) {
   struct piv_sector *s = NULL;
   struct pn_entry *e;
   if (count == PN_MAX_ENTRIES) { r = -E2BIG; goto done; }
   r = piv_load(p->cc, index, &s); if (r) goto done;
   e = &entries[count++]; e->sector = cpu_to_le64(index);
-  memcpy(e->old, s->original + 4112, 12); piv_sector_free(p->cc, s);
+  memcpy(e->old, s->original + 4112, iv); piv_sector_free(p->cc, s);
  }
  if (!count || count > (1ULL << 32) - p->encryptions) { r = -EDQUOT; goto done; }
  /* Local checks are NOT a historical nonce-uniqueness guarantee. */
@@ -197,21 +197,21 @@ static int pn_write(struct piv_control *p, bool hidden, u64 offset, const u8 *da
    if (r) goto done;
    memcpy(ivs + i * PN_CARRIER, groups[i].fresh, PN_CARRIER);
   }
-  for (i = g * PN_GROUP; i < count; i++) get_random_bytes(ivs + i * 12, 12);
+  for (i = g * group; i < count; i++) get_random_bytes(ivs + i * iv, iv);
   for (i = 0; i < count; i++) {
-   for (j = 0; j < count; j++) if (!memcmp(ivs + i * 12, entries[j].old, 12)) collision = true;
-   for (j = 0; j < i; j++) if (!memcmp(ivs + i * 12, ivs + j * 12, 12)) collision = true;
+   for (j = 0; j < count; j++) if (!memcmp(ivs + i * iv, entries[j].old, iv)) collision = true;
+   for (j = 0; j < i; j++) if (!memcmp(ivs + i * iv, ivs + j * iv, iv)) collision = true;
   }
   if (!collision) break;
  }
  if (attempt == 16) { r = -EEXIST; goto done; }
- u->version = 1; u->size = sizeof(*u); u->generation = p->profile.generation;
+ u->version = PIV_CONTROL_VERSION; u->size = sizeof(*u); u->generation = p->profile.generation;
  /* Prepare every tuple before the first mutation. No external WAL/replay. */
  for (i = 0; i < count; i++) {
   u64 sector = le64_to_cpu(entries[i].sector), start = sector * unit;
   bool primary = !hidden && start < offset + bytes && start + unit > offset;
   memset(u->tuple, 0, sizeof(u->tuple)); u->sector = sector;
-  memcpy(u->expected_iv, entries[i].old, 12); memcpy(u->tuple + 4112, ivs + i * 12, 12);
+  memcpy(u->expected_iv, entries[i].old, iv); memcpy(u->tuple + 4112, ivs + i * iv, iv);
   if (primary) {
    struct piv_sector *s = NULL;
    u64 lo = max(start, offset), hi = min(start + unit, offset + bytes);
@@ -221,12 +221,12 @@ static int pn_write(struct piv_control *p, bool hidden, u64 offset, const u8 *da
    entries[i].primary = cpu_to_le32(1);
   }
   r = piv_update(p, NULL, u, true, primary, true); if (r) goto done;
-  memcpy(entries[i].tuple, u->tuple, 4124);
+  memcpy(entries[i].tuple, u->tuple, PIV_TUPLE_BYTES);
  }
  u->flags = PIV_APPLY_DEFER_FLUSH;
  for (i = 0; i < count; i++) {
   u->sector = le64_to_cpu(entries[i].sector);
-  memcpy(u->expected_iv, entries[i].old, 12); memcpy(u->tuple, entries[i].tuple, 4124);
+  memcpy(u->expected_iv, entries[i].old, iv); memcpy(u->tuple, entries[i].tuple, PIV_TUPLE_BYTES);
   r = piv_update(p, NULL, u, false, le32_to_cpu(entries[i].primary), true); if (r) goto done;
   if ((i + 1) % 32 == 0) { r = blkdev_issue_flush(p->cc->dev->bdev); if (r) goto done; }
  }
@@ -243,16 +243,17 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
  struct piv_native *n;
  u8 *zero;
  u64 i;
+ u32 group = PN_CARRIER / p->profile.iv_size;
  int r;
  if (s->version != 3 || s->size != sizeof(*s) || s->generation != p->profile.generation ||
      s->context_length > 120 || !s->context_length || (s->flags & ~1U) ||
      memchr_inv(s->reserved, 0, sizeof(s->reserved))) return -EINVAL;
  if (p->native || !piv_quiesced(p) || !p->transaction || p->controller != controller || p->failed) return -EBUSY;
- if (p->profile.sectors < PN_GROUP || p->profile.sectors > (256ULL * 1024 * 1024) / p->profile.sector_size) return -EINVAL;
+ if (p->profile.sectors < group || p->profile.sectors > (256ULL * 1024 * 1024) / p->profile.sector_size) return -EINVAL;
  n = kzalloc(sizeof(*n), GFP_NOIO); if (!n) return -ENOMEM;
  memcpy(n->key, s->key, 32); memcpy(n->context, s->context, s->context_length);
  n->context_length = s->context_length;
- n->hidden_bytes = (p->profile.sectors / PN_GROUP) * PN_DATA;
+ n->hidden_bytes = (p->profile.sectors / group) * PN_DATA;
  n->record_cipher = crypto_alloc_aead("rfc7539(chacha20,poly1305)", 0, 0);
  n->hmac = crypto_alloc_shash("hmac(sha256)", 0, 0);
  if (IS_ERR(n->record_cipher) || IS_ERR(n->hmac)) { r = -ENOENT; goto bad; }

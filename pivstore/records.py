@@ -11,17 +11,19 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from .profile import Image, UnsupportedImage
 from .format import context
 
-SECTORS = 48
 BYTES = 576
 PAYLOAD = 512
 MAGIC = b'PIVBLK03'
 
 
 class Records:
-    def __init__(self, sectors, identity, key):
-        if len(key) != 32 or sectors < SECTORS:
-            raise ValueError('Expected a 32-byte key and at least 48 primary sectors')
-        self.count = sectors // SECTORS
+    def __init__(self, sectors, identity, key, iv_size=12):
+        if iv_size not in (12, 16):
+            raise ValueError('Unsupported carrier IV size')
+        self.sectors_per_record = BYTES // iv_size
+        if len(key) != 32 or sectors < self.sectors_per_record:
+            raise ValueError('Expected a 32-byte key and at least one complete carrier group')
+        self.count = sectors // self.sectors_per_record
         self.capacity = self.count * PAYLOAD
         self.identity = identity + b'/block/'
         self.key = key
@@ -58,7 +60,7 @@ class Records:
 
 def decode_image(image, key):
     """All-or-error extraction without the primary key; stock journal must be clean."""
-    records = Records(image.layout.sectors, context(image), key)
+    records = Records(image.layout.sectors, context(image), key, image.layout.iv_bytes)
     carrier = b''.join(image.iv_slots())
     return b''.join(records.decode(i, carrier[i * BYTES:(i + 1) * BYTES])
                     for i in range(records.count))

@@ -24,17 +24,20 @@ owner.close()
 base = layout.offsets(0)[1]
 assert base % 512 == 0
 raw = os.open('/dev/vdb', os.O_RDONLY | os.O_DIRECT)
-buffer = mmap.mmap(-1, 1536)
+group = 576 // layout.iv_bytes
+tuple_size = layout.tuple_bytes
+carrier_bytes = ((group * tuple_size + 511) // 512) * 512
+buffer = mmap.mmap(-1, carrier_bytes)
 def carrier():
-    assert os.preadv(raw, [buffer], base) == 1536
-    return [buffer[i * 28 + 16:i * 28 + 28] for i in range(48)]
+    assert os.preadv(raw, [buffer], base) == carrier_bytes
+    return [buffer[i * tuple_size + 16:(i + 1) * tuple_size] for i in range(group)]
 before = carrier()
 journal_base = layout.integrity_offset + 8 * 512
 journal_bytes = layout.journal_sections * layout.journal_section_sectors * 512
 journal = mmap.mmap(-1, journal_bytes)
 known_ids = {0x1111111111111111, 0x2222222222222222, 0x3333333333333333, 0x4444444444444444}
 def committed_new_ivs():
-    # Pinned no-MAC journal: address8, saved tails8 per 512-byte data unit, tuple28.
+    # Pinned no-MAC journal: address8, saved tails8 per 512-byte data unit, tuple28/32.
     factor = layout.sector_size // 512
     stride = layout.journal_entry_bytes
     iv_at = 8 + factor * 8 + 16
@@ -49,9 +52,9 @@ def committed_new_ivs():
             for entry in range(504 // stride):
                 at = section_base + header * 512 + entry * stride
                 sector = int.from_bytes(journal[at:at + 8], 'little')
-                if sector % factor or sector >= 48 * factor: continue
+                if sector % factor or sector >= group * factor: continue
                 index = sector // factor
-                if journal[at + iv_at:at + iv_at + 12] != before[index]: changed.add(index)
+                if journal[at + iv_at:at + iv_at + layout.iv_bytes] != before[index]: changed.add(index)
     return changed
 old = (w / 'expected-hidden-volume').read_bytes()
 new = b'partial-record power cut'.ljust(512, b'!')
@@ -72,8 +75,8 @@ deadline = time.monotonic() + 300
 while time.monotonic() < deadline:
     current = carrier()
     changed = len({i for i, (a, b) in enumerate(zip(before, current)) if a != b} | committed_new_ivs())
-    if 0 < changed < 48:
-        (w / 'cut-boundary.json').write_text(json.dumps(dict(changed_committed_or_current_ivs=changed,
+    if 0 < changed < group:
+        (w / 'cut-boundary.json').write_text(json.dumps(dict(changed_committed_or_current_ivs=changed, total_carrier_ivs=group,
             mechanism='partial current/committed journal carrier observed with delayed lower writes',
             hardware_power_loss_tested=False)) + '\n')
         print('PIV_POWER_CUT', flush=True)

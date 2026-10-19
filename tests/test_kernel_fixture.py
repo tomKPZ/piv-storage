@@ -2,9 +2,12 @@
 
 from contextlib import contextmanager
 import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -61,12 +64,23 @@ class KernelFixtureTests(FixtureCase):
     def test_carrier_extraction_order(self):
         with Image(self.path) as image:
             carrier = b''.join(image.iv_slots())
-            self.assertEqual(len(carrier), image.layout.sectors * 12)
+            self.assertEqual(len(carrier), image.layout.sectors * image.layout.iv_bytes)
+            self.assertEqual(image.summary()['gross_carrier_bytes'], len(carrier))
             for index in (0, 32768 // (image.layout.sector_size // 512) - 1,
                               32768 // (image.layout.sector_size // 512), image.layout.sectors - 1):
                 _, offset = image.layout.offsets(index)
-                self.assertEqual(carrier[index * 12:(index + 1) * 12],
-                                 image.read(12, offset + 16))
+                self.assertEqual(carrier[index * image.layout.iv_bytes:(index + 1) * image.layout.iv_bytes],
+                                 image.read(image.layout.iv_bytes, offset + 16))
+
+    def test_cli_carrier_bytes_match_written_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'carrier.raw'
+            response = subprocess.check_output([sys.executable, '-m', 'pivstore',
+                'extract-ivs', str(self.path), '--output', str(output)], text=True)
+            with Image(self.path) as image:
+                carrier = b''.join(image.iv_slots())
+                self.assertEqual(json.loads(response)['extracted_bytes'], len(carrier))
+                self.assertEqual(output.read_bytes(), carrier)
 
     def test_wrong_key_rejected(self):
         wrong = bytes([self.key[0] ^ 1]) + self.key[1:]

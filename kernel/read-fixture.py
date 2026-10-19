@@ -19,5 +19,5 @@ with Image(Path(sys.argv[1])) as image:
         expected = json.loads(Path(sys.argv[2]).read_text())
         for index, value in expected.items():
             _, offset = image.layout.offsets(int(index))
-            assert image.read(12, offset + 16).hex() == value, index
+            assert image.read(image.layout.iv_bytes, offset + 16).hex() == value, index
         print('Kernel-authenticated IV results match independent offline layout reads')

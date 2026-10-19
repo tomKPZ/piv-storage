@@ -25,20 +25,21 @@ struct piv_read_iv {
 	__u32 size;
 	__u64 generation;
 	__u64 sector; /* encryption-sector index */
-	__u8 iv[12];
-	__u32 reserved[3];
+	__u8 iv[16];
+	__u32 reserved[2];
 };
 #define PIV_READ_IV _IOWR('P', 1, struct piv_read_iv)
 #define PIV_QUERY_MUTATION 4
-#define PIV_TUPLE_BYTES 4124
+#define PIV_CONTROL_VERSION 2
+#define PIV_TUPLE_BYTES 4128
 struct piv_update {
 	__u32 version;
 	__u32 size;
 	__u64 generation;
 	__u64 sector;
-	__u8 expected_iv[12];
+	__u8 expected_iv[16];
 	__u32 flags;
-	__u8 tuple[PIV_TUPLE_BYTES]; /* sector ciphertext, zero-pad to4096 || tag16 || IV12 (RAM ABI only) */
+	__u8 tuple[PIV_TUPLE_BYTES]; /* sector ciphertext, zero-pad to4096 || tag16 || IV[12|16], zero-pad to16 (RAM ABI only) */
 	__u32 reserved;
 };
 #define PIV_READ_QUIESCED _IOWR('P', 2, struct piv_read_iv)

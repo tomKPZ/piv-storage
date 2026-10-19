@@ -140,3 +140,36 @@ maintained AESGCM or ChaCha20Poly1305 primitive only after validating the exact
 LUKS cipher/integrity combination. Active owner tables are checked against that
 selection on setup and reuse. Neither profile changes the hidden nonce policy
 or its documented limits.
+
+## Stock original AEGIS-128 profiles
+
+artifacts/aegis-control-4096-001 and aegis-control-512-001 use the same pinned
+Linux/cryptsetup and shared stock generator, with --cipher aegis128-random,
+--integrity aead and --key-size 128. Stock full-primary readback agrees with the
+independent pinned SUPERCOP AEGIS-128 AES-NI reference. This original five-state
+algorithm is distinct from AEGIS-128L in current libaegis/libsodium.
+
+LUKS encryption is aegis128-random; the active transform is capi:aegis128-random.
+Its ordinary metadata tuple is tag16 || IV16 (32 bytes). Linux's primary AAD is
+LE64(primary_sector_index * primary_sector_size/512) || IV16. The pinned
+crypto/aegis128-core.c declares a 16-byte key/nonce and accepts 16-byte tags;
+cryptsetup's existing random-IV sizing supplies the matching ordinary tuple.
+No custom IV length or clear hidden metadata is used.
+
+| Primary sector bytes | Primary sectors | Decoy bytes | Hidden bytes | Metadata-run sectors |
+| --- | ---: | ---: | ---: | ---: |
+| 4096 | 28,216 | 115,572,736 | 400,896 | 256 |
+| 512 | 213,008 | 109,060,096 | 3,028,992 | 2048 |
+
+The two superblocks retain version4, interleave15 and flags8, with block3/0,
+provided_data_sectors225728/213008 and journal_sections7/23. Journal strides
+remain 104/48 bytes and section sizes264/88 addressing sectors: rounding absorbs
+the extra four tuple bytes. Substitute tuple_size32 for28 in the geometry
+formulas above. The ordinary lower table uses buffer_sectors:128 at BOTH primary
+sector sizes; block_size:4096 is explicit only for the 4096 profile. Journal
+sectors remain1848/2024. These are observed defaults, not prototype overrides.
+
+Every 576-byte hidden record consumes exactly36 full 16-byte IVs. Complete groups
+and incomplete tails are derived from the actual primary count; all IV bytes are
+used. The hidden encoding and public context remain v3. The widened RAM control
+ABI is version2; no disk padding or legacy control decoder was added.

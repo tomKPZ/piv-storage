@@ -75,7 +75,7 @@ def main():
                 with os.fdopen(fd, 'wb') as destination:
                     for iv in image.iv_slots():
                         destination.write(iv)
-                result = {'extracted_bytes': image.layout.sectors * 12,
+                result = {'extracted_bytes': image.layout.sectors * image.layout.iv_bytes,
                           'primary_authentication': 'not performed'}
             else:
                 with args.volume_key_file.open('rb') as stream:

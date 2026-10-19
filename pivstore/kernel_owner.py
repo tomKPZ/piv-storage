@@ -69,6 +69,8 @@ class GuestOwner:
                                                self.offset, 128 * 1024 * 1024)
             finally:
                 os.close(raw)
+            if self.layout.iv_bytes != (16 if self.encryption == 'aegis128-random' else 12):
+                raise ValueError('LUKS and integrity IV sizes disagree')
             if self.layout.sector_size != metadata['segments']['0']['sector_size']:
                 raise ValueError('LUKS and integrity sector sizes disagree')
             existing = dm('info', name, check=False).returncode == 0
@@ -81,7 +83,8 @@ class GuestOwner:
                 owner_size = int(subprocess.check_output(['blockdev', '--getsize64', '/dev/mapper/' + name]))
                 validate_integrity_table(dm('table', self.lower_name).stdout, owner_size // self.layout.sector_size,
                                          self.raw_device, self.offset, self.layout.sector_size,
-                                         self.layout.journal_sections * self.layout.journal_section_sectors)
+                                         self.layout.journal_sections * self.layout.journal_section_sectors,
+                                 self.layout.tuple_bytes)
                 # Key-containing table is kept in memory and sent only through stdin.
                 fields = dm('table', '--showkeys', name).stdout.split()
                 if fields[2:4] != ['crypt', self.mapping_cipher]:
@@ -121,14 +124,15 @@ class GuestOwner:
     def validate(self):
         if dm('table', self.name).stdout.split()[2:4] != ['crypt', self.mapping_cipher]:
             raise ValueError('Primary mapping cipher differs from LUKS metadata')
-        if (self.device.sectors, self.device.sector_size) != (self.layout.sectors, self.layout.sector_size):
+        if (self.device.sectors, self.device.sector_size, self.device.iv_size, self.device.tuple_size) != (self.layout.sectors, self.layout.sector_size, self.layout.iv_bytes, self.layout.tuple_bytes):
             raise ValueError('Native geometry differs from supported superblock')
         table = dm('table', self.lower_name).stdout
         if table != self.lower_table:
             raise ValueError('Lower integrity mapping changed outside owner')
         validate_integrity_table(table, self.device.sectors, self.raw_device, self.offset,
                                  self.layout.sector_size,
-                                 self.layout.journal_sections * self.layout.journal_section_sectors)
+                                 self.layout.journal_sections * self.layout.journal_section_sectors,
+                                 self.layout.tuple_bytes)
         lower = Path('/dev/mapper/' + self.lower_name).stat().st_rdev
         if lower != self.device.lower_device:
             raise ValueError('Native control bound to unexpected lower device')

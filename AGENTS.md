@@ -45,7 +45,7 @@ resolved from context/evidence, not for routine implementation decisions.
   partition, root-ext4 file or hidden-volume metadata dependency. /run ownership
   locks are volatile. Early activation must be possible from an initramfs.
 - One authenticated record covers exactly one hidden 512-byte logical block in
-  48 primary IVs. Full-block authentication prevents old/new fragment mixing;
+  48 primary IVs for AES/ChaCha or 36 for original AEGIS-128. Full-block authentication prevents old/new fragment mixing;
   cross-block transactions, hidden crash recovery and rollback resistance are
   NOT goals. Interrupted updates may leave hidden blocks returning EIO.
 - Decoy access must not depend on hidden-record authentication. A decoy write
@@ -66,11 +66,14 @@ resolved from context/evidence, not for routine implementation decisions.
   scripts/fetch_kernel.py stages the COMPLETE module including dm-audit.h;
   kernel/prepare.py alone stages only the patch and is insufficient for a build.
 - Supported profiles: LUKS2 AES-GCM/random (integrity aead) or ChaCha20-Poly1305
-  via chacha20-random (integrity poly1305), 512- or 4096-byte sectors, 12-byte IV,
-  16-byte tag, integrity v4 fixed padding and ordinary journal. Validate geometry,
+  via chacha20-random (integrity poly1305), or original aegis128-random
+  (integrity aead). All support 512/4096-byte sectors and 16-byte tags; AES/ChaCha
+  use 32-byte keys and 12-byte IVs, AEGIS uses 16-byte keys and 16-byte IVs.
+  Integrity v4 fixed padding and the ordinary journal are required. Validate geometry,
   AAD, extents and arithmetic. Offline diagnostics reject dirty journals; native
   setup delegates replay to Linux before authenticated access.
-- Use maintained crypto primitives. Setup uses Python standard library/cryptsetup; diagnostics use cryptography;
+- Use maintained crypto primitives. Setup uses Python standard library/cryptsetup; diagnostics use cryptography plus the optional pinned
+  SUPERCOP AES-NI reference for original AEGIS-128 (not 128L);
   actual crypto/I/O runs in the experimental kernel module. Retain the independent
   codec and complete primary verifier as cross-checks. Only synthetic test keys.
 
@@ -119,5 +122,5 @@ Use only disposable synthetic data and test keys. Never put keys in argv, logs,
 commits, fixtures, or documentation. Keep generated disks, VM images, secrets and
 large downloaded sources out of git; add scoped ignore rules when creating them.
 Do not touch real disks or erase/format unrelated storage. Default destructive
-experiments to guest-owned disposable images. Do not commit or publish unless
-requested. Keep source revision and test-environment provenance reproducible.
+experiments to guest-owned disposable images. Commit each completed, verified update automatically (standing user authorization).
+Do not publish or push unless requested. Keep source revision and test-environment provenance reproducible.

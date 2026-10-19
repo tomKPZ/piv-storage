@@ -9,7 +9,8 @@ are historical evidence, not requirements for the current implementation.
 
 Architecture: one coordinated kernel owner, two writable native block devices,
 ordinary stock dm-integrity persistence, no separate history/WAL/partition.
-Each 512-byte hidden block is one address-bound authenticated record in 48 IVs.
+Each 512-byte hidden block is one address-bound authenticated record in 48 IVs
+for AES/ChaCha or 36 IVs for original AEGIS-128.
 Fresh salts/encodings replace persistent nonce reservations. Hidden damage is
 local EIO; decoy writes preserve an encrypted invalid marker for unavailable
 hidden data. Full-block hidden writes repair those records. Initialization is an
@@ -23,7 +24,7 @@ Implemented in this working tree:
   separation; all tuples prepared in RAM then applied through stock integrity.
 - Simplified setup and independent v3 decoder; legacy codecs, bootstrap,
   recovery/compaction modules and obsolete state-protocol tests removed.
-- AES-GCM and ChaCha20-Poly1305 primary profiles at 512 or 4096 bytes per
+- AES-GCM, ChaCha20-Poly1305 and original AEGIS-128 primary profiles at 512 or 4096 bytes per
   sector, including geometry-aware native I/O, journal/layout parsing, controls
   and independent diagnostics.
 - Updated interface/security documentation. Results below distinguish tested behavior from untested guarantees.
@@ -51,7 +52,7 @@ conflicting names. Add direct-I/O lower-device failure coverage for both views u
 semantics. Confirm teardown/recreation after fail-stop and local hidden repair;
 do not import the removed exact-transaction recovery expectations.
 
-Then consider bounded batching to reduce repeated 48-primary-sector rewrites
+Then consider bounded batching to reduce repeated full-carrier-group rewrites
 for adjacent decoy sectors (especially eight 512-byte sectors in a 4096-byte
 write), and per-sector read/setup overhead. Each hidden block still needs its
 whole carrier group refreshed. Preserve fresh entropy, whole-block
@@ -324,3 +325,89 @@ matches the frozen package/module inputs used in the VMs. Changes are left
 uncommitted. Next priorities remain direct lower-device EIO/fail-stop/recreate
 coverage and bounded batching; no additional crash, nonce-history, rollback,
 general-host or deniability guarantee was introduced by cipher support.
+
+
+## Session handoff: original AEGIS-128
+
+Standing user authorization: commit each completed verified update automatically;
+do not push/publish without a separate request. ChaCha20-Poly1305 support was
+committed as 8b83aef before this work began.
+
+AEGIS-128 uses the ordinary aegis128-random/aead profile with a 16-byte key,
+16-byte IV and 16-byte tag, at both primary sector sizes. The 576-byte v3 hidden
+record is unchanged; group size is derived as 576/IV_bytes (36 for AEGIS, 48 for
+AES/ChaCha). No external persistence or disk padding. Primary control ABI 2 widens
+IV fields to 16 bytes and tuples to 4128, rejects nonzero unused padding and old
+ABI requests. Native SETUP/STATUS remain ABI 3. Lower-table/journal/offset parsing
+checks tuple-specific geometry against LUKS and the queried owner.
+
+The optional independent SUPERCOP AES-NI diagnostic library is source/SHA pinned;
+it is separate from the maintained Linux primary data path, stdlib-only setup
+and hidden-record decoder. Do not substitute AEGIS-128L or treat the historical
+reference as production crypto. See docs/development.md for its explicit build
+and trusted library-path input. No new host installs/root/modules were required.
+
+Stock aegis-control-4096-001 and aegis-control-512-001 passed full stock readback
+and independent reference authentication. All 27 host tests passed separately
+against all six stock profiles, no skips and ResourceWarning errors enabled.
+Coverage includes both IV widths' torn-record boundaries, primary authentication,
+geometry, CLI extraction/output counts, corruption and unsupported configurations.
+Final review corrected inspect/extract-ivs counts that still assumed 12-byte IVs;
+actual extraction was already geometry-aware. Native bootstrap dependency checks
+still pass without site-packages.
+
+Focused aegis-kernel-4096-001 and aegis-kernel-512-001 built the matched module
+and passed PREPARE/APPLY, independent primary crypto/AAD comparison, primary
+write/restore, padding/corruption rejection, lifecycle and stock final readback.
+Independent host checks authenticated every final sector and matched kernel IVs
+to raw offsets. Original AEGIS primary hashes:
+
+- 4096: a9944fe4990d72988f91464b92ddb4ea25e80010bfdbcf27ec0d108c2921f199
+- 512: 55ea5706557fe00c72c628e4480bfcc41f307eac5c755a143d432072dafa6029
+
+artifacts/aegis-native-4096-001 and aegis-native-512-001 passed the full paired
+writable-device/filesystem suite: absent/damaged/wrong-key isolation, encrypted
+invalid markers and repair, actual boundary/tail mutations and restore, hidden
+preservation/last-block rewrite, concurrent ext4/ext2, clean reopen and stock
+full-primary readback. Independent host verification matched all 28,216 primary
+sectors / 400,896 hidden bytes (4096) and 213,008 sectors / 3,028,992 hidden bytes
+(512) against guest oracles; current IVs were distinct. Final primary hashes:
+
+- 4096: 589e7dea3e01dffd206d19f84bc9451e868e3e19e5e5ab42a4e1daa312c21230
+- 512: e42c7683a69cdfcf4bbf0fbca32de0f9bd6c15e950aaf2d79a714cc60054019a
+
+artifacts/aegis-power-4096-001 observed 32/36 changed current/committed IVs before
+SIGKILL. Stock replay preserved the original primary hash and all 782 other
+hidden blocks; the affected block returned local EIO. Invalid-marker preservation
+and repair passed. Stock and independent final primary/hidden verification passed
+with distinct current IVs. Host page cache survived; no hardware power-loss,
+whole-hidden-record recovery or rollback claim is added.
+
+artifacts/aegis-aes-kernel-001 passed AES control regression, including nonzero
+unused IV/expected-IV padding rejection. Stock/independent final readback retained
+the original AES hash. aegis-aes-native-001 also passed the full paired-device
+regression; independent host verification matched all 28,244 primary sectors and
+301,056 hidden bytes to guest oracles, with distinct current IVs.
+
+artifacts/aegis-early-4096-001 and aegis-early-512-001 passed actual RAM-root
+activation and read/write/restore of both devices without persistent OS storage,
+external metadata or a Python crypto package. Independent final primary/hidden
+verification passed for both boot images, matching the native oracles with
+distinct current IVs. Both sector sizes retain early-boot support.
+
+Kernel stage vendor/kernel-build/aegis-001 and complete scaffold
+artifacts/aegis-input-001/scaffold.tar exactly match current kernel files. Guest
+is still pinned Debian 6.12.113+deb13-amd64 / source 6.12.113-1 / cryptsetup
+2:2.7.5-2, with matching config/symbol checks. VM packages are frozen; later
+changes affect only reporting, comments/indentation and an unused constant,
+not executed native paths. Both initramfs builds include aegis128 explicitly.
+
+Next priorities remain direct lower-device EIO/fail-stop/recreate coverage and
+bounded batching. Cipher support adds no general-host, historical nonce-safety,
+crash recovery or deniability guarantee. The long 512-byte suite still exposes
+per-sector/full-volume setup and repeated carrier-refresh costs under QEMU TCG.
+
+Python compilation, changed-shell syntax and git diff --check passed. Successful
+guest logs contained no unexpected compiler warnings or kernel BUG/Oops/WARNING
+diagnostics. All requested AEGIS-128 implementation and verification work is
+complete; commit this update under the standing user authorization.

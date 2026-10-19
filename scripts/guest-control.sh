@@ -17,15 +17,16 @@ PIV_SECTOR_SIZE=${PIV_SECTOR_SIZE:-4096}
 case "$PIV_SECTOR_SIZE" in 512|4096) ;; *) exit 1;; esac
 PIV_PRIMARY_CIPHER=${PIV_PRIMARY_CIPHER:-aes-gcm-random}
 case "$PIV_PRIMARY_CIPHER" in
-    aes-gcm-random) primary_integrity=aead ;;
-    chacha20-random) primary_integrity=poly1305 ;;
+    aes-gcm-random) primary_integrity=aead; primary_key_bytes=32 ;;
+    chacha20-random) primary_integrity=poly1305; primary_key_bytes=32 ;;
+    aegis128-random) primary_integrity=aead; primary_key_bytes=16 ;;
     *) exit 1 ;;
 esac
 modprobe dm_integrity
 modprobe dm_crypt
 
 # Synthetic keys are runtime-only files in the ignored, private run directory.
-head -c 32 /dev/urandom > volume.key
+head -c "$primary_key_bytes" /dev/urandom > volume.key
 head -c 32 /dev/urandom > passphrase.key
 device=/dev/vdb
 cleanup() {
@@ -34,7 +35,7 @@ cleanup() {
 trap cleanup EXIT
 
 cryptsetup luksFormat --batch-mode --type luks2 --cipher "$PIV_PRIMARY_CIPHER" \
-    --key-size 256 --sector-size "$PIV_SECTOR_SIZE" --integrity "$primary_integrity" \
+    --key-size "$((primary_key_bytes * 8))" --sector-size "$PIV_SECTOR_SIZE" --integrity "$primary_integrity" \
     --pbkdf pbkdf2 --pbkdf-force-iterations 1000 \
     --volume-key-file volume.key --key-file passphrase.key "$device"
 cryptsetup open --key-file passphrase.key "$device" piv-control

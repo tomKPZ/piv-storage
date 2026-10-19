@@ -43,9 +43,23 @@ class LayoutTests(unittest.TestCase):
                          (data + (32768 + 1792) * 512, tag + (32768 + 1792) * 512))
         self.assertLessEqual(layout.offsets(layout.sectors - 1)[0] + 512, 134217728)
 
+    def test_aegis32_byte_tuple_geometries(self):
+        for size, block, sections, count, run in ((512, 0, 23, 213008, 2048),
+                                                 (4096, 3, 7, 225728, 256)):
+            layout = parse_superblock(header(tuple_size=32, block=block,
+                                             sections=sections, provided=count),
+                                      16777216, 134217728)
+            self.assertEqual((layout.iv_bytes, layout.tuple_bytes, layout.metadata_run_sectors),
+                             (16, 32, run))
+            boundary = 32768 // (size // 512)
+            data, tag = layout.offsets(0)
+            self.assertEqual(layout.offsets(boundary),
+                             (data + (32768 + run) * 512, tag + (32768 + run) * 512))
+            self.assertEqual(layout.offsets(boundary - 1)[1], tag + (boundary - 1) * 32)
+
     def test_reject_unsupported_or_invalid_superblocks(self):
         for change in ({'magic': b'badmagic'}, {'version': 6}, {'flags': 10},
-                       {'flags': 9}, {'tuple_size': 32}, {'block': 1},
+                       {'flags': 9}, {'tuple_size': 30}, {'block': 1},
                        {'interleave': 14}, {'sections': 0}, {'sections': 4097},
                        {'provided': 0}, {'provided': 9}, {'provided': 2**63}):
             with self.subTest(change=change), self.assertRaises(UnsupportedImage):
@@ -66,7 +80,8 @@ class SegmentTests(unittest.TestCase):
                           'journal_integrity': 'none'}}}}
 
     def test_supported_segment(self):
-        for cipher, integrity in (('aes-gcm-random', 'aead'), ('chacha20-random', 'poly1305')):
+        for cipher, integrity in (('aes-gcm-random', 'aead'), ('chacha20-random', 'poly1305'),
+                                   ('aegis128-random', 'aead')):
             for size in (512, 4096):
                 segment = self.metadata['segments']['0']
                 segment['encryption'] = cipher
@@ -101,21 +116,22 @@ class SegmentTests(unittest.TestCase):
 
 class IntegrityTableTests(unittest.TestCase):
     def test_both_stock_geometries_and_reject_mixed_options(self):
-        for size, count, journal, buffer in ((512, 214800, 2024, 128),
-                                             (4096, 28244, 1848, 32)):
+        for size, count, journal, buffer, tuple_size in ((512, 214800, 2024, 128, 28),
+                    (4096, 28244, 1848, 32, 28), (512, 213008, 2024, 128, 32),
+                    (4096, 28216, 1848, 128, 32)):
             options = [f'journal_sectors:{journal}', 'interleave_sectors:32768',
                        f'buffer_sectors:{buffer}', 'journal_watermark:50',
                        'commit_time:10000', 'fix_padding']
             if size == 4096:
                 options.insert(0, 'block_size:4096')
-            table = f'0 {count * (size // 512)} integrity 254:16 32768 28 J {len(options)} ' + ' '.join(options)
-            validate_integrity_table(table, count, os.makedev(254, 16), 16777216, size, journal)
-            for changed in (table.replace('28 J', '32 J'),
+            table = f'0 {count * (size // 512)} integrity 254:16 32768 {tuple_size} J {len(options)} ' + ' '.join(options)
+            validate_integrity_table(table, count, os.makedev(254, 16), 16777216, size, journal, tuple_size)
+            for changed in (table.replace(f'{tuple_size} J', '30 J'),
                             table.replace('fix_padding', 'fix_hmac'),
                             table.replace(f'buffer_sectors:{buffer}', 'buffer_sectors:1'),
                             table.replace(f'journal_sectors:{journal}', 'journal_sectors:1')):
                 with self.subTest(size=size, table=changed), self.assertRaises(ValueError):
-                    validate_integrity_table(changed, count, os.makedev(254, 16), 16777216, size, journal)
+                    validate_integrity_table(changed, count, os.makedev(254, 16), 16777216, size, journal, tuple_size)
 
 
 if __name__ == '__main__':

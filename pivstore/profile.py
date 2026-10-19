@@ -1,7 +1,7 @@
 """Read-only LUKS2/dm-integrity profile, cross-checked with stock Linux fixtures.
 
 LUKS2 header checksums and redundant-header selection are delegated to cryptsetup.
-Only the no-journal-crypto, fixed-padding, 512/4096-byte AES-GCM and ChaCha20-Poly1305 profiles are accepted.
+Only the no-journal-crypto, fixed-padding, 512/4096-byte AES-GCM, ChaCha20-Poly1305 and original AEGIS-128 profiles are accepted.
 """
 
 from contextlib import AbstractContextManager
@@ -42,8 +42,12 @@ class Layout:
         return self.primary_bytes // self.sector_size
 
     @property
+    def tuple_bytes(self):
+        return self.tag_bytes + self.iv_bytes
+
+    @property
     def journal_entry_bytes(self):
-        return ((8 + 8 * (self.sector_size // 512) + 28 + 7) // 8) * 8
+        return ((8 + 8 * (self.sector_size // 512) + self.tuple_bytes + 7) // 8) * 8
 
     def offsets(self, index):
         if not 0 <= index < self.sectors:
@@ -54,7 +58,7 @@ class Layout:
         base = self.integrity_offset + (self.initial_sectors + area * (
             self.interleave_sectors + self.metadata_run_sectors)) * 512
         return (base + (self.metadata_run_sectors + offset) * 512,
-                base + (offset // factor) * 28)
+                base + (offset // factor) * self.tuple_bytes)
 
 
 def read_exact(fd, length, offset, limit):
@@ -71,23 +75,23 @@ def parse_superblock(header, offset, file_size):
         raise UnsupportedImage('Incomplete integrity superblock')
     magic, version, interleave, tuple_size, sections, provided, flags, block = (
         struct.unpack_from('<8sBBHIQIB', header))
-    if (magic, version, interleave, tuple_size, flags) != (
-            b'integrt\0', 4, 15, 28, 8) or block not in (0, 3):
+    if (magic, version, interleave, flags) != (
+            b'integrt\0', 4, 15, 8) or tuple_size not in (28, 32) or block not in (0, 3):
         raise UnsupportedImage('Unsupported integrity superblock profile')
     if offset < 32768 or offset % 4096 or offset + 4096 > file_size:
         raise UnsupportedImage('Invalid integrity offset')
     factor = 1 << block
     if not 1 <= sections <= 4096 or provided <= 0 or provided % factor:
         raise UnsupportedImage('Invalid integrity dimensions')
-    # Pinned Linux: header address8 + saved data-sector tails8*factor + tuple28.
-    entry_bytes = ((8 + 8 * factor + 28 + 7) // 8) * 8
+    # Pinned Linux: header address8 + saved data-sector tails8*factor + tuple[28|32].
+    entry_bytes = ((8 + 8 * factor + tuple_size + 7) // 8) * 8
     section_sectors = (504 // entry_bytes) * 8 * factor + 8
     initial = 8 + section_sectors * sections
-    metadata_run = ((28 * (32768 // factor) + 4095) // 4096) * 8
+    metadata_run = ((tuple_size * (32768 // factor) + 4095) // 4096) * 8
     layout = Layout(offset, provided * 512, sections, section_sectors,
-                    initial, metadata_run, sector_size=512 * factor)
+                    initial, metadata_run, sector_size=512 * factor, iv_bytes=tuple_size - 16)
     data, tag = layout.offsets(layout.sectors - 1)
-    if data + layout.sector_size > file_size or tag + 28 > file_size:
+    if data + layout.sector_size > file_size or tag + tuple_size > file_size:
         raise UnsupportedImage('Primary extents exceed image size')
     return layout
 
@@ -153,6 +157,9 @@ class Image(AbstractContextManager):
                 raise UnsupportedImage('Invalid LUKS2 segment metadata') from exc
             self.encryption = metadata['segments']['0']['encryption']
             self.layout = parse_superblock(self.read(4096, offset), offset, self.size)
+            expected_iv = 16 if self.encryption == 'aegis128-random' else 12
+            if self.layout.iv_bytes != expected_iv:
+                raise UnsupportedImage('LUKS and integrity IV sizes disagree')
             if self.layout.sector_size != metadata['segments']['0']['sector_size']:
                 raise UnsupportedImage('LUKS and integrity sector sizes disagree')
             self.check_empty_journal()
@@ -185,14 +192,14 @@ class Image(AbstractContextManager):
 
     def summary(self):
         return {**asdict(self.layout), 'uuid': self.uuid, 'encryption': self.encryption, 'primary_sectors': self.layout.sectors,
-                'gross_carrier_bytes': self.layout.sectors * 12,
+                'gross_carrier_bytes': self.layout.sectors * self.layout.iv_bytes,
                 'journal': 'validated empty; no replay implemented'}
 
     def iv_slots(self):
         """Yield carrier bytes in logical-sector order; does not authenticate them."""
         for index in range(self.layout.sectors):
             _, tag_offset = self.layout.offsets(index)
-            yield self.read(12, tag_offset + 16)
+            yield self.read(self.layout.iv_bytes, tag_offset + 16)
 
     def verify(self, key):
         from .sector import SectorCodec
@@ -201,7 +208,7 @@ class Image(AbstractContextManager):
         for index in range(self.layout.sectors):
             data_offset, tag_offset = self.layout.offsets(index)
             ciphertext = self.read(self.layout.sector_size, data_offset)
-            metadata = self.read(28, tag_offset)
+            metadata = self.read(self.layout.tuple_bytes, tag_offset)
             plaintext = codec.decrypt(index, ciphertext, metadata)
             digest.update(plaintext)
         return digest.hexdigest()

@@ -25,8 +25,10 @@ def setup(initialize=False):
     assert result.returncode == 0, result.stderr
     value = json.loads(result.stdout)
     primary_bytes = int(subprocess.check_output(['blockdev', '--getsize64', DECOY]))
-    sector_size = json.loads(crypt('luksDump', '--dump-json-metadata', '/dev/vdb').stdout)['segments']['0']['sector_size']
-    assert value['hidden_bytes'] == primary_bytes // sector_size // 48 * 512
+    segment = json.loads(crypt('luksDump', '--dump-json-metadata', '/dev/vdb').stdout)['segments']['0']
+    sector_size = segment['sector_size']
+    iv_size = 16 if segment['encryption'] == 'aegis128-random' else 12
+    assert value['hidden_bytes'] == primary_bytes // sector_size // (576 // iv_size) * 512
     assert value['decoy'] == DECOY and value['hidden'] == HIDDEN
     return value
 
@@ -59,6 +61,7 @@ capacity = geometry['hidden_bytes']
 assert subprocess.check_output(['blockdev', '--getro', HIDDEN]).strip() == b'0'
 assert subprocess.check_output(['blockdev', '--getro', DECOY]).strip() == b'0'
 owner = GuestOwner('/dev/vdb', W / 'passphrase.key')
+iv_size = owner.device.iv_size
 status = native_status(owner.device)
 assert status['active'] and status['views'] == 3 and not status['failed']
 # Legacy controls cannot bypass the shared native owner.
@@ -86,7 +89,7 @@ assert Path(HIDDEN).read_bytes() == before_hidden
 # including the incomplete carrier tail when present. Restore with fresh IVs.
 primary_size = int(subprocess.check_output(['blockdev', '--getsize64', DECOY]))
 sector_size = json.loads(crypt('luksDump', '--dump-json-metadata', '/dev/vdb').stdout)['segments']['0']['sector_size']
-positions = (48 * sector_size - 512, 32768 * 512 - 512, primary_size - 512)
+positions = ((576 // iv_size) * sector_size - 512, 32768 * 512 - 512, primary_size - 512)
 fd = os.open(DECOY, os.O_RDWR | os.O_DIRECT)
 for position in positions:
     length = min(1024, primary_size - position)
@@ -126,7 +129,7 @@ close()
 owner = GuestOwner('/dev/vdb', W / 'passphrase.key')
 owner.device.suspend(); owner.device.begin()
 old_iv = owner.device.read_iv(0, quiesced=True)
-new_iv = os.urandom(12)
+new_iv = os.urandom(owner.device.iv_size)
 prepared = owner.device.prepare(0, old_iv, new_iv)
 owner.device.apply(0, old_iv, prepared)
 owner.device.end(); owner.device.resume(); owner.remove(); owner.close()

@@ -3,6 +3,7 @@ from unittest.mock import patch
 from pivstore.records import Records, BYTES, PAYLOAD
 from pivstore.profile import UnsupportedImage
 from pivstore.blocks import SETUP, STATUS
+from pivstore.kernel_api import READ, UPDATE
 
 
 class RecordTests(unittest.TestCase):
@@ -13,6 +14,9 @@ class RecordTests(unittest.TestCase):
     def test_geometry_and_abi(self):
         self.assertEqual((self.records.count, self.records.capacity), (588, 301056))
         self.assertEqual((SETUP.size, STATUS.size, BYTES, PAYLOAD), (192, 48, 576, 512))
+        self.assertEqual((READ.size, UPDATE.size), (48, 4176))
+        wide = Records(28244, b'test', bytes(32), 16)
+        self.assertEqual((wide.sectors_per_record, wide.count), (36, 784))
         for i in (-1, 588):
             with self.assertRaises(ValueError): self.records.aad(i)
         with self.assertRaises(ValueError): self.records.encode(0, b'short')
@@ -39,7 +43,7 @@ class RecordTests(unittest.TestCase):
     def test_corruption_and_every_sector_torn_boundary(self):
         old = self.records.encode(0, b'A' * 512)
         new = self.records.encode(0, b'B' * 512)
-        for boundary in range(12, BYTES, 12):
+        for boundary in sorted(set(range(12, BYTES, 12)) | set(range(16, BYTES, 16))):
             with self.assertRaises(UnsupportedImage):
                 self.records.decode(0, new[:boundary] + old[boundary:])
         for at in (0, 31, 32, 575):
@@ -60,7 +64,7 @@ class ExtractionTests(unittest.TestCase):
         from types import SimpleNamespace
         from pivstore.records import context
         image = SimpleNamespace(uuid='00000000-0000-0000-0000-000000000000',
-                                layout=SimpleNamespace(sectors=97, primary_bytes=97 * 4096, sector_size=4096))
+                                layout=SimpleNamespace(sectors=97, primary_bytes=97 * 4096, sector_size=4096, iv_bytes=12))
         records = Records(97, context(image), bytes(32))
         carrier = records.encode(0, b'A' * 512) + records.encode(1, b'B' * 512) + b'tail ignored'
         if corrupt:

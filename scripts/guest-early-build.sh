@@ -29,6 +29,7 @@ cp /mnt/piv-work/passphrase.key /mnt/piv-work/hidden.key /mnt/piv-work/guest-ear
  /mnt/piv-work/expected-hidden-volume /mnt/piv-work/expected-primary.sha256 "${DESTDIR}/piv/"
 manual_add_modules virtio_blk
 manual_add_modules dm_integrity
+manual_add_modules aegis128
 manual_add_modules gcm
 manual_add_modules ghash_generic
 manual_add_modules ctr

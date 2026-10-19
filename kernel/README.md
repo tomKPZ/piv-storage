@@ -2,7 +2,7 @@
 
 The experimental module extends dm-crypt and registers paired piv-view targets
 sharing one crypt owner, hidden-record crypto, stateless record authentication.
-Primary encryption supports AES-GCM and ChaCha20-Poly1305 with stored random IVs.
+Primary encryption supports AES-GCM, ChaCha20-Poly1305 and original AEGIS-128 with stored random IVs.
 See [native interface and end-to-end tests](../docs/native-blocks.md).
 The userspace FUSE/NBD adapters have been removed; their historical test results
 remain in ROADMAP.md and Git history. Authenticated sector controls remain for
@@ -39,6 +39,10 @@ python3 scripts/vm.py run --script scripts/guest-kernel.sh \
   --share-file artifacts/control-003/share/volume.key \
   --share-file artifacts/control-003/share/expected.sha256 --timeout 1200
 ```
+
+For original AEGIS-128, additionally share the pinned diagnostic library described
+in docs/development.md as libaegis128-reference.so. Native paired-device and
+early-boot tests do not require this reference.
 
 Use fresh staging/run names. vm.py freezes sources for each run, including reboot.
 Never force module loading. Independent host parsing/authentication and hidden

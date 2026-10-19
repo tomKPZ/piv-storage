@@ -43,7 +43,7 @@ The guest initializes zeros on the stock fixture before introducing dm-delay.
 An O_DIRECT raw observer validates whole journal-section commit IDs, parses the
 pinned 48-byte (512-byte primary) or 104-byte (4096-byte primary) entries and
 combines new committed/current IV addresses. It cuts
-QEMU when some but not all 48 carrier slots have changed. The observer never
+QEMU when some but not all carrier slots (48 for AES/ChaCha, 36 for AEGIS-128) have changed. The observer never
 writes metadata or bypasses the native owner for mutations. Journal inspection
 is test instrumentation, not a second native recovery implementation.
 

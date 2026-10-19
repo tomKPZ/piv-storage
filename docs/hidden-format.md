@@ -1,14 +1,15 @@
 # Stateless hidden block format v3
 
-One logical 512-byte hidden block uses 48 consecutive primary 12-byte IVs, in
-logical primary-sector order. Hidden block i uses primary sectors 48*i through
-48*i+47. There is no header record, allocator, length field or public magic.
-Capacity is floor(primary_sectors/48)*512. Incomplete tail primary sectors carry
+One logical 512-byte hidden block uses 576 consecutive carrier bytes, in
+logical primary-sector order. Let group=576/IV_bytes: 48 primary sectors for
+AES-GCM/ChaCha20-Poly1305 (12-byte IV), or 36 for original AEGIS-128 (16-byte IV).
+Hidden block i uses primary sectors group*i through group*i+group-1. There is no header record, allocator, length field or public magic.
+Capacity is floor(primary_sectors/group)*512. Incomplete tail primary sectors carry
 no hidden block and receive ordinary fresh random IVs on coordinated writes.
 Primary sector size is 512 or 4096 bytes; it changes the primary span of one
 record (24 KiB or 192 KiB), not its encoding or logical hidden-block size.
-Both supported primary ciphers (AES-GCM and ChaCha20-Poly1305) supply the same
-12-byte carrier slots. The independently keyed hidden AEAD and context are
+AEGIS-128 instead spans 18 KiB or 144 KiB per record. Every byte of its
+16-byte IV is a carrier byte; there is no stored padding or discarded IV suffix. The independently keyed hidden AEAD and context are
 unchanged; volume identity and geometry bind the records, and the native owner
 authenticates primary data under the selected primary cipher before access.
 
@@ -49,4 +50,5 @@ except with negligible forgery probability. Old valid whole blocks can still be
 replayed, and valid blocks at different addresses can belong to different times.
 UUID/address binding rejects transplantation, but same-UUID clones and rollback
 have no external freshness anchor. Cross-sector recovery is deliberately absent.
-No prior hidden formats are decoded. Changing UUID or geometry changes the AAD.
+No prior hidden formats are decoded. Changing UUID or primary geometry changes the AAD. Record v3 bytes/context
+are unchanged; the validated primary profile determines slot width/group size.
