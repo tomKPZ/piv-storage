@@ -46,6 +46,7 @@ def validate_integrity_table(table, sectors, raw_device, offset):
 class KernelDevice:
     def __init__(self, control, owner):
         self.fd = None
+        self.control_path = str(control)
         self.owner = Path(owner)
         self.name = self.owner.name
         if not re.fullmatch(r'piv-[a-zA-Z0-9_-]+', self.name):
@@ -57,7 +58,7 @@ class KernelDevice:
             data = bytearray(QUERY.size)
             fcntl.ioctl(self.fd, command(0, QUERY.size, 2), data, True)
             v, size, self.generation, self.sectors, sector, iv, tag, tup, flags, reserved = QUERY.unpack(data)
-            if (v, size, sector, iv, tag, tup, flags, reserved) != (1, 48, 4096, 12, 16, 28, 7, 0):
+            if (v, size, sector, iv, tag, tup, reserved) != (1, 48, 4096, 12, 16, 28, 0) or flags not in (7, 15):
                 raise ValueError('Unsupported kernel control/profile')
             devices = bytearray(16)
             fcntl.ioctl(self.fd, command(7, 16, 2), devices, True)
@@ -66,6 +67,7 @@ class KernelDevice:
             if not stat.S_ISBLK(info.st_mode) or info.st_rdev != os.makedev(major, minor):
                 raise ValueError('Control is bound to a different owner')
             self.lower_device = os.makedev(low_major, low_minor)
+            self.flags = flags
             self.validate_callback = None
         except BaseException:
             self.close()
@@ -83,7 +85,7 @@ class KernelDevice:
         data = bytearray(QUERY.size)
         fcntl.ioctl(self.fd, command(0, QUERY.size, 2), data, True)
         value = QUERY.unpack(data)
-        if value[2:4] != (self.generation, self.sectors) or value[8] != 7:
+        if value[2:4] != (self.generation, self.sectors) or value[8] != self.flags:
             raise OSError(errno.ESTALE, 'Kernel owner changed')
 
     def validate(self):
@@ -126,6 +128,30 @@ class KernelDevice:
         data = bytearray(UPDATE.pack(1, UPDATE.size, self.generation, index,
                                     old_iv, int(defer_flush), prepared, 0))
         fcntl.ioctl(self.fd, command(4, UPDATE.size, 1), data, True)
+
+    def read_primary_sector(self, index):
+        data = bytearray(UPDATE.pack(1, UPDATE.size, self.generation, index,
+                                    bytes(12), 0, bytes(4124), 0))
+        fcntl.ioctl(self.fd, command(9, UPDATE.size), data, True)
+        return UPDATE.unpack(data)[6][:4096]
+
+    def prepare_primary(self, index, old_iv, new_iv, plaintext):
+        if len(plaintext) != 4096 or len(old_iv) != 12 or len(new_iv) != 12:
+            raise ValueError('Invalid primary preparation')
+        data = bytearray(UPDATE.pack(1, UPDATE.size, self.generation, index,
+                                    old_iv, 0, plaintext + bytes(16) + new_iv, 0))
+        fcntl.ioctl(self.fd, command(10, UPDATE.size), data, True)
+        value = UPDATE.unpack(data)[6]
+        if value[-12:] != new_iv:
+            raise OSError(errno.EIO, 'Invalid primary prepare response')
+        return value
+
+    def apply_primary(self, index, old_iv, prepared, *, defer_flush=False):
+        if len(old_iv) != 12 or len(prepared) != 4124:
+            raise ValueError('Invalid primary tuple')
+        data = bytearray(UPDATE.pack(1, UPDATE.size, self.generation, index,
+                                    old_iv, int(defer_flush), prepared, 0))
+        fcntl.ioctl(self.fd, command(11, UPDATE.size, 1), data, True)
 
     def suspend(self):
         dm('suspend', self.name)

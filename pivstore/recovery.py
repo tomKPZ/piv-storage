@@ -220,3 +220,84 @@ class Journal:
         self.path.unlink()
         fsync_dir(self.path.parent)
         self.raw = None
+
+
+class SparseJournal(Journal):
+    """v2 sparse transactions; indices remain logical primary-sector indices.
+
+    The count is derived from the bounded ciphertext length before decryption;
+    address ordering and the IV digest are checked after complete authentication.
+    """
+    def create(self, carrier, entries):
+        count = len(carrier) // 12
+        if len(carrier) % 12 or not 1 <= count <= self.sectors:
+            raise ValueError('Invalid sparse carrier size')
+        salt = secrets.token_bytes(32)
+        header = MAGIC + salt
+        encryptor = Cipher(algorithms.AES(derive(self.key, salt, self.aad)), modes.GCM(bytes(12))).encryptor()
+        encryptor.authenticate_additional_data(header + self.aad)
+
+        def produce(stream):
+            stream.write(header)
+            stream.write(encryptor.update(HEADER.pack(b'PIVTXN02', count, hashlib.sha256(carrier).digest())))
+            previous = -1
+            seen = 0
+            for index, old, value in entries:
+                if (not previous < index < self.sectors or len(old) != 12 or len(value) != 4124 or
+                        value[-12:] != carrier[seen * 12:(seen + 1) * 12]):
+                    raise ValueError('Invalid sparse transaction entry')
+                stream.write(encryptor.update(ENTRY.pack(index, old, value)))
+                previous = index
+                seen += 1
+            if seen != count:
+                raise ValueError('Incomplete sparse transaction')
+            stream.write(encryptor.finalize())
+            stream.write(encryptor.tag)
+        atomic_stream(self.path, produce, exclusive=True)
+
+    def load(self):
+        # Reuse the full authentication prepass with an exact size inferred from
+        # the bounded file length, never decrypted untrusted metadata.
+        info = self.path.lstat()
+        minimum = 40 + HEADER.size + 16
+        if not minimum < info.st_size <= self.expected_size or (info.st_size - minimum) % ENTRY.size:
+            raise UnsupportedImage('Invalid sparse journal length')
+        maximum = self.expected_size
+        self.expected_size = info.st_size
+        try:
+            return super().load()
+        finally:
+            self.expected_size = maximum
+
+    def entries(self):
+        if self.raw is None:
+            raise ValueError('Journal must be authenticated before replay')
+        raw = self.raw
+        expected_count = (len(raw) - 40 - HEADER.size - 16) // ENTRY.size
+        decryptor = Cipher(algorithms.AES(derive(self.key, raw[8:40], self.aad)),
+                           modes.GCM(bytes(12), raw[-16:])).decryptor()
+        decryptor.authenticate_additional_data(raw[:40] + self.aad)
+        buffer = bytearray()
+        count = 0
+        previous = -1
+        expected_hash = None
+        digest = hashlib.sha256()
+        for offset in range(40, len(raw) - 16, CHUNK):
+            buffer.extend(decryptor.update(raw[offset:min(offset + CHUNK, len(raw) - 16)]))
+            if expected_hash is None and len(buffer) >= HEADER.size:
+                magic, sectors, expected_hash = HEADER.unpack(buffer[:HEADER.size])
+                del buffer[:HEADER.size]
+                if magic != b'PIVTXN02' or sectors != expected_count:
+                    raise ValueError('Invalid sparse journal header')
+            while expected_hash is not None and len(buffer) >= ENTRY.size:
+                index, old, value = ENTRY.unpack(buffer[:ENTRY.size])
+                del buffer[:ENTRY.size]
+                if not previous < index < self.sectors or count >= expected_count or old == value[-12:]:
+                    raise ValueError('Invalid sparse entry address/IV')
+                digest.update(value[-12:])
+                previous = index
+                count += 1
+                yield index, old, value
+        decryptor.finalize()
+        if buffer or count != expected_count or digest.digest() != expected_hash:
+            raise ValueError('Incomplete sparse transaction')

@@ -1,11 +1,24 @@
+#include <crypto/hash.h>
+#include <linux/fs.h>
+#include <linux/magic.h>
+#include <linux/highmem.h>
+#include <linux/sort.h>
+#include <linux/vmalloc.h>
+#include <linux/unaligned.h>
+#include <linux/rbtree.h>
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Included after native AEAD helpers. cc is borrowed only while lock is held.
  * misc_open serializes our open callback with misc_deregister via misc_mtx.
  * A registration reference survives deregistration; each open takes its own.
  * Open fds pin THIS_MODULE and remain valid (ENODEV) after target destruction.
  */
+struct piv_native;
+static LIST_HEAD(piv_controls);
+static DEFINE_MUTEX(piv_controls_lock);
 static atomic64_t piv_generation = ATOMIC64_INIT(0);
 struct piv_control {
+	struct list_head list;
+	struct piv_native *native;
 	struct miscdevice misc;
 	struct kref refs;
 	struct mutex lock;
@@ -178,7 +191,7 @@ static int piv_read_iv(struct piv_control *p, struct piv_read_iv *out, bool quie
 }
 
 static int piv_update(struct piv_control *p, struct file *file,
-		      struct piv_update *u, bool prepare)
+		      struct piv_update *u, bool prepare, bool primary, bool internal)
 {
 	struct crypt_config *cc = p->cc;
 	struct piv_sector *old = NULL, *candidate = NULL;
@@ -190,16 +203,16 @@ static int piv_update(struct piv_control *p, struct file *file,
 		return ret;
 	if (u->reserved || (u->flags && (prepare || u->flags != PIV_APPLY_DEFER_FLUSH)))
 		return -EINVAL;
-	if (!piv_quiesced(p) || !p->transaction || p->controller != file)
+	if (!internal && (!piv_quiesced(p) || !p->transaction || p->controller != file))
 		return -EBUSY;
 	if (p->failed)
 		return -EIO;
-	if (prepare && memchr_inv(u->tuple, 0, 4112))
+	if (prepare && memchr_inv(u->tuple + (primary ? 4096 : 0), 0, primary ? 16 : 4112))
 		return -EINVAL;
 	ret = piv_load(cc, u->sector, &old);
 	if (ret)
 		goto done;
-	/* Exact replay is safe even after an unacknowledged successful write. */
+	/* Exact replay performs no new encryption or changed data write. */
 	if (!prepare && !memcmp(old->original, u->tuple, PIV_TUPLE_BYTES)) {
 		ret = u->flags ? 0 : blkdev_issue_flush(cc->dev->bdev);
 		goto io_done;
@@ -221,6 +234,8 @@ static int piv_update(struct piv_control *p, struct file *file,
 		if (ret)
 			goto done;
 		p->encryptions++;
+		if (primary)
+			memcpy(page_address(old->page), u->tuple, 4096);
 		ret = piv_crypto(cc, old, u->tuple + 4112);
 		if (!ret) {
 			memcpy(u->tuple, page_address(old->page), 4096);
@@ -228,7 +243,7 @@ static int piv_update(struct piv_control *p, struct file *file,
 		}
 		goto done;
 	}
-	/* Authenticate the supplied tuple and enforce identical primary plaintext. */
+	/* Authenticate candidate; hidden-only APPLY also requires identical plaintext. */
 	candidate = kzalloc(sizeof(*candidate), GFP_NOIO);
 	if (!candidate) {
 		ret = -ENOMEM;
@@ -249,7 +264,7 @@ static int piv_update(struct piv_control *p, struct file *file,
 	ret = piv_crypto(cc, candidate, NULL);
 	if (ret)
 		goto done;
-	if (memcmp(page_address(candidate->page), page_address(old->page), 4096)) {
+	if (!primary && memcmp(page_address(candidate->page), page_address(old->page), 4096)) {
 		ret = -EPERM;
 		goto done;
 	}
@@ -271,26 +286,71 @@ done:
 	return ret;
 }
 
+/* A replay-only activation can leave valid committed journal entries on disk:
+ * native postsuspend initializes the journal only after wrote_to_journal. Copy
+ * one authenticated CURRENT tuple through the same target before END. This is
+ * not encryption, consumes no nonce, and needs no external recovery plan because
+ * every byte is identical. Native journaling still protects its sector atomicity.
+ */
+static int piv_checkpoint(struct crypt_config *cc)
+{
+	struct piv_sector *s = NULL;
+	int ret;
+
+	ret = piv_load(cc, 0, &s);
+	if (ret)
+		return ret;
+	memcpy(page_address(s->page), s->original, 4096);
+	memcpy(s->io.integrity_metadata, s->original + 4096, 28);
+	ret = piv_bio(cc, s, REQ_OP_WRITE | REQ_SYNC | REQ_FUA);
+	if (!ret)
+		ret = submit_bio_wait(s->bio);
+	if (!ret)
+		ret = blkdev_issue_flush(cc->dev->bdev);
+	piv_sector_free(cc, s);
+	return ret;
+}
+
+#include "piv-native.inc"
+
 static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct piv_control *p = file->private_data;
 	struct piv_read_iv read;
 	struct piv_query profile;
+	struct piv_native_status status = {};
+	struct piv_native_setup *setup = NULL;
+	u8 *seeds = NULL;
 	struct piv_update *update = NULL;
-	bool updating = cmd == PIV_PREPARE || cmd == PIV_APPLY;
+	bool preparing = cmd == PIV_PREPARE || cmd == PIV_PREPARE_PRIMARY;
+	bool primary = cmd == PIV_PREPARE_PRIMARY || cmd == PIV_APPLY_PRIMARY;
+	bool updating = preparing || cmd == PIV_APPLY || cmd == PIV_APPLY_PRIMARY;
+	bool data_request = updating || cmd == PIV_READ_PRIMARY;
 	unsigned int noio;
 	long ret = 0;
 
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
 	if (cmd != PIV_QUERY && cmd != PIV_DEVICES && cmd != PIV_READ_IV && cmd != PIV_READ_QUIESCED &&
-	    cmd != PIV_BEGIN && cmd != PIV_END && cmd != PIV_SYNC && !updating)
+	    cmd != PIV_BEGIN && cmd != PIV_END && cmd != PIV_SYNC &&
+	    cmd != PIV_NATIVE_SETUP && cmd != PIV_NATIVE_DETACH && cmd != PIV_NATIVE_STATUS && !data_request)
 		return -ENOTTY;
-	if (updating) {
+	if (cmd == PIV_NATIVE_SETUP) {
+		setup = memdup_user((void __user *)arg, sizeof(*setup));
+		if (IS_ERR(setup)) return PTR_ERR(setup);
+		if (setup->version != 1 || setup->size != sizeof(*setup) || setup->nonce_count > (1U << 20)) {
+			ret = -EINVAL; goto out;
+		}
+		/* User faults must never occur under the owner's lifecycle lock. */
+		if (setup->nonce_count) {
+			seeds = vmemdup_user(u64_to_user_ptr(setup->nonce_pointer), setup->nonce_count * 12);
+			if (IS_ERR(seeds)) { ret = PTR_ERR(seeds); seeds = NULL; goto out; }
+		}
+	} else if (data_request) {
 		update = memdup_user((void __user *)arg, sizeof(*update));
 		if (IS_ERR(update))
 			return PTR_ERR(update);
-	} else if (cmd != PIV_QUERY && cmd != PIV_DEVICES &&
+	} else if (cmd != PIV_QUERY && cmd != PIV_DEVICES && cmd != PIV_NATIVE_STATUS &&
 		   copy_from_user(&read, (void __user *)arg, sizeof(read))) {
 		return -EFAULT;
 	}
@@ -298,9 +358,46 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	noio = memalloc_noio_save();
 	if (!p->live)
 		ret = -ENODEV;
+	else if (cmd == PIV_NATIVE_STATUS) {
+		status.generation = p->profile.generation;
+		if (p->native) {
+			status.active = 1; status.views = p->native->views; status.failed = p->native->failed;
+			status.hidden_bytes = p->native->hidden_bytes; status.nonces = p->native->nonce_count;
+			status.log_bytes = p->native->position;
+		}
+	} else if (cmd == PIV_NATIVE_SETUP)
+		ret = pn_setup(p, file, setup, seeds);
+	else if (cmd == PIV_NATIVE_DETACH) {
+		ret = piv_identity(p, read.version, read.size, read.generation, read.sector, sizeof(read));
+		if (!ret && (read.sector || memchr_inv(read.iv, 0, 12) || memchr_inv(read.reserved, 0, sizeof(read.reserved)))) ret = -EINVAL;
+		if (!ret && (!p->native || p->native->views)) ret = -EBUSY;
+		if (!ret && !p->failed && !p->native->failed) {
+			ret = piv_checkpoint(p->cc);
+			if (ret) { p->failed = true; p->native->failed = true; }
+		}
+		if (!ret) { pn_free(p->native); p->native = NULL; }
+	} else if (p->native && cmd != PIV_QUERY && cmd != PIV_DEVICES)
+		ret = -EBUSY;
 	else if (updating)
-		ret = piv_update(p, file, update, cmd == PIV_PREPARE);
-	else if (cmd == PIV_READ_IV || cmd == PIV_READ_QUIESCED)
+		ret = piv_update(p, file, update, preparing, primary, false);
+	else if (cmd == PIV_READ_PRIMARY) {
+		struct piv_sector *sector = NULL;
+		ret = piv_identity(p, update->version, update->size, update->generation,
+				   update->sector, sizeof(*update));
+		if (!ret && (update->flags || update->reserved ||
+		    memchr_inv(update->expected_iv, 0, 12) ||
+		    memchr_inv(update->tuple, 0, PIV_TUPLE_BYTES)))
+			ret = -EINVAL;
+		if (!ret && (p->blocked || p->failed))
+			ret = -EBUSY;
+		if (!ret)
+			ret = piv_load(p->cc, update->sector, &sector);
+		if (!ret) {
+			memcpy(update->tuple, page_address(sector->page), 4096);
+			memcpy(update->tuple + 4112, sector->original + 4112, 12);
+		}
+		piv_sector_free(p->cc, sector);
+	} else if (cmd == PIV_READ_IV || cmd == PIV_READ_QUIESCED)
 		ret = piv_read_iv(p, &read, cmd == PIV_READ_QUIESCED);
 	else if (cmd == PIV_QUERY || cmd == PIV_DEVICES)
 		profile = p->profile;
@@ -323,7 +420,8 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			if (!p->transaction || p->controller != file)
 				ret = -EPERM;
 			else {
-				ret = blkdev_issue_flush(p->cc->dev->bdev);
+				ret = cmd == PIV_END ? piv_checkpoint(p->cc) :
+					blkdev_issue_flush(p->cc->dev->bdev);
 				if (!ret && cmd == PIV_END) {
 					p->transaction = false;
 					p->controller = NULL;
@@ -335,16 +433,21 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	memalloc_noio_restore(noio);
 	mutex_unlock(&p->lock);
 	if (!ret) {
-		if (cmd == PIV_DEVICES)
+		if (cmd == PIV_NATIVE_STATUS)
+			ret = copy_to_user((void __user *)arg, &status, sizeof(status)) ? -EFAULT : 0;
+		else if (cmd == PIV_DEVICES)
 			ret = copy_to_user((void __user *)arg, &p->devices, sizeof(p->devices)) ? -EFAULT : 0;
 		else if (cmd == PIV_QUERY)
 			ret = copy_to_user((void __user *)arg, &profile, sizeof(profile)) ? -EFAULT : 0;
 		else if (cmd == PIV_READ_IV || cmd == PIV_READ_QUIESCED)
 			ret = copy_to_user((void __user *)arg, &read, sizeof(read)) ? -EFAULT : 0;
-		else if (cmd == PIV_PREPARE)
+		else if (preparing || cmd == PIV_READ_PRIMARY)
 			ret = copy_to_user((void __user *)arg, update, sizeof(*update)) ? -EFAULT : 0;
 	}
+out:
+	kvfree_sensitive(seeds, setup ? setup->nonce_count * 12 : 0);
 	kfree_sensitive(update);
+	kfree_sensitive(setup);
 	return ret;
 }
 
@@ -434,7 +537,7 @@ static int piv_register(struct crypt_config *cc, struct dm_target *ti)
 		.sectors = ti->len >> cc->sector_shift,
 		.sector_size = cc->sector_size, .iv_size = cc->iv_size,
 		.tag_size = cc->integrity_tag_size, .tuple_size = cc->tuple_size,
-		.flags = PIV_QUERY_LOWER_WRITE | PIV_QUERY_PRIMARY_FILTER | PIV_QUERY_MUTATION,
+		.flags = PIV_QUERY_LOWER_WRITE | PIV_QUERY_PRIMARY_FILTER | PIV_QUERY_MUTATION | PIV_QUERY_PRIMARY_CONTROL,
 	};
 	p->devices = (struct piv_devices) {
 		.owner_major = MAJOR(disk_devt(dm_disk(dm_table_get_md(ti->table)))),
@@ -454,6 +557,7 @@ static int piv_register(struct crypt_config *cc, struct dm_target *ti)
 		return ret;
 	}
 	cc->piv_control = p;
+	mutex_lock(&piv_controls_lock); list_add_tail(&p->list, &piv_controls); mutex_unlock(&piv_controls_lock);
 	return 0;
 }
 
@@ -462,10 +566,12 @@ static void piv_unregister(struct crypt_config *cc)
 	struct piv_control *p = cc->piv_control;
 	if (!p)
 		return;
+	mutex_lock(&piv_controls_lock); list_del(&p->list); mutex_unlock(&piv_controls_lock);
 	mutex_lock(&p->lock);
 	p->live = false;
 	p->blocked = true;
 	p->cc = NULL;
+	pn_free(p->native); p->native = NULL;
 	mutex_unlock(&p->lock);
 	misc_deregister(&p->misc);
 	kref_put(&p->refs, piv_free);

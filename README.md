@@ -4,13 +4,13 @@ Research prototype for storing an independently encrypted auxiliary payload in
 the persistent random IVs of a Linux authenticated encrypted block volume,
 while preserving the primary volume's plaintext and authentication.
 
-**Status:** an initial offline pack/unpack prototype is implemented, including
-inspection, IV extraction, primary authentication and copy-output updates.
-An online service now provides a read-only NBD primary export and one writable
-FUSE hidden file, using serialized whole-image replacement for regular files.
-Stock Linux authenticated both random-IV replacements and a packed image without
-changing primary plaintext. This is a research prototype, not a production
-storage format or a deniability guarantee.
+**Status:** the offline and userspace prototypes are implemented. The new native
+interface exposes two writable device-mapper block devices, decoy and hidden,
+with encryption and coordinated updates in the kernel. Setup returns without
+leaving an NBD/FUSE service running. See [native block usage](docs/native-blocks.md).
+The implementation remains restricted to a pinned disposable QEMU guest and one
+supported authenticated LUKS2 profile; it is not production storage or a
+proven deniability mechanism.
 This README and [ROADMAP.md](ROADMAP.md) are working
 hypotheses, not a fixed specification. Change them when experiments or source
 inspection provide better evidence; record consequential decisions and why.
@@ -25,14 +25,15 @@ The implemented offline compatibility baseline can:
    changing their plaintext.
 4. Produce an image readable by unmodified Linux dm-crypt and cryptsetup.
 
-The current online target is one writable hidden file, supplied keys, and a
-read-only primary view on disposable VM storage. The offline
+The current target is two writable block devices suitable for independent
+filesystems, supplied keys, and disposable VM storage. Earlier one-file FUSE
+and NBD backends remain regression references. The offline
 tool and its tests remain the compatibility reference. Broader offline hardening,
 systematic steganalysis/benchmarks, extra profiles and production deployment work
 are deferred so they do not block the online demonstration.
 
-Two coordinated online backends are implemented. The regular-file backend uses
-whole-image replacement, a read-only NBD primary export and FUSE. The native
+Earlier coordinated online backends remain available. The regular-file backend uses
+whole-image replacement, a read-only NBD primary export and FUSE. The original native
 backend uses an opt-in dm-crypt extension, a read-only device-mapper primary view,
 and the same one-file FUSE interface. It authenticates and reencrypts unchanged
 primary sectors through the existing dm-integrity target, without raw metadata
@@ -43,7 +44,12 @@ The native prototype milestones K0–K3 are complete on the pinned disposable
 Debian QEMU guest. See [native build/run instructions](kernel/README.md),
 [implemented protocol and recovery limits](docs/kernel-implementation.md),
 [regular-file usage](docs/online-implementation.md), and [test evidence](ROADMAP.md).
-Neither backend supports ordinary primary writes. Native setup deliberately
+The opt-in v2 backend adds independently encrypted records and coordinated
+read-write primary access through NBD, with encryption/integrity I/O in the
+kernel. Legacy direct crypt views and v1 primary exports remain read-only. The current
+piv-view block interface is writable on both sides. See
+[incremental records and writable usage](docs/incremental-records.md).
+Native setup deliberately
 rejects arbitrary host devices and requires private recovery state on guest root
 ext4. External state is observable evidence and is required for interrupted-update
 recovery; this is not a deniability guarantee.
@@ -83,7 +89,9 @@ private image. It never replaces an existing destination or edits the input.
 32-byte salt, HKDF-SHA256 and ChaCha20-Poly1305 with all framing/padding inside
 encryption. Read [the format and its assumptions](docs/hidden-format.md) before
 changing it. At the tested size, usable hidden capacity is 338,864 bytes.
-Every update rewrites all 28,244 primary sectors; incremental records are deferred.
+Every v1 update rewrites all 28,244 primary sectors. Opt-in native v2 rewrites
+only changed 32-sector records and has 281,920 bytes of hidden capacity on this
+fixture; it is a distinct format with no automatic v1 migration.
 
 Use disposable known-lineage images only: the CLI cannot establish historical
 GCM nonce usage, enforce a primary-key lifetime budget, or make clone branches
@@ -276,7 +284,8 @@ payload. Uniform-looking IVs alone do not prove deniability.
   shell history, and memory can preserve evidence or keys.
 - Primary writes regenerate IVs and can destroy auxiliary records. First support
   offline auxiliary updates and primary read-only use; do not promise survival
-  of arbitrary primary writes.
+  of arbitrary stock primary writes. The v2 coordinated write path preserves
+  hidden records by refreshing their complete encodings with fresh IVs.
 - Authentication detects corruption, not necessarily freshness. Same-address
   rollback may authenticate; rollback resistance needs trusted external state
   or a different explicit assumption.

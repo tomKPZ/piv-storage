@@ -2,7 +2,7 @@
 
 ## Mission and authorization
 
-Continue this project autonomously toward a small online prototype that
+Continue this project autonomously toward a small online prototype, now including coordinated primary writes, that
 stores an independently encrypted auxiliary payload in persistent IVs while
 preserving stock-Linux authentication and primary plaintext. The existing offline
 prototype is the compatibility baseline; the user has reduced further offline
@@ -41,11 +41,18 @@ resolved from context/evidence, not for routine implementation decisions.
 - Preserve the offline CLI and regression tests, but advance the online milestones
   in ROADMAP.md instead of expanding offline hardening or evaluation. Defer
   unrelated benchmarks, alternative profiles and complete environment pinning.
-- Target one writable hidden file and a read-only primary view on disposable VM
-  storage. Reuse the whole-carrier v1 format and serialize commits initially.
-  A general hidden filesystem and primary writes are not required. The first
-  mounted and native kernel demos are complete. Read the latest ROADMAP.md
-  handoff and docs/kernel-implementation.md before choosing further work.
+- The user's intended interface is now TWO writable native block devices, hidden
+  and decoy, supporting independent filesystems without NBD/FUSE in the data path.
+  Read docs/native-blocks.md and the newest roadmap handoff first. Keep setup,
+  persistence, nonce reservations, hidden crypto and both views under one shared
+  kernel owner. External recovery state on the independent guest root filesystem
+  is retained for the prototype; do not claim a self-contained deniable disk.
+- Preserve the existing v1 offline/online/native modes. The preceding extension requested
+  incremental hidden records and coordinated fresh-IV primary writes. The opt-in
+  v2 backend uses 32-sector records and a writable NBD frontend with native kernel
+  crypto. Direct owner bios remain filtered; never enable ordinary native writes
+  or preserve a GCM IV across changed plaintext. Read docs/incremental-records.md
+  and the latest ROADMAP.md handoff for actual status and test evidence.
 - One backend must own the backing storage and coordinate both views. Never edit
   raw metadata behind an independently active dm-crypt mapping. Authentication,
   nonce freshness, cache coherence and minimum commit recovery remain required.
@@ -58,9 +65,12 @@ resolved from context/evidence, not for routine implementation decisions.
   lock, replace the canonical path, and fsync its parent. Reuse this simpler path
   as the reference/fallback during kernel work. Never delete the stable
   .pivstore.lock sidecar on shutdown or recover from orphan staging copies.
-- The native backend is a contained opt-in dm-crypt extension, not a new target.
+- The native backend extends dm-crypt and registers paired piv-view DM targets
+  in the same experimental module.
   Preserve authenticated PREPARE, exact-tuple APPLY and suspend/controller lifetime
-  gates. Persist nonce reservations before encryption and the complete encrypted
+  gates. The new primary preparation/application controls deliberately permit
+  requested plaintext changes, while the original APPLY must still reject them.
+  Persist nonce reservations before encryption and the complete encrypted
   recovery journal before mutation. Authenticate all recovery ciphertext before
   parsing metadata or replay. Never regenerate tuples on uncertain completion.
   Use kernel/README.md to reproduce the K0–K3 tests. Do not claim the external
@@ -104,8 +114,11 @@ resolved from context/evidence, not for routine implementation decisions.
   them; reject unrecovered journal state until a supported workflow is proven.
 - Existing offline updates require a closed mapping. Online updates must pass
   through a single coordinated owner with a defined commit/recovery path;
-  the primary view remains read-only. Ordinary primary writes are unsupported
-  and may destroy hidden data.
+  v1 primary views remain read-only. v2 writes must pass through the coordinated
+  owner, refresh every intersecting hidden record, reserve fresh IVs first and
+  journal exact tuples before mutation. Stock/uncoordinated writes destroy hidden
+  data. Only requested primary bytes may change; hidden-only updates must preserve
+  all primary plaintext. Never expose a direct cached primary view beside v2 NBD.
 - Hidden-record authentication, whole-record transactions, primary-sector
   atomicity and rollback resistance are separate properties.
 - No public hidden magic/header or assumed-random padding. Review pseudorandomness

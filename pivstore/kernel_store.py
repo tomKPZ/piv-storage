@@ -35,7 +35,11 @@ class KernelStore(OnlineStore):
             layout=SimpleNamespace(primary_bytes=self.primary_bytes, sector_size=4096,
                                    sectors=device.sectors))
         self.identity = blob.context(self.description)
+        if getattr(self, 'incremental', False):
+            self.identity += b'/incremental/v2'
         self.journal = Journal(self.state / 'pending', hidden_key, self.identity, device.sectors)
+        if getattr(self, 'incremental', False):
+            self._format_setup()
         try:
             self.lock_fd = os.open(self.state / 'owner.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
             lock_info = os.fstat(self.lock_fd)
@@ -63,11 +67,14 @@ class KernelStore(OnlineStore):
             if any(carrier[i:i + 12] not in self.ledger.used for i in range(0, len(carrier), 12)):
                 raise UnsupportedImage('Current IVs do not belong to the trusted nonce lineage')
             if self.ledger.initialized:
-                self.payload = bytearray(blob.decode(carrier, hidden_key, self.identity))
+                self.payload = bytearray(self._decode_carrier(carrier) if getattr(self, 'incremental', False)
+                                         else blob.decode(carrier, hidden_key, self.identity))
                 self.dirty = False
             else:
                 self.payload = bytearray()
                 self.dirty = True
+                if getattr(self, 'incremental', False):
+                    self.committed = []
             self.device.end()
             self.device.resume()
         except BaseException:

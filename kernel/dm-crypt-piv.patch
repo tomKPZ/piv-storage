@@ -52,27 +52,30 @@
 +	if (ret)
 +		goto bad;
 +
-@@ -3524,0 +3555,6 @@
+@@ -3524,0 +3555,9 @@
 +
++	/* Native dual views bypass this private owner; prohibit cached raw I/O. */
++	if (cc->piv_control && READ_ONCE(cc->piv_control->native))
++		return DM_MAPIO_KILL;
 +	/* Filter before the preflush/discard bypass, including WRITE|PREFLUSH. */
 +	if (cc->piv_enabled && bio_op(bio) != REQ_OP_READ &&
 +	    !(bio_op(bio) == REQ_OP_WRITE && !bio->bi_iter.bi_size &&
 +	      (bio->bi_opf & REQ_PREFLUSH)))
 +		return DM_MAPIO_KILL;
-@@ -3624,0 +3661 @@
+@@ -3624,0 +3664 @@
 +		num_feature_args += cc->piv_enabled;
-@@ -3636,0 +3674,2 @@
+@@ -3636,0 +3677,2 @@
 +			if (cc->piv_enabled)
 +				DMEMIT(" piv_control");
-@@ -3707 +3746 @@
+@@ -3707 +3749 @@
 -	return 0;
 +	return piv_preresume(ti);
-@@ -3714,0 +3754 @@
+@@ -3714,0 +3757 @@
 +	piv_unblock(ti);
-@@ -3721 +3761 @@
+@@ -3721 +3764 @@
 -static int crypt_message(struct dm_target *ti, unsigned int argc, char **argv,
 +static int crypt_message_inner(struct dm_target *ti, unsigned int argc, char **argv,
-@@ -3761,0 +3802,15 @@
+@@ -3761,0 +3805,15 @@
 +static int crypt_message(struct dm_target *ti, unsigned int argc, char **argv,
 +			 char *result, unsigned int maxlen)
 +{
@@ -82,12 +85,35 @@
 +	if (!p)
 +		return crypt_message_inner(ti, argc, argv, result, maxlen);
 +	mutex_lock(&p->lock);
-+	ret = (p->transaction || p->resuming) ? -EBUSY :
++	ret = (p->transaction || p->resuming || p->native) ? -EBUSY :
 +		crypt_message_inner(ti, argc, argv, result, maxlen);
 +	mutex_unlock(&p->lock);
 +	return ret;
 +}
 +
-@@ -3802,0 +3858,2 @@
+@@ -3802,0 +3861,2 @@
 +	.presuspend = piv_presuspend,
 +	.presuspend_undo = piv_unblock,
+@@ -3810 +3870,21 @@
+-module_dm(crypt);
++static int __init piv_module_init(void)
++{
++	int r;
++	pn_wq = alloc_ordered_workqueue("piv-native", WQ_MEM_RECLAIM);
++	if (!pn_wq) return -ENOMEM;
++	r = dm_register_target(&crypt_target);
++	if (r) goto free_wq;
++	r = dm_register_target(&piv_view_target);
++	if (!r) return 0;
++	dm_unregister_target(&crypt_target);
++free_wq:
++	destroy_workqueue(pn_wq); return r;
++}
++static void __exit piv_module_exit(void)
++{
++	dm_unregister_target(&piv_view_target);
++	dm_unregister_target(&crypt_target);
++	destroy_workqueue(pn_wq);
++}
++module_init(piv_module_init);
++module_exit(piv_module_exit);

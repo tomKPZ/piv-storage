@@ -4,7 +4,11 @@ The opt-in dm-crypt patch now supports native authenticated IV reads and
 prepared-tuple updates. Hidden encryption and FUSE stay in userspace. The
 regular-file/NBD backend remains available; native payload commits use the same
 v1 carrier format and can be unpacked offline after closing the native stack.
-This is a disposable QEMU prototype, not a stable kernel ABI or a security proof.
+This describes the older native v1 control adapter. Current two-block-device
+usage and kernel-owned recovery are in [native blocks](native-blocks.md). The optional v2 writable adapter is described in
+[incremental records](incremental-records.md); it retains the private filtered
+owner and adds coordinated primary I/O. This is a disposable QEMU prototype,
+not a stable kernel ABI or a security proof.
 
 ## Ownership and supported format
 
@@ -45,8 +49,10 @@ parsing. The stopped volume's format remains stock-readable.
 
 All commands require CAP_SYS_ADMIN, including use of inherited/passed fds. The
 misc device is mode0600. Query returns version1/size48, owner generation,
-encryption-sector count and sizes; capability flags7 identify lower write access,
-primary mutation filtering and update support. A separate device query binds the
+encryption-sector count and sizes; capability bits1/2/4 identify lower write access,
+primary mutation filtering and update support. Updated modules also advertise
+bit8 (total15) for explicit primary-I/O controls; legacy flags7 are accepted
+only by the v1 adapter. A separate device query binds the
 control to exact owner/lower major/minor numbers. Generation is module-local,
 not a persistent disk identity or nonce log.
 
@@ -79,7 +85,11 @@ the underlying devices honoring ordering/flushes. The kernel cannot make the
 whole v1 record atomic in that journal; external recovery provides that property.
 
 Exact current-tuple equality is an idempotent replay, including after a lost
-acknowledgment. It does not reencrypt. Other applies require the expected old IV;
+acknowledgment. It does not reencrypt. END resubmits one authenticated current
+sector tuple unchanged before flushing, ensuring native dm-integrity also
+checkpoints replay-only journal entries on subsequent shutdown. This copy is not
+an encryption invocation and spends no nonce. It can write integrity journal
+metadata even during otherwise read-only service startup. Other applies require the expected old IV;
 a valid proposed tuple with changed primary plaintext is refused. Reusing the
 current IV for new encryption is refused. Global/historical nonce uniqueness is
 the controller's responsibility, not solved by one-sector checks.

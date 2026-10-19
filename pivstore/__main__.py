@@ -41,6 +41,7 @@ def main():
     extraction.add_argument('image', type=Path)
     extraction.add_argument('--output', type=Path, required=True)
     extraction.add_argument('--hidden-key-file', type=Path, required=True)
+    extraction.add_argument('--incremental', action='store_true', help='Extract the opt-in v2 record format')
     service = sub.add_parser('serve', help='Run coordinated read-only NBD and one hidden FUSE file')
     service.add_argument('image', type=Path)
     service.add_argument('--volume-key-file', type=Path, required=True)
@@ -59,8 +60,31 @@ def main():
     kernel.add_argument('--mountpoint', type=Path, required=True)
     kernel.add_argument('--name', default='piv-native')
     kernel.add_argument('--initialize', action='store_true')
+    kernel.add_argument('--incremental', action='store_true', help='Opt-in v2 records and coordinated writable NBD primary')
+    kernel.add_argument('--socket', type=Path, help='Private new NBD socket, required with --incremental')
+    for action in ('open-blocks', 'close-blocks'):
+        block = sub.add_parser(action, help='Configure/remove the two native writable DM views')
+        block.add_argument('--device', type=Path, default=Path('/dev/vdb'))
+        block.add_argument('--key-file', type=Path, required=True)
+        block.add_argument('--name', default='piv-native')
+        if action == 'open-blocks':
+            block.add_argument('--hidden-key-file', type=Path, required=True)
+            block.add_argument('--state-directory', type=Path)
+            block.add_argument('--initialize', action='store_true')
     args = parser.parse_args()
     try:
+        if args.action in ('open-blocks', 'close-blocks'):
+            from .blocks import open_blocks, close_blocks
+            if args.action == 'open-blocks':
+                with args.hidden_key_file.open('rb') as stream:
+                    hidden_key = stream.read(33)
+                result = open_blocks(args.device, args.key_file, hidden_key,
+                                     state_directory=args.state_directory, name=args.name,
+                                     initialize=args.initialize)
+                print(json.dumps(result, indent=2))
+            else:
+                close_blocks(args.device, args.key_file, name=args.name)
+            return 0
         if args.action == 'serve-kernel':
             from .kernel_owner import GuestOwner
             from .kernel_store import KernelStore
@@ -69,11 +93,21 @@ def main():
                 hidden_key = stream.read(33)
             if len(hidden_key) != 32:
                 raise ValueError('Hidden key must contain exactly 32 bytes')
+            if args.incremental != bool(args.socket):
+                raise ValueError('--incremental and --socket must be supplied together')
+            from .incremental_store import IncrementalStore
+            from .nbd import PrimaryServer
+            store_class = IncrementalStore if args.incremental else KernelStore
             owner = GuestOwner(args.device, args.key_file, args.name)
             try:
-                with KernelStore(owner.device, args.state_directory, hidden_key, owner.uuid,
+                if args.incremental:
+                    from .kernel_api import dm
+                    if dm('info', owner.view_name, check=False).returncode == 0:
+                        dm('remove', owner.view_name)  # Refuse an in-use direct view.
+                with store_class(owner.device, args.state_directory, hidden_key, owner.uuid,
                                  initialize=args.initialize) as store:
-                    primary = owner.presentation()
+                    primary = None if args.incremental else owner.presentation()
+                    server = None
                     fsname = 'pivstore-kernel-' + owner.uuid
                     # The UUID/global lock prove no live controller owns this mount.
                     existing = subprocess.run(['findmnt', '-n', '-o', 'SOURCE', '--mountpoint',
@@ -84,8 +118,17 @@ def main():
                             raise ValueError('Mountpoint belongs to a different filesystem')
                         subprocess.run(['fusermount3', '-uz', str(args.mountpoint)], check=True)
                     args.mountpoint.mkdir(mode=0o700, parents=True, exist_ok=True)
-                    print('Native read-only primary: ' + str(primary), flush=True)
-                    mount(store, args.mountpoint, fsname=fsname)
+                    try:
+                        if args.incremental:
+                            server = PrimaryServer(args.socket, store)
+                            server.start()
+                            print('Coordinated writable primary NBD socket: ' + str(args.socket), flush=True)
+                        else:
+                            print('Native read-only primary: ' + str(primary), flush=True)
+                        mount(store, args.mountpoint, fsname=fsname)
+                    finally:
+                        if server is not None:
+                            server.stop()
             finally:
                 owner.close()
             return 0
@@ -122,7 +165,7 @@ def main():
             with args.hidden_key_file.open('rb') as stream:
                 hidden_key = stream.read(33)
             if args.action == 'unpack':
-                result = unpack(args.image, args.output, hidden_key)
+                result = unpack(args.image, args.output, hidden_key, incremental=args.incremental)
             else:
                 with args.volume_key_file.open('rb') as stream:
                     primary_key = stream.read(33)

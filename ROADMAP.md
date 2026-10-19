@@ -5,6 +5,45 @@ approach. The user has narrowed the offline prototype to make room for an
 online implementation; the active priorities below supersede historical next
 steps in the session notes.
 
+## Current migration: two native writable block devices
+
+The user clarified the intended interface: configure a backing device and key
+files, receive decoy and hidden writable block devices for independent filesystems.
+This supersedes NBD/FUSE as the finished native interface. Retain them as regression
+baselines. The selected implementation adds two piv-view DM targets sharing the
+extended crypt owner, kernel hidden crypto, nonce history and a durable encrypted
+log on independent guest root ext4. Userspace only initializes/configures mappings.
+Implementation and filesystem/recovery validation are complete within the pinned
+disposable-VM scope; see the latest session handoff below and
+docs/native-blocks.md. Do not confuse a successful block interface with generic
+host deployment, on-device-only recovery, production durability or deniability.
+
+Exit: both devices work after setup exits; concurrent real filesystems preserve
+each other's contents; native record encoding matches independent userspace
+extraction; reservation/WAL durability precedes encryption/writes; VM loss and
+kernel-owned replay recover both views without reencryption; stock Linux and host
+verify complete primary hashes. Keep original regressions passing and record
+error cases/source/environment precisely.
+
+## Current extension: incremental records and coordinated primary writes
+
+The user has requested this extension after completion of K0–K3. It supersedes
+previous deferrals of incremental records/primary writes for this bounded scope.
+Status: implemented and verified in artifacts/incremental-004 and
+artifacts/incremental-sector-003; all exit criteria below passed.
+Keep all v1 modes intact. v2 uses independently randomized 32-sector records,
+sparse encrypted exact-tuple recovery journals and a coordinated writable NBD
+frontend backed by native primary crypto/integrity I/O. A direct writable DM
+view would bypass preservation policy; adding an in-kernel userspace broker is
+outside this implementation. See docs/incremental-records.md.
+
+Exit criteria: same-size hidden edits affect only their records; primary writes
+preserve hidden contents, change only requested plaintext, and refresh all touched
+record IVs; nonce reservations precede encryption; recovery replays exact sparse
+tuples without reencryption; mounted writable ext4 and hidden FUSE operate
+concurrently; stock Linux and the independent host codec verify final results.
+Exercise controller death and actual VM interruption around native journal I/O.
+
 ## Scope decision
 
 The offline compatibility baseline is sufficient: pack/unpack works on one
@@ -544,3 +583,180 @@ passwords, real-data images, or sensitive host information.
   Prototype complete; independent crypto review, systematic deniability analysis,
   production rollback/key policy, incremental records and exhaustive kernel/crash
   hardening remain deliberately deferred, not implied by the successful demo.
+
+### 2026-10-18: incremental records and coordinated primary writes
+
+- User requested incremental hidden records with fresh-IV primary writes after
+  the v1 native prototype. Added an opt-in v2 format; v1 defaults and extraction
+  remain unchanged. See docs/incremental-records.md for setup and exact contract.
+- Records occupy 32 sectors/384 IV bytes, with 320 payload bytes under the existing
+  salted hidden encryption. Record 0 holds encrypted file length; others hold
+  fixed chunks. A same-length edit changes only affected records; resizing also
+  changes length/clears old content as necessary. Fixture capacity is 281,920
+  bytes, with 20 residual sectors carrying no hidden data. Startup still verifies
+  every primary sector and decodes all records; initialization remains a full
+  record-area rewrite. No public carrier format marker or automatic v1 migration.
+- Added READ_PRIMARY/PREPARE_PRIMARY/APPLY_PRIMARY control operations (9/10/11),
+  advertised by capability bit8 (total15). Native code authenticates old data,
+  encrypts supplied primary plaintext with a reserved fresh IV, and authenticates
+  exact candidate tuples before application. The original hidden-only APPLY
+  still refuses changed plaintext. Direct primary bios remain filtered.
+- Writable access uses coordinated NBD with native kernel crypto/integrity I/O.
+  Direct writable DM access would bypass record-preservation policy; a kernel
+  bio-to-userspace broker is not part of this extension. The CLI removes an unused
+  RO wrapper and refuses an in-use one; no independent cached primary view may
+  coexist. NBD advertises WRITE/FLUSH/FUA, with all writes synchronous through
+  complete transaction durability. Unsupported trim/zeroing remain rejected.
+- Primary writes merge partial sectors, refresh each intersecting hidden record
+  while retaining its contents, and change only requested primary bytes. They
+  first flush buffered hidden edits. Nonrecord tail sectors receive fresh random
+  IVs. A shared lock serializes NBD and FUSE operations. Recovery uses encrypted
+  sparse exact-tuple journals, with full ciphertext authentication, address/order,
+  nonce and complete-record coverage validation before any apply. Reservations
+  precede encryption; file/directory journal fsync precedes mutation; exact replay
+  performs no reencryption. Offline unpack --incremental needs only the hidden key.
+- Initial artifacts/incremental-001 passed mounted writes, concurrent FUSE,
+  controller death, in-flight QEMU cut and stock full-primary recovery. Its closed
+  export was correctly rejected by the host parser for nonempty native journal
+  entries; do not call it a passing independent offline verification. Source
+  inspection showed replay-only activations can leave entries because native
+  postsuspend initializes the journal only after wrote_to_journal. END now copies
+  one authenticated current sector tuple unchanged through the SAME lower target
+  before flushing, allowing native checkpointing on shutdown even without new
+  carrier encryption. This spends no nonce and also causes journal writes during
+  otherwise read-only startup. The conservative offline journal check is intact.
+- artifacts/incremental-002 and incremental-sector-002 were intentionally stopped
+  while refining that checkpoint fix, not passing runs. incremental-003 passed
+  mounted tests but its thread-based observer missed the delayed-I/O cut window;
+  the final observer runs in a separate process, independently of controller
+  Python ioctl/GIL scheduling. It closes inherited ownership/controller fds.
+- artifacts/incremental-sector-003 passed final native boundary/negative/lifecycle
+  checks, including native primary preparation checked with independent AES-GCM,
+  hidden-only APPLY refusal of changed plaintext, primary exact replay/restoration,
+  stale/repeated-IV refusal and corrupt-original rejection for the new operations.
+  Stock and host authenticated all 28,244 sectors with original primary SHA256
+  b54b4937b0a9539574c7525d1634b3052cbb3836ca8d46211bb1cf03e4aaf1c4.
+  Independent IV comparisons/current uniqueness, exact source matching and absence
+  of unexpected BUG/Oops/WARNING/KASAN diagnostics passed.
+- Final host suite: 50 tests passed with ResourceWarning errors enabled and
+  PIV_FIXTURE=artifacts/control-003. Nine new cases cover record locality,
+  partial/cross-record/tail primary writes, same-data nonce refresh, crash phases
+  without reencryption, corrupt/sparse/wrong-key recovery rejection, record binding,
+  hidden-only decoding and writable NBD protocol behavior. Syntax/whitespace
+  checks passed. No new host dependencies or privileges; nbd-client is installed
+  only inside disposable guests. Keys/disks/builds remain ignored.
+- Final artifacts/incremental-004 passed the full combined run with final Python
+  and kernel sources matching the frozen inputs exactly: record locality,
+  controller SIGKILL during sparse primary application, real writable ext4/NBD,
+  concurrent hidden FUSE edits, original file preservation and stock file readback.
+  An independent observer saw one delayed write in flight after at least96
+  applied entries; host SIGKILL of QEMU and reboot used the SAME root/data disks.
+  The closed pre-replay snapshot was rejected for a nonempty native journal.
+  Stock integrity replay plus sparse roll-forward recovered both views. Final
+  stock and host all-sector authentication/expected primary SHA256 agreed:
+  e1a9296775585387bdb128980d429b88ddbcc76568f7e97e185ea9ab1dd5f4a8.
+  Host unpack --incremental, with no primary key or external recovery state,
+  extracted the expected47-byte payload. Strict empty-journal parsing now passes.
+  All28,244 current IVs are unique; no unexpected BUG/Oops/WARNING/KASAN appeared
+  in first-phase console or reboot dmesg. Host page cache survives this cut;
+  hardware host power loss, all torn-write patterns and filesystem operations
+  spanning multiple NBD requests were not made atomic or exhaustively tested.
+- This requested extension is complete within the disposable-guest scope. Source,
+  docs and tests remain uncommitted for review; no additional tools or user action
+  are required to finish implementation. Future direct-DM write brokerage,
+  incremental startup/read caching and production hardening are separate work.
+- Remaining limitations: block-level write amplification, external journal/state
+  availability, no independent cross-record freshness commitment, pre-adoption
+  nonce history and clones/rollback, no transparent failed-device rebuild or NBD
+  reconnection under mounted filesystems, no systematic deniability/crypto review
+  or exhaustive kernel/hardware crash testing. Lost external journals can leave
+  independently valid mixed-generation records. Preserve these qualifications;
+  successful recovery assumes the durable private state survives.
+
+
+## Session handoff: native paired writable devices (2026-10-18)
+
+- Implemented a shared kernel owner and two piv-view DM targets. open-blocks
+  accepts a backing device and credential/hidden-key files, initializes or reopens
+  state, prints writable decoy/hidden paths and exits. No userspace data daemon
+  remains. The fixture hidden capacity is fixed at 281,600 bytes. Both logical
+  devices use 512-byte sectors, authenticated 4 KiB primary RMW and independent
+  logical caches. Unsupported discard/zeroing is refused.
+- kernel/piv-native.inc owns record crypto, fresh-IV generation, bounded persistent
+  nonce history, encrypted exact-tuple WAL and recovery through the same lower
+  integrity target. Reservations are fsynced before encryption, WAL before apply,
+  and DONE before write completion. Recovery copies tuples without encryption.
+  Startup authenticates every primary sector, all hidden records, IV uniqueness
+  and history membership. Native ownership blocks private raw bios and old control
+  operations. One shared workqueue and owner lock coordinate both views.
+- Private native.log lives on independent root ext4, never either exposed view.
+  native.phase prevents fallback to obsolete bootstrap history after adoption;
+  missing/empty adopted logs and wrong keys are refused. Userspace imports seeds
+  only during initial adoption. Seed usercopy occurs outside the lifecycle mutex;
+  configuration ABI remains bounded and keys never enter command arguments.
+- Added an independent userspace log authenticator and ABI/history/coverage/phase
+  tests. Its cross-check discovered the C log KDF copies 21 bytes of its literal,
+  yielding pivstore/native/log/v plus context. The decoder and wire specification
+  now match actual persisted bytes. Do not silently change the historical domain.
+- artifacts/dual-002 passed initial concurrent ext4/ext2 native use and stock/host
+  authentication plus hidden extraction. artifacts/dual-004 passed the refined
+  4 KiB-block filesystem demonstration, setup-process exit, raw/RMW writes,
+  concurrent filesystem writes, close/reopen and stock full-primary verification.
+  Its appended power-cut attempt missed the observation window; the combined run
+  is not a passing crash test. Its CLOSED exported disk/log pair is coherent.
+  Host authenticated all 28,244 sectors with SHA256
+  461bcdb24ffaa2a0cbb3521a79080347b68fca68faea6e1acecf3ef7586955fc,
+  extracted the entire expected 281,600-byte hidden volume, and independently
+  authenticated 6,877 native frames/148,340 nonce reservations/383,598,828 bytes.
+- artifacts/dual-build-001 failed compilation (fixed syntax). dual-003 failed
+  target creation after suppressing udev resume rules removed the private mapper
+  symlink; ordinary resume rules restore it. Neither is a passing run. Private
+  owner udev reads can produce expected filtered Buffer I/O errors; they are not
+  public-device failures. Initial large-stack/alignment warnings were corrected
+  with heap allocation and io_min=4096.
+- artifacts/dual-regression-003 passed original native control, primary helper,
+  boundary, corruption and lifetime regressions with the new target registered.
+  artifacts/dual-policy-005 passed direct kernel wrong-key rejection, correct
+  retry, missing/empty history refusal and full primary/hidden/history preservation.
+- artifacts/dual-power-006 passed an actual QEMU kill while dm-delay reported one
+  queued delayed write after durable WAL. A separate observer checks only newly
+  appended frames and DM's queued-write count (sysfs inflight remained zero).
+  The pre-replay snapshot correctly failed offline journal checks. Kernel-owned
+  recovery, hidden byte comparison and stock full-primary verification passed.
+  Nonce count was exactly 148,372 = prior count + 32; replay spent no nonce.
+  Independent host primary SHA256 agreed:
+  bc01324d09d67e7fd65381e78b87540aec459e30e678e6e493a6bc38bd3b6930.
+  Host hidden extraction and all 6,880 log frames/history membership also passed.
+- Final artifacts/dual-final-007 passed with the final seed-copy/lifecycle
+  hardening and adoption marker. An invalid userspace seed pointer returns EFAULT
+  without wedging the owner; fresh initialization, hidden writes across records,
+  primary same-data RMW, close/reopen and complete original-primary preservation
+  passed. Host authenticated all 28,244 sectors with the original b54b4937... hash
+  before the power test. The VM was then killed with one queued delayed write and
+  complete durable WAL; reboot/kernel replay, both logical views and stock
+  full-primary verification passed. Host final SHA256:
+  b30e4067d58ac28b5d6d69368250ec2cbae0e526caf013463834d934442ea0ec.
+  Independent hidden-only extraction matched all 281,600 expected bytes; all 136
+  frames/56,980 reserved nonces/2,822,188 log bytes authenticated, no pending WAL
+  or trailing bytes, and every current IV was unique and in history. The nonce
+  count matched the prior count plus 32, demonstrating no recovery encryption.
+  This run uses raw block tests; concurrent ext4/ext2 was verified separately in
+  dual-004. Its reused recovery-result message mentions concurrent filesystems;
+  that phrase has been removed from the source script to avoid overstating this
+  individual run. Final C inputs match staged dual-007 byte-for-byte; Python data
+  path sources match the frozen guest package. No unexpected compiler warnings,
+  BUG/Oops/WARNING/KASAN or alignment diagnostics appeared in final/reboot logs.
+- Final host suite: 55 tests passed with ResourceWarning errors enabled and
+  PIV_FIXTURE=artifacts/control-003, without skips. Python compilation, guest-shell
+  syntax and git diff whitespace checks passed. No new host tools/privileges.
+  Kernel/header/source remain Debian 6.12.113-1, guest release
+  6.12.113+deb13-amd64, GCC 14.2.0-19, cryptsetup 2:2.7.5-2. Sources/hashes and
+  four permitted config differences remain pinned; stock module is untouched.
+- Remaining work is hardening beyond this prototype: native lower-device/root-log
+  error injection, exhaustive lifecycle races, lockdep/KASAN, batching and safe log
+  compaction/rekey, broader disk geometry, generic host deployment and independent
+  crypto/deniability review. Limit 2^20 recorded nonces/512 MiB log, high write
+  amplification, independent private-state availability, pre-adoption history,
+  clones/snapshot rollback and hardware durability remain explicit limitations.
+  Host page cache survives a QEMU kill; hardware power loss was not tested.
+  Changes remain uncommitted; do not commit unless requested.

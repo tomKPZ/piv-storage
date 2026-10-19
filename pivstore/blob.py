@@ -66,12 +66,16 @@ def pack(source, output, primary_key, hidden_key, payload):
     return rewrite_copy(source, output, primary_key, plan)
 
 
-def unpack(source, output, hidden_key):
+def unpack(source, output, hidden_key, *, incremental=False):
     output = Path(output)
     if output.exists() or output.is_symlink():
         raise FileExistsError('Output must not exist')
     with Image(source) as image:
-        payload = decode(b''.join(image.iv_slots()), hidden_key, context(image))
+        if incremental:
+            from .records import decode_image
+            payload = decode_image(image, hidden_key)
+        else:
+            payload = decode(b''.join(image.iv_slots()), hidden_key, context(image))
         image.check_unchanged()
         fd, name = tempfile.mkstemp(prefix='.pivstore-', suffix='.partial', dir=output.parent)
         temporary = Path(name)

@@ -1,9 +1,15 @@
 # Experimental native dm-crypt backend
 
-The kernel backend now includes authenticated IV reads, prepared-tuple updates,
+The module now also provides two native writable block devices sharing kernel
+record crypto and recovery, configured by open-blocks/close-blocks. See
+[the native block interface](../docs/native-blocks.md) for current usage and tests.
+The older control backend includes authenticated IV reads, prepared-tuple updates,
 transaction gates and a userspace recovery/FUSE adapter. It preserves the same
 v1 hidden encoding and stock-readable AES-GCM/integrity format. Detailed protocol,
 recovery ordering and limitations are in [implementation notes](../docs/kernel-implementation.md).
+An opt-in v2 adapter adds incremental records and a writable NBD primary using
+new native primary-I/O controls. Direct DM views stay read-only; see
+[incremental setup and recovery](../docs/incremental-records.md).
 Final guest runs are recorded in ROADMAP.md; the regular-file backend remains
 available as a reference/fallback.
 

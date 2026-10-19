@@ -1,6 +1,8 @@
 # Kernel backend investigation and proposed next phase
 
-Status: the K0–K3 prototype is implemented and tested. This document preserves
+Status: the K0–K3 prototype is implemented and tested. The subsequent migration
+adds shared piv-view targets and kernel-owned hidden crypto/recovery; see
+[native blocks](native-blocks.md) for the current interface. This document preserves
 the investigation and original design gates; current protocol, ordering and
 limitations are in [implementation notes](kernel-implementation.md), with
 [reproduction instructions](../kernel/README.md) and evidence in ROADMAP.md.

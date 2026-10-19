@@ -1,7 +1,8 @@
 """Bounded, local-only fixed-newstyle NBD primary export with simple replies.
 
-Implements EXPORT_NAME, INFO/GO, LIST, ABORT and read/disconnect transmission.
-Other options are rejected; writes are drained and rejected even for raw clients.
+Implements EXPORT_NAME, INFO/GO, LIST, ABORT and bounded simple transmission.
+Stores opt into write-through WRITE/FLUSH/FUA. Default exports remain read-only;
+prohibited writes are drained and rejected even for raw clients.
 """
 
 import errno
@@ -20,7 +21,8 @@ REPLY_OPTION_MAGIC = 0x3E889045565A9
 REQUEST_MAGIC = 0x25609513
 REPLY_MAGIC = 0x67446698
 MAX_REQUEST = 1024 * 1024
-EXPORT_FLAGS = 3  # HAS_FLAGS | READ_ONLY; no flush/trim/multi-connection promises.
+EXPORT_FLAGS = 3  # Default HAS_FLAGS | READ_ONLY.
+WRITABLE_FLAGS = 13  # HAS_FLAGS | SEND_FLUSH | SEND_FUA; all writes durable.
 
 
 def receive(sock, size):
@@ -38,6 +40,7 @@ def option_reply(sock, option, kind, payload=b''):
 
 
 def session(sock, store):
+    export_flags = WRITABLE_FLAGS if getattr(store, 'primary_writable', False) else EXPORT_FLAGS
     sock.sendall(struct.pack('>QQH', MAGIC, OPTION_MAGIC, 3))
     flags, = struct.unpack('>I', receive(sock, 4))
     if flags & ~3 or not flags & 1:
@@ -53,7 +56,7 @@ def session(sock, store):
         if option == 1:  # EXPORT_NAME
             if payload not in (b'', b'primary'):
                 return
-            sock.sendall(struct.pack('>QH', store.primary_bytes, EXPORT_FLAGS) +
+            sock.sendall(struct.pack('>QH', store.primary_bytes, export_flags) +
                          (b'' if flags & 2 else b'\0' * 124))
             break
         if option == 3 and not payload:  # LIST
@@ -76,7 +79,7 @@ def session(sock, store):
             if name not in (b'', b'primary'):
                 option_reply(sock, option, 0x80000006)
                 continue
-            option_reply(sock, option, 3, struct.pack('>HQH', 0, store.primary_bytes, EXPORT_FLAGS))
+            option_reply(sock, option, 3, struct.pack('>HQH', 0, store.primary_bytes, export_flags))
             # Byte-addressable server; the kernel frontend normally uses 512-byte
             # requests. Minimum 1 avoids imposing an unnegotiated alignment limit.
             option_reply(sock, option, 3, struct.pack('>HIII', 3, 1, 4096, MAX_REQUEST))
@@ -93,12 +96,22 @@ def session(sock, store):
             return
         if command == 2:  # DISC: no reply
             return
-        if command == 1:  # WRITE has a payload, even though prohibited.
-            receive(sock, length)
+        if command == 1:  # WRITE always has a payload, including prohibited writes.
+            data = receive(sock, length)
         result = b''
         error = 0
         try:
-            if command != 0:
+            if getattr(store, 'primary_writable', False) and command in (1, 3):
+                if command == 1:
+                    if request_flags & ~1 or not length:
+                        error = errno.EINVAL
+                    else:
+                        store.write_primary(offset, data)  # Write-through, including FUA.
+                elif request_flags or length or offset:
+                    error = errno.EINVAL
+                else:
+                    store.flush()
+            elif command != 0:
                 error = errno.EPERM if command in (1, 4, 6) else errno.EINVAL
             elif request_flags or not length:
                 error = errno.EINVAL

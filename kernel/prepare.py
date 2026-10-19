@@ -17,7 +17,7 @@ def main():
     if hashlib.sha256(source.read_bytes()).hexdigest() != SOURCE_SHA256:
         raise RuntimeError('Reviewed dm-crypt source mismatch')
     shutil.copyfile(source, destination / 'dm-crypt.c')
-    for name in ('Makefile', 'piv-control.h', 'piv-control.inc'):
+    for name in ('Makefile', 'piv-control.h', 'piv-control.inc', 'piv-native.inc'):
         shutil.copyfile(ROOT / 'kernel' / name, destination / name)
     subprocess.run(['patch', '--batch', '-p1', '-i',
                     str(ROOT / 'kernel/dm-crypt-piv.patch')],

@@ -73,7 +73,7 @@ query = (2 << 30) | (size << 16) | (ord('P') << 8)
 buf = bytearray(size)
 fcntl.ioctl(ctl, query, buf, True)
 version, length, generation, sectors, sector_size, iv, tag, tup, flags, reserved = struct.unpack(fmt, buf)
-assert (version, length, sector_size, iv, tag, tup, flags, reserved) == (1, size, 4096, 12, 16, 28, 7, 0)
+assert (version, length, sector_size, iv, tag, tup, flags, reserved) == (1, size, 4096, 12, 16, 28, 15, 0)
 assert sectors * 4096 == int(subprocess.check_output(['blockdev', '--getsize64', path]))
 assert generation > 0
 rejected(lambda: fcntl.ioctl(ctl, query + 2, buf), {errno.ENOTTY})
@@ -186,10 +186,14 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 native = KernelDevice(controls[0], path)
 validate_integrity_table(subprocess.check_output(['dmsetup', 'table', 'piv-kernel_dif'], text=True),
                          sectors, os.stat('/dev/vdb').st_rdev, 16777216)
+assert native.read_primary_sector(0) == first
+rejected(lambda: native.read_primary_sector(sectors), {errno.ERANGE})
+rejected(lambda: native.prepare_primary(0, bytes.fromhex(observed['0']), os.urandom(12), first), {errno.EBUSY})
 rejected(native.begin, {errno.EBUSY})
 native.suspend()
 rejected(lambda: native.prepare(0, bytes.fromhex(observed['0']), os.urandom(12)), {errno.EBUSY})
 native.begin()
+rejected(lambda: native.read_primary_sector(0), {errno.EBUSY})
 rejected(lambda: fcntl.ioctl(ctl, (1 << 30) | (48 << 16) | (ord('P') << 8) | 5,
                              bytearray(struct.pack(read_fmt, 1, 48, generation, 0, bytes(12), 0, 0, 0)), True),
          {errno.EBUSY})
@@ -223,6 +227,24 @@ for index, old, value in prepared:
     assert native.read_iv(index, quiesced=True) == value[-12:]
     observed[str(index)] = value[-12:].hex()
     rejected(lambda: native.prepare(index, value[-12:], value[-12:]), {errno.EINVAL})
+# Distinct primary-write operations authenticate old/new tuples but permit a
+# changed plaintext. Legacy hidden APPLY must still refuse that exact candidate.
+old = bytes.fromhex(observed['0'])
+nonce = os.urandom(12)
+rejected(lambda: native.prepare_primary(0, old, old, bytes(4096)), {errno.EINVAL})
+rejected(lambda: native.prepare_primary(0, os.urandom(12), nonce, bytes(4096)), {errno.ESTALE})
+changed = native.prepare_primary(0, old, nonce, bytes(4096))
+assert AESGCM(primary_key).decrypt(nonce, changed[:4112], struct.pack('<Q', 0) + nonce) == bytes(4096)
+rejected(lambda: native.apply(0, old, changed), {errno.EPERM})
+bad = bytearray(changed); bad[4096] ^= 1
+rejected(lambda: native.apply_primary(0, old, bytes(bad)), {errno.EBADMSG, errno.EIO})
+native.apply_primary(0, old, changed)
+native.apply_primary(0, old, changed)
+# Restore original plaintext with a fresh IV, never by restoring the old tuple.
+restored_iv = os.urandom(12)
+restored = native.prepare_primary(0, nonce, restored_iv, first)
+native.apply_primary(0, nonce, restored)
+observed['0'] = restored_iv.hex()
 p = subprocess.run(['dmsetup', 'resume', 'piv-kernel'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 assert p.returncode != 0  # transaction gate survives until explicit end
 p = subprocess.run(['dmsetup', 'message', 'piv-kernel', '0', 'key', 'wipe'],
@@ -282,13 +304,17 @@ for placement in placements:
     rejected(lambda: read_iv(current, owner, placement['sector']), {errno.EBADMSG, errno.EIO})
     assert read_iv(current, owner, 1).hex() == observed['1']
     broken = KernelDevice(glob.glob('/dev/pivctl-*')[0], path)
+    rejected(lambda: broken.read_primary_sector(placement['sector']), {errno.EBADMSG, errno.EIO})
     broken.suspend(); broken.begin()
     bad_index = placement['sector']
     old_iv = bytes.fromhex(observed[str(bad_index)])
+    rejected(lambda: broken.prepare_primary(bad_index, old_iv, os.urandom(12), bytes(4096)),
+             {errno.EBADMSG, errno.EIO})
     rejected(lambda: broken.prepare(bad_index, old_iv, os.urandom(12)),
              {errno.EBADMSG, errno.EIO})
     exact = next(value for i, old, value in prepared if i == bad_index)
     rejected(lambda: broken.apply(bad_index, old_iv, exact), {errno.EBADMSG, errno.EIO})
+    rejected(lambda: broken.apply_primary(bad_index, old_iv, exact), {errno.EBADMSG, errno.EIO})
     broken.close()
     run('dmsetup', 'remove', '--retry', 'piv-kernel')
     run('dmsetup', 'remove', '--retry', 'piv-kernel_dif')
