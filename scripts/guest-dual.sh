@@ -45,9 +45,6 @@ cryptsetup close piv-init
 rmmod dm_crypt
 insmod /root/piv-module/dm-crypt.ko
 python3 guest-dual-test.py
-if test -f guest-dual-power.py; then
-  python3 guest-dual-power.py
-fi
 dmesg > dmesg.txt
 dpkg-query -W -f='${Package}\t${Version}\n' > packages.tsv
 sync

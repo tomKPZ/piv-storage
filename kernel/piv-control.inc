@@ -28,7 +28,7 @@ struct piv_control {
 	bool resuming;
 	bool transaction;
 	bool failed;
-	u32 encryptions;
+	u64 encryptions;
 	struct file *controller;
 	struct crypt_config *cc;
 	struct piv_query profile;
@@ -226,7 +226,7 @@ static int piv_update(struct piv_control *p, struct file *file,
 		goto done;
 	}
 	if (prepare) {
-		if (p->encryptions >= (1U << 20)) {
+		if (p->encryptions >= (1ULL << 32)) {
 			ret = -EDQUOT;
 			goto done;
 		}
@@ -320,7 +320,6 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	struct piv_query profile;
 	struct piv_native_status status = {};
 	struct piv_native_setup *setup = NULL;
-	u8 *seeds = NULL;
 	struct piv_update *update = NULL;
 	bool preparing = cmd == PIV_PREPARE || cmd == PIV_PREPARE_PRIMARY;
 	bool primary = cmd == PIV_PREPARE_PRIMARY || cmd == PIV_APPLY_PRIMARY;
@@ -338,14 +337,12 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	if (cmd == PIV_NATIVE_SETUP) {
 		setup = memdup_user((void __user *)arg, sizeof(*setup));
 		if (IS_ERR(setup)) return PTR_ERR(setup);
-		if (setup->version != 1 || setup->size != sizeof(*setup) || setup->nonce_count > (1U << 20)) {
+		if (setup->version != 3 || setup->size != sizeof(*setup)) {
 			ret = -EINVAL; goto out;
 		}
-		/* User faults must never occur under the owner's lifecycle lock. */
-		if (setup->nonce_count) {
-			seeds = vmemdup_user(u64_to_user_ptr(setup->nonce_pointer), setup->nonce_count * 12);
-			if (IS_ERR(seeds)) { ret = PTR_ERR(seeds); seeds = NULL; goto out; }
-		}
+		/* Early boot: wait for seeded CRNG without holding owner lifecycle lock. */
+		ret = wait_for_random_bytes();
+		if (ret) goto out;
 	} else if (data_request) {
 		update = memdup_user((void __user *)arg, sizeof(*update));
 		if (IS_ERR(update))
@@ -359,14 +356,15 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	if (!p->live)
 		ret = -ENODEV;
 	else if (cmd == PIV_NATIVE_STATUS) {
-		status.generation = p->profile.generation;
+		status.generation = p->profile.generation; status.version = 3;
+		status.encryptions = p->encryptions;
 		if (p->native) {
 			status.active = 1; status.views = p->native->views; status.failed = p->native->failed;
-			status.hidden_bytes = p->native->hidden_bytes; status.nonces = p->native->nonce_count;
-			status.log_bytes = p->native->position;
+			status.hidden_bytes = p->native->hidden_bytes;
+			status.invalidations = p->native->invalidations;
 		}
 	} else if (cmd == PIV_NATIVE_SETUP)
-		ret = pn_setup(p, file, setup, seeds);
+		ret = pn_setup(p, file, setup);
 	else if (cmd == PIV_NATIVE_DETACH) {
 		ret = piv_identity(p, read.version, read.size, read.generation, read.sector, sizeof(read));
 		if (!ret && (read.sector || memchr_inv(read.iv, 0, 12) || memchr_inv(read.reserved, 0, sizeof(read.reserved)))) ret = -EINVAL;
@@ -445,7 +443,6 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			ret = copy_to_user((void __user *)arg, update, sizeof(*update)) ? -EFAULT : 0;
 	}
 out:
-	kvfree_sensitive(seeds, setup ? setup->nonce_count * 12 : 0);
 	kfree_sensitive(update);
 	kfree_sensitive(setup);
 	return ret;

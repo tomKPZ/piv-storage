@@ -2,6 +2,7 @@
 """Both writable block devices outlive the setup process; no NBD/FUSE service."""
 import hashlib
 import json
+import mmap
 import os
 from pathlib import Path
 import subprocess
@@ -12,19 +13,18 @@ from pivstore.kernel_owner import GuestOwner, crypt
 from pivstore.blocks import native_status
 
 W = Path('/mnt/piv-work')
-STATE = '/var/tmp/piv-dual/state'
 DECOY = '/dev/mapper/piv-native-decoy'
 HIDDEN = '/dev/mapper/piv-native-hidden'
 
 def setup(initialize=False):
     args = ['python3', '-m', 'pivstore', 'open-blocks', '--device', '/dev/vdb',
             '--key-file', str(W / 'passphrase.key'), '--hidden-key-file', str(W / 'hidden.key'),
-            '--state-directory', STATE]
+            ]
     if initialize: args.append('--initialize')
     result = subprocess.run(args, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     value = json.loads(result.stdout)
-    assert value['hidden_bytes'] == 281600
+    assert value['hidden_bytes'] == 301056
     assert value['decoy'] == DECOY and value['hidden'] == HIDDEN
     return value
 
@@ -32,6 +32,25 @@ def close():
     subprocess.run(['python3', '-m', 'pivstore', 'close-blocks', '--device', '/dev/vdb',
                     '--key-file', str(W / 'passphrase.key')], check=True)
 
+# A stock random-IV carrier is not a valid hidden block. That must not gate decoy.
+setup()
+fd = os.open(HIDDEN, os.O_RDONLY)
+try:
+    os.pread(fd, 512, 0)
+except OSError as exc:
+    assert exc.errno == 5
+else:
+    raise AssertionError('Uninitialized hidden block was readable')
+os.close(fd)
+assert subprocess.check_output(['sha256sum', DECOY], text=True).split()[0] == (W / 'primary-before.sha256').read_text().strip()
+fd = os.open(HIDDEN, os.O_RDWR | os.O_DIRECT)
+page = mmap.mmap(-1, 512); page[:] = b'A' * 512
+os.pwritev(fd, [page], 0); os.fsync(fd)
+page[:] = bytes(512)
+assert os.preadv(fd, [page], 0) == 512 and page[:] == b'A' * 512
+os.close(fd); page.close()
+close()
+print('Uninitialized hidden EIO isolation and individual repair passed', flush=True)
 print('Creating two native writable DM devices', flush=True)
 setup(True)
 assert subprocess.check_output(['blockdev', '--getro', HIDDEN]).strip() == b'0'
@@ -48,12 +67,12 @@ else:
     raise AssertionError('Legacy primary control escaped native ownership')
 owner.close()
 # Native hidden decryption returns a fixed zero-filled raw block volume.
-assert Path(HIDDEN).read_bytes() == bytes(281600)
+assert Path(HIDDEN).read_bytes() == bytes(301056)
 fd = os.open(HIDDEN, os.O_RDWR)
 value = hashlib.shake_256(b'native-hidden-block-partial').digest(1700)
 assert os.pwrite(fd, value, 511) == len(value)
 os.fsync(fd); os.close(fd)
-assert Path(HIDDEN).read_bytes() == bytes(511) + value + bytes(281600 - 511 - len(value))
+assert Path(HIDDEN).read_bytes() == bytes(511) + value + bytes(301056 - 511 - len(value))
 # A decoy write affecting those IV records must preserve the logical hidden data.
 before_hidden = Path(HIDDEN).read_bytes()
 fd = os.open(DECOY, os.O_RDWR)
@@ -63,6 +82,50 @@ assert Path(HIDDEN).read_bytes() == before_hidden
 close(); setup()
 assert Path(HIDDEN).read_bytes() == before_hidden
 print('Native block RMW, hidden preservation and reopen passed', flush=True)
+# Re-encode one primary sector with a different IV through the authenticated
+# control helper, simulating a legitimate stock write that destroys one record.
+close()
+owner = GuestOwner('/dev/vdb', W / 'passphrase.key')
+owner.device.suspend(); owner.device.begin()
+old_iv = owner.device.read_iv(0, quiesced=True)
+new_iv = os.urandom(12)
+prepared = owner.device.prepare(0, old_iv, new_iv)
+owner.device.apply(0, old_iv, prepared)
+owner.device.end(); owner.device.resume(); owner.remove(); owner.close()
+setup()
+def unavailable(index):
+    fd = os.open(HIDDEN, os.O_RDONLY)
+    try:
+        try: os.pread(fd, 512, index * 512)
+        except OSError as exc: assert exc.errno == 5
+        else: raise AssertionError('Unavailable block was returned as valid')
+    finally: os.close(fd)
+unavailable(0)
+assert Path(HIDDEN).open('rb').read(0) == b''
+fd = os.open(DECOY, os.O_RDWR)
+original = os.pread(fd, 4096, 0)
+os.pwrite(fd, original, 0); os.fsync(fd); os.close(fd)
+# Decoy write marks unavailable data invalid; it must not manufacture zeros.
+subprocess.run(['blockdev', '--flushbufs', HIDDEN], check=True)
+unavailable(0)
+owner = GuestOwner('/dev/vdb', W / 'passphrase.key')
+assert native_status(owner.device)['invalidations'] >= 1
+assert not native_status(owner.device)['failed']
+owner.close()
+fd = os.open(HIDDEN, os.O_RDWR | os.O_DIRECT)
+page = mmap.mmap(-1, 512); page[:] = before_hidden[:512]
+os.pwritev(fd, [page], 0); os.fsync(fd); os.close(fd); page.close()
+assert Path(HIDDEN).read_bytes() == before_hidden
+close()
+# A wrong hidden key must not make the decoy unavailable; no writes in this case.
+from pivstore.blocks import open_blocks, close_blocks
+open_blocks('/dev/vdb', W / 'passphrase.key', bytes(32))
+unavailable(0)
+assert subprocess.check_output(['sha256sum', DECOY], text=True).split()[0] == (W / 'primary-before.sha256').read_text().strip()
+close_blocks('/dev/vdb', W / 'passphrase.key')
+setup()
+assert Path(HIDDEN).read_bytes() == before_hidden
+print('Damaged-record isolation, invalid-marker preservation, repair and wrong-key decoy access passed', flush=True)
 # Real filesystems mounted on BOTH native block devices, simultaneously.
 primary = Path('/run/piv-primary'); primary.mkdir(exist_ok=True)
 hidden = Path('/run/piv-hidden-volume'); hidden.mkdir(exist_ok=True)
@@ -109,7 +172,6 @@ subprocess.run(['umount', str(hidden)], check=True); subprocess.run(['umount', s
 (W / 'expected-primary.sha256').write_text(subprocess.check_output(['sha256sum', DECOY], text=True).split()[0] + '\n')
 (W / 'expected-hidden-volume').write_bytes(Path(HIDDEN).read_bytes())
 close()
-shutil.copyfile(Path(STATE) / 'native.log', W / 'native.log')
 subprocess.run(['rmmod', 'dm_crypt'], check=True); subprocess.run(['modprobe', 'dm_crypt'], check=True)
 crypt('open', '--readonly', '--key-file', W / 'passphrase.key', '/dev/vdb', 'piv-stock')
 actual = subprocess.check_output(['sha256sum', '/dev/mapper/piv-stock'], text=True).split()[0]

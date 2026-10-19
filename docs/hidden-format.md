@@ -1,93 +1,46 @@
-> Codec reference: the v2 native records reuse this envelope with record-specific
-> AAD and 384-byte carriers. Whole-volume v1 creation and copy-output mutation
-> have been retired; v1 decoding remains for archived fixtures. Historical pack
-> behavior below describes the retired implementation, not current commands.
+# Stateless hidden block format v3
 
-# Experimental auxiliary blob format v1
+One logical 512-byte hidden block uses 48 consecutive primary 12-byte IVs, in
+logical primary-sector order. Hidden block i uses primary sectors 48*i through
+48*i+47. There is no header record, allocator, length field or public magic.
+Capacity is floor(primary_sectors/48)*512. Incomplete tail primary sectors carry
+no hidden block and receive ordinary fresh random IVs on coordinated writes.
 
-This is an experimental composition of standard library primitives, not a
-reviewed deniable storage format. It implements one fixed-size record covering
-the whole carrier. It intentionally sacrifices incremental update efficiency
-to avoid a hidden allocator, multi-record transactions and exposed metadata.
+```
+carrier[576] = salt[32] || ciphertext[528] || Poly1305_tag[16]
+plaintext[528] = "PIVBLK03"[8] || state_LE64[8] || data[512]
+context = "pivstore/volume/v3\0" || canonical_UUID_ASCII || NUL
+          || LE64(primary_bytes) || LE64(4096)
+AAD = context || "/block/" || LE64(hidden_block_index)
+subkey = HKDF-SHA256(hidden_key, salt, info=AAD, length=32)
+ciphertext, tag = ChaCha20Poly1305(subkey, nonce=12 zero bytes, plaintext, AAD)
+```
 
-## Keys and byte layout
+State 0 means valid data. State 1 with zero data is an encrypted invalid marker;
+all nonzero states and malformed plaintexts are unavailable to readers. The
+kernel emits canonical state 1 only when a decoy write must refresh an absent,
+damaged, wrong-key or previously invalid hidden record. No cleartext invalid bit
+is stored. Full 512-byte hidden writes replace unavailable records with valid
+data; they still authenticate all original primary sectors first.
 
-Both primary and hidden keys are independent supplied 32-byte high-entropy files.
-Password handling is out of scope. The hidden key does not derive from the
-primary key; reading hidden data does not require the primary key.
+Every encoding chooses a new uniform 256-bit salt from the seeded kernel CRNG.
+The fixed ChaCha nonce is used with a newly derived key. Python cryptography is
+the independent decoder/reference encoder; Linux crypto implements the data path.
+The whole 576-byte encoding is generated before primary encryption. Slots are
+checked against each other and all IVs replaced in that update; a collision
+regenerates the encoding up to 16 times. This check cannot reconstruct historical
+nonce use or guarantee global primary-key uniqueness. All successful and failed
+primary encryption attempts consume the externally managed lifetime budget.
 
-Carrier = concatenation of 12-byte IVs in primary logical-sector order. Given C
-carrier bytes, payload capacity is C - 64. Reject carriers shorter than 64 bytes.
+The random salt and assumed pseudorandom derived-key ChaCha ciphertext and
+masked Poly1305 tag motivate pseudorandomness of the stored encoding. The magic,
+state and invalid-marker zeros are encrypted. This is a composition argument,
+not independent cryptographic review or a proof of disk indistinguishability.
+Stock journal timing and snapshots can reveal write patterns.
 
-    carrier = salt[32] || ciphertext[C-48] || Poly1305 tag[16]
-    plaintext = encrypted_magic[8] || length_LE64[8] || payload || zero_padding
-    encrypted_magic = ASCII PIVBLB01
-
-The plaintext has exactly C - 48 bytes. There is no public magic, length, version,
-or constant padding in the carrier. Padding is inside encryption. The 32-byte
-salt is uniformly random and regenerated on every pack, including repeated
-payloads. The rest is ChaCha20-Poly1305 output from the maintained cryptography
-library. No custom cipher, MAC, PRNG, or KDF primitive is implemented.
-
-For a volume UUID encoded as canonical ASCII and primary size V:
-
-    AAD = ASCII("pivstore/blob/v1\0") || UUID || NUL || LE64(V) || LE64(4096)
-    subkey = HKDF-SHA256(hidden_key, salt, info=AAD, length=32)
-    ciphertext, tag = ChaCha20Poly1305(subkey, nonce=12 zero bytes, plaintext, AAD)
-
-The fixed AEAD nonce is used only with a newly derived subkey. Salt repetition
-under a hidden key would repeat that subkey/nonce; require fresh CSPRNG entropy
-for every operation and reject unsupported RNG workflows. Random 256-bit salts
-make accidental repeats negligible at prototype scale. This does not make
-snapshot rollback safe for the primary GCM key.
-
-Binding UUID/size in AAD makes cross-volume transplantation fail authentication
-when UUIDs differ. Same-UUID clones remain indistinguishable without trusted
-external state; writing independent branches is unsupported. Do not change the
-UUID of an image containing a v1 blob and expect extraction to continue working.
-
-## Why the encoding is expected to look random
-
-The salt is random. With a high-entropy hidden key, the derived key is assumed
-pseudorandom; ChaCha20 ciphertext is assumed pseudorandom and its one-time
-Poly1305 tag is masked by secret per-message material. The fixed plaintext
-header and padding therefore do not appear directly in the carrier. This is a
-design argument under standard primitive assumptions, not a proof that every
-joint carrier distribution or adversarial experiment is indistinguishable.
-Ordinary AEAD confidentiality alone would not justify this claim for arbitrary
-serialization. Independent cryptographic review remains outstanding.
-
-## Primary nonce policy
-
-Every pack randomizes the entire carrier and rewrites every primary sector.
-Generate the entire envelope before primary encryption. Reject envelopes whose
-12-byte slots collide with any current IV or with one another, regenerating the
-envelope before any primary encryption occurs. The writer also independently
-checks this property. Rejection is negligible for the small tested profile.
-
-Only current IV collisions can be checked locally. Historical primary nonce
-usage is not reconstructible from the image. Require a known disposable lineage,
-no ordinary primary writes, no branching clones, no old-IV restoration into
-changed primary data, fresh entropy, and an externally managed conservative
-primary-key encryption budget. The CLI is a research tool and does not enforce
-that external lifetime budget. Repeating a failed pack starts with new entropy;
-never resume by replaying cached IV plans.
-
-## Updates, extraction and limitations
-
-Primary writes are copy-output operations. Authenticate the entire input, build
-the envelope, make a private temporary copy, reencrypt every affected primary
-sector with exact Linux AAD, authenticate/hash the complete output, fsync it,
-and publish with an exclusive hard link followed by directory fsync. Existing
-destinations are never replaced. Partial copies are removed on caught errors;
-process/power crashes can leave private .partial files. A publication followed
-by an fsync error can leave a valid but unacknowledged output; do not auto-retry
-onto that destination. This assumes local filesystem hard-link/fsync semantics,
-not arbitrary network filesystems or hardware power-failure guarantees.
-
-Extraction authenticates the hidden record and validates its encrypted header,
-length and zero padding before publishing plaintext to a private output file.
-Wrong keys, uninitialized carriers and corruption are intentionally reported
-without claiming which occurred. Same-volume rollback remains possible. A
-primary key holder can destroy the payload. No redundancy or incremental update
-support exists, and every pack has roughly one full-primary-volume write cost.
+All 512 bytes authenticate together. Partial old/new record assembly fails
+except with negligible forgery probability. Old valid whole blocks can still be
+replayed, and valid blocks at different addresses can belong to different times.
+UUID/address binding rejects transplantation, but same-UUID clones and rollback
+have no external freshness anchor. Cross-sector recovery is deliberately absent.
+No prior hidden formats are decoded. Changing UUID or geometry changes the AAD.

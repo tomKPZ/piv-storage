@@ -16,7 +16,6 @@ import struct
 import subprocess
 import uuid
 
-from .sector import SectorCodec
 
 
 class UnsupportedImage(ValueError):
@@ -184,6 +183,7 @@ class Image(AbstractContextManager):
             yield self.read(12, tag_offset + 16)
 
     def verify(self, key):
+        from .sector import SectorCodec
         codec = SectorCodec(key)
         digest = hashlib.sha256()
         for index in range(self.layout.sectors):

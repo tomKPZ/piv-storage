@@ -20,8 +20,7 @@ security specification. Respect tool/sandbox approval requirements.
 
 1. Read README.md, ROADMAP.md, applicable nested instructions, and existing design
    notes (especially docs/development.md, docs/observed-layout.md and
-   docs/hidden-format.md, docs/native-blocks.md, docs/native-faults.md and
-   docs/kernel-backend.md). Inspect
+   docs/hidden-format.md, docs/native-blocks.md and docs/native-faults.md). Inspect
    git status and relevant code before changing anything.
 2. Determine what is actually implemented and tested. Recheck environmental
    assumptions as needed; the initial host is WSL2 without visible DM/KVM nodes.
@@ -38,66 +37,41 @@ resolved from context/evidence, not for routine implementation decisions.
 
 ## Implementation priorities
 
-- Maintain the paired native block interface, standalone bootstrap and independent
-  read-only verification/extraction tools. The user authorized retiring FUSE/NBD,
-  regular-file online service and offline mutation commands. Do not restore them
-  as regression baselines; their history and prior results remain in Git.
-- The user's intended interface is now TWO writable native block devices, hidden
-  and decoy, supporting independent filesystems without NBD/FUSE in the data path.
-  Read docs/native-blocks.md and the newest roadmap handoff first. Keep setup,
-  persistence, nonce reservations, hidden crypto and both views under one shared
-  kernel owner. External recovery state on the independent guest root filesystem
-  is retained for the prototype; do not claim a self-contained deniable disk.
-- NativeBootstrap initializes/replays unfinished fixed-volume adoption using the
-  existing ledger/pending-v2 encoding. After native READY, kernel native.log owns
-  history. Never rebuild missing adopted history from bootstrap state. Keep
-  independent v1/v2 decoders for historical fixtures and native cross-checks.
-- Closed-volume compact-state maintenance is implemented. Read docs/compaction.md.
-  Recover/verify through the kernel, detach its log fd before replacing the file,
-  preserve ALL spent IVs including abandoned reservations, fsync/verify a complete
-  candidate and atomically publish it. Never reset the primary-key nonce budget
-  or compact a live context. Ignore orphan temporary snapshots as recovery input.
-- One backend must own the backing storage and coordinate both views. Never edit
-  raw metadata behind an independently active dm-crypt mapping. Authentication,
-  nonce freshness, cache coherence and minimum commit recovery remain required.
-- A private external recovery journal is allowed for the VM experiment, with
-  explicit deniability limitations. It is not permission to use real disks or
-  claim crash safety without tests. Retain the independent hidden codec and image
-  verifier as test references.
-- The native backend extends dm-crypt and registers paired piv-view DM targets
-  in the same experimental module.
-  Preserve authenticated PREPARE, exact-tuple APPLY and suspend/controller lifetime
-  gates. The new primary preparation/application controls deliberately permit
-  requested plaintext changes, while the original APPLY must still reject them.
-  Persist nonce reservations before encryption and the complete encrypted
-  recovery journal before mutation. Authenticate all recovery ciphertext before
-  parsing metadata or replay. Never regenerate tuples on uncertain completion.
-  Use kernel/README.md to reproduce the K0–K3 tests. Do not claim the external
-  state provides deniability or detects disk-and-state rollback.
-- Build/load experimental kernel code only in disposable guests with matched
-  source/config/symbol versions. Do not install host modules or force-load an
-  ABI-mismatched module. Keep private owner bios rejected while the paired views
-  coordinate writes. Sector journaling alone does not make hidden transactions
-  atomic; preserve the native reservation/WAL/completion protocol.
-- Pin one ordinary supported LUKS2/dm-integrity profile before broadening support.
-  Confirm actual IV/tag lengths, sector/address units, AAD, tuple layout, padding,
-  offsets, journal state and replay behavior from sources and kernel fixtures.
-- Use maintained crypto libraries. Keep format parsing, sector crypto, carrier
-  mapping, hidden records and persistence logic independently understandable.
-- Reject unsupported/dirty formats and malformed metadata explicitly. Validate
-  all offsets, sizes and arithmetic before reading or writing.
-- Prefer supplied high-entropy keys initially; avoid implementing keyslot or
-  password bootstrap machinery before the mechanism is established.
-- Setup/diagnostics use Python with cryptography and cryptsetup; the data path
-  is the experimental kernel module.
-  Reproduce integration with scripts/vm.py and scripts/guest-control.sh; use
-  scripts/guest-verify.sh for an existing output image. Read the documented 9p
-  failure before changing the VM storage path. Tests use PIV_FIXTURE pointing
-  to a successful control run; never use failed runs as trusted fixtures.
-- The v2 hidden records use fresh salted derived ChaCha20-Poly1305 keys. Do not
-  interpret this as independent cryptographic review. Bootstrap/kernel history
-  cannot establish nonce usage before adoption; preserve the known synthetic
-  lineage and external-state/rollback limitations.
+- Maintain the paired native writable decoy/hidden block devices, one coordinated
+  kernel owner and independent read-only image/record decoders. No FUSE/NBD,
+  offline writer, legacy decoding, external history/WAL, bootstrap or compaction.
+- The user explicitly selected a stateless design. Persist only ordinary stock
+  LUKS/dm-integrity structures and encrypted records inside IVs. No separate
+  partition, root-ext4 file or hidden-volume metadata dependency. /run ownership
+  locks are volatile. Early activation must be possible from an initramfs.
+- One authenticated record covers exactly one hidden 512-byte logical block in
+  48 primary IVs. Full-block authentication prevents old/new fragment mixing;
+  cross-block transactions, hidden crash recovery and rollback resistance are
+  NOT goals. Interrupted updates may leave hidden blocks returning EIO.
+- Decoy access must not depend on hidden-record authentication. A decoy write
+  refreshes valid hidden records, or writes a fresh encrypted invalid marker for
+  absent/damaged/wrong-key records. Never turn corruption into authenticated
+  zeros. Full hidden writes may repair a block after primary authentication.
+- Fresh seeded CRNG entropy is mandatory. Local proposed/replaced IV collision
+  rejection is only a small check, not lifetime nonce history. The 2^32 per-owner
+  encryption counter resets at recreation and does not enforce the per-key
+  lifetime budget. Document probabilistic collisions, amplification, retries,
+  rollback and clones. Do not resurrect an observable nonce ledger.
+- Preserve authenticated PREPARE/exact-tuple APPLY and owner lifetime gates.
+  Apply through the ordinary lower dm-integrity journal; its per-sector atomicity
+  does not make a hidden record atomic. Storage/primary-auth errors stop the
+  shared owner. Local hidden unavailability must not stop the decoy.
+- Build/load experimental kernel code only in disposable guests with exact
+  source/config/symbol matches. Never install host modules or touch real disks.
+  scripts/fetch_kernel.py stages the COMPLETE module including dm-audit.h;
+  kernel/prepare.py alone stages only the patch and is insufficient for a build.
+- Pin one supported profile: LUKS2 AES-GCM/random, 4096-byte sectors, 12-byte IV,
+  16-byte tag, integrity v4 fixed padding and ordinary journal. Validate geometry,
+  AAD, extents and arithmetic. Offline diagnostics reject dirty journals; native
+  setup delegates replay to Linux before authenticated access.
+- Use maintained crypto primitives. Setup uses Python standard library/cryptsetup; diagnostics use cryptography;
+  actual crypto/I/O runs in the experimental kernel module. Retain the independent
+  codec and complete primary verifier as cross-checks. Only synthetic test keys.
 
 ## Invariants to preserve
 
@@ -113,8 +87,8 @@ resolved from context/evidence, not for routine implementation decisions.
 - Raw edits bypass dm-integrity journaling. Never assume its atomicity protects
   them; reject unrecovered journal state until a supported workflow is proven.
 - All writes pass through one coordinated native owner. Refresh every intersecting
-  hidden record, reserve fresh IVs before encryption and journal exact tuples
-  before mutation. Stock/uncoordinated writes can destroy hidden data. Only
+  hidden record with fresh randomness before primary encryption.
+  Stock/uncoordinated writes can destroy hidden data. Only
   requested primary bytes may change; hidden-only updates preserve all primary
   plaintext. Never expose an independently cached bypass of the paired views.
 - Hidden-record authentication, whole-record transactions, primary-sector

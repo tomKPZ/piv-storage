@@ -58,16 +58,15 @@ struct piv_devices {
 #define PIV_PREPARE_PRIMARY _IOWR('P', 10, struct piv_update)
 #define PIV_APPLY_PRIMARY _IOW('P', 11, struct piv_update)
 struct piv_native_setup {
-	__u32 version, size;
-	__u64 generation, nonce_pointer;
-	__u32 nonce_count, context_length;
-	__u8 key[32], context[128];
-	char path[256];
-	__u32 reserved[4];
+ __u32 version, size;
+ __u64 generation;
+ __u32 flags, context_length; /* flags bit 0: destructive initialize to zeros */
+ __u8 key[32], context[128];
+ __u32 reserved[2];
 };
 struct piv_native_status {
-	__u64 generation, hidden_bytes, nonces, log_bytes;
-	__u32 active, views, failed, reserved;
+ __u64 generation, hidden_bytes, encryptions, invalidations;
+ __u32 active, views, failed, version;
 };
 #define PIV_NATIVE_SETUP _IOW('P', 12, struct piv_native_setup)
 #define PIV_NATIVE_DETACH _IOW('P', 13, struct piv_read_iv)

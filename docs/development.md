@@ -74,7 +74,8 @@ The verification task opens the volume read-only, reads/authenticates every
 primary byte, checks the expected plaintext hash, and verifies that the raw
 image digest did not change. It records package/kernel provenance and a result
 marker. This passed for both a four-sector random-IV experiment and a complete
-hidden-payload pack. The whole-record hidden format is in docs/hidden-format.md.
+hidden-payload pack in earlier revisions. Current stateless v3 records are
+documented in docs/hidden-format.md; use current native tests for that format.
 
 ## Source subset
 

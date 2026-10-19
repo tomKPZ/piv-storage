@@ -9,7 +9,6 @@ import subprocess
 import secrets
 
 from .profile import Image, UnsupportedImage
-from .blob import unpack
 
 
 def main():
@@ -29,36 +28,25 @@ def main():
     extraction.add_argument('image', type=Path)
     extraction.add_argument('--output', type=Path, required=True)
     extraction.add_argument('--hidden-key-file', type=Path, required=True)
-    extraction.add_argument('--incremental', action='store_true', help='Extract the opt-in v2 record format')
-    for action in ('open-blocks', 'close-blocks', 'compact-state'):
+    for action in ('open-blocks', 'close-blocks'):
         block = sub.add_parser(action, help={'open-blocks': 'Configure two native writable DM views',
-                                            'close-blocks': 'Remove native writable views',
-                                            'compact-state': 'Compact recovery history with both views closed'}[action])
+                                            'close-blocks': 'Remove native writable views'}[action])
         block.add_argument('--device', type=Path, default=Path('/dev/vdb'))
         block.add_argument('--key-file', type=Path, required=True)
         block.add_argument('--name', default='piv-native')
-        if action in ('open-blocks', 'compact-state'):
+        if action == 'open-blocks':
             block.add_argument('--hidden-key-file', type=Path, required=True)
-            block.add_argument('--state-directory', type=Path)
             if action == 'open-blocks':
                 block.add_argument('--initialize', action='store_true')
     args = parser.parse_args()
     try:
-        if args.action == 'compact-state':
-            from .compaction import compact_state
-            with args.hidden_key_file.open('rb') as stream:
-                hidden_key = stream.read(33)
-            result = compact_state(args.device, args.key_file, hidden_key,
-                                   state_directory=args.state_directory, name=args.name)
-            print(json.dumps(result, indent=2))
-            return 0
         if args.action in ('open-blocks', 'close-blocks'):
             from .blocks import open_blocks, close_blocks
             if args.action == 'open-blocks':
                 with args.hidden_key_file.open('rb') as stream:
                     hidden_key = stream.read(33)
                 result = open_blocks(args.device, args.key_file, hidden_key,
-                                     state_directory=args.state_directory, name=args.name,
+                                     name=args.name,
                                      initialize=args.initialize)
                 print(json.dumps(result, indent=2))
             else:
@@ -73,9 +61,10 @@ def main():
             print('Created a private 32-byte key file')
             return 0
         if args.action == 'unpack':
+            from .records import unpack
             with args.hidden_key_file.open('rb') as stream:
                 hidden_key = stream.read(33)
-            result = unpack(args.image, args.output, hidden_key, incremental=args.incremental)
+            result = unpack(args.image, args.output, hidden_key)
             print(json.dumps(result, indent=2))
             return 0
         with Image(args.image) as image:

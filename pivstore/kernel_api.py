@@ -19,8 +19,12 @@ def command(number, size, direction=3):
 
 def dm(*args, input=None, check=True):
     # Never pass keys or tuple data as command arguments.
-    return subprocess.run(['dmsetup', *args], input=input, text=True,
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check)
+    result = subprocess.run(['dmsetup', '--noudevsync', *args], input=input, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check)
+    if result.returncode == 0 and args and args[0] in ('create', 'resume'):
+        subprocess.run(['dmsetup', '--noudevsync', 'mknodes', args[1]], check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return result
 
 
 def validate_integrity_table(table, sectors, raw_device, offset):
@@ -72,14 +76,6 @@ class KernelDevice:
         except BaseException:
             self.close()
             raise
-
-    def validate_state(self, directory):
-        if os.stat(directory).st_dev != os.stat('/').st_dev:
-            raise ValueError('Recovery state must be on the guest root filesystem')
-        filesystem = subprocess.check_output(['findmnt', '-n', '-o', 'FSTYPE', '-T', str(directory)],
-                                            text=True).strip()
-        if filesystem != 'ext4':
-            raise ValueError('Recovery state requires the pinned local ext4 root')
 
     def check(self):
         data = bytearray(QUERY.size)

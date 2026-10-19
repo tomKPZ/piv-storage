@@ -11,7 +11,6 @@ import uuid
 
 from .kernel_api import KernelDevice, dm, validate_integrity_table
 from .profile import parse_superblock, validate_segment
-from .recovery import fsync_dir
 
 
 def guest_guard(source, allow_test_stack=False):
@@ -91,7 +90,7 @@ class GuestOwner:
             expected_uuid = 'CRYPT-LUKS2-' + self.uuid.replace('-', '') + '-' + name
             if dm('info', '-c', '--noheadings', '-o', 'uuid', name).stdout.strip() != expected_uuid:
                 raise ValueError('Mapping does not belong to this disposable LUKS volume')
-            subprocess.run(['udevadm', 'settle'], check=True)
+            dm('mknodes', name)
             owner_path = '/dev/mapper/' + name
             matches = []
             for path in glob.glob('/dev/pivctl-*'):
