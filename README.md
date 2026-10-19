@@ -55,6 +55,10 @@ python3 -m pivstore unpack artifacts/dual-final-007/share/dual-power-final.img \
 PIV_FIXTURE=artifacts/control-003 python3 -W error::ResourceWarning -m unittest discover -v
 ```
 
+Use [closed-volume compaction](docs/compaction.md) to shrink recovery state while
+retaining every spent nonce. It refuses active volumes and does not reset the
+per-key nonce budget.
+
 Other retained commands are keygen, extract-ivs and close-blocks. Extraction
 outputs must not already exist. See [development and fixture creation](docs/development.md),
 [record format](docs/incremental-records.md), [observed layout](docs/observed-layout.md),

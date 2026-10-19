@@ -52,6 +52,11 @@ resolved from context/evidence, not for routine implementation decisions.
   existing ledger/pending-v2 encoding. After native READY, kernel native.log owns
   history. Never rebuild missing adopted history from bootstrap state. Keep
   independent v1/v2 decoders for historical fixtures and native cross-checks.
+- Closed-volume compact-state maintenance is implemented. Read docs/compaction.md.
+  Recover/verify through the kernel, detach its log fd before replacing the file,
+  preserve ALL spent IVs including abandoned reservations, fsync/verify a complete
+  candidate and atomically publish it. Never reset the primary-key nonce budget
+  or compact a live context. Ignore orphan temporary snapshots as recovery input.
 - One backend must own the backing storage and coordinate both views. Never edit
   raw metadata behind an independently active dm-crypt mapping. Authentication,
   nonce freshness, cache coherence and minimum commit recovery remain required.

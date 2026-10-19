@@ -30,17 +30,28 @@ def main():
     extraction.add_argument('--output', type=Path, required=True)
     extraction.add_argument('--hidden-key-file', type=Path, required=True)
     extraction.add_argument('--incremental', action='store_true', help='Extract the opt-in v2 record format')
-    for action in ('open-blocks', 'close-blocks'):
-        block = sub.add_parser(action, help='Configure/remove the two native writable DM views')
+    for action in ('open-blocks', 'close-blocks', 'compact-state'):
+        block = sub.add_parser(action, help={'open-blocks': 'Configure two native writable DM views',
+                                            'close-blocks': 'Remove native writable views',
+                                            'compact-state': 'Compact recovery history with both views closed'}[action])
         block.add_argument('--device', type=Path, default=Path('/dev/vdb'))
         block.add_argument('--key-file', type=Path, required=True)
         block.add_argument('--name', default='piv-native')
-        if action == 'open-blocks':
+        if action in ('open-blocks', 'compact-state'):
             block.add_argument('--hidden-key-file', type=Path, required=True)
             block.add_argument('--state-directory', type=Path)
-            block.add_argument('--initialize', action='store_true')
+            if action == 'open-blocks':
+                block.add_argument('--initialize', action='store_true')
     args = parser.parse_args()
     try:
+        if args.action == 'compact-state':
+            from .compaction import compact_state
+            with args.hidden_key_file.open('rb') as stream:
+                hidden_key = stream.read(33)
+            result = compact_state(args.device, args.key_file, hidden_key,
+                                   state_directory=args.state_directory, name=args.name)
+            print(json.dumps(result, indent=2))
+            return 0
         if args.action in ('open-blocks', 'close-blocks'):
             from .blocks import open_blocks, close_blocks
             if args.action == 'open-blocks':

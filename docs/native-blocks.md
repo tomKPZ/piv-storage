@@ -158,11 +158,13 @@ primary request; record authentication is distinct from transaction freshness.
 The experimental limits are 2^20 recorded nonces and a 512 MiB log. Neither is
 an assertion about unknowable encryption before adoption. This requires known
 synthetic key lineage; stock primary writes, rekeys, clones and independent
-controllers invalidate it. There is no compaction or online rekey yet. Write amplification is substantial:
+controllers invalidate it. Closed-volume [log compaction](compaction.md) preserves all reservations and
+removes completed WALs; it does not reset the per-key budget. There is no online
+compaction or primary rekey yet. Write amplification is substantial:
 a single 512-byte hidden request can refresh 96 primary sectors and append almost
 400 KiB of WAL. The small concurrent-filesystem demonstration generated about
-384 MB of log. This bounds useful prototype runtime; compaction and batching
-need a separate durability design. Writes
+384 MB of log. Close both views and compact between sessions to reclaim log space. Batching
+and online compaction need separate durability designs. Writes
 fail closed at a limit or persistence/device error. After a native device error,
 repair/recreate the stack and replay the log; automatic rebuilding underneath
 mounted filesystems is unsupported.

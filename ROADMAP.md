@@ -5,6 +5,27 @@ approach. The user has narrowed the offline prototype to make room for an
 online implementation; the active priorities below supersede historical next
 steps in the session notes.
 
+## Closed native-log compaction: complete
+
+Implemented and verified in artifacts/compaction-001 and compaction-host-001.
+An explicit compact-state command requires both public views closed.
+Recover/verify through the kernel, detach its log fd, preserve EVERY reserved IV
+in a freshly authenticated snapshot, fsync/verify the temporary, atomically rename
+and fsync the parent, then revalidate with a fresh kernel context. Never compact
+an active log or reset nonce lineage/budgets. See docs/compaction.md.
+
+Exit criteria (passed): abandoned reservations and all historical IVs survive; active use is refused;
+no primary plaintext/hidden bytes change; kernel accepts snapshots; write/fsync/
+rename/ENOSPC and process/VM interruption leave a complete canonical history.
+Stock and independent host verification must agree. This is closed maintenance,
+not background compaction, a primary rekey or broader host deployment.
+
+Next bounded milestone: coordinated write batching to reduce repeated record
+refreshes and nonce/WAL amplification. Preserve request completion, flush/FUA,
+fail-stop and exact replay guarantees; do not silently buffer acknowledged writes
+without durable recovery. Broader geometry, rekey, online compaction and generic
+host deployment remain separate work.
+
 ## Native failure handling: selected cases complete
 
 Completed and verified in artifacts/native-fault-002: real lower-device write EIO
@@ -903,3 +924,71 @@ are descriptive docstrings only. Changes are uncommitted.
   Next bounded milestone: design/test safe native-log compaction without dropping
   any historical reservations; include crash/append failure tests at its new
   persistence boundaries. Compaction does not reset the per-key nonce budget.
+
+
+## Session handoff: closed log compaction (2026-10-18)
+
+- Committed prior native fault-test milestone as 9d945be, then implemented
+  compact-state in pivstore/compaction.py and CLI. This is CLOSED maintenance,
+  not a userspace data service or offline primary-volume writer. Both public
+  views must be removed. Active contexts are refused without detaching them.
+- The command holds the existing volume ownership lock, runs kernel recovery
+  and all-sector/all-record validation, detaches the native context/log fd,
+  authenticates the complete log, writes ALL historical IVs into normal NONCES
+  batches plus READY with fresh salts, fsyncs/authenticates the candidate,
+  atomically replaces native.log and fsyncs the directory, then loads/verifies
+  it again in the kernel before removing the private stack. Primary data is
+  never reencrypted; unchanged-tuple journal checkpoints remain intentional.
+  No new kernel ABI or log format is introduced. Keep the historical 21-byte
+  log KDF domain. Compaction never resets the per-key nonce budget.
+- Log snapshots preserve obsolete/abandoned reservations as well as current IVs.
+  Pending WALs are recovered first, never omitted before applying their exact
+  tuples. The candidate must have exact nonce-set equality, READY and no pending
+  WAL/trailing bytes. Before publication errors leave the old log canonical;
+  after publication errors can leave the complete new log, with the SAME history.
+  Do not blindly restore an older log or treat orphan temporaries as authority.
+- Host suite: 30 tests passed with ResourceWarning errors and
+  PIV_FIXTURE=artifacts/control-003, without skips. Six new cases cover abandoned
+  history, multi-batch snapshots, fresh salts, malformed/wrong-key/partial/pending
+  input, active-owner refusal, write/fsync/rename/parent-fsync errors and process
+  SIGKILL at frame/prepared/published/durable boundaries. Python compilation,
+  shell syntax and whitespace checks passed.
+- artifacts/compaction-host-001 is a separate HOST-only closed-fixture experiment:
+  independently authenticated the closed cleanup-native-001 volume and compacted
+  a COPY of its log. All 148,372 IVs survived; 383,732,268 bytes/6,880 frames became
+  1,811,888 bytes/291 frames. The source image/log were not modified. This is codec
+  and history evidence, not an extra kernel/hardware persistence test.
+- artifacts/compaction-001 passed the full VM experiment, task/QEMU zero. Input
+  was the coherent CLOSED native-fault-002 disk/log pair, including its actual
+  reservations from failed WAL appends. Tests passed active refusal with both
+  views still usable, closed/CLI compaction, pending exact-current-tuple replay
+  after omitting only a known final DONE, and real guest-root ext4 ENOSPC with
+  the canonical file unchanged and no leftover partial candidate. Freeing space
+  allowed normal maintenance and full logical view validation again.
+- Finally SIGKILL QEMU after os.replace and BEFORE explicit parent fsync, with
+  the candidate file fsynced and kernel log fd already detached. Reboot on the
+  SAME root/data disks restored both views and the EXACT same nonce set/count.
+  Source/driver assumptions remain pinned Debian 6.12.113-1, guest release
+  6.12.113+deb13-amd64, GCC14.2.0-19 and cryptsetup2:2.7.5-2. Module C is unchanged
+  from dual-007. Frozen guest Python/test sources match current package exactly.
+- Stock Linux and independent scripts/check_compaction.py passed. Every one of
+  the 28,244 primary ciphertext/tag/IV tuples was byte-identical to the input,
+  and all 281,600 hidden bytes matched. Primary SHA256:
+  2a9b441ce9b2b866cf933d5e1c70a798acbeaa8115e0a313a4663f6689143a7c.
+  Tuple SHA256:
+  c2dac216b568cfdc32fc87bee6fdbe61ccc3e4eab675110ba0d324773a5e7a83.
+  All 57,396 reservations remained (including abandoned ones); 4,156,356 log
+  bytes/153 frames became 701,060 bytes/114 frames. No pending WAL/trailing bytes;
+  current IVs unique and in history. See host-verification.json and
+  share/compaction-results.json/cut-boundary.json in that run. No unexpected
+  compiler warnings, BUG/Oops/WARNING/KASAN or alignment diagnostics appeared.
+- No new host tools/root/module installations. Temporary snapshot needs free
+  space alongside the old log; it is not a way to compact a totally full FS
+  without first freeing space. Manual shutdown/maintenance is required; no
+  background compaction, primary rekey, reduced write amplification or rollback
+  resistance was added. Root-state/clone/history and hardware power-loss
+  limitations remain. New compaction changes are uncommitted.
+- Next: bounded write batching that preserves synchronous/FUA/flush durability,
+  all nonce reservation/recovery invariants and both logical views. Do not trade
+  correctness for reduced log size. Further kernel persistence-fault phases,
+  debug/lifecycle coverage, geometry and production deployment remain open.
