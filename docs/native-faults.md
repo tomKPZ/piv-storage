@@ -107,3 +107,55 @@ filesystems on a failed project stack. Restore the fault source and unmount both
 views before teardown in normal use. Resource cleanup is best effort and is not
 hidden recovery, rollback, atomic initialization or a guarantee against hardware
 that acknowledges writes without persisting them.
+
+
+## Concurrent lifecycle and explicit flush/FUA evidence
+
+scripts/guest-lifecycle.sh builds a SEPARATE test-only piv-io-test.ko against the
+pinned guest headers and loads it alongside the previously verified dm-piv.ko.
+Never link this helper into the production module or load it on the host. Its
+root-only write interface accepts two integers (public view and request mode),
+reads 512 bytes at sector 0 and writes those SAME bytes with plain, FUA or
+PREFLUSH|FUA flags, or submits a flush. It accepts no keys, paths, offsets or user
+payload. The helper is unloaded before lifecycle stress begins.
+
+Dynamic kprobe entry/return events around pn_worker, pn_write,
+blkdev_issue_flush and bio_endio record function metadata and results, not
+plaintext or keys. Trace parsing requires complete non-overlapping ordered
+workers, successful paired lower flush returns, a completed flush before write
+return and public completion, and a preflush before a PREFLUSH payload (possibly
+in a separate DM-split flush bio). A standalone flush must also reach a native
+worker. Probe misses, ring-buffer overruns, missing events and negative results
+are failures, not skipped coverage. See the [kernel kprobe tracing documentation](https://docs.kernel.org/trace/kprobetrace.html)
+for the event/profile interface. Probes are removed before module unload.
+
+Concurrent writers own disjoint logical regions that share carrier groups,
+change/read/restore their data, and interleave direct and O_DSYNC writes with
+fsync. Another thread suspends/resumes public views during that workload. Held
+public descriptors must prevent removal, close and unload without changing
+mapping identities. A request queued while a public view is suspended must wait
+for resume while its peer remains usable. Complete primary/hidden oracles are
+checked afterward and after a new owner generation. Stock full-primary readback
+and custom unload finish the test.
+
+This is a public-view lifecycle contract. Direct administrative suspension or
+replacement of the PRIVATE owner/lower mappings while views are active remains
+outside the supported workflow. Successful kernel flush return/order is not
+proof that physical hardware honored persistence, hidden-record atomicity, or a
+debug-kernel/lockdep audit. See ROADMAP.md for executed results.
+
+Example using a CLOSED native fixture and a matched module (fresh run directory):
+
+```sh
+python3 scripts/vm.py run --code --script scripts/guest-lifecycle.sh \
+  --run-dir artifacts/lifecycle-next \
+  --data-image artifacts/separate-native-4096-002/share/dual-final.img \
+  --share-file artifacts/batch-native-4096-001/share/experimental-dm-piv.ko \
+  --share-file kernel/piv-io-test.c --share-file kernel/guest-lifecycle-test.py \
+  --share-file kernel/lifecycle_trace.py \
+  --share-file artifacts/control-003/share/passphrase.key \
+  --share-file artifacts/control-003/hidden.key \
+  --share-file artifacts/separate-native-4096-002/share/expected-hidden-volume \
+  --share-file artifacts/separate-native-4096-002/share/expected-primary.sha256 \
+  --timeout 2400
+```

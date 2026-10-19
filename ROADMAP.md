@@ -54,12 +54,16 @@ Bounded 16 KiB decoy I/O is implemented; final regression results are recorded
 below. Each intersecting hidden record still needs its whole carrier refreshed;
 separate small bios still repeat work.
 
-Next add deterministic concurrent lifecycle/flush stress: mixed decoy/hidden
-requests, barriers, busy close/suspend and teardown, with explicit completion
-ordering evidence. O_DSYNC/fsync and fault regressions are not a full flush/FUA
-trace or debug-kernel audit. Profile remaining per-sector read/setup overhead
-before selecting another optimization. Any cross-bio coalescing, new crash
-guarantee or in-carrier redundancy requires separate design and evidence.
+Concurrent public lifecycle and explicit flush/FUA trace regressions are now
+implemented and verified on AES4096 and AEGIS512; see the final handoff. A
+lockdep/KASAN kernel audit and broader scheduling/storage coverage remain open.
+
+Next build reproducible matched ordinary-Linux controls for detectability:
+compare layout, IV encodings, journal/write footprints and snapshot changes
+under the same primary workload, recording observable differences and limits.
+Statistical agreement cannot prove deniability. Profile remaining per-sector
+read/setup overhead before choosing another optimization. Any cross-bio
+coalescing, crash guarantee or in-carrier redundancy needs separate evidence.
 
 Further work: detectability against matched ordinary controls, independent
 cryptographic review, debug-kernel/lifecycle stress, explicit budget/rekey tooling,
@@ -649,3 +653,83 @@ matching host-verification.json. This bounded milestone is complete. Next work
 is concurrent lifecycle/flush stress and evidence-led profiling of read/setup
 cost. No cross-bio coalescing, broader host deployment or new crash/deniability
 claims follow from these results.
+
+
+## Session handoff: concurrent lifecycle/flush stress (2026-10-19)
+
+Added scripts/guest-lifecycle.sh, kernel/guest-lifecycle-test.py, the independent
+kernel/lifecycle_trace.py evidence checker and three rejection tests. The
+separate kernel/piv-io-test.c helper compiles only against pinned guest headers;
+it is not part of dm-piv's Makefile or production interface. It accepts only two
+public-view names, sector 0 and 512-byte same-data requests with exact plain/FUA/
+PREFLUSH|FUA/flush modes, and wipes its temporary page. No keys, arbitrary paths,
+offsets or plaintext are exposed through it. The production driver, disk format,
+control ABI, cryptography and setup frontend are unchanged.
+
+Kernel probes trace pn_worker, pn_write, blkdev_issue_flush and bio_endio on a
+global trace clock. The checker rejects incomplete or overlapping workers,
+unpaired/failed flushes, missing completion-after-flush and missing preflush
+before payload. DM may split preflush into its own bio. Probe misses and trace
+buffer overruns are failures. Tests wait for complete worker-return evidence
+before stopping tracing, since upper completion can wake the submitting CPU
+before the worker returns on another CPU. Probes and the helper are removed
+before final production-module unload. Only metadata/results are traced.
+
+Four writers own disjoint logical regions but deliberately share carriers:
+two 16 KiB decoy regions and two 512-byte hidden blocks. Each performs eight
+nontrivial write/read/fsync iterations and restores its original bytes (36 total
+writes). Another thread performs eight public-view suspend/resume cycles;
+recorded writer progress must demonstrate interleaving. Held public descriptors
+must prevent remove/close/unload while retaining all mapping identities. Prepared
+direct-write descriptors/buffers then prove actual pwritev/pwritev2 remains
+blocked during public suspension, while the peer stays usable, and completes
+after resume. Full primary/hidden checks, clean new-generation reopen, stock
+readback and unload follow. Private owner/lower administrative mutation while
+views are active remains unsupported; this tests the public lifecycle contract.
+
+Host 33 tests passed without skips on AES4096 with ResourceWarning errors and
+optional original AEGIS reference enabled. The three new checker tests reject
+missing flush/completion/worker evidence, preflush after payload, errors and
+missing worker entry. Python compilation, changed-shell syntax and whitespace
+checks passed. No host installs/root/modules, physical-device access or full
+kernel build was needed. The reused production module/source stage are
+batch-native-4096-001/share/experimental-dm-piv.ko and vendor/kernel-build/batch-001.
+
+AES4096 lifecycle-4096-004 PASSED. Both views each exercised four flag modes:
+plain/FUA writes completed two lower flushes; preflush+FUA completed three
+(one before payload); standalone flush completed one. Every trace had complete
+ordered workers and zero missed/overrun events. Concurrent writer progress at
+suspend/resume completion was [0,2,2,6,6,8,8,10], proving overlap. Busy operations,
+blocked writes, new generation, stock readback and module unload passed. An
+unrelated stock encrypted filesystem stayed mounted and writable. Independent
+verification authenticated all 28,244 primary sectors and matched all 301,056
+hidden bytes, with distinct current IVs. Primary hash:
+e745a517d7eef8d46faa53fcdb9e732c0fe3da40e66e2bc228797eb40251065c.
+
+AEGIS512 lifecycle-512-002 also PASSED using identical helper/parser/harness
+bytes. All eight flag cases had the same successful worker/flush counts as AES,
+zero missed probes and zero overruns. Concurrent suspend/resume progress was
+[2,4,4,7,8,9,11,13]. Busy checks, witnessed blocked writes, complete oracles,
+new-generation reopen, stock authentication and unload passed. Independent
+verification authenticated all 213,008 primary sectors and matched all 3,028,992
+hidden bytes, with distinct current IVs. Primary hash:
+e42c7683a69cdfcf4bbf0fbca32de0f9bd6c15e950aaf2d79a714cc60054019a.
+Both final guest logs contain no unexpected compiler warnings, kernel BUG/Oops/
+WARNING or trace errors. Expected unsigned-module taint and udev probes of the
+blocked private owner are not test failures. Frozen test inputs match current
+sources; production includes match the previously verified batch-001 stage.
+This bounded milestone is complete; no production-driver defect was found.
+
+Failed experiments are not trusted fixtures: lifecycle-probe-001 established
+tracefs/symbol availability; lifecycle-4096-001's helper used removed no_llseek;
+lifecycle-4096-002 hit Python append's unsupported SEEK_END on tracefs seq_files.
+Direct descriptor writes fix that. lifecycle-4096-003 passed flags, concurrent
+oracles and busy checks but its blocked-write witness assumed syscall 296 and
+opened after suspension. Final witnesses prepare descriptors first and accept
+x86_64 pwritev 296 or pwritev2 328. Obsolete lifecycle-512-001 was stopped after
+its flag traces passed. These were harness/API issues; no security guarantees
+or error assertions were relaxed to turn them into passes.
+
+Limits: bounded workload and pinned normal kernel, not lockdep/KASAN or broad
+scheduler/hardware coverage. Successful ordered kernel flush returns do not
+prove physical persistence, hidden-record atomicity or rollback resistance.

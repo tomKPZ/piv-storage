@@ -54,7 +54,9 @@ No discard or write-zeroes bypass is advertised. WRITE|PREFLUSH drains the lower
 journal before its payload; each write batch flushes every 32 applied sectors and
 at completion, satisfying FUA before completion as well. Flush bios reach the
 lower journal through the same ordered workqueue. Suspend/removal uses DM
-references and generation binding. Larger batches are not atomic writes; an
+references and generation binding. Public-view concurrency, busy teardown and
+exact flush/FUA trace tests are described in [the lifecycle notes](native-faults.md#concurrent-lifecycle-and-explicit-flushfua-evidence).
+Larger batches are not atomic writes; an
 interrupted decoy batch may damage either touched hidden record. Opening still
 authenticates the full primary volume sector by sector; setup overhead remains.
 

@@ -112,6 +112,11 @@ resolved from context/evidence, not for routine implementation decisions.
 
 Guest test scaffolding lives in scripts/guest-common.sh, automatically frozen by
 vm.py. Reuse it rather than duplicating guards, builds and package setup.
+kernel/piv-io-test.c is a separate guest-only exact-bio-flags test helper; never
+link it into dm-piv or load it on the host. Lifecycle traces must have complete
+worker/flush/completion ordering and zero missed/overrun events; absent evidence
+is a test failure. Private owner/lower administrative mutations while views are
+active are outside the supported public-view lifecycle.
 
 Use small reproducible fixtures and pure userspace checks first, then stock Linux
 inside a disposable VM. Cross-check crypto against independently generated kernel
