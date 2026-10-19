@@ -66,8 +66,10 @@ observing deniability or single-snapshot statistical proof follows.
 
 The internal source-led security/threat-model review is complete; see
 docs/security-review.md and the final handoff. Independent cryptographic review
-remains outstanding. Next profile remaining per-sector read/setup overhead
-before another optimization. Any cross-bio coalescing,
+remains outstanding. Authenticated read/setup profiling is complete; see
+docs/read-performance.md. Next implement and measure a bounded authenticated
+primary range-read helper for setup, decoy reads and carrier collection. Preserve
+full authentication and avoid persistent caches. Any cross-bio coalescing,
 crash guarantee or in-carrier redundancy needs separate evidence.
 
 Further work: expanded journal/active-metadata attack fixtures, independent
@@ -846,3 +848,51 @@ full activation cost before selecting a measured optimization. Independent
 cryptographic review of the joint encoding distribution remains an external
 requirement for stronger concealment claims. Debug-kernel testing, active journal
 fixtures and explicit per-cipher lifetime/rekey policy remain separate open items.
+
+
+## Session handoff: authenticated read/setup profiling (2026-10-19)
+
+Added scripts/guest-profile.sh and kernel/guest-profile-test.py, using the shared
+guarded guest scaffold and unchanged batch-native-4096-001 module. Timings run
+without instrumentation; a separate entry-probe pass verifies exact primary
+authentication load/record/write/checkpoint counts with zero missed hits. Setup
+is delimited at the ioctl because pn_setup is inlined; piv_load's unique non-cold
+compiler specialization is resolved from the loaded module. Public read counters
+start after udev settles. Cumulative totals include discovery, deltas do not.
+
+Sequential QEMU TCG runs profile-4096-003 and profile-512-001 both passed. Complete
+primary/hidden oracles, zero read-phase encryption use, close/module unload and
+stock Linux readback passed. Host check_stateless independently authenticated
+all 28,244 AES4096 / 213,008 original-AEGIS512 primary sectors and matched all
+301,056 / 3,028,992 hidden bytes. Both have host-verification.json. Current IVs
+were distinct, not a lifetime uniqueness result. Frozen harnesses match current
+sources; runtime includes match batch-001. No unexpected kernel diagnostics.
+
+Median stock/native activation: AES 0.266/5.826 s, AEGIS 0.254/35.336 s. The native
+setup ioctl took 5.146/34.647 s, with exactly primary_sectors+1 authenticated loads
+(full scan plus checkpoint). At 16 KiB requests, reading 1 MiB through stock/native
+decoy took 24.705/60.182 ms for AES and 22.346/321.641 ms for AEGIS. Reading 64 KiB
+hidden took 1.122/0.706 s; larger requests barely helped. A 4 KiB hidden request
+authenticated 384/288 primary sectors and decoded eight records. Full samples,
+method, caveats, module hash and reproduction are in docs/read-performance.md,
+linked from README. These are warm-cache TCG diagnostics with Python comparisons,
+not physical-media throughput or a controlled cipher comparison.
+
+Host 40 tests passed with ResourceWarning errors, AES4096 fixture and optional
+AEGIS reference enabled; Python compilation, shell syntax and git diff --check
+passed. No new runtime/format/ABI change, host installation/module load, physical
+device access or full kernel build. profile-4096-001 failed on invalid stock
+512-byte direct reads; profile-4096-002 was stopped when compiler symbol details
+were identified. Neither is a successful fixture. Final runs do not weaken
+alignment or counter assertions.
+
+Next bounded task: prototype a shared authenticated range-read helper, gathering
+at most 16 KiB of primary ciphertext/tag/IV tuples per lower read, authenticating
+every sector with unchanged Linux AAD before copying requested bytes. Use for
+setup scans, decoy reads and carrier reads without lazy verification, persistent
+caches or cross-bio writeback. Retain per-sector crypto checks; measure fewer
+lower submissions and repeated timings rather than assuming a speedup. Keep the
+old module/results as the baseline. Recheck complete oracles and corruption/
+lower-fault isolation, lifecycle/flush behavior and other affected guest suites
+before accepting the optimization. This profile identifies a candidate path;
+it does not separate CPU crypto, allocation, scheduling and lower-I/O costs.

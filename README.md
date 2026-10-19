@@ -11,6 +11,8 @@ Volatile ownership locks live in /run. A separate mounted root filesystem is not
 an architectural requirement; keys, userspace setup tools and the matching module
 must be available when activating it. Deployment remains restricted to our pinned
 QEMU guest and synthetic 128 MiB disk, not general host or production use.
+[Read and activation profiling](docs/read-performance.md) records measured costs
+and the remaining per-sector authentication overhead.
 
 The separate `dm-piv.ko` module registers `piv-crypt` and `piv-view`, alongside
 the stock `dm-crypt` module's `crypt` target. Stock encrypted filesystems may
