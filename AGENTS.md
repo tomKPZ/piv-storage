@@ -38,6 +38,10 @@ resolved from context/evidence, not for routine implementation decisions.
 
 ## Implementation priorities
 
+- The user prioritizes remaining work that requires core module changes. Follow
+  ROADMAP.md's core-first order; include necessary tests/docs with each change.
+  Do not fabricate kernel features to defer useful validation. Concrete security
+  defects override feature ordering; standalone tooling/assessment comes later.
 - Maintain the paired native writable decoy/hidden block devices, one coordinated
   kernel owner and independent read-only image/record decoders. No FUSE/NBD,
   offline writer, legacy decoding, external history/WAL, bootstrap or compaction.

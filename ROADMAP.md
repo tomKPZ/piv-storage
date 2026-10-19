@@ -44,42 +44,73 @@ Exit criteria (all passed):
    primary remains valid and hidden either authenticates a complete old/new
    block or returns EIO. No recovery-file dependency or silent fragment mixing.
 
-## Next bounded work
+## Next bounded work: core module changes first
 
-Failure handling and mapping cleanup are implemented; see the final handoff
-for direct-I/O fault, ownership and boot regression evidence. Preserve that
-coverage when changing the I/O path.
+The user's 2026-10-19 priority change puts work requiring production module
+changes ahead of standalone userspace tooling and assessment. Tests and concise
+documentation remain part of each core change's exit criteria; this does not
+mean postponing validation until after implementation. Known integrity or memory
+safety defects take precedence over this ordering whenever discovered.
 
-Bounded 16 KiB decoy I/O is implemented; final regression results are recorded
-below. Each intersecting hidden record still needs its whole carrier refreshed;
-separate small bios still repeat work.
+1. **Larger geometry support (next implementation).** Replace the native 256 MiB
+   primary cap with reviewed address/count bounds and bounded allocation/I/O.
+   Check native capacity, sector conversions, range ends, carrier/tail arithmetic
+   and activation cost. Make only the userspace/fixture changes necessary to
+   exercise the module: retain the pinned disposable guest and exact /dev/vdb
+   guard, adding explicitly approved synthetic sizes rather than opening generic
+   host devices. Exit: at least one disposable image whose primary exceeds the
+   old cap, at both sector sizes, with boundary/tail reads and writes, complete
+   primary/hidden verification, stock authentication and preserved failure
+   behavior. Removing the cap alone does not complete this milestone.
+2. **Scalable activation and initialization.** Make long kernel setup/initialize
+   operations responsive to cancellation and scheduler needs, with defined
+   cleanup and partial-initialization semantics. Retain the full authentication
+   scan, seeded randomness and exclusive ownership. Exit: witnessed interruption
+   of a long operation, no leaked mappings/keys or usable half-ready owner, and
+   successful subsequent activation after supported cleanup. Initialization may
+   already have changed hidden records; cancellation is not rollback.
+3. **Core resource/lifecycle hardening.** Review and improve allocation failure,
+   queue/resource bounds, lifetime and teardown handling where concrete evidence
+   requires module changes. Pair changes with targeted injection/concurrency
+   tests, and debug-kernel checks when an appropriate test kernel is available.
+   Do not add speculative machinery or build a large debug kernel merely to
+   manufacture a source change. A test revealing no defect is still useful,
+   but standalone test expansion comes after identified core implementation work.
+4. **Kernel compatibility and maintenance.** Deliberately port the private fork to
+   another selected supported kernel, reviewing upstream dm-crypt fixes and API
+   differences. Keep stock crypt coexistence and exact source/config/symbol
+   validation. This is an actual porting task, not a promise of one binary module
+   working across kernels; select the additional version before downloading or
+   building another large environment.
+5. **Further core performance work, only when justified.** Current bounded
+   authenticated read batching and 16 KiB decoy write batching are complete.
+   Use measurements to select any remaining allocation/crypto/I/O changes.
+   Concurrency, cross-bio coalescing and caches are optional architectural work,
+   not requirements to implement by default. Preserve authentication, fresh-IV
+   coordination, error isolation and flush/completion semantics.
 
-Concurrent public lifecycle and explicit flush/FUA trace regressions are now
-implemented and verified on AES4096 and AEGIS512; see the final handoff. A
-lockdep/KASAN kernel audit and broader scheduling/storage coverage remain open.
+## Work following core implementation
 
-Matched ordinary-Linux controls now quantify layout, IV, journal and snapshot
-behavior on AES4096 and AEGIS512. The native known-workload footprint differs
-from ordinary requested writes; ordinary whole-group rewrites can match its
-changed-IV positions. See docs/detectability.md; no multi-snapshot/workload
-observing deniability or single-snapshot statistical proof follows.
+- Security/test expansion: active on-disk metadata/journal negative fixtures,
+  broader interruption and scheduling/storage coverage, and a refreshed full
+  six-profile matrix. Targeted versions of these tests move forward whenever
+  needed to validate a core change or investigate a suspected defect.
+- Independent cryptographic review of the whole encoding and per-cipher usage
+  policy. External review can proceed in parallel if available; findings that
+  affect integrity, confidentiality or encoding override the implementation order.
+- Explicit lifetime-budget guidance and migration/rekey tooling. The resetting
+  owner counter cannot enforce key-lifetime usage across stock writes, clones or
+  recreations. Define the policy/workflow before deciding whether extra kernel
+  controls are useful; do not invent an on-disk ledger or online-rekey feature.
+- General device deployment, packaging/signing, boot-time key provisioning and
+  documentation consolidation. Actual RAM-root activation is already verified;
+  production boot integration and unrestricted host deployment are not.
 
-The internal source-led security/threat-model review is complete; see
-docs/security-review.md and the final handoff. Independent cryptographic review
-remains outstanding. Authenticated read/setup profiling is complete; see
-docs/read-performance.md. Bounded authenticated primary range reads are now
-implemented for setup, decoy reads and carrier collection, preserving every
-sector check and using no persistent cache; see the final handoff. Next add
-active on-disk metadata/journal negative fixtures against stock recovery and
-native activation, documenting rejection, replay acceptance and availability
-limits without promising freshness or mutation-free hostile activation. Any cross-bio coalescing,
-crash guarantee or in-carrier redundancy needs separate evidence.
-
-Further work: expanded journal/active-metadata attack fixtures, independent
-cryptographic review, debug-kernel/lifecycle stress, explicit budget/rekey tooling,
-larger geometry, generic device deployment and boot-time key provisioning. No
-production, rollback-resistance or broad deniability claim is authorized by these
-tests. A self-contained disk layout does not hide installed software or keys.
+Current evidence and limits remain in docs/security-review.md,
+docs/read-performance.md, docs/detectability.md and the handoffs below. Broader
+crash recovery, in-carrier redundancy, rollback resistance and deniability against
+snapshot/workload observers remain outside the current scope. Neither this
+priority change nor a larger volume authorizes stronger security/storage claims.
 
 ## Session handoff: stateless architecture (2026-10-18)
 
@@ -987,3 +1018,18 @@ Record both rejection and accepted valid replay, preserve explicit availability/
 freshness limits, and never claim activation cannot modify hostile storage before
 the full scan. Independent crypto review, debug-kernel memory/lifecycle stress,
 per-cipher lifetime/rekey policy and broader deployment remain open.
+
+
+## Session handoff: core-first priorities (2026-10-19)
+
+Reordered remaining work at the user's request. The next implementation is
+larger native geometry, followed by cancellable/scalable setup, evidence-led
+resource/lifecycle hardening, deliberate kernel porting and optional measured
+performance work. Standalone journal/metadata assessment, deployment tooling and
+documentation consolidation follow core changes; required tests/docs ship with
+each change, and concrete security defects always take priority. The previous
+handoffs' historical "next" entries are superseded by the top-level order.
+No module or runtime change was made in this prioritization update. Existing
+stateless-format, nonce, crash and threat-model limitations remain in force.
+Verification: reviewed current kernel cap/setup path and userspace guest guard;
+git diff --check passed. Runtime tests were not rerun for a documentation change.
