@@ -6,12 +6,14 @@ from pathlib import Path
 import subprocess
 from pivstore.blocks import open_blocks, close_blocks
 
+assert Path('/sys/module/dm_crypt').is_dir() and Path('/sys/module/dm_piv').is_dir()
 mounts = Path('/proc/mounts').read_text()
 assert ' ext4 ' not in mounts and ' ext2 ' not in mounts
 assert not Path('/var/lib/pivstore').exists()
 root_mount = next(line for line in mounts.splitlines() if line.split()[1] == '/')
 assert root_mount.split()[2] in ('rootfs', 'tmpfs', 'ramfs')
 value = open_blocks('/dev/vdb', '/piv/passphrase.key', Path('/piv/hidden.key').read_bytes())
+assert subprocess.check_output(['dmsetup', 'table', 'piv-native'], text=True).split()[2] == 'piv-crypt'
 expected = Path('/piv/expected-hidden-volume').read_bytes()
 assert value['hidden_bytes'] == len(expected)
 assert Path(value['hidden']).read_bytes() == expected
@@ -27,5 +29,7 @@ assert Path(value['hidden']).read_bytes() == expected
 with Path(value['decoy']).open('rb') as stream:
     assert hashlib.file_digest(stream, 'sha256').hexdigest() == Path('/piv/expected-primary.sha256').read_text().strip()
 close_blocks('/dev/vdb', '/piv/passphrase.key')
+subprocess.run(['rmmod', 'dm_piv'], check=True)
+assert Path('/sys/module/dm_crypt').is_dir()
 assert not Path('/var/lib/pivstore').exists()
 print('PIV_EARLY_BOOT_PASS: both writable devices on RAM root, no persistent root filesystem', flush=True)

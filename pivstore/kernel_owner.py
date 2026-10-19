@@ -89,6 +89,7 @@ class GuestOwner:
                 fields = dm('table', '--showkeys', name).stdout.split()
                 if fields[2:4] != ['crypt', self.mapping_cipher]:
                     raise ValueError('Unexpected primary mapping cipher')
+                fields[2] = 'piv-crypt'
                 fields[8] = str(int(fields[8]) + 1)
                 fields.append('piv_control')
                 dm('suspend', name)
@@ -122,7 +123,7 @@ class GuestOwner:
             raise
 
     def validate(self):
-        if dm('table', self.name).stdout.split()[2:4] != ['crypt', self.mapping_cipher]:
+        if dm('table', self.name).stdout.split()[2:4] != ['piv-crypt', self.mapping_cipher]:
             raise ValueError('Primary mapping cipher differs from LUKS metadata')
         if (self.device.sectors, self.device.sector_size, self.device.iv_size, self.device.tuple_size) != (self.layout.sectors, self.layout.sector_size, self.layout.iv_bytes, self.layout.tuple_bytes):
             raise ValueError('Native geometry differs from supported superblock')

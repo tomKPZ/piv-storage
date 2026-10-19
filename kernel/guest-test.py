@@ -56,6 +56,7 @@ before = digest()
 assert before == open('/mnt/piv-work/expected.sha256').read().strip()
 table = subprocess.check_output(['dmsetup', 'table', '--showkeys', 'piv-kernel'], text=True).split()
 assert table[2] == 'crypt' and len(table) == 9 + int(table[8])
+table[2] = 'piv-crypt'
 table[8] = str(int(table[8]) + 1)
 table.append('piv_control')
 # Read-only owner mode cannot supply the required lower write access.
@@ -303,7 +304,7 @@ rejected(lambda: fcntl.ioctl(ctl, query, buf), {errno.ENODEV})
 rejected(lambda: read_iv(ctl, generation, 0), {errno.ENODEV})
 assert not glob.glob('/dev/pivctl-*')
 # The open control pins the module until release.
-p = subprocess.run(['rmmod', 'dm_crypt'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+p = subprocess.run(['rmmod', 'dm_piv'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 assert p.returncode != 0
 os.close(ctl)
 # Corrupt only the closed guest-owned disk, never underneath a live mapping.
@@ -317,6 +318,7 @@ for placement in placements:
     run('cryptsetup', 'open', '--disable-keyring', '--key-file',
         '/mnt/piv-work/passphrase.key', '/dev/vdb', 'piv-kernel')
     fields = subprocess.check_output(['dmsetup', 'table', '--showkeys', 'piv-kernel'], text=True).split()
+    fields[2] = 'piv-crypt'
     fields[8] = str(int(fields[8]) + 1)
     fields.append('piv_control')
     run('dmsetup', 'suspend', 'piv-kernel')
@@ -352,8 +354,8 @@ for placement in placements:
     assert os.pwrite(raw, old, placement['offset']) == 1
     os.fsync(raw)
     os.close(raw)
-run('rmmod', 'dm_crypt')
-run('modprobe', 'dm_crypt')
+run('rmmod', 'dm_piv')
+assert os.path.isdir('/sys/module/dm_crypt')
 run('cryptsetup', 'open', '--readonly', '--key-file', '/mnt/piv-work/passphrase.key', '/dev/vdb', 'piv-kernel')
 assert digest() == before
 run('cryptsetup', 'close', 'piv-kernel')

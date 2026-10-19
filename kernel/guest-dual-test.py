@@ -213,7 +213,9 @@ subprocess.run(['umount', str(hidden)], check=True); subprocess.run(['umount', s
 (W / 'expected-primary.sha256').write_text(subprocess.check_output(['sha256sum', DECOY], text=True).split()[0] + '\n')
 (W / 'expected-hidden-volume').write_bytes(Path(HIDDEN).read_bytes())
 close()
-subprocess.run(['rmmod', 'dm_crypt'], check=True); subprocess.run(['modprobe', 'dm_crypt'], check=True)
+subprocess.run(['rmmod', 'dm_piv'], check=True)
+assert Path('/sys/module/dm_crypt').is_dir()
+assert subprocess.check_output(['dmsetup', 'table', 'piv-stock-live'], text=True).split()[2] == 'crypt'
 crypt('open', '--readonly', '--key-file', W / 'passphrase.key', '/dev/vdb', 'piv-stock')
 actual = subprocess.check_output(['sha256sum', '/dev/mapper/piv-stock'], text=True).split()[0]
 assert actual == (W / 'expected-primary.sha256').read_text().strip()

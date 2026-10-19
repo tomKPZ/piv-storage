@@ -1,2 +1,3 @@
-# Build this replacement module against the exact running guest headers.
-obj-m += dm-crypt.o
+# Private fork: coexist with the stock dm-crypt module and crypt target.
+obj-m += dm-piv.o
+dm-piv-y := dm-crypt.o

@@ -411,3 +411,83 @@ Python compilation, changed-shell syntax and git diff --check passed. Successful
 guest logs contained no unexpected compiler warnings or kernel BUG/Oops/WARNING
 diagnostics. All requested AEGIS-128 implementation and verification work is
 complete; commit this update under the standing user authorization.
+
+
+## Session handoff: separate renamed target
+
+User selected coexistence with stock dm-crypt while retaining the private source
+fork. Kbuild produces dm-piv.ko (kernel name dm_piv), registering piv-crypt and
+piv-view with aliases dm-piv-crypt/dm-piv-view. Stock crypt stays untouched and
+can remain mounted and busy. Module metadata lists only dm-mod as a dependency.
+Private queues use kpiv_io/kpiv_crypt; the write thread uses piv_write and logs
+use piv-crypt. No private symbols are exported to or imported from stock crypt.
+
+Setup still unlocks with stock cryptsetup and delegates journal replay to Linux.
+It then suspends the newly created private owner and reloads its table as
+piv-crypt with piv_control. Reuse/validation require piv-crypt. Teardown uses
+explicit DM removal because stock cryptsetup does not manage the custom target.
+Public device names and all cipher profiles, crypto, control ABI and disk format
+remain unchanged. Existing mounted stock volumes are not adopted or converted.
+The setup guard still restricts activation to the pinned disposable QEMU disk.
+
+Shared guest tests create an independent disposable stock-encrypted ext4 on a
+guest-root-backed loop file before loading dm-piv. That stock volume remains
+mounted/writable after custom-module teardown; loaded-targets.txt and
+coexistence-result.txt record coexistence. No tests unload stock dm-crypt.
+This sentinel is test data, never runtime metadata or an external-state dependency.
+
+Initial separate-001 ordinary/control/native/power runs passed, but
+separate-early-512-001 caught a real first-owner namespace bug: both modules' ID
+allocators started at 1, producing the same kcryptd_io-253:1-1 sysfs name while
+old/new tables coexisted during reload. Sysfs rejected the new queue. The final
+separate-002 stage fixes queue/thread names; initial001 is not the release module.
+Retain the actual first-owner RAM-root regression: earlier stock mappings can
+advance IDs and mask this collision. No crypto or persistence change was needed.
+
+Verified with corrected stage002:
+
+- All 27 host tests passed separately against AES4096 and AEGIS512 stock fixtures,
+  with ResourceWarning errors and no skips. Other codecs/formats are unchanged.
+- artifacts/separate-kernel-512-002 built the matched module and passed the full
+  AEGIS512 control/corruption/lifecycle suite, primary mutation/restore and stock
+  full-primary readback. Independent host checks authenticated all 213,008 final
+  sectors with the original hash and matched raw IV offsets. Stock crypt remained
+  mounted/writable throughout load and unload.
+- separate-native-4096-002 passed paired native read/write, carrier/metadata/tail
+  mutations and restore, hidden preservation/repair/invalid markers/wrong-key
+  isolation, concurrent ext4/ext2, clean reopen and stock final readback. Independent
+  host decoding matched all 28,244 primary sectors and all 301,056 hidden bytes to
+  guest oracles, with distinct current IVs. Final primary hash:
+  e745a517d7eef8d46faa53fcdb9e732c0fe3da40e66e2bc228797eb40251065c.
+  The unrelated stock encrypted filesystem stayed mounted and writable.
+- separate-power-4096-002 cut at 32/36 AEGIS changed current/committed IVs. Stock
+  replay preserved the primary and other hidden blocks; local EIO, invalid-marker
+  preservation and repair passed. Stock and independent primary/hidden verification
+  passed, and stock crypt stayed busy across custom load/unload on both boots.
+  This is VM interruption with surviving host cache, not hardware power loss.
+
+Corrected actual RAM-root boots passed as separate-early-512-002 (built in
+separate-early-build-512-002 from the prior closed AEGIS512 fixture) and
+separate-early-4096-002 (from the corrected AES native test). They loaded both
+modules, required the owner target piv-crypt, tested both writable devices and
+unloaded only dm_piv, leaving stock dm-crypt present. Independent final primary/
+hidden verification matched both complete guest oracles, with distinct current
+IVs. The first-owner collision regression passes without the original sysfs
+error or kernel stack dump. Neither boot used a persistent OS filesystem.
+
+The complete matched source stage is vendor/kernel-build/separate-002 and its
+scaffold is artifacts/separate-input-002/scaffold.tar. Kernel/headers/config/symbol
+pins remain unchanged. Source comparison confirms the private dm-crypt C differs
+from the previous implementation only in target, workqueue/thread/log names and
+module metadata; primary helpers/native records/control definitions are unchanged.
+No host installs, host modules, host root or real-device access were used.
+
+Next priorities remain lower-device EIO/fail-stop/recreate coverage, failed-setup
+cleanup and bounded batching. Separation does not provide a stable cross-kernel
+module ABI, upstream maintenance, generic deployment or new deniability/crash
+claims. Commit completed updates under the user's standing authorization.
+
+Python compilation, changed-shell syntax and git diff --check passed. A fresh
+patch-only stage reproduced every tested source byte (the complete build stage
+also supplies dm-audit.h). Corrected guest logs have no unexpected compiler or
+kernel BUG/Oops/WARNING/kobject diagnostics. Separation is implemented and tested.

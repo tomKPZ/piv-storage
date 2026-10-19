@@ -1,11 +1,16 @@
 # Paired native block devices
 
-The module extends pinned dm-crypt to reuse its exact primary AEAD/AAD handling
-and stock dm-integrity journal, avoiding a second primary crypto implementation.
-The patched dm-crypt module registers piv-view alongside its opted-in crypt
-owner. The decoy and hidden targets reference that owner, lower dm-integrity
-device, serialization lock and record cipher. Both expose plaintext logical I/O;
-there is no userspace I/O service or persistent state file.
+The separate dm-piv.ko module contains a private fork of pinned dm-crypt to reuse
+its exact primary AEAD/AAD handling and stock dm-integrity journal. It registers
+piv-crypt and paired piv-view targets. Stock dm-crypt keeps its crypt target and
+can remain loaded with unrelated encrypted filesystems mounted throughout setup,
+I/O and removal of our module. No stock symbols are hooked or replaced. The fork
+still needs upstream fixes and exact matching kernel headers/config/symbols.
+
+Both public views reference one private piv-crypt owner, lower dm-integrity
+device, serialization lock and record cipher. They expose plaintext logical I/O;
+there is no userspace I/O service or persistent state file. Existing mounted
+stock mappings are not converted into paired volumes by loading this module.
 
 A failed setup can leave private mappings behind. In this disposable prototype,
 tear down that stack or discard the guest before retrying; never work around
@@ -13,14 +18,15 @@ it by creating an overlapping independent mapping.
 
 Setup remains privileged and intentionally restricted to QEMU, the pinned
 6.12.113+deb13-amd64 guest and disposable 128 MiB /dev/vdb. It invokes cryptsetup
-for ordinary LUKS opening and journal replay, opts the crypt mapping into
-piv_control, suspends it, begins ownership, authenticates every primary sector,
+for ordinary LUKS opening and journal replay, suspends the new crypt mapping,
+reloads its private table as piv-crypt with piv_control, resumes it, then suspends
+and begins coordinated ownership, authenticates every primary sector,
 and loads the hidden key/context through ABI 3. Optional destructive initialization
 writes zero hidden blocks before exposing devices. Opening never requires that
 any hidden record authenticate. CRNG readiness is awaited before setup takes the
 owner lock. Runtime ownership locks use /run, which may be tmpfs.
 
-The private crypt mapping rejects ordinary bios while native ownership is active.
+The private piv-crypt mapping rejects ordinary bios while native ownership is active.
 Public piv-view map callbacks queue bounded work to an ordered reclaim-capable
 workqueue. Work runs under the shared lock and NOIO allocation scope. Hidden bios
 are split to 512 bytes, decoy bios to the primary encryption-sector size
@@ -72,6 +78,12 @@ Uninitialized/damaged blocks need a full 512-byte direct-I/O write for targeted
 repair. Buffered sub-page writes may first read a 4096-byte page containing
 unavailable blocks and fail before reaching the target. Destructive full-volume
 initialization avoids this issue for normal filesystem use.
+
+Use the project close-blocks command to remove the private stack. Stock cryptsetup
+does not directly manage our custom target. The controller tears down our DM
+mappings explicitly; ordinary cryptsetup remains available for unrelated volumes
+and for stock readback after closing ours. No primary or hidden disk format or
+control ABI changed with module separation.
 
 The integration patch is kernel/dm-crypt-piv.patch. piv-control.inc owns privileged
 controls, authenticated primary tuple preparation/application and lifetime gates;
@@ -136,3 +148,12 @@ vm.py automatically freezes guest-common.sh for setup guards, package installati
 module build/load and provenance recording. Tests keep their scenario logic in
 separate scripts. guest-stateless-prebuilt.sh reuses the same guest-dual.sh test
 body with PIV_PREBUILT=1; share guest-dual.sh and guest-early-build.sh when using it.
+
+The shared guest loader creates a separate disposable stock-encrypted ext4
+filesystem on a guest-root-backed loop image before loading dm-piv. It remains
+mounted and is checked writable after custom-module teardown. Never put that
+loop backing file on the 9p share. See coexistence-result.txt and loaded-targets.txt.
+The stock module is never unloaded or replaced by these tests. This independent
+sentinel is test data, not runtime metadata or a persistent-root requirement.
+The RAM-root test deliberately starts with its first stock/private owner, which
+also checks that per-module workqueue IDs cannot collide across the two targets.

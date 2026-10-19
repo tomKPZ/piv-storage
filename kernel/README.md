@@ -1,7 +1,9 @@
-# Experimental native dm-crypt backend
+# Separate persistent-IV kernel module
 
-The experimental module extends dm-crypt and registers paired piv-view targets
-sharing one crypt owner, hidden-record crypto, stateless record authentication.
+dm-piv.ko is a private fork of pinned dm-crypt, registering piv-crypt and paired
+piv-view targets. It coexists with unmodified dm-crypt/crypt and does not require
+unloading stock crypt, including when an ordinary encrypted filesystem is busy.
+The hidden views share one owner, hidden-record crypto and stateless authentication.
 Primary encryption supports AES-GCM, ChaCha20-Poly1305 and original AEGIS-128 with stored random IVs.
 See [native interface and end-to-end tests](../docs/native-blocks.md).
 The userspace FUSE/NBD adapters have been removed; their historical test results
@@ -12,7 +14,13 @@ the selected stock fixture.
 
 Build/load ONLY inside the pinned disposable guest, never on the host or real
 disks. Source/header/config/symbol versions must match; do not force-load a module.
-Unsigned-module taint is expected. No full kernel build or new host package is
+Unsigned-module taint is expected.
+Kbuild links the private dm-crypt.o into dm-piv.ko; module aliases are dm-piv-crypt
+and dm-piv-view. It exports no private dm-crypt functions or stock target alias.
+Private sysfs workqueues use kpiv_io/kpiv_crypt names and the write thread uses
+piv_write. Separate target names alone are insufficient: during table reload the
+old stock and new private targets share a device number and can have identical
+per-module allocation IDs, so their workqueue names must also differ. No full kernel build or new host package is
 needed. Source archives are SHA-256 pinned using Debian's HTTPS source descriptor;
 its OpenPGP signature has not been independently verified. The staging script
 checks orig dm-crypt equality with the reviewed upstream file and refuses distro

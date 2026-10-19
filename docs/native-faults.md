@@ -33,7 +33,7 @@ python3 scripts/vm.py run --code \
   --power-cut-script scripts/guest-stateless-recover.sh \
   --run-dir artifacts/stateless-power-next \
   --data-image artifacts/control-003/control.img \
-  --share-file artifacts/stateless-next/share/experimental-dm-crypt.ko \
+  --share-file artifacts/stateless-next/share/experimental-dm-piv.ko \
   --share-file kernel/guest-stateless-power.py \
   --share-file artifacts/control-003/share/passphrase.key \
   --share-file artifacts/control-003/hidden.key --timeout 3600

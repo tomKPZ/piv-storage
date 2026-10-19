@@ -16,6 +16,7 @@ copy_exec /usr/sbin/cryptsetup
 copy_exec /usr/sbin/dmsetup
 copy_exec /usr/sbin/blockdev
 copy_exec /usr/sbin/modprobe
+copy_exec /usr/sbin/rmmod
 # kmod dlopens decompression libraries; ldd alone does not discover them.
 copy_exec /usr/lib/x86_64-linux-gnu/liblzma.so.5
 copy_exec /usr/lib/x86_64-linux-gnu/libzstd.so.1
@@ -24,10 +25,11 @@ mkdir -p "${DESTDIR}/usr/lib/python3.13" "${DESTDIR}/piv"
 cp -a /usr/lib/python3.13/. "${DESTDIR}/usr/lib/python3.13/"
 # Native setup intentionally needs no Python cryptography or CFFI extension.
 cp -a /opt/piv-code/pivstore "${DESTDIR}/piv/pivstore"
-cp /root/piv-module/dm-crypt.ko "${DESTDIR}/piv/dm-crypt.ko"
+cp /root/piv-module/dm-piv.ko "${DESTDIR}/piv/dm-piv.ko"
 cp /mnt/piv-work/passphrase.key /mnt/piv-work/hidden.key /mnt/piv-work/guest-early-test.py \
  /mnt/piv-work/expected-hidden-volume /mnt/piv-work/expected-primary.sha256 "${DESTDIR}/piv/"
 manual_add_modules virtio_blk
+manual_add_modules dm_crypt
 manual_add_modules dm_integrity
 manual_add_modules aegis128
 manual_add_modules gcm
@@ -56,7 +58,8 @@ mkdir -p /run
 mount -t tmpfs tmpfs /run
 modprobe virtio_blk
 modprobe dm_integrity
-insmod /piv/dm-crypt.ko
+modprobe dm_crypt
+insmod /piv/dm-piv.ko
 export PYTHONPATH=/piv
 export PYTHONDONTWRITEBYTECODE=1
 python3.13 -S /piv/guest-early-test.py

@@ -1,7 +1,7 @@
 #!/bin/bash
 source /mnt/piv-work/guest-common.sh
 guest_code
-guest_load_module /mnt/piv-work/experimental-dm-crypt.ko
+guest_load_module /mnt/piv-work/experimental-dm-piv.ko
 python3 - <<'PY'
 import errno
 import json
@@ -45,13 +45,14 @@ close_blocks('/dev/vdb', w / 'passphrase.key')
 (w / 'power-results.json').write_text(json.dumps(dict(affected_block=outcome,
     other_hidden_blocks_unchanged=True, primary_unchanged=True, repair_passed=True)) + '\n')
 PY
-rmmod dm_crypt
-modprobe dm_crypt
+rmmod dm_piv
 cryptsetup open --readonly --key-file passphrase.key /dev/vdb piv-stock
 sha256sum /dev/mapper/piv-stock | cut -d ' ' -f 1 > stock-primary.sha256
 cmp power-primary.sha256 stock-primary.sha256
 cryptsetup close piv-stock
 dd if=/dev/vdb of=stateless-power-final.img bs=1M status=none
+guest_stock_live_check
+printf 'Stock crypt stayed busy while dm_piv loaded and unloaded.\n' > coexistence-result.txt
 dmesg > reboot-dmesg.txt
 printf 'Partial-carrier VM interruption, stock journal replay, local EIO isolation/repair and stock full-primary verification passed\n' > result.txt
 sync

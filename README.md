@@ -12,6 +12,12 @@ an architectural requirement; keys, userspace setup tools and the matching modul
 must be available when activating it. Deployment remains restricted to our pinned
 QEMU guest and synthetic 128 MiB disk, not general host or production use.
 
+The separate `dm-piv.ko` module registers `piv-crypt` and `piv-view`, alongside
+the stock `dm-crypt` module's `crypt` target. Stock encrypted filesystems may
+remain mounted while our module loads, serves its paired devices and unloads.
+It retains a private copy of pinned dm-crypt code; it does not hook or replace
+the stock target. Exact kernel build compatibility is still required.
+
 README and ROADMAP are provisional research notes. This is not a proven
 indistinguishability construction or reliable production storage.
 

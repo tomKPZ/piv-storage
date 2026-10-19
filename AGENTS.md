@@ -61,7 +61,11 @@ resolved from context/evidence, not for routine implementation decisions.
   Apply through the ordinary lower dm-integrity journal; its per-sector atomicity
   does not make a hidden record atomic. Storage/primary-auth errors stop the
   shared owner. Local hidden unavailability must not stop the decoy.
-- Build/load experimental kernel code only in disposable guests with exact
+- Build dm-piv.ko as a separate module registering piv-crypt/piv-view. Keep
+  stock dm-crypt/crypt loaded and independent; never unload it to activate ours.
+  Keep private sysfs workqueue names distinct (kpiv_io/kpiv_crypt): independent
+  stock/fork ID allocators can collide during a suspended table reload.
+  Build/load experimental kernel code only in disposable guests with exact
   source/config/symbol matches. Never install host modules or touch real disks.
   scripts/fetch_kernel.py stages the COMPLETE module including dm-audit.h;
   kernel/prepare.py alone stages only the patch and is insufficient for a build.

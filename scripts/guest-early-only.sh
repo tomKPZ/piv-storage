@@ -4,5 +4,5 @@ source /mnt/piv-work/guest-common.sh
 guest_packages
 guest_code
 mkdir -p /root/piv-module
-cp experimental-dm-crypt.ko /root/piv-module/dm-crypt.ko
+cp experimental-dm-piv.ko /root/piv-module/dm-piv.ko
 bash /mnt/piv-work/guest-early-build.sh
