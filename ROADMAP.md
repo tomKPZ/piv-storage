@@ -64,13 +64,13 @@ from ordinary requested writes; ordinary whole-group rewrites can match its
 changed-IV positions. See docs/detectability.md; no multi-snapshot/workload
 observing deniability or single-snapshot statistical proof follows.
 
-Next perform a source-led security/threat-model review of the whole encoding,
-nonce budgets and supported claims, distinguishing internal analysis from the
-still-outstanding independent cryptographic review. Profile remaining per-sector
-read/setup overhead before another optimization. Any cross-bio coalescing,
+The internal source-led security/threat-model review is complete; see
+docs/security-review.md and the final handoff. Independent cryptographic review
+remains outstanding. Next profile remaining per-sector read/setup overhead
+before another optimization. Any cross-bio coalescing,
 crash guarantee or in-carrier redundancy needs separate evidence.
 
-Further work: detectability against matched ordinary controls, independent
+Further work: expanded journal/active-metadata attack fixtures, independent
 cryptographic review, debug-kernel/lifecycle stress, explicit budget/rekey tooling,
 larger geometry, generic device deployment and boot-time key provisioning. No
 production, rollback-resistance or broad deniability claim is authorized by these
@@ -801,3 +801,48 @@ shared metric source match the frozen runs; the analyzed images were read-only.
 No host installs/root/modules, real disks, large toolchains or new kernel build.
 This bounded assessment is complete. Next: source-led security/threat-model
 review, with independent cryptographic review still explicitly outstanding.
+
+
+## Session handoff: security and threat-model review (2026-10-19)
+
+Completed the bounded internal source review of runtime/format revision 1f4c94f.
+docs/security-review.md records assets, observer capabilities, trusted components,
+encoding assumptions, primary/hidden nonce domains, kernel/setup boundaries and
+open work. Primary references are RFC 5869, RFC 8439, NIST SP 800-38D and Linux
+dm-integrity documentation; actual AAD/layout and mutation gates were checked
+against the pinned staged dm-crypt helper and current includes. No new concrete
+implementation defect requiring a runtime/format change was identified. This is
+not an exhaustive memory-safety audit or independent cryptographic assessment.
+
+Clarifications now carried into README/format/agent instructions:
+- A single raw image can retain journal history; current-IV pseudorandomness
+  alone does not imply full-disk indistinguishability. Known-workload/snapshot
+  distinctions from matched controls remain explicit.
+- Hidden records provide an offline guessing oracle. Direct hidden keys require
+  independent high entropy; HKDF does not make passwords safe. No key commitment,
+  alternative-opening protocol or protection from a live administrator is claimed.
+- Random-IV GCM's 2^32 invocation bound is across ALL instances using a key. The
+  resetting owner counter cannot enforce it. ChaCha/original-AEGIS aggregate
+  policies have not been established merely by using the same diagnostic cap.
+- Context/address binding is not freshness, primary-key/cipher binding or clone
+  prevention. Old valid blocks and mixed valid block epochs remain accepted.
+  Reusing a salt at one context/address reuses a ChaCha stream/one-time MAC key.
+- Un-MACed journal commit IDs do not authenticate hostile replay ordering; primary
+  AEAD does not authenticate all disk metadata. Activation delegates replay to
+  Linux before the native full scan. Active malicious metadata/journal experiments
+  and forensic reconstruction of older hidden records remain unperformed.
+
+Added three executable limitation regressions: whole-record rollback acceptance,
+mixed valid block epochs, and plaintext-XOR leakage under deliberately repeated
+salt. All 40 host tests passed without skips, with ResourceWarning errors, the
+AES4096 fixture and optional original-AEGIS reference enabled. Python compilation
+and git diff --check passed. Current production includes still match the verified
+batch-001 source stage. No kernel/runtime, ABI, record bytes or persistent state
+changed; no new VM run, host installation, module load or physical-device access
+was needed. Existing VM evidence is retained, not represented as newly executed.
+
+Next bounded implementation work: profile authenticated primary/hidden reads and
+full activation cost before selecting a measured optimization. Independent
+cryptographic review of the joint encoding distribution remains an external
+requirement for stronger concealment claims. Debug-kernel testing, active journal
+fixtures and explicit per-cipher lifetime/rekey policy remain separate open items.

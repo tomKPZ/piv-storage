@@ -52,3 +52,8 @@ UUID/address binding rejects transplantation, but same-UUID clones and rollback
 have no external freshness anchor. Cross-sector recovery is deliberately absent.
 No prior hidden formats are decoded. Changing UUID or primary geometry changes the AAD. Record v3 bytes/context
 are unchanged; the validated primary profile determines slot width/group size.
+
+See [security-review.md](security-review.md) for observer boundaries, salt-reuse
+consequences, offline key guessing, journal history and per-key lifetime limits.
+AAD does not bind the primary key/cipher or a generation. Valid whole-record
+rollback and mixed valid block epochs are intentionally accepted.

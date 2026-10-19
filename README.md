@@ -19,7 +19,9 @@ It retains a private copy of pinned dm-crypt code; it does not hook or replace
 the stock target. Exact kernel build compatibility is still required.
 
 README and ROADMAP are provisional research notes. This is not a proven
-indistinguishability construction or reliable production storage.
+indistinguishability construction or reliable production storage. The internal
+[security and threat-model review](docs/security-review.md) defines the observer
+boundaries and open assumptions; independent cryptographic review remains open.
 
 ## Use
 
@@ -102,7 +104,10 @@ its replaced IVs. There is **no historical collision detection**. For q uniforml
 random primary IVs under one key, collision probability is approximately
 q(q-1)/2^97 for 96-bit IVs, or q(q-1)/2^129 for 128-bit IVs. A 2^32 per-owner
 encryption cap is only a diagnostic guard: reopening
-resets it, and all stock writes, retries, failed preparations and clones count
+resets it. For random-IV AES-GCM, the 2^32 limit applies across all
+instances using the key, not separately to each activation; this prototype does
+not enforce that lifetime requirement. All stock writes, retries, failed
+preparations and clones count
 toward the real per-key lifetime budget. Manage that budget externally.
 2^32 invocations represent 16 TiB at 4096 bytes per encryption or 2 TiB at 512 bytes, including rewrite amplification. These are primary encryption bytes,
 not application-write allowances. For AES/ChaCha, a 512-byte hidden write reencrypts 192 KiB of
@@ -168,7 +173,10 @@ volume, not an activation switch. Do not override a cipher's normal IV size to i
 
 The encoded salt/ciphertext/tag is expected to look random under the primitive
 assumptions in [the format notes](docs/hidden-format.md). Layout compatibility
-and statistical tests are not a deniability proof. Multiple snapshots, ordinary
+and statistical tests are not a deniability proof. Even a single raw image can
+contain journal history. Hidden records allow
+offline key guessing, so the hidden key must be independent high-entropy key
+material, not a password. Multiple snapshots, ordinary
 journal traces, write amplification, memory, installed software, keys and other
 host artifacts remain explicit limitations. [Matched ordinary-Linux controls](docs/detectability.md)
 show that the current prototype's extra reencryption is visible under a known

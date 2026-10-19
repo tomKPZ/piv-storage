@@ -51,6 +51,31 @@ class RecordTests(unittest.TestCase):
             with self.assertRaises(UnsupportedImage): self.records.decode(0, bytes(damaged))
         with self.assertRaises(UnsupportedImage): self.records.decode(0, old[:-1])
 
+    def test_whole_record_rollback_is_accepted(self):
+        old = self.records.encode(0, b'A' * PAYLOAD)
+        new = self.records.encode(0, b'B' * PAYLOAD)
+        self.assertEqual(self.records.decode(0, new), b'B' * PAYLOAD)
+        # Decoding a newer value creates no persistent freshness anchor.
+        self.assertEqual(self.records.decode(0, old), b'A' * PAYLOAD)
+
+    def test_independently_valid_blocks_can_mix_epochs(self):
+        old = [self.records.encode(i, b'A' * PAYLOAD) for i in range(2)]
+        new = [self.records.encode(i, b'B' * PAYLOAD) for i in range(2)]
+        self.assertEqual(b''.join(self.records.decode(i, carrier)
+                                 for i, carrier in enumerate((new[0], old[1]))),
+                         b'B' * PAYLOAD + b'A' * PAYLOAD)
+
+    def test_repeated_salt_reuses_stream_at_same_address(self):
+        # Deliberate RNG failure: never do this outside this negative test.
+        with patch('pivstore.records.secrets.token_bytes', return_value=bytes(32)):
+            first = self.records.encode(0, b'A' * PAYLOAD)
+            second = self.records.encode(0, b'B' * PAYLOAD)
+        # Salt32 + encrypted header16 precede the payload; exclude tag16.
+        leaked_xor = bytes(a ^ b for a, b in zip(first[48:560], second[48:560]))
+        self.assertEqual(leaked_xor, bytes([ord('A') ^ ord('B')]) * PAYLOAD)
+        self.assertEqual(self.records.decode(0, first), b'A' * PAYLOAD)
+        self.assertEqual(self.records.decode(0, second), b'B' * PAYLOAD)
+
     def test_deterministic_reference(self):
         # Fixed entropy here only: ensures codec changes cannot silently change format.
         with patch('pivstore.records.secrets.token_bytes', return_value=bytes(range(32))):

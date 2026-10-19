@@ -20,7 +20,8 @@ security specification. Respect tool/sandbox approval requirements.
 
 1. Read README.md, ROADMAP.md, applicable nested instructions, and existing design
    notes (especially docs/development.md, docs/observed-layout.md and
-   docs/hidden-format.md, docs/native-blocks.md and docs/native-faults.md). Inspect
+   docs/hidden-format.md, docs/native-blocks.md, docs/native-faults.md and
+   docs/security-review.md). Inspect
    git status and relevant code before changing anything.
 2. Determine what is actually implemented and tested. Recheck environmental
    assumptions as needed; the initial host is WSL2 without visible DM/KVM nodes.
@@ -129,6 +130,11 @@ Use pristine stock fixtures, distinguish same-workload writes from deliberate
 ordinary reencryption controls, and exclude native initialization only explicitly.
 Live journal samples are not atomic; byte statistics are descriptive, not a
 security acceptance test. Retain observed snapshot/I/O distinctions in claims.
+
+Retain the observer boundaries in docs/security-review.md. A single raw image
+can include journal history; high-entropy hidden keys are required because records
+provide an offline guessing oracle. The owner counter does not enforce the GCM
+per-key lifetime requirement. Internal source review is not external crypto review.
 
 Keep correctness, crash safety and deniability claims separate. Multiple snapshots,
 journals, memory and host artifacts are explicit limitations. Statistical tests
