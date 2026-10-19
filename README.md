@@ -122,7 +122,18 @@ primary data with 4096-byte sectors (384 times as many bytes), or 24 KiB with
 512-byte sectors (48 times), before ordinary journal overhead.
 AEGIS-128 rewrites 144 KiB (288 times) or 18 KiB (36 times), respectively. Each primary AEAD also has per-message and
 aggregate security constraints; collision probability alone is not a full bound.
+The same amplification applies to device writes: small hidden or decoy writes
+cost whole-group reencryption plus journal traffic, reducing write throughput
+and increasing flash wear. No write throughput, latency or wear measurements
+exist yet; [read profiling](docs/read-performance.md) covers reads only.
+
 Never rely on snapshot-restored RNG state or replay cached encryption plans.
+Repeated randomness is not a minor nonce-budget effect: a repeated hidden salt
+at one address reuses a ChaCha20 keystream and Poly1305 key, leaking the XOR of
+hidden plaintexts (a host regression demonstrates this), and a repeated primary
+IV under one key is AEAD nonce reuse; for AES-GCM this enables forgery and
+authentication-key recovery. VM snapshot restores, image clones and cloned RNG
+state all invalidate the birthday estimates above.
 
 ## Disk format and diagnostics
 
@@ -185,7 +196,12 @@ contain journal history. Hidden records allow
 offline key guessing, so the hidden key must be independent high-entropy key
 material, not a password. Multiple snapshots, ordinary
 journal traces, write amplification, memory, installed software, keys and other
-host artifacts remain explicit limitations. [Matched ordinary-Linux controls](docs/detectability.md)
+host artifacts remain explicit limitations. There is no protection against
+root, a compromised kernel, live-memory or crash dumps, swap, or malicious
+storage firmware; keys pass through Python setup memory that cannot be reliably
+wiped. A holder of the decoy key can decrypt retained journal entries and may see
+whole carrier groups reencrypted with unchanged plaintext (see the
+[security review](docs/security-review.md#journal-history-and-the-decoy-key-holder)). [Matched ordinary-Linux controls](docs/detectability.md)
 show that the current prototype's extra reencryption is visible under a known
 primary workload: AES/4096 changed 192 IVs where ordinary writes changed 7.
 Ordinary whole-group rewrites matched those 192 positions too, so this footprint

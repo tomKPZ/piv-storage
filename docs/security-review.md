@@ -155,6 +155,31 @@ The private dm-crypt fork also requires ongoing upstream security maintenance;
 exact source compatibility does not establish that a pinned kernel is free of
 vulnerabilities. Broad deployment is still out of scope.
 
+## Journal history and the decoy-key holder
+
+Added 2026-10-19 from source/layout reasoning; no journal-forensic experiment
+was performed. The supported journal retains recent sector writes (ciphertext,
+tag, IV and plaintext sector number) until wraparound. The 128 MiB fixtures had
+1,848 stock journal sectors (about 0.9 MiB), so at 4096-byte sectors only a few
+recent 192 KiB group rewrites can remain. A single raw image therefore carries a
+short write history even though multi-snapshot observers are out of scope.
+
+| Observer | What retained journal entries can show |
+| --- | --- |
+| No keys | Recently rewritten sector numbers and old IVs; contiguous whole-group rewrites. |
+| Decoy key holder (coercion case) | Old and new primary plaintext for those sectors: whole carrier groups reencrypted with unchanged plaintext, unusual for ordinary filesystems. |
+| Hidden key holder | Potentially older versions of hidden records from correctly associated fragments. |
+
+Every coordinated decoy write also refreshes its full group, so this pattern
+indicates use of the prototype rather than proving hidden data exists. In many
+coercion settings that distinction offers little protection. Candidate
+mitigations, none implemented or tested: formatting with stock
+`--integrity-no-journal` (removes on-disk history; torn writes then return
+decoy EIO, as for stock users of that option); journal encryption (hides sector
+numbers only from keyless observers, and is unverified for LUKS2 AEAD in
+cryptsetup); and a record format that re-randomizes only touched IVs, reducing
+the group footprint at a capacity cost. These need design review before any claim.
+
 ## Disposition and verification
 
 No new kernel/runtime change was made for this review. The important findings
