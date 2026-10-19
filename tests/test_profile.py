@@ -57,6 +57,30 @@ class LayoutTests(unittest.TestCase):
                              (data + (32768 + run) * 512, tag + (32768 + run) * 512))
             self.assertEqual(layout.offsets(boundary - 1)[1], tag + (boundary - 1) * 32)
 
+    def test_large_extent_arithmetic_above_32_bit_byte_offsets(self):
+        # Synthetic metadata only: no multi-GiB allocation or actual disk access.
+        for block in (0, 3):
+            for tuple_size in (28, 32):
+                unit = 512 << block
+                layout = parse_superblock(header(block=block, tuple_size=tuple_size,
+                                                  provided=(8 * 1024**3) // 512),
+                                          16777216, 12 * 1024**3)
+                index = (2**32 // unit) + 17
+                logical512 = index * (unit // 512)
+                area, within = divmod(logical512, 32768)
+                base = 16777216 + 512 * (layout.initial_sectors + area * (
+                    32768 + layout.metadata_run_sectors))
+                self.assertEqual(layout.offsets(index), (
+                    base + (layout.metadata_run_sectors + within) * 512,
+                    base + (within // (unit // 512)) * tuple_size))
+                self.assertGreater(layout.offsets(index)[0], 2**32)
+                last_data, last_tag = layout.offsets(layout.sectors - 1)
+                required = max(last_data + unit, last_tag + tuple_size)
+                with self.assertRaises(UnsupportedImage):
+                    parse_superblock(header(block=block, tuple_size=tuple_size,
+                                            provided=(8 * 1024**3) // 512),
+                                     16777216, required - 1)
+
     def test_reject_unsupported_or_invalid_superblocks(self):
         for change in ({'magic': b'badmagic'}, {'version': 6}, {'flags': 10},
                        {'flags': 9}, {'tuple_size': 30}, {'block': 1},

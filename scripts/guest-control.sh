@@ -6,7 +6,10 @@ test "$(id -u)" = 0
 test "$(findmnt -n -o FSTYPE /mnt/piv-work)" = 9p
 cd /mnt/piv-work
 test -b /dev/vdb
-test "$(blockdev --getsize64 /dev/vdb)" = 134217728
+case "$(blockdev --getsize64 /dev/vdb)" in
+    134217728|536870912) ;;
+    *) echo "Unsupported disposable guest disk size" >&2; exit 1 ;;
+esac
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get -o Acquire::Retries=2 update

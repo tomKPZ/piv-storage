@@ -10,7 +10,9 @@ recovery file**. It retains the ordinary LUKS2/dm-integrity layout and journal.
 Volatile ownership locks live in /run. A separate mounted root filesystem is not
 an architectural requirement; keys, userspace setup tools and the matching module
 must be available when activating it. Deployment remains restricted to our pinned
-QEMU guest and synthetic 128 MiB disk, not general host or production use.
+QEMU guest and synthetic 128 or 512 MiB disks, not general host or production
+use. [Larger-volume support](docs/large-volumes.md) is verified beyond the former
+256 MiB primary cap at both sector sizes; live resizing is not implemented.
 [Read and activation profiling](docs/read-performance.md) records measured costs
 and bounded primary read batching. Every sector still authenticates before
 plaintext or carrier IVs are returned.

@@ -21,7 +21,7 @@ security specification. Respect tool/sandbox approval requirements.
 1. Read README.md, ROADMAP.md, applicable nested instructions, and existing design
    notes (especially docs/development.md, docs/observed-layout.md and
    docs/hidden-format.md, docs/native-blocks.md, docs/native-faults.md and
-   docs/security-review.md and docs/read-performance.md). Inspect
+   docs/security-review.md, docs/read-performance.md and docs/large-volumes.md). Inspect
    git status and relevant code before changing anything.
 2. Determine what is actually implemented and tested. Recheck environmental
    assumptions as needed; the initial host is WSL2 without visible DM/KVM nodes.
@@ -70,6 +70,11 @@ resolved from context/evidence, not for routine implementation decisions.
   bios to 512 bytes. Retain the two-carrier-group/96-tuple preparation bound,
   ordered work and lower preflush/completion-flush semantics. Batching is within
   one bio, not cross-bio writeback. Tail primary sectors have no hidden record.
+- Larger geometry uses checked kernel file-offset bounds rather than a 256 MiB
+  primary cap. Frontend/VM fixtures allow only pinned QEMU /dev/vdb at 128 or
+  512 MiB, plus explicitly opted-in test wrappers. Never broaden this into
+  arbitrary host-device activation as a side effect of geometry work. The actual
+  validated raw size must reach extent parsing. Live resize is unsupported.
 - Native setup, decoy reads and carrier collection use bounded 16 KiB range
   reads. Authenticate every sector with unchanged Linux AAD/tag offsets before
   publishing any range bytes or IVs. Keep per-sector crypto counts and late-sector

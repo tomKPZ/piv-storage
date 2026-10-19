@@ -253,7 +253,12 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
      s->context_length > 120 || !s->context_length || (s->flags & ~1U) ||
      memchr_inv(s->reserved, 0, sizeof(s->reserved))) return -EINVAL;
  if (p->native || !piv_quiesced(p) || !p->transaction || p->controller != controller || p->failed) return -EBUSY;
- if (p->profile.sectors < group || p->profile.sectors > (256ULL * 1024 * 1024) / p->profile.sector_size) return -EINVAL;
+ /* Bound every primary byte offset by the kernel's signed file limit.
+  * Carrier indices, hidden capacity and 512-byte addresses are then smaller;
+  * all per-request allocations remain bounded independently of volume size.
+  */
+ if (p->profile.sectors < group ||
+     p->profile.sectors > (u64)MAX_LFS_FILESIZE / p->profile.sector_size) return -EINVAL;
  n = kzalloc(sizeof(*n), GFP_NOIO); if (!n) return -ENOMEM;
  memcpy(n->key, s->key, 32); memcpy(n->context, s->context, s->context_length);
  n->context_length = s->context_length;
@@ -366,12 +371,14 @@ static int pn_map(struct dm_target *ti, struct bio *bio)
 {
 	struct pn_view *v = ti->private;
 	struct pn_work *w;
+	u64 sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
+	if (sector > ((u64)MAX_LFS_FILESIZE >> 9)) return DM_MAPIO_KILL;
 	if (bio_op(bio) != REQ_OP_READ && bio_op(bio) != REQ_OP_WRITE && bio_op(bio) != REQ_OP_FLUSH)
 		return DM_MAPIO_KILL;
 	w = kmalloc(sizeof(*w), GFP_NOWAIT | __GFP_NOWARN);
 	if (!w) return DM_MAPIO_REQUEUE;
 	INIT_WORK(&w->work, pn_worker); w->p = v->p; w->bio = bio; w->hidden = v->hidden;
-	w->offset = dm_target_offset(ti, bio->bi_iter.bi_sector) << 9;
+	w->offset = sector << 9;
 	kref_get(&w->p->refs); queue_work(pn_wq, &w->work);
 	return DM_MAPIO_SUBMITTED;
 }

@@ -52,17 +52,15 @@ documentation remain part of each core change's exit criteria; this does not
 mean postponing validation until after implementation. Known integrity or memory
 safety defects take precedence over this ordering whenever discovered.
 
-1. **Larger geometry support (next implementation).** Replace the native 256 MiB
-   primary cap with reviewed address/count bounds and bounded allocation/I/O.
-   Check native capacity, sector conversions, range ends, carrier/tail arithmetic
-   and activation cost. Make only the userspace/fixture changes necessary to
-   exercise the module: retain the pinned disposable guest and exact /dev/vdb
-   guard, adding explicitly approved synthetic sizes rather than opening generic
-   host devices. Exit: at least one disposable image whose primary exceeds the
-   old cap, at both sector sizes, with boundary/tail reads and writes, complete
-   primary/hidden verification, stock authentication and preserved failure
-   behavior. Removing the cap alone does not complete this milestone.
-2. **Scalable activation and initialization.** Make long kernel setup/initialize
+1. **Larger geometry support — complete.** Native setup now uses reviewed kernel
+   file-offset bounds instead of the 256 MiB primary cap. Pinned frontend/fixture
+   guards allow only 128 or 512 MiB guest disks. Both sector sizes passed on
+   primary volumes above the old cap, including high-address and tail I/O,
+   complete primary/hidden verification, stock authentication and preserved
+   fail-stop behavior. See docs/large-volumes.md and the final handoff. This does
+   not implement live resize or validate arbitrary sizes up to the arithmetic
+   bound; memory and I/O remain bounded per request.
+2. **Scalable activation and initialization (next implementation).** Make long kernel setup/initialize
    operations responsive to cancellation and scheduler needs, with defined
    cleanup and partial-initialization semantics. Retain the full authentication
    scan, seeded randomness and exclusive ownership. Exit: witnessed interruption
@@ -1033,3 +1031,74 @@ No module or runtime change was made in this prioritization update. Existing
 stateless-format, nonce, crash and threat-model limitations remain in force.
 Verification: reviewed current kernel cap/setup path and userspace guest guard;
 git diff --check passed. Runtime tests were not rerun for a documentation change.
+
+
+## Session handoff: larger native geometry (2026-10-19)
+
+Completed the next core-first milestone. Replaced pn_setup's 256 MiB primary cap
+with primary_sectors <= MAX_LFS_FILESIZE / sector_size, and checked the public
+map's 512-byte sector offset before converting it to bytes. Reviewed primary/
+hidden capacities, address/AAD conversions, record-group products, range ends,
+request counters and initialization indices: whole-volume arithmetic is 64-bit,
+while allocations and small counters remain bounded to individual requests.
+No AEAD, hidden record bytes, ABI, journal protocol or persistent state changed.
+
+GuestOwner now uses the actual guarded raw size for extent parsing. Python and
+shared shell guards allow exactly 128 or 512 MiB in the pinned QEMU /dev/vdb
+workflow, retaining explicit test-wrapper opt-in. vm.py adds --blank-mib 512;
+blank size and copied input are mutually exclusive, and copied inputs must be
+regular files at an approved size. No arbitrary host device or generic deployment
+was enabled. Added guest-large.sh/guest-large-512.sh and guest-large-test.py to
+format fresh guest-owned synthetic fixtures through stock Linux before testing.
+
+Source stage vendor/kernel-build/large-001 and scaffold
+artifacts/large-input-001/scaffold.tar exactly match current production includes.
+large-4096-001 built the module with matching config/symbol pins and no compiler
+warnings; the other two runs reused it. Module:
+artifacts/large-4096-001/share/experimental-dm-piv.ko, SHA-256
+0a97560fd0df8a9709619725689eb9baaf128da4fd6cf7e2830387242bc95948.
+No new host installation/module load/root access, real disk or full kernel build.
+
+Both 512 MiB runs PASSED all exit criteria:
+- large-4096-001 AES-GCM/4096: primary 512,344,064 bytes / 125,084 sectors,
+  hidden 1,333,760 bytes, incomplete carrier tail 44 sectors.
+- large-512-001 original AEGIS-128/512: primary 485,490,688 bytes / 948,224
+  sectors, hidden 13,485,568 bytes, incomplete carrier tail 20 sectors.
+- Full hidden initialization retained the stock primary hash; seeded nonzero
+  hidden records at low/high/end addresses survived coordinated decoy writes.
+  Nontrivial read/write/restore crossed the old cap, high unaligned addresses,
+  integrity interleaves, carrier boundaries, actual incomplete tails and ends.
+  EOF reads/past-end writes did not wrap or fail-stop a healthy owner.
+- High-address lower read EIO and witnessed last-carrier ciphertext read corruption
+  returned EIO without changing caller buffers. Failure stayed shared/sticky after
+  fault restoration; recreate recovered complete expected views without repair.
+- Clean reopen, custom unload, unrelated mounted stock crypt and stock full-primary
+  authentication passed. Independent host verification authenticated every primary
+  sector and matched every hidden byte for both large-final.img outputs. Current
+  IVs were distinct; historical usage is still unknown.
+
+large-lifecycle-128-001 additionally passed the original AES4096 fixture: exact
+plain/FUA/PREFLUSH/flush ordering with complete traces and zero missed/overrun
+events, concurrent writes/reads/fsync to shared carriers, public suspend/resume,
+busy mapping/unload protection, new generation, full oracles and stock readback.
+Its independent host verification also passed. All three runs have
+host-verification.json and no unexpected kernel BUG/Oops/WARNING; injected errors
+and unsigned module taint are expected.
+
+Host 43 tests passed without skips with ResourceWarning errors, AES4096 fixture
+and original-AEGIS reference enabled. Three new tests cover approved-size/identity
+guards and synthetic 8 GiB layout arithmetic above 32-bit byte offsets across
+both sector/tuple sizes, including truncated extents. No actual 8 GiB kernel run
+is claimed. Changed Python compilation, shell syntax, VM CLI help and
+git diff --check passed. New documentation is docs/large-volumes.md, linked from
+README and deployment/development notes.
+
+Initialization/activation took 93.25 s AES4096 and 507.53 s AEGIS512; subsequent
+activation without initialization took 9.83 / 7.89 s. These are concurrent TCG
+samples including frontend/udev work, not controlled performance guarantees.
+The long initialization is evidence for the next core task: cancellable/scalable
+setup and initialization with explicit cleanup, while retaining full verification.
+The lifetime diagnostic cap remains; sufficiently large initialization can fail
+after partial changes. Geometry-bound hidden AAD means live resize/migration is
+unsupported. Only 128/512 MiB guest deployment is enabled; the arithmetic bound
+is not a claim of arbitrary-size support or stronger security/crash guarantees.

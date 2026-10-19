@@ -16,7 +16,10 @@ permission to use /dev/kvm. Default `--timeout 1200` covers boot and task execut
 
 The guest base is the SHA-512-pinned Debian 13 nocloud build 20261017-2634.
 It boots the Debian 6.12.113+deb13-amd64 kernel. The runner creates a separate
-qcow2 OS overlay and a sparse 128 MiB raw data disk exposed as /dev/vdb. The
+qcow2 OS overlay and a sparse 128 MiB raw data disk exposed as /dev/vdb by
+default. --blank-mib 512 explicitly selects the other approved fixture size; see
+[large-volumes.md](large-volumes.md). Copied images must be regular 128/512 MiB
+files; the runner copies them before attaching the private copy. The
 base stays unchanged. Network access uses QEMU user networking without forwarded
 ports. The runner completes first-boot setup with a random ephemeral root login
 credential, logging console output only after login to avoid credential echo.

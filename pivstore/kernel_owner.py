@@ -24,8 +24,10 @@ def guest_guard(source, allow_test_stack=False):
     if str(source) not in allowed or not stat.S_ISBLK(Path(source).stat().st_mode):
         raise ValueError('Unsupported disposable test device')
     size = subprocess.check_output(['blockdev', '--getsize64', str(source)], text=True)
-    if int(size) != 128 * 1024 * 1024:
-        raise ValueError('Expected a 128 MiB disposable guest disk')
+    size = int(size)
+    if size not in (128 * 1024 * 1024, 512 * 1024 * 1024):
+        raise ValueError('Expected an explicitly supported 128 or 512 MiB disposable guest disk')
+    return size
 
 
 def crypt(*args):
@@ -44,7 +46,7 @@ class GuestOwner:
         self.source = Path(source)
         if not re.fullmatch(r'piv-[a-zA-Z0-9_-]{1,40}', name):
             raise ValueError('Invalid experimental mapping name')
-        guest_guard(self.source, allow_test_stack)
+        self.raw_bytes = guest_guard(self.source, allow_test_stack)
         metadata = json.loads(crypt('luksDump', '--dump-json-metadata', self.source).stdout)
         self.offset = validate_segment(metadata)
         self.encryption = metadata['segments']['0']['encryption']
@@ -67,7 +69,7 @@ class GuestOwner:
             raw = os.open(self.source, os.O_RDONLY)
             try:
                 self.layout = parse_superblock(os.pread(raw, 4096, self.offset),
-                                               self.offset, 128 * 1024 * 1024)
+                                               self.offset, self.raw_bytes)
             finally:
                 os.close(raw)
             if self.layout.iv_bytes != (16 if self.encryption == 'aegis128-random' else 12):

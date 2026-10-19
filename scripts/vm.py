@@ -11,6 +11,7 @@ import secrets
 import selectors
 import shutil
 import subprocess
+import stat
 import time
 import urllib.request
 
@@ -106,10 +107,15 @@ def run(args):
     # guest loop devices over 9p: that path faulted in the pinned guest kernel.
     with (run_dir / "control.img").open("xb") as disk:
         if args.data_image:
+            if not args.data_image.is_file():
+                raise ValueError('Input image must be a regular file')
             with args.data_image.open('rb') as source:
+                info = os.fstat(source.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_size not in (128 * 1024 * 1024, 512 * 1024 * 1024):
+                    raise ValueError('Expected a regular 128 or 512 MiB image')
                 shutil.copyfileobj(source, disk)
         else:
-            disk.truncate(128 * 1024 * 1024)
+            disk.truncate(args.blank_mib * 1024 * 1024)
     os.chmod(run_dir / "control.img", 0o600)
     command = ["qemu-system-x86_64", "-machine", "q35,accel=" + args.accel,
                "-cpu", "max", "-smp", "2", "-m", "1024",
@@ -219,7 +225,10 @@ def main():
     task.add_argument("--run-dir", type=Path, required=True)
     task.add_argument('--power-cut-script', type=Path,
                       help='Reboot same disks after PIV_POWER_CUT and execute this follow-up')
-    task.add_argument("--data-image", type=Path,
+    disks = task.add_mutually_exclusive_group()
+    disks.add_argument("--blank-mib", type=int, choices=(128, 512), default=128,
+                       help="Size of a new disposable blank disk (default: 128 MiB)")
+    disks.add_argument("--data-image", type=Path,
                       help="Copy this image into the guest data disk; never attach it directly")
     task.add_argument("--share-file", type=Path, action='append', default=[])
     task.add_argument("--code", action='store_true', help='Export package source read-only to the guest')

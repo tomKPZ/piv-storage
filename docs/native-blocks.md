@@ -29,7 +29,7 @@ teardown. Do not manipulate the same stack concurrently with external dmsetup
 commands; these checks do not protect against a racing privileged administrator.
 
 Setup remains privileged and intentionally restricted to QEMU, the pinned
-6.12.113+deb13-amd64 guest and disposable 128 MiB /dev/vdb. It invokes cryptsetup
+6.12.113+deb13-amd64 guest and disposable 128 or 512 MiB /dev/vdb. It invokes cryptsetup
 for ordinary LUKS opening and journal replay, suspends the new crypt mapping,
 reloads its private table as piv-crypt with piv_control, resumes it, then suspends
 and begins coordinated ownership, authenticates every primary sector,
@@ -91,8 +91,9 @@ padding up to 4096, tag16, IV[12 or 16], zero padding up to 16 IV bytes. Expecte
 IV fields likewise have zero padding up to 16 bytes. All nonzero padding is
 rejected. Padding exists only in RAM, never on disk. The integrity tuple is
 28 or 32 bytes according to the validated primary profile. Native SETUP/STATUS
-retain ABI 3, separate from the primary-sector controls. The native test cap is 256 MiB of primary bytes, rather than a
-sector-count cap; public setup still restricts the raw guest disk to 128 MiB.
+retain ABI 3, separate from the primary-sector controls. The old 256 MiB primary
+cap has been replaced by checked kernel file-offset bounds. Public setup still permits only 128 or 512 MiB raw test disks; see
+[larger geometry](large-volumes.md) for tested extents and limitations.
 
 Uninitialized/damaged blocks need a full 512-byte direct-I/O write for targeted
 repair. Buffered sub-page writes may first read a 4096-byte page containing
