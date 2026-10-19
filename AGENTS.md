@@ -61,6 +61,10 @@ resolved from context/evidence, not for routine implementation decisions.
   Apply through the ordinary lower dm-integrity journal; its per-sector atomicity
   does not make a hidden record atomic. Storage/primary-auth errors stop the
   shared owner. Local hidden unavailability must not stop the decoy.
+- Decoy bios are bounded to 16 KiB at power-of-two DM split boundaries, hidden
+  bios to 512 bytes. Retain the two-carrier-group/96-tuple preparation bound,
+  ordered work and lower preflush/completion-flush semantics. Batching is within
+  one bio, not cross-bio writeback. Tail primary sectors have no hidden record.
 - Build dm-piv.ko as a separate module registering piv-crypt/piv-view. Keep
   stock dm-crypt/crypt loaded and independent; never unload it to activate ours.
   Keep private sysfs workqueue names distinct (kpiv_io/kpiv_crypt): independent

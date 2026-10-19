@@ -8,6 +8,11 @@
 #define PN_DATA 512
 #define PN_CARRIER 576
 #define PN_MAX_ENTRIES 96
+/* Power-of-two DM split boundary; <= one smallest carrier group (36 * 512).
+ * An unaligned request can intersect at most two groups / 96 prepared tuples.
+ * No cross-bio accumulation or delayed completion is used.
+ */
+#define PN_DECOY_BYTES 16384
 struct pn_entry {
  __le64 sector;
  __le32 primary;
@@ -334,7 +339,7 @@ static void pn_worker(struct work_struct *work)
 		r = blkdev_issue_flush(p->cc->dev->bdev);
 	} else {
 		u64 limit = w->hidden ? p->native->hidden_bytes : p->profile.sectors * p->profile.sector_size;
-		if (!bytes || bytes > (w->hidden ? 512 : p->profile.sector_size) || (w->offset & 511) ||
+		if (!bytes || bytes > (w->hidden ? PN_DATA : PN_DECOY_BYTES) || (w->offset & 511) ||
 		    (bytes & 511) || w->offset > limit || bytes > limit - w->offset) { r = -EINVAL; goto done; }
 		buffer = kmalloc(bytes, GFP_NOIO);
 		if (!buffer) { r = -ENOMEM; goto done; }
@@ -343,7 +348,11 @@ static void pn_worker(struct work_struct *work)
 			if (!r) pn_copy_bio(bio, buffer, true);
 		} else if (bio_op(bio) == REQ_OP_WRITE) {
 			pn_copy_bio(bio, buffer, false);
-			r = pn_write(p, w->hidden, w->offset, buffer, bytes);
+			/* Drain earlier journal writes before a WRITE|PREFLUSH payload.
+			 * pn_write flushes each batch before completion, satisfying FUA too.
+			 */
+			r = (bio->bi_opf & REQ_PREFLUSH) ? blkdev_issue_flush(p->cc->dev->bdev) : 0;
+			if (!r) r = pn_write(p, w->hidden, w->offset, buffer, bytes);
 		} else r = -EOPNOTSUPP;
 	}
 	if (r && r != PN_UNAVAILABLE) { p->failed = true; p->native->failed = true; }
@@ -392,7 +401,7 @@ static int pn_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	mutex_unlock(&found->lock);
 	if (r) { dm_put_device(ti, v->owner); goto free_ref; }
 	ti->private = v; ti->num_flush_bios = 1;
-	r = dm_set_target_max_io_len(ti, v->hidden ? 1 : found->profile.sector_size / 512);
+	r = dm_set_target_max_io_len(ti, v->hidden ? 1 : PN_DECOY_BYTES / 512);
 	if (!r) return 0;
 	mutex_lock(&found->lock); found->native->views &= ~(v->hidden ? 2 : 1); mutex_unlock(&found->lock);
 	dm_put_device(ti, v->owner);

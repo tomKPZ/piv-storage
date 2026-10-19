@@ -80,6 +80,8 @@ Each 512-byte hidden block has one authentication tag and occupies 48 primary IV
 for AES-GCM/ChaCha20-Poly1305 or 36 for AEGIS-128.
 Every hidden update freshly encodes its whole block; every overlapping decoy
 write refreshes affected hidden records before reencrypting primary sectors.
+Decoy I/O is processed in batches of up to 16 KiB, refreshing each intersecting
+record once per batch. Separate small writes still repeat that work.
 Original primary data is authenticated before modification. Only requested decoy
 bytes may change. Authentication binds hidden blocks to their address and volume.
 

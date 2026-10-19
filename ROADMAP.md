@@ -50,12 +50,16 @@ Failure handling and mapping cleanup are implemented; see the final handoff
 for direct-I/O fault, ownership and boot regression evidence. Preserve that
 coverage when changing the I/O path.
 
-Next assess bounded batching to reduce repeated full-carrier-group rewrites
-for adjacent decoy sectors (especially eight 512-byte sectors in a 4096-byte
-write), and per-sector read/setup overhead. Each hidden block still needs its
-whole carrier group refreshed. Preserve fresh entropy, whole-block
-authentication, correct flush/FUA completion and primary integrity. Any new
-crash guarantee or in-carrier redundancy is a separate design decision.
+Bounded 16 KiB decoy I/O is implemented; final regression results are recorded
+below. Each intersecting hidden record still needs its whole carrier refreshed;
+separate small bios still repeat work.
+
+Next add deterministic concurrent lifecycle/flush stress: mixed decoy/hidden
+requests, barriers, busy close/suspend and teardown, with explicit completion
+ordering evidence. O_DSYNC/fsync and fault regressions are not a full flush/FUA
+trace or debug-kernel audit. Profile remaining per-sector read/setup overhead
+before selecting another optimization. Any cross-bio coalescing, new crash
+guarantee or in-carrier redundancy requires separate design and evidence.
 
 Further work: detectability against matched ordinary controls, independent
 cryptographic review, debug-kernel/lifecycle stress, explicit budget/rekey tooling,
@@ -558,3 +562,90 @@ EIO coverage, not hardware power-loss/durability proof or hidden crash recovery.
 Next: bounded batching/per-sector overhead, then broader lifecycle/debug-kernel
 stress and matched-control detectability work. No host installs/modules, root or
 real-device operations were used. Module/source pins remain separate-002.
+
+
+## Session handoff: bounded decoy batching (2026-10-19)
+
+Decoy bios now split at 16 KiB power-of-two boundaries, hidden bios remain 512
+bytes. Each affected carrier group refreshes once per work item, using the
+existing two-group/96-tuple preparation bound. Larger decoy reads use the same
+bound and copy into the caller's bio only after authentication of the entire
+work item. No cross-bio accumulation, delayed completion, new disk format, key
+handling or ABI is introduced. Separate small writes can still repeat work.
+WRITE|PREFLUSH explicitly drains the lower journal before the payload; ordered
+work and the existing per-32-sector/final flushes preserve completion semantics.
+A larger batch is not an atomic write and may damage either touched hidden
+record if interrupted. Primary bytes outside the request must stay unchanged.
+
+Source stage: vendor/kernel-build/batch-001; complete scaffold:
+artifacts/batch-input-001/scaffold.tar. All three matched guest builds passed pinned
+config/symbol checks without compiler warnings. Kernel/header/source/package
+pins remain unchanged; the only runtime source change is kernel/piv-native.inc.
+The reusable module is batch-native-4096-001/share/experimental-dm-piv.ko.
+Current includes exactly match the staged/tested bytes. No host root, modules,
+installations, full kernel build or real-device access was used.
+
+New guest-batch-test/guest-batch measure direct O_DSYNC write/fsync counts and
+timing, nontrivial write/read/restore, 4/16/32k, unaligned primary/batch/carrier
+boundaries and incomplete tails. Complete primary/hidden checks, reopen, stock
+readback and custom unload follow. Previous-module baselines (kernel unchanged
+through 4f5ef60) and new outputs independently verify against the same oracles.
+
+| Profile / request at offset 0 | Old encryptions | New encryptions |
+| --- | ---: | ---: |
+| AES4096 /4k |48|48|
+| AES4096 /16k |192|48|
+| AES4096 /32k |384|96|
+| AEGIS512 /4k |288|36|
+| AEGIS512 /16k |1152|36|
+| AEGIS512 /32k |2304|108|
+
+Executed benchmark runs: batch-baseline-4096-001, batch-baseline-512-001,
+batch-native-4096-001, batch-native-512-001, batch-chacha-512-001. All passed.
+The ChaCha512 carrier-boundary case reaches the full 96-tuple/two 48-sector bound;
+AES4096 group alignment and AEGIS512's 36-sector groups cannot reach that in one
+split. AEGIS32k uses 108 because its two 16k splits overlap 18k carrier groups.
+AES16k measured 134ms old vs 40ms new; AEGIS16k 14ms new. Single QEMU TCG samples
+with concurrent guests are diagnostic, not controlled throughput guarantees.
+Each final image authenticated every primary sector, matched the complete hidden
+oracle and had distinct current IVs. This does not establish lifetime uniqueness.
+
+Regression results:
+- Host 30 tests passed on AES4096 without skips (ResourceWarning errors, optional original
+  AEGIS reference enabled). Compilation, changed-shell syntax and whitespace pass.
+- batch-faults-4096-001 passed setup cleanup/foreign-name protection, 16k direct
+  decoy and 512 hidden lower read/write errors, sticky shared failure after
+  restoration, teardown/recreation, local hidden EIO/invalid-marker/direct repair,
+  complete oracles, stock authentication and custom unload. Independent verification
+  passed. Updated tests allow unavailable blocks only in the touched carrier range.
+- batch-power-4096-001 cut at 32/48 changed committed/current IVs during the existing
+  hidden-write interruption. Stock replay preserved the primary; the affected
+  hidden block returned EIO, all other blocks matched, invalid-marker preservation
+  and repair passed. Independent full verification passed. Host cache survived;
+  this is not hardware power loss or new decoy-batch crash-atomicity evidence.
+- batch-filesystems-4096-001 passed concurrent ext4/ext2, RMW, hidden preservation,
+  setup exit, reopen, wrong-key/invalid-marker/repair and stock readback. Independent
+  verification matched all 28,244 primary sectors and 301,056 hidden bytes. Its
+  initramfs passed actual RAM-root boot as batch-early-4096-001: both writable
+  views, standard-library-only setup, no persistent OS disk and custom unload.
+  Independent full primary/hidden verification matched afterward.
+- Stock crypt stayed loaded with a mounted writable encrypted sentinel in the
+  normal guest runs. All completed run logs have no unexpected BUG/Oops/WARNING
+  or compiler diagnostics; unsigned experimental module taint and injected EIO
+  diagnostics are expected.
+
+batch-faults-512-001 also passed every ownership/setup, larger decoy lower-I/O,
+shared fail-stop/recreation and local-repair assertion. The 16 KiB decoy write
+prepared 72 encryptions (two AEGIS carrier groups); the hidden write prepared 36.
+Reads spent zero, no faulted record needed repair after recreation, and full
+oracles/stock authentication/custom unload passed. Independent verification
+matched all 213,008 primary sectors and 3,028,992 hidden bytes, with distinct
+current IVs. No unexpected kernel diagnostics appeared. Both fault matrices
+restore the lower device before teardown; this is not arbitrary failing-close
+or hardware durability evidence.
+
+All ten VM runs/boots completed successfully; every final output image has a
+matching host-verification.json. This bounded milestone is complete. Next work
+is concurrent lifecycle/flush stress and evidence-led profiling of read/setup
+cost. No cross-bio coalescing, broader host deployment or new crash/deniability
+claims follow from these results.

@@ -61,7 +61,9 @@ scripts/guest-faults.sh and kernel/guest-fault-test.py use a disposable linear
 wrapper below stock dm-integrity. The test reloads it as dm-flakey with up=0,
 down=3600 and either error_reads or error_writes, after activation and after udev
 probes drain. Carrier record 10 avoids sector 0, whose checkpoint can still be served from
-dm-integrity's journal cache. A direct raw read witnesses error_reads before the
+dm-integrity's journal cache. Decoy requests use a 16 KiB-aligned 16 KiB span
+at or beyond carrier record 10; hidden requests use one 512-byte block.
+A direct raw read witnesses error_reads before the
 selected public read, and failing writes must have spent fresh encryptions.
 These features return errors; no silently dropped writes are used.
 Their definitions were checked against the pinned v6.12.113 source in
@@ -73,7 +75,7 @@ failure and both views must keep rejecting direct reads and writes after the
 wrapper is restored. Only teardown/recreation clears the
 fail-stop. Stock journal replay and full-primary verification follow; hidden
 blocks must match the original oracle, with local EIO/whole-block repair allowed
-only for the affected record. A separate fresh-IV primary rewrite tests local
+only for carrier records intersecting the failed request. A separate fresh-IV primary rewrite tests local
 hidden EIO, invalid-marker preservation and direct repair without global failure.
 
 Setup tests fail after cryptsetup creates mappings, before native setup, during

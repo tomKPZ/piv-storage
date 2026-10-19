@@ -41,16 +41,22 @@ owner lock. Runtime ownership locks use /run, which may be tmpfs.
 The private piv-crypt mapping rejects ordinary bios while native ownership is active.
 Public piv-view map callbacks queue bounded work to an ordered reclaim-capable
 workqueue. Work runs under the shared lock and NOIO allocation scope. Hidden bios
-are split to 512 bytes, decoy bios to the primary encryption-sector size
-(512 or 4096 bytes). Decoy writes use authenticated primary-sector RMW. No
-discard or write-zeroes bypass is advertised. Writes finish with
-a lower-device flush, including FUA requests; flush bios also reach the lower
-journal. Suspend/removal uses DM references and generation binding. The current
-backend processes one primary encryption sector per work item: a 4096-byte decoy
-write on the 512-byte profile can refresh the same carrier group eight times.
-Opening authenticates the full primary volume sector by sector. Smaller sectors
-therefore add substantial request/setup overhead; bounded batching remains future
-work, even though each individual hidden write rewrites fewer primary bytes.
+are split to 512 bytes, decoy bios at 16 KiB boundaries. Decoy writes use
+authenticated primary-sector RMW and refresh each intersecting carrier group
+once per work item. At most two carrier groups / 96 primary tuples are prepared;
+the 16 KiB limit is smaller than the smallest primary carrier span (36 * 512
+bytes).
+Incomplete tail sectors receive fresh random IVs without hidden records. No
+cross-bio accumulation, extra writeback cache, delay or on-disk format is added.
+Separate small writes can still refresh the same group repeatedly.
+
+No discard or write-zeroes bypass is advertised. WRITE|PREFLUSH drains the lower
+journal before its payload; each write batch flushes every 32 applied sectors and
+at completion, satisfying FUA before completion as well. Flush bios reach the
+lower journal through the same ordered workqueue. Suspend/removal uses DM
+references and generation binding. Larger batches are not atomic writes; an
+interrupted decoy batch may damage either touched hidden record. Opening still
+authenticates the full primary volume sector by sector; setup overhead remains.
 
 On a write, authenticate the complete affected carrier groups, preserve valid
 hidden data (or mark unavailable data invalid), generate fresh encodings and
@@ -169,3 +175,33 @@ The stock module is never unloaded or replaced by these tests. This independent
 sentinel is test data, not runtime metadata or a persistent-root requirement.
 The RAM-root test deliberately starts with its first stock/private owner, which
 also checks that per-module workqueue IDs cannot collide across the two targets.
+
+
+## Bounded decoy I/O measurements
+
+scripts/guest-batch.sh and kernel/guest-batch-test.py use a CLOSED native fixture
+and complete expected views. Supplying scaffold.tar builds the current module
+and checks 16 KiB split counts; supplying only experimental-dm-piv.ko measures
+the historical one-primary-sector baseline. Use a fresh VM run for each:
+
+```sh
+python3 scripts/vm.py run --code --script scripts/guest-batch.sh \
+  --run-dir artifacts/batch-next \
+  --data-image artifacts/separate-native-4096-002/share/dual-final.img \
+  --share-file artifacts/stateless-input-next/scaffold.tar \
+  --share-file kernel/check-config.py --share-file kernel/guest-batch-test.py \
+  --share-file artifacts/control-003/share/passphrase.key \
+  --share-file artifacts/control-003/hidden.key \
+  --share-file artifacts/separate-native-4096-002/share/expected-hidden-volume \
+  --share-file artifacts/separate-native-4096-002/share/expected-primary.sha256 \
+  --timeout 3600
+```
+
+The test measures exact primary encryption invocations and elapsed direct
+O_DSYNC write/fsync time, writes nontrivial data, reads it back and restores the
+original bytes. Cases include 4/16/32 KiB, unaligned requests, carrier boundaries
+and incomplete tails. Complete primary/hidden verification, clean reopen, stock
+readback and custom unload follow. batch-results.json stores each sample; single
+QEMU TCG timings are diagnostic, not a stable throughput benchmark. Work scales
+with the carrier groups intersected by each 16 KiB split, rather than just the
+application byte count. No throughput gain is promised for isolated small I/O.

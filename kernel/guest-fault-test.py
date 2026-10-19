@@ -54,22 +54,22 @@ def fault(mode='linear'):
     dm('reload', 'piv-test-fault', input=table(mode))
     dm('resume', 'piv-test-fault')
 
-def direct(path, *, write=None, offset=0):
-    value = mmap.mmap(-1, 512)
+def direct(path, *, write=None, offset=0, size=512):
+    if write is not None: size = len(write)
+    value = mmap.mmap(-1, size)
     fd = os.open(path, os.O_RDWR | os.O_DIRECT)
     try:
         if write is None:
-            assert os.preadv(fd, [value], offset) == 512
+            assert os.preadv(fd, [value], offset) == size
             return value[:]
-        assert len(write) == 512
         value[:] = write
-        assert os.pwritev(fd, [value], offset) == 512
+        assert os.pwritev(fd, [value], offset) == size
         os.fsync(fd)
     finally:
         os.close(fd)
         value.close()
 
-def verify(views, unavailable=None):
+def verify(views, unavailable=()):
     assert subprocess.check_output(['sha256sum', views['decoy']], text=True).split()[0] == PRIMARY
     repaired = False
     for index in range(len(EXPECTED) // 512):
@@ -77,7 +77,7 @@ def verify(views, unavailable=None):
         try:
             actual = direct(views['hidden'], offset=index * 512)
         except OSError as exc:
-            assert index == unavailable and exc.errno == errno.EIO
+            assert index in unavailable and exc.errno == errno.EIO
             direct(views['hidden'], write=expected, offset=index * 512)
             actual = direct(views['hidden'], offset=index * 512)
             repaired = True
@@ -157,14 +157,17 @@ for role in ('decoy', 'hidden'):
         generation = handle.device.generation
         # Sector0 may be served from dm-integrity's cached setup checkpoint.
         # Choose record10, which setup did not write, and witness the raw fault.
-        offset = 10 * (512 if role == 'hidden' else
-                       (576 // handle.device.iv_size) * handle.device.sector_size)
-        old = direct(v[role], offset=offset)
+        carrier_bytes = (576 // handle.device.iv_size) * handle.device.sector_size
+        size = 512 if role == 'hidden' else 16384
+        offset = 10 * 512 if role == 'hidden' else ((10 * carrier_bytes + size - 1) // size) * size
+        affected = (range(10, 11) if role == 'hidden' else
+                    range(offset // carrier_bytes, (offset + size - 1) // carrier_bytes + 1))
+        old = direct(v[role], offset=offset, size=size)
         before_count = blocks.native_status(handle.device)['encryptions']
-        print(f'Injecting lower {mode} through {role} at carrier record10', flush=True)
+        print(f'Injecting lower {mode} through {role}, {size} bytes at offset {offset}', flush=True)
         fault(mode)
         if mode == 'reads': assert rejected(lambda: direct(SOURCE)).errno == errno.EIO
-        failure = rejected(lambda: direct(v[role], write=old if mode == 'writes' else None, offset=offset))
+        failure = rejected(lambda: direct(v[role], write=old if mode == 'writes' else None, offset=offset, size=size))
         assert failure.errno == errno.EIO
         failed = blocks.native_status(handle.device)
         assert failed['failed']
@@ -174,16 +177,17 @@ for role in ('decoy', 'hidden'):
         # Removing the fault does not clear the shared owner's fail-stop.
         for other in ('decoy', 'hidden'):
             assert rejected(lambda: direct(v[other])).errno == errno.EIO
-            assert rejected(lambda: direct(v[other], write=old)).errno == errno.EIO
+            assert rejected(lambda: direct(v[other], write=old[:512])).errno == errno.EIO
         handle.close()
         close_views(); absent()
         v = open_views()
         handle = owner()
         assert handle.device.generation != generation and not blocks.native_status(handle.device)['failed']
         handle.close()
-        repaired = verify(v, unavailable=10)
+        repaired = verify(v, unavailable=affected)
         close_views(); absent()
-        results.append(dict(view=role, fault=mode, failed_both_views=True, recreated=True, repaired=repaired, prepared_encryptions=spent))
+        results.append(dict(view=role, fault=mode, bytes=size, offset=offset,
+                            failed_both_views=True, recreated=True, repaired=repaired, prepared_encryptions=spent))
         print(f'{role} lower {mode}: fail-stop, teardown, replay and recreation passed', flush=True)
 
 # A legitimate fresh-IV primary rewrite destroys one hidden record only.
