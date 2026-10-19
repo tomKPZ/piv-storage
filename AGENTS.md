@@ -21,7 +21,7 @@ security specification. Respect tool/sandbox approval requirements.
 1. Read README.md, ROADMAP.md, applicable nested instructions, and existing design
    notes (especially docs/development.md, docs/observed-layout.md and
    docs/hidden-format.md, docs/native-blocks.md, docs/native-faults.md and
-   docs/security-review.md, docs/read-performance.md and docs/large-volumes.md). Inspect
+   docs/security-review.md, docs/read-performance.md and docs/large-volumes.md and docs/cancellation.md). Inspect
    git status and relevant code before changing anything.
 2. Determine what is actually implemented and tested. Recheck environmental
    assumptions as needed; the initial host is WSL2 without visible DM/KVM nodes.
@@ -70,6 +70,12 @@ resolved from context/evidence, not for routine implementation decisions.
   bios to 512 bytes. Retain the two-carrier-group/96-tuple preparation bound,
   ordered work and lower preflush/completion-flush semantics. Batching is within
   one bio, not cross-bio writeback. Tail primary sectors have no hidden record.
+- Setup polls pending signals and yields between authenticated ranges and
+  complete initialization records. Keep cancellation outside pn_write: completed
+  records stay committed, full scan is mandatory on retry, and cancellation is
+  not rollback. Failed-attempt cleanup may errorize only its newly created,
+  identity-checked private owner to drain probes; never force public views or
+  existing/foreign mappings. Normal close retains busy-device protection.
 - Larger geometry uses checked kernel file-offset bounds rather than a 256 MiB
   primary cap. Frontend/VM fixtures allow only pinned QEMU /dev/vdb at 128 or
   512 MiB, plus explicitly opted-in test wrappers. Never broaden this into

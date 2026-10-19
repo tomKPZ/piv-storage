@@ -36,8 +36,9 @@ grow/shrink, conversion or migration of an existing hidden volume.
 
 Kernel per-request memory stays bounded independently of volume size. Setup and
 initialization still do work proportional to volume size and hold the setup
-lifecycle lock. They are not yet cooperatively cancellable; that is the next core
-milestone. Diagnostic image decoding/current-IV scans also use memory proportional
+lifecycle lock. [Cooperative cancellation](cancellation.md) now checks pending
+signals between read ranges and complete initialization records. It does not
+interrupt a stalled lower I/O or roll back already zeroed records. Diagnostic image decoding/current-IV scans also use memory proportional
 to image geometry, and are not a constant-memory large-storage interface.
 
 The 2^32 per-owner encryption cap remains a resetting diagnostic. Full hidden

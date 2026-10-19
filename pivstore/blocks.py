@@ -73,7 +73,7 @@ def open_blocks(source, key_file, hidden_key, *, name='piv-native', initialize=F
             if owner.created:
                 # Removing the exclusive attempt's owner frees its native state;
                 # do not issue an extra native checkpoint on failure.
-                owner.remove()
+                owner.remove(abort=True)
         except BaseException as cleanup:
             error.add_note(f'Private mapping cleanup incomplete: {cleanup}')
         raise

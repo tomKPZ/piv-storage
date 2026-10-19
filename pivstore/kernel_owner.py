@@ -132,7 +132,7 @@ class GuestOwner:
         except BaseException as error:
             if self.created:
                 try:
-                    self.remove()
+                    self.remove(abort=True)
                 except BaseException as cleanup:
                     error.add_note(f'Private mapping cleanup incomplete: {cleanup}')
             self.close()
@@ -177,12 +177,14 @@ class GuestOwner:
         if {p.name for p in raw_holders.iterdir()} != {lower_sys}:
             raise ValueError('Unexpected independent holder of backing storage')
 
-    def remove(self):
+    def remove(self, *, abort=False):
+        if abort and not self.created:
+            raise ValueError('Cannot discard an owner created by another attempt')
         if self.device is not None:
             self.device.close()
         for name in (self.name, self.lower_name):
             if name in self.mappings:
-                remove_mapping(name, self.mappings[name])
+                remove_mapping(name, self.mappings[name], discard=abort and name == self.name)
 
     def close(self):
         if self.device is not None:

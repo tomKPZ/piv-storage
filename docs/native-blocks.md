@@ -222,3 +222,8 @@ whole-request transactions. Private pages and metadata are wiped after use.
 Scalar privileged mutation controls are unchanged. No cache or lazy setup
 verification was introduced. Measurements and exact authentication/submission
 counts are in [read-performance.md](read-performance.md).
+
+Setup can now be cancelled cooperatively with SIGINT; see
+[cancellation.md](cancellation.md) for safe boundaries, partial initialization,
+private error-table cleanup and signal/I/O limits. No setup progress file or
+lazy authentication path is introduced.

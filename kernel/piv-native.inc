@@ -242,6 +242,15 @@ done:
  return r;
 }
 
+/* Cooperative setup only: never interrupt an in-flight hidden-record write.
+ * Completed initialization records remain committed; cancellation is not undo.
+ */
+static int pn_setup_poll(void)
+{
+ cond_resched();
+ return signal_pending(current) ? -EINTR : 0;
+}
+
 static int pn_setup(struct piv_control *p, struct file *controller, struct piv_native_setup *s)
 {
  struct piv_native *n;
@@ -271,6 +280,7 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
  /* Hidden availability must not decide whether the decoy can be opened. */
  for (i = 0; i < p->profile.sectors;) {
   u32 count = min_t(u64, p->profile.sectors - i, PIV_READ_BYTES / p->profile.sector_size);
+  r = pn_setup_poll(); if (r) goto bad;
   r = piv_read_range(p, i, count, NULL, NULL); if (r) goto bad;
   i += count;
  }
@@ -278,11 +288,14 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
   zero = kzalloc(PN_DATA, GFP_NOIO);
   if (!zero) { r = -ENOMEM; goto bad; }
   for (i = 0; i < n->hidden_bytes / PN_DATA; i++) {
+   r = pn_setup_poll(); if (r) break;
    r = pn_write(p, true, i * PN_DATA, zero, PN_DATA); if (r) break;
   }
   kfree_sensitive(zero); if (r) goto bad;
  }
+ r = pn_setup_poll(); if (r) goto bad;
  r = piv_checkpoint(p->cc); if (r) goto bad;
+ r = pn_setup_poll(); if (r) goto bad;
  n->ready = true; p->transaction = false; p->controller = NULL;
  return 0;
 bad:

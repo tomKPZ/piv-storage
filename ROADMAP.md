@@ -60,14 +60,14 @@ safety defects take precedence over this ordering whenever discovered.
    fail-stop behavior. See docs/large-volumes.md and the final handoff. This does
    not implement live resize or validate arbitrary sizes up to the arithmetic
    bound; memory and I/O remain bounded per request.
-2. **Scalable activation and initialization (next implementation).** Make long kernel setup/initialize
-   operations responsive to cancellation and scheduler needs, with defined
-   cleanup and partial-initialization semantics. Retain the full authentication
-   scan, seeded randomness and exclusive ownership. Exit: witnessed interruption
-   of a long operation, no leaked mappings/keys or usable half-ready owner, and
-   successful subsequent activation after supported cleanup. Initialization may
-   already have changed hidden records; cancellation is not rollback.
-3. **Core resource/lifecycle hardening.** Review and improve allocation failure,
+2. **Scalable activation and initialization — complete.** Setup yields and polls
+   pending signals between authenticated ranges and whole initialization records;
+   its owner-lock wait is interruptible. Witnessed cancellation, failed-attempt
+   cleanup and healthy reopen passed on both tested volume sizes. Full scanning,
+   seeded randomness and exclusive ownership remain mandatory. Completed records
+   remain changed; cancellation is not rollback or a hard latency guarantee. See
+   docs/cancellation.md and the final handoff for limits and evidence.
+3. **Core resource/lifecycle hardening (next implementation).** Review and improve allocation failure,
    queue/resource bounds, lifetime and teardown handling where concrete evidence
    requires module changes. Pair changes with targeted injection/concurrency
    tests, and debug-kernel checks when an appropriate test kernel is available.
@@ -1102,3 +1102,81 @@ The lifetime diagnostic cap remains; sufficiently large initialization can fail
 after partial changes. Geometry-bound hidden AAD means live resize/migration is
 unsupported. Only 128/512 MiB guest deployment is enabled; the arithmetic bound
 is not a claim of arbitrary-size support or stronger security/crash guarantees.
+
+
+## Session handoff: cancellable native setup (2026-10-19)
+
+Completed the second core-first milestone. PIV_NATIVE_SETUP takes the owner
+mutex interruptibly; setup calls cond_resched and checks pending signals before
+each bounded authenticated scan range and whole initialization record, and around
+the final checkpoint. Cancellation returns EINTR and frees unfinished native
+state. There is no interruption inside pn_write: completed healthy records stay
+committed. Retry performs full verification again; initialization restarts rather
+than resumes. No ABI, encoding or persistent metadata changed.
+
+The controlled SIGINT test uses a default Python KeyboardInterrupt handler and
+unwinds frontend ownership. Default terminating signals/process death, repeated
+interruption of cleanup and arbitrary clients do not inherit this guarantee.
+Lower I/O, flushes, allocation and checkpoints can delay cancellation indefinitely;
+a cancelled contended SETUP caller's subsequent fd close can wait for the owner
+mutex. No hard latency, crash atomicity or memory-erasure guarantee is claimed.
+
+The first two AES runs (cancel-4096-001/002) exposed a real cleanup defect:
+udev probes could hold the suspended private mapping open after interrupted
+setup. They FAILED and are not accepted fixtures. Failed-attempt cleanup now
+replaces only its newly created, identity-checked private owner's table with an
+error target (dmsetup wipe_table --noflush), draining those probes before normal
+removal. It does not erase backing storage. Existing owners, foreign names and
+public views are never forced; normal close retains busy protection. Tests reject
+cleanup exception notes and check absence before settling udev.
+
+Successful disposable QEMU runs, all with independent host verification:
+
+- artifacts/cancel-4096-003: AES-GCM/4096, 128 MiB raw disk. Witnessed scan
+  cancellation plus cleanup 0.339049 s, zero encryptions; initialization 0.450311 s,
+  96 encryptions/two complete hidden records. Healthy reopen verified the zeroed
+  prefix and unchanged remainder, then ordinary full initialization completed.
+  Final host verification authenticated 28,244 primary sectors and matched all
+  301,056 hidden bytes (zeros).
+- artifacts/cancel-512-001: original AEGIS-128/512, 512 MiB raw disk. Scan
+  cancellation plus cleanup 0.305701 s, zero encryptions; initialization 0.463972 s,
+  72 encryptions/two complete records. Final verification authenticated 948,224
+  primary sectors and all 13,485,568 hidden bytes: a 1,024-byte zero prefix and
+  the original remainder. Full initialization was not repeated on this fixture.
+- Both cancellation runs witnessed a second SETUP ioctl blocked on the owner
+  mutex, then its EINTR marker while the first still scanned (0.008352/0.008960 s
+  after SIGINT). These markers precede fd close, not full cleanup. Phase witnesses
+  use filtered kernel probes plus the actual ioctl syscall; traces had no missed
+  probes or overruns. Delay-target timing is observed evidence, not a deadline.
+- artifacts/cancel-faults-4096-001: existing failure/ownership suite passed after
+  the cleanup change, including setup/view failures, foreign/existing ownership,
+  shared sticky lower-I/O failure, authentication rejection and local hidden
+  damage/repair. Independent verification matched all 28,244 primary sectors and
+  301,056 original hidden bytes.
+
+All three passed full guest oracles, stock primary readback, custom module unload
+and stock crypt coexistence. Each has result.txt and host-verification.json;
+no unexpected kernel BUG/Oops/WARNING occurred. Injected errors and unsigned
+module taint are expected. Current IVs were distinct; lifetime history remains
+unknown.
+
+Source stage vendor/kernel-build/cancel-001 and scaffold
+artifacts/cancel-input-001/scaffold.tar match the production includes. Pinned
+Linux 6.12.113+deb13-amd64/source 6.12.113-1, GCC 14.2.0-19 and cryptsetup
+2:2.7.5-2; module built without compiler warnings or config/symbol mismatches.
+All successful runs used experimental-dm-piv.ko SHA-256
+aee864c71a5e75442a800484ef722a86a2f79df4393f4792bf9d5f08006c68c4
+from cancel-4096-003/share. Their frozen production/harness snapshots match the
+current sources. No host root/module operation or new system dependency needed.
+
+Host suite: 47 tests passed, no skips, with ResourceWarning errors, stock fixture
+and optional original-AEGIS reference enabled. Four new tests cover interruption
+unwind, setup-buffer wiping, identity-before-discard ordering and abort scope.
+Changed Python compilation, shell syntax and git diff --check passed. See
+docs/cancellation.md for semantics and reproduction.
+
+Next: evidence-led core resource/lifecycle review, especially allocation failures,
+queue bounds and teardown concurrency. Select a bounded reproducible defect or
+invariant test before changing production code; do not build another kernel
+speculatively. Broader security review, six-profile refresh and deployment remain
+later work; this milestone does not strengthen deniability or crash guarantees.

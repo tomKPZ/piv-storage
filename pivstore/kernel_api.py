@@ -39,12 +39,16 @@ def mapping_identity(name):
     return fields
 
 
-def remove_mapping(name, identity):
+def remove_mapping(name, identity, *, discard=False):
     current = mapping_identity(name)
     if current is None:
         return
     if current != identity:
         raise ValueError(f'Refusing to remove changed mapping {name}')
+    if discard:
+        # Failed private setup only: drain queued probes without exposing data.
+        # The captured identity was checked above; normal close never uses this.
+        dm('wipe_table', '--noflush', name)
     dm('remove', '--retry', name)
 
 

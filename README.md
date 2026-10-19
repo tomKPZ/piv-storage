@@ -54,7 +54,9 @@ blocks. For our 128 MiB disk fixtures:
 The hidden volume is already encrypted underneath its block interface. Setup
 never creates filesystems. **--initialize destroys all existing hidden contents**
 and writes authenticated zeros, while preserving every decoy plaintext byte.
-Reopen without this flag. Unmount both filesystems before:
+Reopen without this flag. Ctrl-C can [cancel activation/initialization](docs/cancellation.md);
+already initialized records remain zeroed, and lower I/O can delay interruption.
+Unmount both filesystems before:
 
 ```sh
 python3 -m pivstore close-blocks --device /dev/vdb \

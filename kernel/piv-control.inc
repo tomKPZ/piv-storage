@@ -6,6 +6,7 @@
 #include <linux/vmalloc.h>
 #include <linux/unaligned.h>
 #include <linux/rbtree.h>
+#include <linux/sched/signal.h>
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Included after native AEAD helpers. cc is borrowed only while lock is held.
  * misc_open serializes our open callback with misc_deregister via misc_mtx.
@@ -417,7 +418,12 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		   copy_from_user(&read, (void __user *)arg, sizeof(read))) {
 		return -EFAULT;
 	}
-	mutex_lock(&p->lock);
+	if (cmd == PIV_NATIVE_SETUP) {
+		ret = mutex_lock_interruptible(&p->lock);
+		if (ret) { ret = -EINTR; goto out; }
+	} else {
+		mutex_lock(&p->lock);
+	}
 	noio = memalloc_noio_save();
 	if (!p->live)
 		ret = -ENODEV;
