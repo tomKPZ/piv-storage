@@ -128,13 +128,12 @@ static int pn_record(struct piv_native *n, u64 index, u8 *carrier,
 /* Authenticate primary data before accepting its carrier, even for replacement. */
 static int pn_carrier(struct piv_control *p, u64 index, u8 *carrier)
 {
- u32 j, iv = p->profile.iv_size, group = PN_CARRIER / iv;
- for (j = 0; j < group; j++) {
-  struct piv_sector *s = NULL;
-  int r = piv_load(p->cc, index * group + j, &s);
+ u32 j = 0, iv = p->profile.iv_size, group = PN_CARRIER / iv;
+ while (j < group) {
+  u32 count = min_t(u32, group - j, PIV_READ_BYTES / p->profile.sector_size);
+  int r = piv_read_range(p, index * group + j, count, NULL, carrier + j * iv);
   if (r) return r;
-  memcpy(carrier + j * iv, s->original + 4112, iv);
-  piv_sector_free(p->cc, s);
+  j += count;
  }
  return 0;
 }
@@ -265,10 +264,10 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
  r = crypto_aead_setauthsize(n->record_cipher, 16); if (r) goto bad;
  p->native = n;
  /* Hidden availability must not decide whether the decoy can be opened. */
- for (i = 0; i < p->profile.sectors; i++) {
-  struct piv_sector *sector = NULL;
-  r = piv_load(p->cc, i, &sector); if (r) goto bad;
-  piv_sector_free(p->cc, sector);
+ for (i = 0; i < p->profile.sectors;) {
+  u32 count = min_t(u64, p->profile.sectors - i, PIV_READ_BYTES / p->profile.sector_size);
+  r = piv_read_range(p, i, count, NULL, NULL); if (r) goto bad;
+  i += count;
  }
  if (s->flags & 1) {
   zero = kzalloc(PN_DATA, GFP_NOIO);
@@ -289,19 +288,20 @@ bad:
 static int pn_read(struct piv_control *p, bool hidden, u64 offset, u8 *data, u32 bytes)
 {
  u64 unit = hidden ? PN_DATA : p->profile.sector_size, first = offset / unit, last = (offset + bytes - 1) / unit, i;
- u8 *record = hidden ? kmalloc(PN_CARRIER + PN_DATA, GFP_NOIO) : NULL;
+ u8 *record = kmalloc(hidden ? PN_CARRIER + PN_DATA : PIV_READ_BYTES, GFP_NOIO);
  int r = 0;
- if (hidden && !record) return -ENOMEM;
+ if (!record) return -ENOMEM;
  for (i = first; i <= last; i++) {
   u64 start = i * unit, lo = max(start, offset), hi = min(start + unit, offset + bytes);
   if (hidden) {
    r = pn_read_record(p, i, record, record + PN_CARRIER); if (r) break;
    memcpy(data + lo - offset, record + PN_CARRIER + lo - start, hi - lo);
   } else {
-   struct piv_sector *s = NULL;
-   r = piv_load(p->cc, i, &s); if (r) break;
-   memcpy(data + lo - offset, page_address(s->page) + lo - start, hi - lo);
-   piv_sector_free(p->cc, s);
+   u32 count = min_t(u64, last - i + 1, PIV_READ_BYTES / unit);
+   r = piv_read_range(p, i, count, record, NULL); if (r) break;
+   hi = min(start + count * unit, offset + bytes);
+   memcpy(data + lo - offset, record + lo - start, hi - lo);
+   i += count - 1;
   }
  }
  kfree_sensitive(record); return r;

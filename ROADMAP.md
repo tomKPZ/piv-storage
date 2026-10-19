@@ -67,9 +67,12 @@ observing deniability or single-snapshot statistical proof follows.
 The internal source-led security/threat-model review is complete; see
 docs/security-review.md and the final handoff. Independent cryptographic review
 remains outstanding. Authenticated read/setup profiling is complete; see
-docs/read-performance.md. Next implement and measure a bounded authenticated
-primary range-read helper for setup, decoy reads and carrier collection. Preserve
-full authentication and avoid persistent caches. Any cross-bio coalescing,
+docs/read-performance.md. Bounded authenticated primary range reads are now
+implemented for setup, decoy reads and carrier collection, preserving every
+sector check and using no persistent cache; see the final handoff. Next add
+active on-disk metadata/journal negative fixtures against stock recovery and
+native activation, documenting rejection, replay acceptance and availability
+limits without promising freshness or mutation-free hostile activation. Any cross-bio coalescing,
 crash guarantee or in-carrier redundancy needs separate evidence.
 
 Further work: expanded journal/active-metadata attack fixtures, independent
@@ -896,3 +899,91 @@ old module/results as the baseline. Recheck complete oracles and corruption/
 lower-fault isolation, lifecycle/flush behavior and other affected guest suites
 before accepting the optimization. This profile identifies a candidate path;
 it does not separate CPU crypto, allocation, scheduling and lower-I/O costs.
+
+
+## Session handoff: bounded authenticated range reads (2026-10-19)
+
+Implemented piv_read_range in kernel/piv-control.inc. Each call gathers at most
+16 KiB of primary ciphertext plus tag/IV metadata through one dm-integrity bio,
+then invokes the original Linux AEAD helper once per sector with its own tag
+offset and address/IV AAD. One request is reused sequentially. No plaintext or
+IVs are published until the entire range verifies; pages and metadata are wiped
+on all exits. Native setup scans, decoy reads and carrier collection use it.
+Scalar privileged mutation controls, write preparation/application semantics,
+flush ordering, format and ABI are unchanged. There is no persistent cache, lazy
+verification, external state or cross-bio accumulation. Native reads still copy
+to the public bio only on complete work-item success.
+
+Source stage: vendor/kernel-build/read-range-001; complete scaffold:
+artifacts/read-range-input-001/scaffold.tar. read-range-4096-001 built the matched
+module with pinned config/symbol checks and no compiler warnings. Includes match
+the stage exactly. Reusable module:
+artifacts/read-range-4096-001/share/experimental-dm-piv.ko, SHA-256
+c6424fc6e94be964affc4ee7cc4406170f54bb487bc0e4d80cc54bdc49f8a79e.
+Kernel/header/compiler/cryptsetup pins are unchanged. scripts/guest-profile-build.sh
+adds a shared-scaffold build-and-profile entry point. No full kernel build, host
+installation/module loading, host root requirement or real-device access was used.
+
+Uninstrumented profiles ran sequentially without competing benchmark VMs.
+read-range-4096-001 and read-range-512-001 both passed complete view oracles,
+zero read-phase primary encryptions, close/unload, stock authentication and
+independent host checks. Against profile-4096-003 / profile-512-001 baselines:
+- Median native activation AES4096 5.826 → 2.390 s; AEGIS512 35.336 → 2.416 s.
+  Setup ioctl 5.146 → 1.699 s / 34.647 → 1.686 s.
+- 1 MiB decoy read in 16 KiB requests 60.182 → 32.036 ms / 321.641 → 33.179 ms.
+  64 KiB hidden read in 16 KiB requests 1.122 → 0.391 s / 0.706 → 0.063 s.
+- Separate module-qualified probes assert unchanged primary AEAD invocations:
+  setup 28,245 / 213,009 including checkpoint, 16 KiB decoy 4 / 32, and 4 KiB
+  hidden 384 / 288. Read submissions to dm-integrity drop to 7,062 / 6,658 for
+  setup, 1 / 1 for that decoy read, and 96 / 16 for that hidden read. Zero missed
+  probes. These are logical submissions, not physical-media reads.
+
+Full method, samples/comparison tables and reproduction are in
+docs/read-performance.md. Warm-cache TCG/Python timing is diagnostic, not a
+production/cipher benchmark or isolated CPU profile. Historical write/journal
+detectability traces were not remeasured; their scope is now explicit. No new
+deniability, crash atomicity or physical durability claim follows.
+
+Regression results (all passed, with independent host-verification.json):
+- read-range-faults-4096-001 and read-range-faults-512-001: existing setup failure
+  cleanup, foreign-name preservation, lower read/write EIO, shared fail-stop,
+  recreation, local hidden EIO/invalid marker/repair. Added one-sector read-only
+  dm-flakey corruption at the last sector of a 16 KiB decoy item and hidden
+  record 10. Direct caller buffers remained untouched on EIO, both views stayed
+  failed after restoration, and complete oracles matched after recreation.
+  Setup also rejected late-sector corruption and cleaned its own mappings.
+- read-range-lifecycle-4096-001: exact plain/FUA/PREFLUSH/flush completion traces
+  with zero missed/overrun events, concurrent writes to shared carriers, reads,
+  fsync, public suspend/resume, busy mapping/unload protection and new generation.
+- read-range-batch-4096-001, read-range-batch-512-001 and
+  read-range-batch-chacha-512-001: nontrivial direct read/write/restore, exact
+  encryption counts, unaligned/batch/carrier boundaries, incomplete tails and
+  full oracles. ChaCha512 reaches the two-group/96-tuple bound. The current
+  harness now assumes the documented 16 KiB split rather than inferring target
+  behavior from the presence of a build archive; old baselines retain frozen
+  harnesses at historical revisions.
+- read-range-filesystems-4096-001: concurrent writable ext4/ext2, partial I/O,
+  absent/damaged/wrong-key isolation, invalid-marker preservation, direct repair,
+  clean reopen and stock readback. Its generated private initramfs passed
+  read-range-early-4096-001: actual RAM-root activation with no persistent OS
+  filesystem, stdlib-only setup, both writable views and custom unload. The
+  post-boot image independently matches both complete expected views.
+
+Nine standard VM runs plus one RAM-root boot completed; every output has full
+independent primary/hidden verification. Profiles/faults used AES4096 and
+original-AEGIS512, with ChaCha512 additionally covered by the boundary suite.
+This is not a new six-profile matrix, debug-kernel audit or power-cut experiment.
+The unchanged persistence protocol retains earlier interruption evidence; no
+new crash/durability guarantee is inferred. All normal guests kept stock crypt
+loaded with a writable unrelated encrypted filesystem. No unexpected kernel
+BUG/Oops/WARNING or compiler diagnostics; injected I/O/auth errors and unsigned
+module taint are expected. Host 40 tests passed without skips with ResourceWarning
+errors, AES4096 fixture and optional original-AEGIS reference; changed Python
+compilation, shell syntax and git diff --check passed.
+
+This bounded optimization is complete. Next: active on-disk metadata/journal
+negative fixtures using disposable copies and stock replay/native activation.
+Record both rejection and accepted valid replay, preserve explicit availability/
+freshness limits, and never claim activation cannot modify hostile storage before
+the full scan. Independent crypto review, debug-kernel memory/lifecycle stress,
+per-cipher lifetime/rekey policy and broader deployment remain open.

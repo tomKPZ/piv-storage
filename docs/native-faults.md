@@ -159,3 +159,24 @@ python3 scripts/vm.py run --code --script scripts/guest-lifecycle.sh \
   --share-file artifacts/separate-native-4096-002/share/expected-primary.sha256 \
   --timeout 2400
 ```
+
+## Late-sector corruption in batched reads
+
+The range-read regression extends guest-fault-test.py with a one-sector
+`dm-flakey` read replacement below dm-integrity. It uses the documented
+[corrupt_bio_byte feature](https://docs.kernel.org/admin-guide/device-mapper/dm-flakey.html)
+to flip the first byte of a selected ciphertext sector on reads only, leaving
+backing bytes and writes unchanged. A direct raw read witnesses the replacement
+before testing authentication. The chosen sector is the last in one aligned
+16 KiB decoy work item or the last carrier sector of hidden record 10, away from
+the setup checkpoint's journal cache.
+
+Earlier sectors may have decrypted into private pages when this last sector
+fails. A direct-I/O caller buffer prefilled with a sentinel must remain entirely
+unchanged on EIO. Both views must then remain failed after fault removal until
+teardown/recreation. Complete primary/hidden oracles must match afterward with
+no repair. A separate setup attempt with the same later-sector corruption must
+fail, remove its own mappings and permit a healthy full reopen after restoration.
+These synthetic faults test authenticated-read withholding and shared failure,
+not adversarial journal replay, physical corruption durability or atomicity of
+application requests spanning multiple public bios. Results are in ROADMAP.md.

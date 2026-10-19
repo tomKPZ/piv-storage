@@ -54,6 +54,15 @@ def fault(mode='linear'):
     dm('reload', 'piv-test-fault', input=table(mode))
     dm('resume', 'piv-test-fault')
 
+def corrupt_read(sector512, value):
+    # One raw data sector only; unchanged backing bytes and normal writes.
+    lines = (f'0 {sector512} linear /dev/vdb 0\n'
+             f'{sector512} 1 flakey /dev/vdb {sector512} 0 3600 5 corrupt_bio_byte 1 r {value} 0\n'
+             f'{sector512 + 1} {262144 - sector512 - 1} linear /dev/vdb {sector512 + 1}\n')
+    dm('suspend', '--noflush', 'piv-test-fault')
+    dm('reload', 'piv-test-fault', input=lines)
+    dm('resume', 'piv-test-fault')
+
 def direct(path, *, write=None, offset=0, size=512):
     if write is not None: size = len(write)
     value = mmap.mmap(-1, size)
@@ -189,6 +198,53 @@ for role in ('decoy', 'hidden'):
         results.append(dict(view=role, fault=mode, bytes=size, offset=offset,
                             failed_both_views=True, recreated=True, repaired=repaired, prepared_encryptions=spent))
         print(f'{role} lower {mode}: fail-stop, teardown, replay and recreation passed', flush=True)
+
+# Corrupt the last authenticated sector of one read work item. Earlier sectors
+# may have decrypted internally; none of that item's bytes may reach the caller.
+for role in ('decoy', 'hidden'):
+    v = open_views()
+    handle = owner()
+    unit, group = handle.device.sector_size, 576 // handle.device.iv_size
+    size = 16384 if role == 'decoy' else 512
+    offset = ((10 * group * unit + size - 1) // size) * size if role == 'decoy' else 10 * 512
+    last = ((offset + size - 1) // unit if role == 'decoy' else 11 * group - 1)
+    physical = handle.layout.offsets(last)[0]
+    original = direct('/dev/vdb', offset=physical, size=512)
+    replacement = original[0] ^ 1
+    corrupt_read(physical // 512, replacement)
+    observed = direct(SOURCE, offset=physical, size=512)
+    assert observed == bytes([replacement]) + original[1:]
+    with mmap.mmap(-1, size) as buf:
+        sentinel = b'\xa5' * size
+        buf[:] = sentinel
+        fd = os.open(v[role], os.O_RDONLY | os.O_DIRECT)
+        try:
+            assert rejected(lambda: os.preadv(fd, [buf], offset)).errno == errno.EIO
+            assert buf[:] == sentinel, 'Failed authenticated work item exposed bytes'
+        finally:
+            os.close(fd)
+    assert blocks.native_status(handle.device)['failed']
+    fault()
+    for other in ('decoy', 'hidden'):
+        assert rejected(lambda: direct(v[other])).errno == errno.EIO
+    handle.close()
+    close_views(); absent()
+    v = open_views(); assert verify(v) is False
+    close_views(); absent()
+    results.append(dict(corrupt_read=role, bytes=size, withheld_entire_work_item=True,
+                        failed_both_views=True, recreated=True))
+    print(f'{role} late primary corruption: no output, shared fail-stop and recreate passed', flush=True)
+
+# The full setup scan must also reject a later corrupt sector, before views exist.
+corrupt_read(physical // 512, replacement)
+try:
+    rejected(open_views)
+    absent()
+finally:
+    fault()
+v = open_views(); assert verify(v) is False
+close_views(); absent()
+results.append('late primary corruption rejected during setup, cleanup and reopen passed')
 
 # A legitimate fresh-IV primary rewrite destroys one hidden record only.
 handle = owner(); dev = handle.device

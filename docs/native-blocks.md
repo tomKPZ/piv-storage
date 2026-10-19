@@ -182,9 +182,10 @@ also checks that per-module workqueue IDs cannot collide across the two targets.
 ## Bounded decoy I/O measurements
 
 scripts/guest-batch.sh and kernel/guest-batch-test.py use a CLOSED native fixture
-and complete expected views. Supplying scaffold.tar builds the current module
-and checks 16 KiB split counts; supplying only experimental-dm-piv.ko measures
-the historical one-primary-sector baseline. Use a fresh VM run for each:
+and complete expected views. Supplying scaffold.tar builds the current module;
+supplying only experimental-dm-piv.ko reuses a current matched module. Both
+check the documented 16 KiB split contract. Historical pre-batching baselines
+retain their frozen harness at the old Git revision. Use a fresh VM run for each:
 
 ```sh
 python3 scripts/vm.py run --code --script scripts/guest-batch.sh \
@@ -207,3 +208,16 @@ readback and custom unload follow. batch-results.json stores each sample; single
 QEMU TCG timings are diagnostic, not a stable throughput benchmark. Work scales
 with the carrier groups intersected by each 16 KiB split, rather than just the
 application byte count. No throughput gain is promised for isolated small I/O.
+
+## Bounded authenticated reads
+
+Native setup scans, decoy reads and carrier collection use piv_read_range,
+gathering at most 16 KiB through the ordinary integrity target. Every primary
+sector still passes the original Linux AEAD helper with its own address/IV AAD
+and tag offset. The helper publishes no plaintext or IVs until its complete
+range authenticates. Public read work likewise copies to the bio only on full
+success; larger application reads can span multiple work items and are not
+whole-request transactions. Private pages and metadata are wiped after use.
+Scalar privileged mutation controls are unchanged. No cache or lazy setup
+verification was introduced. Measurements and exact authentication/submission
+counts are in [read-performance.md](read-performance.md).

@@ -22,9 +22,9 @@ unit = owner.device.sector_size
 group = 576 // owner.device.iv_size
 size = owner.device.sectors * unit
 groups_end = owner.device.sectors // group * group * unit
-# The same test runs unchanged against the pre-batching module as a baseline.
-batched = (W / 'scaffold.tar').exists()
-quantum = 16384 if batched else unit
+# Current target contract; historical pre-batching runs retain frozen harnesses.
+batched = True
+quantum = 16384
 results = []
 
 def direct(offset, count, write=None):

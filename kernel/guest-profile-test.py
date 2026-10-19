@@ -109,15 +109,17 @@ blocks.native_setup = original_setup
 
 # Timings above are uninstrumented. Probe entry counts below have no payload/key
 # fields and use tracing_on=0: no ring-buffer events need to be retained.
-# The pinned compiler specializes piv_load and inlines pn_setup. Resolve the
-# non-cold specialization explicitly; the setup ioctl is delimited in Python.
-loads = [line.split()[2] for line in Path('/proc/kallsyms').read_text().splitlines()
-         if len(line.split()) == 4 and line.split()[3] == '[dm_piv]'
-         and (line.split()[2] == 'piv_load' or line.split()[2].startswith('piv_load.'))
-         and not line.split()[2].endswith('.cold')]
-assert len(loads) == 1, loads
-probes = {'load': loads[0], 'record': 'pn_record', 'write': 'pn_write',
-          'checkpoint': 'piv_checkpoint'}
+# Resolve compiler specializations in this module, never the stock copy.
+symbols = [line.split()[2] for line in Path('/proc/kallsyms').read_text().splitlines()
+           if len(line.split()) == 4 and line.split()[3] == '[dm_piv]']
+def symbol(stem):
+    matches = [name for name in symbols if (name == stem or name.startswith(stem + '.'))
+               and '.cold' not in name]
+    assert len(matches) == 1, (stem, matches)
+    return 'dm_piv:' + matches[0]
+probes = {event: symbol(function) for event, function in dict(
+    load='piv_load', range='piv_read_range', crypto='crypt_convert_block_aead_iv',
+    record='pn_record', write='pn_write', checkpoint='piv_checkpoint').items()}
 
 
 def probe_command(value):
@@ -159,7 +161,8 @@ try:
     (T / 'events/piv_profile/enable').write_text('1')
     def counted_setup(*args, **kwargs):
         counted('setup-ioctl', lambda: original_setup(*args, **kwargs),
-                dict(load=sectors + 1, record=0, write=0, checkpoint=1))
+                dict(load=1, range=(sectors + 16384 // unit - 1) // (16384 // unit),
+                     crypto=sectors + 1, record=0, write=0, checkpoint=1))
     blocks.native_setup = counted_setup
     views = blocks.open_blocks('/dev/vdb', KEY, HKEY)
     blocks.native_setup = original_setup
@@ -175,7 +178,9 @@ try:
                     assert buf[:] == (primary if role == 'decoy' else EXPECTED)[:count]
                 finally:
                     os.close(fd)
-        counted(f'{role}-{count}', read, dict(load=loads, record=records, write=0, checkpoint=0))
+        counted(f'{role}-{count}', read, dict(load=0, range=(records * ((group + 16384 // unit - 1) // (16384 // unit))
+                                   if records else 1),
+                crypto=loads, record=records, write=0, checkpoint=0))
     (W / 'profile-kprobe-counts.txt').write_text((T / 'kprobe_profile').read_text())
 finally:
     if registered:
@@ -193,7 +198,7 @@ crypt('close', 'piv-stock-profile')
 subprocess.run(['dd', 'if=/dev/vdb', 'of=' + str(W / 'profile-final.img'), 'bs=1M', 'status=none'], check=True)
 results.update(primary_sector=unit, primary_sectors=sectors, group=group,
                cache_state='warm guest/host caches; O_DIRECT bypasses public page cache only',
-               timings_include_python_comparison=True, probes_used_during_timing=False)
+               timings_include_python_comparison=True, probes_used_during_timing=False, bounded_range_reads=True)
 (W / 'profile-results.json').write_text(json.dumps(results, indent=2) + '\n')
 (W / 'result.txt').write_text('Read/setup profiling, exact probe counts, complete oracles and stock readback passed\n')
 print(json.dumps(results), flush=True)

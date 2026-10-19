@@ -163,3 +163,11 @@ reference described in development.md; guest/native crypto does not. The scripts
 need no additional host packages. JSON, traces, snapshots, keys and large outputs
 stay ignored. No hidden metadata, persistent ledger or driver mitigation is
 introduced by this diagnostic experiment.
+
+The numerical control runs above predate bounded primary read batching. That
+optimization preserves record bytes, primary AEAD checks and prepared-tuple write
+semantics, but can change scheduling and read traces. Journal timing/counts were
+not remeasured after it; do not treat these historical transcripts as exact
+current-runtime performance predictions. See read-performance.md for the new
+read measurements. The existing known-workload distinctions still constrain
+claims; a faster read path does not establish deniability.

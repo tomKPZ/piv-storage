@@ -149,6 +149,67 @@ bad:
 	return ret;
 }
 
+/* Bounded lower reads; outputs are published only after every sector verifies.
+ * No cache: all calls fetch current tuples through the same integrity device.
+ */
+#define PIV_READ_BYTES 16384
+struct piv_range_io {
+ struct dm_crypt_io io;
+ struct bio *bio;
+ struct page *pages[PIV_READ_BYTES / PAGE_SIZE];
+};
+static int piv_read_range(struct piv_control *p, u64 index, u32 count,
+                          u8 *data, u8 *ivs)
+{
+ struct crypt_config *cc = p->cc;
+ struct piv_range_io *r;
+ struct aead_request *req = NULL;
+ struct bvec_iter saved;
+ DECLARE_CRYPTO_WAIT(wait);
+ u32 i, bytes, pages;
+ int ret = -ENOMEM;
+ if (!count || count > PIV_READ_BYTES / cc->sector_size ||
+     index >= p->profile.sectors || count > p->profile.sectors - index)
+  return -EINVAL;
+ bytes = count * cc->sector_size; pages = DIV_ROUND_UP(bytes, PAGE_SIZE);
+ r = kzalloc(sizeof(*r), GFP_NOIO); if (!r) return -ENOMEM;
+ r->io.cc = cc; r->io.sector = index << cc->sector_shift;
+ r->io.integrity_metadata = kzalloc(count * cc->tuple_size, GFP_NOIO);
+ r->bio = bio_alloc(cc->dev->bdev, pages, REQ_OP_READ, GFP_NOIO);
+ if (!r->io.integrity_metadata || !r->bio) goto done;
+ r->bio->bi_iter.bi_sector = cc->start + r->io.sector;
+ for (i = 0; i < pages; i++) {
+  u32 length = min_t(u32, PAGE_SIZE, bytes - i * PAGE_SIZE);
+  r->pages[i] = alloc_page(GFP_NOIO | __GFP_ZERO);
+  if (!r->pages[i] || bio_add_page(r->bio, r->pages[i], length, 0) != length) goto done;
+ }
+ ret = dm_crypt_integrity_io_alloc(&r->io, r->bio); if (ret) goto done;
+ saved = r->bio->bi_iter;
+ ret = submit_bio_wait(r->bio); if (ret) goto done;
+ r->bio->bi_iter = saved;
+ crypt_convert_init(cc, &r->io.ctx, r->bio, r->bio, r->io.sector);
+ req = mempool_alloc(&cc->req_pool, GFP_NOIO);
+ aead_request_set_tfm(req, any_tfm_aead(cc));
+ aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG, crypto_req_done, &wait);
+ for (i = 0; i < count; i++) {
+  ret = crypto_wait_req(crypt_convert_block_aead_iv(cc, &r->io.ctx, req, i, NULL), &wait);
+  if (ret) goto done;
+  r->io.ctx.cc_sector += 1U << cc->sector_shift;
+ }
+ for (i = 0; data && i < pages; i++)
+  memcpy(data + i * PAGE_SIZE, page_address(r->pages[i]), min_t(u32, PAGE_SIZE, bytes - i * PAGE_SIZE));
+ for (i = 0; ivs && i < count; i++)
+  memcpy(ivs + i * cc->iv_size, r->io.integrity_metadata + i * cc->tuple_size + 16, cc->iv_size);
+done:
+ if (req) mempool_free(req, &cc->req_pool);
+ if (r->bio) bio_put(r->bio);
+ for (i = 0; i < pages; i++) if (r->pages[i]) {
+  memzero_explicit(page_address(r->pages[i]), PAGE_SIZE); __free_page(r->pages[i]);
+ }
+ kfree_sensitive(r->io.integrity_metadata); kfree_sensitive(r);
+ return ret;
+}
+
 static int piv_identity(struct piv_control *p, u32 version, u32 size,
 			u64 generation, u64 sector, unsigned int expected_size)
 {

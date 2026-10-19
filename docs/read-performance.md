@@ -1,7 +1,9 @@
 # Authenticated read and activation profiling
 
 The bounded profile separates uninstrumented elapsed time from kernel call counts.
-It does not change the production driver, record format, ABI or failure policy.
+Baseline profiling did not change the runtime. The subsequent bounded read
+implementation below changes I/O gathering, preserving the format, ABI and
+authentication/failure policy.
 Measurements use the pinned Debian 6.12.113 guest, QEMU TCG with two virtual CPUs
 and 1 GiB RAM, the existing batch-native-4096-001 module and synthetic closed
 fixtures. Stock dm-crypt stays loaded with an unrelated mounted encrypted
@@ -61,7 +63,7 @@ activation/close checkpoints can write an existing tuple without new encryption.
 Successful sequential runs: artifacts/profile-4096-003 (AES/4096) and
 artifacts/profile-512-001 (original AEGIS/512). The reused module SHA-256 is
 91d424368e7e73e827afd74f4add8364e77af251b5ced96adc56499216ddfa52.
-Both frozen harness copies match the committed source. The production includes
+Both baseline frozen harness copies match revision 4b8bbe2. The production includes
 still match vendor/kernel-build/batch-001; no kernel rebuild was needed.
 
 Median elapsed times, three samples per row:
@@ -115,33 +117,75 @@ before completion when inspection showed that compiler specialization/inlining
 required different probe symbols. The final harness obeys stock logical sizes,
 resolves the actual load symbol and delimits setup before public udev probes.
 
-## Optimization direction
+## Bounded read batching (2026-10-19)
 
-Retain authentication of every primary sector, including sectors whose IVs are
-only being collected for a hidden read. The bounded next candidate is a shared
-range-read helper: gather at most 16 KiB of primary data/tag/IV tuples in one
-lower bio, then authenticate each sector with the unchanged Linux AAD before
-returning any requested bytes. Use it for setup scans, decoy reads and carrier
-collection, without persistent caches, lazy setup verification or cross-bio
-transactions. Count reductions and repeat these timings before accepting it.
+`piv_read_range` now gathers at most 16 KiB of primary ciphertext and tag/IV
+metadata in one bio to dm-integrity. It reuses one AEAD request while invoking the
+unchanged Linux helper for each sector, advancing sector AAD and tag offset.
+It copies plaintext or carrier IVs only after every sector in the range verifies.
+All pages and metadata are private, bounded and wiped on release, including
+partial authentication failure. Setup scans, decoy reads and carrier collection
+use it. Mutation controls and prepared-tuple application retain the scalar path;
+write preparation benefits from faster carrier collection. No persistent cache,
+lazy verification, cross-bio accumulation or completion change was introduced.
 
-The current call-count evidence does not separate CPU crypto time, allocations,
-lower bio latency and scheduling. It identifies repeated authenticated sector
-loads as the path to investigate; it does not prove that any proposed batching
-will achieve a particular speedup. Preserve corruption/fault isolation, bounded
-memory, complete-or-error reads and the existing lifecycle/flush regressions.
-A prototype that weakens those properties to improve timing should be rejected.
+Current probes resolve module-qualified symbols, including compiler
+specializations, and additionally count the private AEAD helper. This prevents
+accidentally counting the simultaneously loaded stock helper. They assert fewer
+range/scalar calls with the original number of primary crypto invocations.
+One helper call submits one read to dm-integrity; the lower target may split or
+satisfy it from journal/cache, so these are not physical-media read counts.
+
+Successful timing runs are read-range-4096-001 and read-range-512-001, run
+sequentially with no competing benchmark VM. Sources are staged in
+vendor/kernel-build/read-range-001; the complete scaffold is
+artifacts/read-range-input-001/scaffold.tar. The AES run built the matched module
+without compiler warnings and checked config/symbol pins. Both profiles reused
+that module; timing was after compilation and without probes. Module SHA-256:
+c6424fc6e94be964affc4ee7cc4406170f54bb487bc0e4d80cc54bdc49f8a79e.
+
+Median elapsed time comparison (same fixtures/request sizes as the baseline):
+
+| Operation | AES/4096 old → new | AEGIS/512 old → new |
+| --- | ---: | ---: |
+| Native activation | 5.826 → 2.390 s | 35.336 → 2.416 s |
+| Setup ioctl | 5.146 → 1.699 s | 34.647 → 1.686 s |
+| 1 MiB native decoy read, 16 KiB requests | 60.182 → 32.036 ms | 321.641 → 33.179 ms |
+| 1 MiB native decoy read, 64 KiB requests | 55.337 → 26.104 ms | 311.938 → 26.534 ms |
+| 64 KiB hidden read, 16 KiB requests | 1.122 → 0.391 s | 0.706 → 0.063 s |
+
+Contemporaneous stock 16 KiB-request medians were 23.429 ms AES and 23.201 ms
+AEGIS per 1 MiB; the baseline values were 24.705/22.346 ms. These repeated TCG
+samples support the bounded optimization, not a universal speedup or cipher
+comparison. They do not isolate allocation, crypto or scheduling CPU time.
+
+| Operation | AES/4096 old → new reads | AEGIS/512 old → new reads | Unchanged primary authentications (AES / AEGIS) |
+| --- | ---: | ---: | ---: |
+| Setup including checkpoint | 28,245 → 7,062 | 213,009 → 6,658 | 28,245 / 213,009 |
+| 16 KiB decoy read | 4 → 1 | 32 → 1 | 4 / 32 |
+| 512-byte hidden read | 48 → 12 | 36 → 2 | 48 / 36 |
+| 4 KiB hidden read | 384 → 96 | 288 → 16 | 384 / 288 |
+
+Setup includes one scalar checkpoint read; other reads use bounded ranges.
+The setup and timed-read counters still show no new primary encryptions.
+Both profiles passed complete plaintext oracles, stock authentication, unload
+and independent host verification of all sectors and hidden bytes. Broader
+regression results and the next task are recorded in ROADMAP.md. Full primary
+authentication is retained; no new crash, durability or deniability claim follows.
 
 ## Reproduce
+## Reproduce
 
-Reuse a module built with [native-blocks.md](native-blocks.md), and a successful
+The current harness requires the bounded range-read module; baseline timings
+above used the harness/module frozen at 4b8bbe2. Reuse a module built with
+[native-blocks.md](native-blocks.md), and a successful
 closed native fixture with its complete oracles. From the repository root:
 
 ```sh
 python3 scripts/vm.py run --code --script scripts/guest-profile.sh \
   --run-dir artifacts/profile-4096-next \
   --data-image artifacts/separate-native-4096-002/share/dual-final.img \
-  --share-file artifacts/batch-native-4096-001/share/experimental-dm-piv.ko \
+  --share-file artifacts/read-range-4096-001/share/experimental-dm-piv.ko \
   --share-file kernel/guest-profile-test.py \
   --share-file artifacts/control-003/share/passphrase.key \
   --share-file artifacts/control-003/hidden.key \
