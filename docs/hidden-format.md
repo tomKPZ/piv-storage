@@ -1,3 +1,8 @@
+> Codec reference: the v2 native records reuse this envelope with record-specific
+> AAD and 384-byte carriers. Whole-volume v1 creation and copy-output mutation
+> have been retired; v1 decoding remains for archived fixtures. Historical pack
+> behavior below describes the retired implementation, not current commands.
+
 # Experimental auxiliary blob format v1
 
 This is an experimental composition of standard library primitives, not a

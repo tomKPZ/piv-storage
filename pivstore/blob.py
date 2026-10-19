@@ -12,7 +12,6 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from .profile import Image, UnsupportedImage
-from .writer import rewrite_copy
 
 MAGIC = b'PIVBLB01'
 
@@ -49,21 +48,6 @@ def decode(carrier, key, aad):
     if plaintext[:8] != MAGIC or length > len(plaintext) - 16 or any(plaintext[16 + length:]):
         raise UnsupportedImage('Invalid authenticated blob format')
     return plaintext[16:16 + length]
-
-
-def make_plan(image, hidden_key, payload, used):
-    for _ in range(16):
-        encoded = encode(payload, hidden_key, image.layout.sectors * 12, context(image))
-        ivs = [encoded[i:i + 12] for i in range(0, len(encoded), 12)]
-        if len(set(ivs)) == len(ivs) and not used.intersection(ivs):
-            return dict(enumerate(ivs))
-    raise RuntimeError('Unable to encode carrier without primary IV collisions')
-
-
-def pack(source, output, primary_key, hidden_key, payload):
-    def plan(image, used):
-        return make_plan(image, hidden_key, payload, used)
-    return rewrite_copy(source, output, primary_key, plan)
 
 
 def unpack(source, output, hidden_key, *, incremental=False):

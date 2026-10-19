@@ -38,7 +38,7 @@ class GuestOwner:
         self.lock_fd = None
         self.device = None
         self.name = name
-        self.view_name = name + '-view'
+        self.view_name = name + '-view'  # Cleanup of retired RO wrappers only.
         self.lower_name = name + '_dif'
         self.source = Path(source)
         if not re.fullmatch(r'piv-[a-zA-Z0-9_-]{1,40}', name):
@@ -128,20 +128,6 @@ class GuestOwner:
         lower_sys = Path(f'/sys/dev/block/{os.major(lower)}:{os.minor(lower)}').resolve().name
         if {p.name for p in raw_holders.iterdir()} != {lower_sys}:
             raise ValueError('Unexpected independent holder of backing storage')
-
-    def presentation(self):
-        path = Path('/dev/mapper/' + self.view_name)
-        owner_dev = Path('/dev/mapper/' + self.name).stat().st_rdev
-        expected = ['0', str(self.device.sectors * 8), 'linear',
-                    f'{os.major(owner_dev)}:{os.minor(owner_dev)}', '0']
-        if dm('info', self.view_name, check=False).returncode:
-            dm('create', '--readonly', self.view_name,
-               input=f'0 {self.device.sectors * 8} linear /dev/mapper/{self.name} 0\n')
-        if dm('table', self.view_name).stdout.split() != expected:
-            raise ValueError('Unexpected primary presentation')
-        if subprocess.check_output(['blockdev', '--getro', str(path)]).strip() != b'1':
-            raise ValueError('Primary presentation must be read-only')
-        return path
 
     def remove(self):
         if self.device is not None:

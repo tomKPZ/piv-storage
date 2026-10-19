@@ -101,13 +101,13 @@ kernel uses maintained HMAC-SHA256/HKDF and RFC7539 ChaCha20-Poly1305 primitives
 matching the existing v2 encoding exactly. Every refreshed IV must be fresh
 against the persistent history and the rest of its transaction.
 
-One-time setup uses the existing userspace v2 codec to initialize/adopt the fixed
+One-time setup uses the standalone NativeBootstrap and v2 codec to initialize/adopt the fixed
 raw volume and import its complete recorded nonce history. Thereafter record
 crypto, reservations, transactions and recovery are kernel-owned. A durable native.phase marker records adoption before public views are created.
 After adoption, missing/empty native history is refused; stale bootstrap history
 is never used to rebuild it. Bootstrap state
-is historical input only; it must not be reopened with the old userspace service
-after native writes. No automatic variable-file-to-block migration is provided.
+is historical input only; it must not be reused to reconstruct native history after native writes.
+The old userspace services have been removed. No automatic variable-file-to-block migration is provided.
 After closure, unpack --incremental can independently extract the hidden raw
 volume using only the hidden key, with no primary key or native recovery log.
 

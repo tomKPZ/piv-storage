@@ -8,7 +8,7 @@ import struct
 from types import SimpleNamespace
 
 from . import blob
-from .incremental_store import IncrementalStore
+from .bootstrap import NativeBootstrap
 from .kernel_api import KernelDevice, command, dm
 from .kernel_owner import GuestOwner
 from .recovery import Ledger, fsync_dir, private_read, atomic_stream
@@ -96,13 +96,9 @@ def open_blocks(source, key_file, hidden_key, *, state_directory=None, name='piv
             if not initialize and not (bootstrap / 'ledger').exists():
                 raise ValueError('Fresh adoption requires --initialize and a new state directory')
             control = owner.device.control_path
-            with IncrementalStore(owner.device, bootstrap, hidden_key, owner.uuid,
-                                  initialize=not (bootstrap / 'ledger').exists()) as store:
-                if not store.ledger.initialized:
-                    store.truncate_hidden(capacity)
-                    store.flush()
-                if store.hidden_size() != capacity:
-                    raise ValueError('Native block mode requires the fixed-capacity record format')
+            with NativeBootstrap(owner.device, bootstrap, hidden_key, owner.uuid, capacity,
+                                 initialize=not (bootstrap / 'ledger').exists()):
+                pass
             owner.device = KernelDevice(control, '/dev/mapper/' + owner.name)
             owner.device.validate_callback = owner.validate
             fd = os.open(log, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)

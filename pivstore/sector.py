@@ -1,4 +1,4 @@
-"""The supported Linux primary-sector codec, shared by offline and online paths."""
+"""The supported Linux primary-sector codec, retained for independent kernel verification."""
 
 import struct
 

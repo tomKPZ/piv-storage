@@ -1,3 +1,7 @@
+> Historical control-backend design and results. FUSE/NBD and copy-output
+> frontends have been retired; any commands mentioning them below are historical,
+> not runnable instructions. Current interface: [native blocks](native-blocks.md).
+
 # Experimental native backend implementation
 
 The opt-in dm-crypt patch now supports native authenticated IV reads and

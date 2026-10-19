@@ -1,3 +1,7 @@
+> Historical control-backend design and results. FUSE/NBD and copy-output
+> frontends have been retired; any commands mentioning them below are historical,
+> not runnable instructions. Current interface: [native blocks](native-blocks.md).
+
 # Kernel backend investigation and proposed next phase
 
 Status: the K0–K3 prototype is implemented and tested. The subsequent migration

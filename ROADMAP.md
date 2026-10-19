@@ -9,8 +9,8 @@ steps in the session notes.
 
 The user clarified the intended interface: configure a backing device and key
 files, receive decoy and hidden writable block devices for independent filesystems.
-This supersedes NBD/FUSE as the finished native interface. Retain them as regression
-baselines. The selected implementation adds two piv-view DM targets sharing the
+This supersedes NBD/FUSE as the finished native interface. The user subsequently
+authorized retiring those frontends and offline mutation; see the cleanup handoff. The selected implementation adds two piv-view DM targets sharing the
 extended crypt owner, kernel hidden crypto, nonce history and a durable encrypted
 log on independent guest root ext4. Userspace only initializes/configures mappings.
 Implementation and filesystem/recovery validation are complete within the pinned
@@ -22,7 +22,7 @@ Exit: both devices work after setup exits; concurrent real filesystems preserve
 each other's contents; native record encoding matches independent userspace
 extraction; reservation/WAL durability precedes encryption/writes; VM loss and
 kernel-owned replay recover both views without reencryption; stock Linux and host
-verify complete primary hashes. Keep original regressions passing and record
+verify complete primary hashes. Keep retained native/diagnostic regressions passing and record
 error cases/source/environment precisely.
 
 ## Current extension: incremental records and coordinated primary writes
@@ -760,3 +760,70 @@ passwords, real-data images, or sensitive host information.
   clones/snapshot rollback and hardware durability remain explicit limitations.
   Host page cache survives a QEMU kill; hardware power loss was not tested.
   Changes remain uncommitted; do not commit unless requested.
+
+
+## Session handoff: retire superseded frontends (2026-10-18)
+
+The user authorized the proposed cleanup after committing e65f296. The paired
+native devices are now the sole serving interface. FUSE/NBD adapters, regular-file
+online service, whole-carrier KernelStore/IncrementalStore services, copy-output
+writer and pack/randomize-ivs/serve/serve-kernel commands were removed, together
+with their dedicated tests, guest programs and usage pages. Historical results
+above remain evidence for those revisions, not a promise to retain those APIs.
+
+Native initialization now uses standalone NativeBootstrap: a fixed-capacity
+zero-filled v2 volume, current-IV adoption, durable reservations, authenticated
+pending-v2 exact-tuple replay and primary-plaintext-preserving native controls.
+It has no hidden-file CRUD, primary write frontend or inheritance from old
+services. Existing bootstrap ledger/pending-v2 bytes and kernel native.log bytes
+are unchanged. Already adopted native state still ignores bootstrap history.
+Only unused whole-carrier journal creation/iteration was removed from recovery;
+active ledger and sparse-journal formats/methods remain compatible.
+
+Retained independent diagnostics: Image/layout parsing and journal refusal,
+Linux sector authentication/full-primary hashing, raw IV extraction, hidden v1/v2
+decoding/extraction and native-log authentication. The shared randomized envelope
+encoder remains necessary for native bootstrap, not an offline volume writer.
+README, AGENTS, kernel instructions and active format/setup notes now describe
+this scope; historical kernel design notes are explicitly labelled historical.
+
+Focused host suite: 24 tests passed with PIV_FIXTURE=artifacts/control-003 and
+ResourceWarning errors, without skips. Five bootstrap tests cover full adoption,
+unchanged primary/tail, no new encryption on reopen, crash boundaries including
+partially applied recovery, abandoned reservations remaining spent, wrong keys,
+corrupted pending state, authenticated incomplete-record refusal and lineage
+rejection. Separate record tests retain address binding, lengths and padding
+checks. Remaining tests cover codecs, layouts, real kernel fixtures and native
+log/adoption policy. Dedicated retired frontend tests were intentionally removed,
+not silently skipped. Python compilation, guest-shell syntax and diff checks pass.
+The retained CLI verified/extracted the pre-cleanup dual-final-007 closed image
+with the same expected primary hash and all 281,600 hidden bytes
+(artifacts/cleanup-host-001). No new dependencies or privileges are needed.
+
+artifacts/cleanup-native-001 passed fresh setup, concurrent real ext4/ext2,
+close/reopen and stock full-primary readback. Independent host verification
+matched all 28,244 sectors with primary SHA256
+6323e01985c33e9e28c41d881a9d87d949ad219e7e12f6c0a3733bdb81dc2ffa,
+extracted the entire expected 281,600-byte hidden volume and authenticated all
+6,877 frames/148,340 reserved nonces/383,598,828 log bytes, with current-IV
+uniqueness/history membership. Host result: host-filesystem.json in that run.
+The VM was killed with one queued delayed write after durable WAL. Recovery
+passed on the same root/data disks; the pre-replay snapshot correctly failed
+the offline empty-journal check. Kernel replay restored both expected logical
+views, and stock Linux verified the full primary hash. Independent host checks
+agreed on all 28,244 authenticated sectors, primary SHA256
+7c5897e4af81c42533085ed31155e2509208c9f0b7eea09f9388f2ccc7960967,
+and all 281,600 hidden bytes. All 6,880 log frames/148,372 recorded nonces/
+383,732,268 log bytes authenticated; no pending WAL/trailing bytes, and current
+IVs were unique and present in history. Count = prior 148,340 + 32, with no new
+recovery encryption. See host-power.json. The runner exited zero; no unexpected
+compiler warnings, BUG/Oops/WARNING/KASAN or alignment diagnostics appeared.
+Expected unsigned-module taint/private-owner udev probe errors remain explained
+in native-blocks.md. This completes the cleanup within the existing VM scope;
+prior durability, external-state, rollback, write-amplification and deniability
+limitations remain unchanged. Kernel
+code is unchanged from dual-007. Bootstrap/setup frozen in this VM are byte-exact;
+subsequent deletion of unused journal base methods leaves every invoked ledger/
+sparse recovery method AST-identical to the frozen version. The unused legacy read-only wrapper creation method was also removed; wrapper
+cleanup remains to reject/remove old mappings safely. Other later package changes
+are descriptive docstrings only. Changes are uncommitted.

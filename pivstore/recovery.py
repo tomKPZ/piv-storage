@@ -131,7 +131,7 @@ class Ledger:
         self.save()
 
 
-class Journal:
+class _AuthenticatedJournal:
     def __init__(self, path, key, identity, sectors):
         if not 1 <= sectors <= 65536:
             raise ValueError('Unsupported recovery geometry')
@@ -141,29 +141,6 @@ class Journal:
         self.sectors = sectors
         self.raw = None
         self.expected_size = 40 + HEADER.size + sectors * ENTRY.size + 16
-
-    def create(self, carrier, entries):
-        if len(carrier) != self.sectors * 12:
-            raise ValueError('Invalid carrier length')
-        salt = secrets.token_bytes(32)
-        header = MAGIC + salt
-        encryptor = Cipher(algorithms.AES(derive(self.key, salt, self.aad)), modes.GCM(bytes(12))).encryptor()
-        encryptor.authenticate_additional_data(header + self.aad)
-
-        def produce(stream):
-            stream.write(header)
-            stream.write(encryptor.update(HEADER.pack(b'PIVTXN01', self.sectors, hashlib.sha256(carrier).digest())))
-            count = 0
-            for index, old, value in entries:
-                if index != count or len(old) != 12 or len(value) != 4124 or value[-12:] != carrier[index * 12:(index + 1) * 12]:
-                    raise ValueError('Invalid prepared transaction entry')
-                stream.write(encryptor.update(ENTRY.pack(index, old, value)))
-                count += 1
-            if count != self.sectors:
-                raise ValueError('Incomplete prepared transaction')
-            stream.write(encryptor.finalize())
-            stream.write(encryptor.tag)
-        atomic_stream(self.path, produce, exclusive=True)
 
     def load(self):
         self.raw = private_read(self.path, self.expected_size)
@@ -186,43 +163,13 @@ class Journal:
             raise UnsupportedImage('Invalid or unauthenticated recovery journal') from exc
         return self
 
-    def entries(self):
-        if self.raw is None:
-            raise ValueError('Journal must be authenticated before replay')
-        raw = self.raw
-        decryptor = Cipher(algorithms.AES(derive(self.key, raw[8:40], self.aad)),
-                           modes.GCM(bytes(12), raw[-16:])).decryptor()
-        decryptor.authenticate_additional_data(raw[:40] + self.aad)
-        buffer = bytearray()
-        count = 0
-        expected_hash = None
-        digest = hashlib.sha256()
-        for offset in range(40, len(raw) - 16, CHUNK):
-            buffer.extend(decryptor.update(raw[offset:min(offset + CHUNK, len(raw) - 16)]))
-            if expected_hash is None and len(buffer) >= HEADER.size:
-                magic, sectors, expected_hash = HEADER.unpack(buffer[:HEADER.size])
-                del buffer[:HEADER.size]
-                if magic != b'PIVTXN01' or sectors != self.sectors:
-                    raise ValueError('Invalid recovery identity')
-            while expected_hash is not None and len(buffer) >= ENTRY.size:
-                index, old, value = ENTRY.unpack(buffer[:ENTRY.size])
-                del buffer[:ENTRY.size]
-                if index != count or count >= self.sectors or old == value[-12:]:
-                    raise ValueError('Invalid recovery entry order/IV')
-                digest.update(value[-12:])
-                count += 1
-                yield index, old, value
-        decryptor.finalize()
-        if buffer or count != self.sectors or digest.digest() != expected_hash:
-            raise ValueError('Incomplete recovery transaction')
-
     def remove(self):
         self.path.unlink()
         fsync_dir(self.path.parent)
         self.raw = None
 
 
-class SparseJournal(Journal):
+class SparseJournal(_AuthenticatedJournal):
     """v2 sparse transactions; indices remain logical primary-sector indices.
 
     The count is derived from the bounded ciphertext length before decryption;

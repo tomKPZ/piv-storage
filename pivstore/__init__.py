@@ -1,1 +1,1 @@
-"""Experimental offline inspection of a narrowly supported persistent-IV profile."""
+"""Native persistent-IV block setup and independent image diagnostics."""

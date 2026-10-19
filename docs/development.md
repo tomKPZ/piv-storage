@@ -67,7 +67,7 @@ It never attaches the supplied image directly. Use the original control volume's
 synthetic passphrase and expected primary digest:
 
 ```sh
-python3 scripts/vm.py run --script scripts/guest-verify.sh --data-image artifacts/packed.img --share-file artifacts/control-003/share/passphrase.key --share-file artifacts/control-003/share/expected.sha256 --run-dir artifacts/verify-packed-002
+python3 scripts/vm.py run --script scripts/guest-verify.sh --data-image artifacts/native-closed.img --share-file artifacts/control-003/share/passphrase.key --share-file artifacts/control-003/share/expected.sha256 --run-dir artifacts/verify-native-next
 ```
 
 The verification task opens the volume read-only, reads/authenticates every
@@ -83,13 +83,12 @@ hidden-payload pack. The whole-record hidden format is in docs/hidden-format.md.
 files, not the complete Debian-patched kernel source. Inspect distro changes if
 behavior differs. A full Linux checkout is unnecessary for the initial review.
 
-## Online integration
+## Native integration
 
-See docs/online-implementation.md for the single-owner FUSE/NBD service and
-scripts/guest-online.sh for its disposable mounted test. Use `scripts/vm.py run
---code` to share the package source read-only; online backing images live on guest
-ext4. Additional FUSE/NBD packages are installed only in the guest. The offline
-commands above remain the stock-kernel compatibility baseline.
+See docs/native-blocks.md for the paired writable-device tests and kernel/README.md
+for module staging/control regressions. Use vm.py run --code to freeze the setup
+package for each run. Only independent diagnostics remain from the offline tools;
+FUSE/NBD services, mutation commands and their guest tests have been retired.
 
 ## Observed infrastructure failure
 
