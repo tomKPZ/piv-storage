@@ -124,3 +124,26 @@ tests. A self-contained disk layout does not hide installed software or keys.
 
 Final validation also passed Python compilation, shell syntax and git diff --check.
 No unexpected compiler/kernel warnings, BUG or Oops diagnostics appeared.
+
+## Session handoff: scaffolding cleanup complete
+
+Removed the two obsolete guest-dual-fault/initial shell wrappers whose Python
+entrypoints had already been deleted, and retired RO-view cleanup in GuestOwner.
+Merged the short kernel architecture/implementation notes into native-blocks.md.
+Shared guest guards, packages, build/load and provenance now live in
+scripts/guest-common.sh, automatically frozen by vm.py including reboot. The
+prebuilt test delegates to the same dual test body rather than maintaining a copy.
+Core crypto, disk format, independent verifier and sector-control tests remain.
+Ignored artifacts were preserved.
+
+Verification: 19 host tests passed (no skips, ResourceWarning errors enabled),
+Python compilation, shell syntax and whitespace checks passed. All three guest
+runs exited zero: scaffold-native-001 (prebuilt-module dual filesystems, stock
+readback and initramfs build), scaffold-power-001 (32/48 committed-IV VM loss,
+reboot/local EIO/repair and stock readback), scaffold-kernel-002 (fresh matched
+module build, sector controls, corruption and lifecycle checks). Independent host
+primary/hidden verification also passed for the native and power-cut output images.
+The first sector run failed when a pending udev probe held the deliberately
+key-wiped owner open. The retained test now drains probes from asynchronous
+resume before key wipe; all original teardown assertions remain. No driver,
+crypto or disk-format changes were made. Next roadmap priorities are unchanged.

@@ -37,7 +37,6 @@ class GuestOwner:
         self.lock_fd = None
         self.device = None
         self.name = name
-        self.view_name = name + '-view'  # Cleanup of retired RO wrappers only.
         self.lower_name = name + '_dif'
         self.source = Path(source)
         if not re.fullmatch(r'piv-[a-zA-Z0-9_-]{1,40}', name):
@@ -131,7 +130,7 @@ class GuestOwner:
     def remove(self):
         if self.device is not None:
             self.device.close()
-        for name in (self.view_name, self.name, self.lower_name):
+        for name in (self.name, self.lower_name):
             if dm('info', name, check=False).returncode == 0:
                 dm('remove', '--retry', name)
 

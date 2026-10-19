@@ -1,14 +1,7 @@
 #!/bin/bash
-set -euo pipefail
-umask 077
-cd /mnt/piv-work
-mkdir -p /opt/piv-code/pivstore
-mount -t 9p -o trans=virtio,version=9p2000.L,ro pivcode /opt/piv-code/pivstore
-export PYTHONPATH=/opt/piv-code
-modprobe dm_integrity
-modprobe dm_crypt
-rmmod dm_crypt
-insmod experimental-dm-crypt.ko
+source /mnt/piv-work/guest-common.sh
+guest_code
+guest_load_module /mnt/piv-work/experimental-dm-crypt.ko
 python3 - <<'PY'
 import errno
 import json

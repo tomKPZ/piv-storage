@@ -1,5 +1,7 @@
 # Paired native block devices
 
+The module extends pinned dm-crypt to reuse its exact primary AEAD/AAD handling
+and stock dm-integrity journal, avoiding a second primary crypto implementation.
 The patched dm-crypt module registers piv-view alongside its opted-in crypt
 owner. The decoy and hidden targets reference that owner, lower dm-integrity
 device, serialization lock and record cipher. Both expose plaintext logical I/O;
@@ -46,6 +48,18 @@ repair. Buffered sub-page writes may first read a 4096-byte page containing
 unavailable blocks and fail before reaching the target. Destructive full-volume
 initialization avoids this issue for normal filesystem use.
 
+The integration patch is kernel/dm-crypt-piv.patch. piv-control.inc owns privileged
+controls, authenticated primary tuple preparation/application and lifetime gates;
+piv-native.inc owns hidden crypto, both views and the ordered workqueue. The
+independent Python codec remains a cross-check for kernel output. Exact-current
+application and journal checkpoints copy existing authenticated tuples without
+new encryption. Fresh preparation spends an encryption invocation even if later
+application fails. The test-only raw controls are not a nonce-policy service.
+
+Hidden unavailability uses a positive internal PN_UNAVAILABLE sentinel. Linux
+BLK_STS_MEDIUM maps to negative -ENODATA, which must retain shared fail-stop
+semantics rather than being mistaken for local hidden unavailability.
+
 ## Reproduce
 
 Use a fresh destination for every source stage and run:
@@ -89,3 +103,8 @@ offline diagnostics. early_vm.py copies the data image and attaches a blank disk
 solely to preserve the /dev/vdb test guard. It never attaches an OS/root disk.
 The builder-only guest-early-only.sh can reuse an already built exact-kernel
 module and closed fixture; it is a test optimization, not an installer.
+
+vm.py automatically freezes guest-common.sh for setup guards, package installation,
+module build/load and provenance recording. Tests keep their scenario logic in
+separate scripts. guest-stateless-prebuilt.sh reuses the same guest-dual.sh test
+body with PIV_PREBUILT=1; share guest-dual.sh and guest-early-build.sh when using it.

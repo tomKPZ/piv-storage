@@ -98,6 +98,9 @@ resolved from context/evidence, not for routine implementation decisions.
 
 ## Verification and claims
 
+Guest test scaffolding lives in scripts/guest-common.sh, automatically frozen by
+vm.py. Reuse it rather than duplicating guards, builds and package setup.
+
 Use small reproducible fixtures and pure userspace checks first, then stock Linux
 inside a disposable VM. Cross-check crypto against independently generated kernel
 data. Verify full primary hashes/authentication, corruption rejection, hidden

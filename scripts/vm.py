@@ -87,6 +87,8 @@ def run(args):
     os.chmod(run_dir, 0o700)
     share = run_dir / "share"
     share.mkdir(mode=0o700)
+    # Freeze shared guest scaffolding alongside the selected task, including reboot.
+    shutil.copyfile(ROOT / 'scripts/guest-common.sh', share / 'guest-common.sh')
     shutil.copyfile(args.script, share / "task.sh")
     if args.power_cut_script:
         shutil.copyfile(args.power_cut_script, share / 'reboot-task.sh')

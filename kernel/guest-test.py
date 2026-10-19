@@ -261,6 +261,9 @@ native = KernelDevice(controls[0], path)
 native.begin(); native.end(); native.resume(); native.close()
 
 # Key wipe is allowed only while suspended; controls must remain blocked.
+# Drain probes from the preceding asynchronous resume before making the owner
+# deliberately unresumable; a queued blkid read would otherwise hold it open.
+run('udevadm', 'settle')
 run('dmsetup', 'suspend', 'piv-kernel')
 run('dmsetup', 'message', 'piv-kernel', '0', 'key', 'wipe')
 rejected(lambda: read_iv(ctl, generation, 0), {errno.EBUSY})
