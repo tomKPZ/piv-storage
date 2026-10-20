@@ -63,6 +63,42 @@ cryptsetup, and hashes every primary byte. Password-keyslot PBKDF2 uses a very l
 iteration count solely to accelerate disposable tests. This is not a recommended
 real-volume password configuration.
 
+## Faster runs: provisioned image and parallel matrix
+
+Without /dev/kvm every run is QEMU TCG emulation, and first boot plus live APT
+setup costs one to several minutes per run. `python3 scripts/vm.py provision`
+boots the pinned base once, installs the union of pinned guest packages
+(cryptsetup 2:2.7.5-2, Python, cryptography, matched 6.12.113 headers, gcc-14,
+make, patch), enables serial root autologin, sets no root password, masks the
+persisted random seed and records the installed package list. The result is a
+read-only qcow2 in ignored downloads/, keyed by the base checksum, package list
+and provisioning script; changing any of them builds a new image.
+
+`vm.py run --provisioned` backs the disposable overlay with that image and
+copies its metadata to `guest-image.json` in the run directory. guest_packages
+then resolves the same pinned packages offline (`apt-get --no-download`), and
+falls back to the normal network path if anything is missing. Every run, with
+or without provisioning, receives host entropy through virtio-rng. Per-run
+`packages.tsv` remains the provenance record. Provisioning repositories were
+live; re-provision deliberately rather than assuming a snapshot pin.
+
+`scripts/suite.py` runs the matrix in parallel, one fresh run directory per VM:
+
+```sh
+python3 scripts/suite.py --prefix artifacts/suite-next \
+  --profile aes-512 --profile chacha-4096 --control artifacts/control-001 \
+  --scaffold artifacts/stage-next/scaffold.tar   # or --module experimental-dm-piv.ko
+```
+
+Per profile it creates a stock fixture (or uses --control), runs the native
+dual-view/early-build test, then runs the selected suites concurrently
+(default faults, profile, cancel, lifecycle, batch, early; optional power and
+controls) and independently verifies every closed output image with
+check_stateless.py. `--jobs` bounds concurrent VMs; `--fresh` disables the
+provisioned image. summary.json records pass/fail, timings and host checks; a
+suite that was not run counts as a failure. Original AEGIS-128 host checks need
+PIV_AEGIS_REFERENCE (below).
+
 ## Artifacts
 
 - `control.img`: raw test volume, outside the guest OS overlay.

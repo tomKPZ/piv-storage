@@ -13,9 +13,16 @@ cd /mnt/piv-work
 
 guest_packages() {
     export DEBIAN_FRONTEND=noninteractive
+    local packages=(cryptsetup-bin=2:2.7.5-2 libcryptsetup12=2:2.7.5-2 python3 e2fsprogs "$@")
+    # Provisioned images (vm.py provision) already contain every pinned package
+    # and their lists; --no-download succeeds only if nothing must be fetched.
+    if test -e /etc/piv-provisioned &&
+        apt-get -y --no-install-recommends --no-download install "${packages[@]}"; then
+        cp /etc/piv-provisioned /mnt/piv-work/guest-provisioned.txt
+        return
+    fi
     apt-get -o Acquire::Retries=2 update
-    apt-get -y --no-install-recommends install \
-        cryptsetup-bin=2:2.7.5-2 libcryptsetup12=2:2.7.5-2 python3 e2fsprogs "$@"
+    apt-get -y --no-install-recommends install "${packages[@]}"
 }
 
 guest_code() {

@@ -17,6 +17,49 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 PIN = json.loads((ROOT / "environment/guest.json").read_text())
+# Union of the pinned packages that guest scripts request. A provisioned image
+# preinstalls them once; guest_packages then resolves them without network.
+PROVISION_PACKAGES = (
+    "cryptsetup-bin=2:2.7.5-2", "libcryptsetup12=2:2.7.5-2", "python3", "e2fsprogs",
+    "python3-cryptography", "linux-headers-6.12.113+deb13-amd64=6.12.113-1",
+    "gcc-14", "make", "patch")
+PROVISION_VERSION = 1
+# Serial autologin replaces the per-run first-boot credential. No root password
+# is stored in the cached image; the random seed is removed so runs do not share
+# persisted RNG state, and every run receives host entropy through virtio-rng.
+PROVISION_SCRIPT = r"""set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+apt-get -o Acquire::Retries=2 update
+apt-get -y --no-install-recommends install {packages}
+apt-get clean
+mkdir -p /etc/systemd/system/serial-getty@ttyS0.service.d
+cat > /etc/systemd/system/serial-getty@ttyS0.service.d/piv-autologin.conf <<'UNIT'
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud 115200,57600,38400,9600 - $TERM
+UNIT
+usermod -p '*' root
+systemctl mask systemd-random-seed.service
+rm -f /var/lib/systemd/random-seed
+printf 'version={version}\n' > /etc/piv-provisioned
+dpkg-query -W -f='${{Package}}\t${{Version}}\n' > /mnt/piv-work/provisioned-packages.tsv
+sync
+"""
+
+
+def provision_key(base_digest):
+    material = json.dumps(dict(base=base_digest, packages=PROVISION_PACKAGES,
+                               version=PROVISION_VERSION, script=PROVISION_SCRIPT), sort_keys=True)
+    return hashlib.sha256(material.encode()).hexdigest()[:16]
+
+
+def provisioned_path():
+    return ROOT / "downloads" / f"provisioned-{provision_key(PIN['sha512'])}.qcow2"
+
+
+def file_sha256(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def digest(path):
@@ -80,8 +123,110 @@ class Console:
         self.selector.close()
 
 
+def qemu_command(args, overlay, data, share, extra=()):
+    return ["qemu-system-x86_64", "-machine", "q35,accel=" + args.accel,
+            "-cpu", "max", "-smp", "2", "-m", "1024",
+            "-drive", f"file={overlay},format=qcow2,if=virtio",
+            *(["-drive", f"file={data},format=raw,if=virtio"] if data else []),
+            "-nic", "user,model=virtio-net-pci",
+            "-device", "virtio-rng-pci",
+            "-virtfs", f"local,path={share},mount_tag=pivwork,security_model=none",
+            "-display", "none", "-serial", "stdio", "-monitor", "none",
+            "-no-reboot", *extra]
+
+
+def first_boot_login(console):
+    """Complete Debian first boot with an ephemeral credential; return it."""
+    console.expect(rb"Press any key to proceed")
+    console.send("\n")
+    console.expect(rb"timezone name or number[^:]*:")
+    console.send("UTC\n")
+    console.expect(rb"new root password[^:]*:")
+    # Ephemeral guest login credential only; never logged or persisted by host.
+    password = secrets.token_urlsafe(24)
+    console.send("\t" + password + "\n")
+    result = console.expect(rb"(again|repeat|reenter|re-enter|login:)")
+    if result.group(1).lower() != b"login:":
+        console.send(password + "\n")
+        console.expect(rb"login:")
+    password_login(console, password)
+    return password
+
+
+def password_login(console, password):
+    console.send("root\n")
+    console.expect(rb"Password:")
+    console.send(password + "\n")
+    console.expect(rb"root@[^\r\n]*[#$] ")
+    console.buffer = b""
+
+
+def autologin(console):
+    console.expect(rb"root@[^\r\n]*[#$] ")
+    console.buffer = b""
+
+
+def provision(args):
+    base = prepare()
+    target = provisioned_path()
+    if target.exists():
+        print(target)
+        return target
+    work = ROOT / "downloads" / (target.stem + ".work")
+    if work.exists():
+        shutil.rmtree(work)
+    share = work / "share"
+    share.mkdir(parents=True, mode=0o700)
+    partial = work / "provisioned.qcow2"
+    subprocess.run(["qemu-img", "create", "-f", "qcow2", "-F", "qcow2",
+                    "-b", str(base), str(partial)], check=True)
+    (share / "provision.sh").write_text(PROVISION_SCRIPT.format(
+        packages=" ".join(PROVISION_PACKAGES), version=PROVISION_VERSION))
+    process = subprocess.Popen(qemu_command(args, partial, None, share), stdin=subprocess.PIPE,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    console = Console(process, time.monotonic() + args.timeout)
+    try:
+        print("Booting pinned base for one-time provisioning", flush=True)
+        first_boot_login(console)
+        with (work / "console.log").open("wb") as log:
+            console.log = log
+            console.send("stty -echo; mkdir -p /mnt/piv-work; "
+                         "mount -t 9p -o trans=virtio,version=9p2000.L pivwork /mnt/piv-work "
+                         "&& bash /mnt/piv-work/provision.sh; "
+                         "rc=$?; printf '\\nPIV_TASK_DONE=%s\\n' \"$rc\"; sync; poweroff\n")
+            match = console.expect(rb"\nPIV_TASK_DONE=(\d+)[\r\n]")
+            console.log = None
+        process.wait(timeout=120)
+        if int(match.group(1)) != 0 or process.returncode != 0:
+            raise RuntimeError(f"Provisioning failed; see {work}")
+    finally:
+        console.close()
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        process.stdin.close()
+        process.stdout.close()
+    metadata = dict(key=provision_key(PIN["sha512"]), base_filename=PIN["filename"],
+                    base_sha512=PIN["sha512"], version=PROVISION_VERSION,
+                    requested_packages=list(PROVISION_PACKAGES),
+                    installed_packages=(share / "provisioned-packages.tsv").read_text(),
+                    image_sha256=file_sha256(partial),
+                    note="Repositories were live at provisioning time; the installed list is "
+                         "the provenance. Re-provision deliberately to refresh.")
+    partial.chmod(0o444)
+    target.with_suffix(".json").write_text(json.dumps(metadata, indent=2) + "\n")
+    partial.replace(target)
+    shutil.rmtree(work)
+    print(target)
+    return target
+
+
 def run(args):
     image = prepare()
+    if args.provisioned:
+        image = provisioned_path()
+        if not image.exists():
+            raise FileNotFoundError("Provisioned image missing; run: python3 scripts/vm.py provision")
     run_dir = args.run_dir.resolve()
     # Never reuse/overwrite an experiment or attach arbitrary host devices.
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -103,6 +248,8 @@ def run(args):
     overlay = run_dir / "guest.qcow2"
     subprocess.run(["qemu-img", "create", "-f", "qcow2", "-F", "qcow2",
                     "-b", str(image), str(overlay)], check=True)
+    if args.provisioned:
+        shutil.copyfile(image.with_suffix(".json"), run_dir / "guest-image.json")
     # Back the test block device directly with a host regular file. Do not run
     # guest loop devices over 9p: that path faulted in the pinned guest kernel.
     with (run_dir / "control.img").open("xb") as disk:
@@ -117,14 +264,7 @@ def run(args):
         else:
             disk.truncate(args.blank_mib * 1024 * 1024)
     os.chmod(run_dir / "control.img", 0o600)
-    command = ["qemu-system-x86_64", "-machine", "q35,accel=" + args.accel,
-               "-cpu", "max", "-smp", "2", "-m", "1024",
-               "-drive", f"file={overlay},format=qcow2,if=virtio",
-               "-drive", f"file={run_dir / 'control.img'},format=raw,if=virtio",
-               "-nic", "user,model=virtio-net-pci",
-               "-virtfs", f"local,path={share},mount_tag=pivwork,security_model=none",
-               "-display", "none", "-serial", "stdio", "-monitor", "none",
-               "-no-reboot"]
+    command = qemu_command(args, overlay, run_dir / 'control.img', share)
     if args.code:
         frozen_code = run_dir / 'code' / 'pivstore'
         shutil.copytree(ROOT / 'pivstore', frozen_code,
@@ -137,24 +277,13 @@ def run(args):
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     console = Console(process, time.monotonic() + args.timeout)
     try:
-        print("Booting guest and completing first-boot setup", flush=True)
-        console.expect(rb"Press any key to proceed")
-        console.send("\n")
-        console.expect(rb"timezone name or number[^:]*:")
-        console.send("UTC\n")
-        console.expect(rb"new root password[^:]*:")
-        # Ephemeral guest login credential only; never logged or persisted by host.
-        password = secrets.token_urlsafe(24)
-        console.send("\t" + password + "\n")
-        result = console.expect(rb"(again|repeat|reenter|re-enter|login:)")
-        if result.group(1).lower() != b"login:":
-            console.send(password + "\n")
-            console.expect(rb"login:")
-        console.send("root\n")
-        console.expect(rb"Password:")
-        console.send(password + "\n")
-        console.expect(rb"root@[^\r\n]*[#$] ")
-        console.buffer = b""
+        if args.provisioned:
+            print("Booting provisioned guest", flush=True)
+            password = None
+            autologin(console)
+        else:
+            print("Booting guest and completing first-boot setup", flush=True)
+            password = first_boot_login(console)
         # First-boot prompts can echo credentials. Log only after login completes.
         with (run_dir / "console.log").open("wb") as log:
             console.log = log
@@ -181,12 +310,11 @@ def run(args):
             process = subprocess.Popen(command, stdin=subprocess.PIPE,
                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             console = Console(process, deadline)
-            console.expect(rb'login:')
-            console.send('root\n')
-            console.expect(rb'Password:')
-            console.send(password + '\n')
-            console.expect(rb'root@[^\r\n]*[#$] ')
-            console.buffer = b''
+            if args.provisioned:
+                autologin(console)
+            else:
+                console.expect(rb'login:')
+                password_login(console, password)
             with (run_dir / 'reboot-console.log').open('wb') as log:
                 console.log = log
                 console.send("stty -echo; mkdir -p /mnt/piv-work; "
@@ -220,6 +348,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
     sub.add_parser("prepare")
+    provisioning = sub.add_parser("provision", help="Build the cached provisioned guest image once")
+    provisioning.add_argument("--accel", choices=("tcg", "kvm"), default="tcg")
+    provisioning.add_argument("--timeout", type=int, default=1800)
     task = sub.add_parser("run")
     task.add_argument("--script", type=Path, required=True)
     task.add_argument("--run-dir", type=Path, required=True)
@@ -234,9 +365,13 @@ def main():
     task.add_argument("--code", action='store_true', help='Export package source read-only to the guest')
     task.add_argument("--accel", choices=("tcg", "kvm"), default="tcg")
     task.add_argument("--timeout", type=int, default=1200)
+    task.add_argument("--provisioned", action="store_true",
+                      help="Boot the cached provisioned image (see provision) instead of first boot")
     args = parser.parse_args()
     if args.action == "prepare":
         print(prepare())
+    elif args.action == "provision":
+        provision(args)
     else:
         run(args)
 
