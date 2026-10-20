@@ -34,8 +34,11 @@ for ordinary LUKS opening and journal replay, suspends the new crypt mapping,
 reloads its private table as piv-crypt with piv_control, resumes it, then suspends
 and begins coordinated ownership, authenticates every primary sector,
 and loads the hidden key/context through ABI 3. Optional destructive initialization
-writes zero hidden blocks before exposing devices. Opening never requires that
-any hidden record authenticate. CRNG readiness is awaited before setup takes the
+writes zero hidden blocks before exposing devices. Without initialization,
+setup requires one hidden record (data or invalid marker) to authenticate under
+the key, using carriers collected by the primary scan, unless the caller sets
+the uninitialized-carrier flag; otherwise it returns EKEYREJECTED. Hidden
+availability beyond that one record never gates the decoy. CRNG readiness is awaited before setup takes the
 owner lock. Runtime ownership locks use /run, which may be tmpfs.
 
 The private piv-crypt mapping rejects ordinary bios while native ownership is active.
@@ -64,12 +67,16 @@ On a write, authenticate the complete affected carrier groups, preserve valid
 hidden data (or mark unavailable data invalid), generate fresh encodings and
 prepare all primary tuples in RAM. Then apply exact tuples through the lower
 journal, flushing every 32 sectors and at completion. There is no durable
-cross-sector plan. A crash can destroy affected hidden blocks; any primary
-I/O/authentication failure stops both views until teardown. Hidden authentication
-failure returns EIO for that block without stopping the owner.
+cross-sector plan. A crash can destroy affected hidden blocks. Failures before
+the first applied tuple (reads, authentication, allocation, preparation) fail
+only that bio; APPLY-time or flush failures stop both views until teardown. See
+[failure scope](native-faults.md). Hidden authentication failure returns EIO for
+that block without stopping the owner.
 
 ABI 3 SETUP is 192 bytes: version/size, generation, flags/context_length, hidden
-key32, context128, reserved2. Flag 1 destructively initializes all hidden blocks.
+key32, context128, reserved2. Flag 1 destructively initializes all hidden blocks;
+flag 2 accepts a carrier where no record authenticates (fresh/uninitialized).
+Other flag bits are rejected.
 STATUS is 48 bytes: generation, hidden_bytes, encryptions, invalidations (u64),
 active/views/failed/version (u32). Counters are volatile; invalidations count group writes in successfully
 completed invalid-marker requests, not durable lifetime history.
@@ -114,9 +121,11 @@ application and journal checkpoints copy existing authenticated tuples without
 new encryption. Fresh preparation spends an encryption invocation even if later
 application fails. The test-only raw controls are not a nonce-policy service.
 
-Hidden unavailability uses a positive internal PN_UNAVAILABLE sentinel. Linux
-BLK_STS_MEDIUM maps to negative -ENODATA, which must retain shared fail-stop
-semantics rather than being mistaken for local hidden unavailability.
+Hidden unavailability uses positive internal sentinels: PN_UNAVAILABLE, and
+PN_INVALID for an authenticated invalid marker (which also proves the key to
+the setup guard). Linux BLK_STS_MEDIUM maps to negative -ENODATA, a storage
+error that must never be mistaken for hidden unavailability: it is local only
+before mutation and stops the owner once APPLY has begun.
 
 ## Reproduce
 

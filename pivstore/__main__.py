@@ -38,6 +38,9 @@ def main():
             block.add_argument('--hidden-key-file', type=Path, required=True)
             if action == 'open-blocks':
                 block.add_argument('--initialize', action='store_true')
+                block.add_argument('--uninitialized', action='store_true',
+                                   help='Accept a carrier with no authenticating hidden record; '
+                                        'decoy writes then cannot preserve hidden data under a wrong key')
     args = parser.parse_args()
     try:
         if args.action in ('open-blocks', 'close-blocks'):
@@ -47,7 +50,8 @@ def main():
                     hidden_key = stream.read(33)
                 result = open_blocks(args.device, args.key_file, hidden_key,
                                      name=args.name,
-                                     initialize=args.initialize)
+                                     initialize=args.initialize,
+                                     uninitialized=args.uninitialized)
                 print(json.dumps(result, indent=2))
             else:
                 close_blocks(args.device, args.key_file, name=args.name)

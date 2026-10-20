@@ -14,9 +14,20 @@ A hidden authentication failure means local EIO, not global fail-stop. Decoy
 reads remain available. A decoy write overlapping an unavailable hidden block
 stores a fresh encrypted invalid marker, never fabricated valid zeros. A full
 512-byte hidden write repairs the block after authenticating the primary carrier.
-A primary authentication or storage I/O failure stops both views. Unmount/remove
-and recreate after correcting the underlying problem; do not clear an error flag
-on a mounted stack. An EIO write may have partially changed the disk.
+
+Failure scope follows mutation. Reads never mutate; a write authenticates its
+whole carrier, encodes records and prepares every tuple in RAM before its first
+lower write. Any failure up to that point (lower read error, primary
+authentication failure, allocation, nonce-collision retry exhaustion, encryption
+cap, request validation) fails only that bio; preparation may still have spent
+encryption invocations. Once the APPLY loop starts, any failure, and any failed
+flush (standalone, PREFLUSH or batch), stops both views: storage may be partial
+or durability unknown. dm-integrity itself also enters a sticky failed state on
+journal/metadata write errors. Unmount/remove and recreate after correcting the
+underlying problem; do not clear an error flag on a mounted stack. An EIO write
+may have partially changed the disk. Group-scoped poisoning was not added: after
+an APPLY failure the lower journal is typically failed too, so it would not
+restore availability.
 
 Fault tests use only disposable synthetic guest disks. VM SIGKILL preserves the
 host page cache and is not hardware power-loss evidence. Never infer hidden
@@ -70,12 +81,16 @@ Their definitions were checked against the pinned v6.12.113 source in
 environment/sources.json and the [kernel documentation](https://docs.kernel.org/admin-guide/device-mapper/dm-flakey.html).
 
 For each view, direct reads and writes trigger the corresponding lower error.
-Once an operation actually reaches a failing lower I/O, the owner must report
+With error_reads, the read and a write needing the same carrier must fail with
+EIO, spend no encryption and leave the owner healthy; after the wrapper is
+restored the SAME owner generation must read and rewrite that range and pass the
+complete primary/hidden oracle without repair. With error_writes, preparation
+spends encryptions, APPLY reaches the failing lower write, the owner must report
 failure and both views must keep rejecting direct reads and writes after the
-wrapper is restored. Only teardown/recreation clears the
-fail-stop. Stock journal replay and full-primary verification follow; hidden
-blocks must match the original oracle, with local EIO/whole-block repair allowed
-only for carrier records intersecting the failed request. A separate fresh-IV primary rewrite tests local
+wrapper is restored. Only teardown/recreation clears that fail-stop. Stock
+journal replay and full-primary verification follow; hidden blocks must match
+the original oracle, with local EIO/whole-block repair allowed only for carrier
+records intersecting the failed request. A separate fresh-IV primary rewrite tests local
 hidden EIO, invalid-marker preservation and direct repair without global failure.
 
 Setup tests fail after cryptsetup creates mappings, before native setup, during
@@ -173,10 +188,11 @@ the setup checkpoint's journal cache.
 
 Earlier sectors may have decrypted into private pages when this last sector
 fails. A direct-I/O caller buffer prefilled with a sentinel must remain entirely
-unchanged on EIO. Both views must then remain failed after fault removal until
-teardown/recreation. Complete primary/hidden oracles must match afterward with
-no repair. A separate setup attempt with the same later-sector corruption must
+unchanged on EIO. The owner must stay healthy: a write overlapping the corrupt
+carrier must fail before spending any encryption, unrelated requests on both
+views must succeed during the fault, and after removal the same owner must pass
+the complete primary/hidden oracles with no repair. A separate setup attempt with the same later-sector corruption must
 fail, remove its own mappings and permit a healthy full reopen after restoration.
-These synthetic faults test authenticated-read withholding and shared failure,
+These synthetic faults test authenticated-read withholding and scoped failure,
 not adversarial journal replay, physical corruption durability or atomicity of
 application requests spanning multiple public bios. Results are in ROADMAP.md.

@@ -3,8 +3,12 @@
  * Whole hidden blocks authenticate, but interrupted multi-sector writes can
  * destroy them. All work is serialized under the owner lock in NOIO context.
  */
-/* Positive internal sentinel: -ENODATA may also mean a block medium error. */
+/* Positive internal sentinels: -ENODATA may also mean a block medium error.
+ * Both are LOCAL hidden unavailability. PN_INVALID additionally proves that the
+ * configured hidden key authenticated the record (an encrypted invalid marker).
+ */
 #define PN_UNAVAILABLE 1
+#define PN_INVALID 2
 #define PN_DATA 512
 #define PN_CARRIER 576
 #define PN_MAX_ENTRIES 96
@@ -117,8 +121,8 @@ static int pn_record(struct piv_native *n, u64 index, u8 *carrier,
  if (!r && encrypt) memcpy(carrier + 32, buffer + length, 544);
  if (r == -EBADMSG) r = PN_UNAVAILABLE;
  if (!r && !encrypt) {
-  if (memcmp(buffer + length, "PIVBLK03", 8) ||
-      get_unaligned_le64(buffer + length + 8) != 0) r = PN_UNAVAILABLE;
+  if (memcmp(buffer + length, "PIVBLK03", 8)) r = PN_UNAVAILABLE;
+  else if (get_unaligned_le64(buffer + length + 8) != 0) r = PN_INVALID;
   else memcpy(data, buffer + length + 16, PN_DATA);
  }
  memzero_explicit(key, 32); kfree_sensitive(buffer);
@@ -151,7 +155,11 @@ static void pn_free(struct piv_native *n)
 }
 struct pn_group { u64 index; bool invalid; u8 data[512], old[576], fresh[576]; };
 
-static int pn_write(struct piv_control *p, bool hidden, u64 offset, const u8 *data, u32 bytes)
+/* *mutated reports whether storage may have changed. Every failure before that
+ * point leaves the disk untouched; the caller may then fail only this request.
+ */
+static int pn_write(struct piv_control *p, bool hidden, u64 offset, const u8 *data, u32 bytes,
+		    bool *mutated)
 {
  struct piv_native *n = p->native;
  struct pn_group *groups = kcalloc(2, sizeof(*groups), GFP_NOIO);
@@ -174,7 +182,7 @@ static int pn_write(struct piv_control *p, bool hidden, u64 offset, const u8 *da
   if (hidden) memcpy(rec->data, data, PN_DATA);
   else {
    r = pn_record(n, index, rec->old, rec->data, false, false);
-   if (r == PN_UNAVAILABLE) { rec->invalid = true; r = 0; }
+   if (r == PN_UNAVAILABLE || r == PN_INVALID) { rec->invalid = true; r = 0; }
    if (r) goto done;
   }
   for (j = 0; j < group; j++) {
@@ -228,6 +236,8 @@ static int pn_write(struct piv_control *p, bool hidden, u64 offset, const u8 *da
   memcpy(entries[i].tuple, u->tuple, PIV_TUPLE_BYTES);
  }
  u->flags = PIV_APPLY_DEFER_FLUSH;
+ /* Conservative: any APPLY-loop failure may follow a lower write. */
+ *mutated = true;
  for (i = 0; i < count; i++) {
   u->sector = le64_to_cpu(entries[i].sector);
   memcpy(u->expected_iv, entries[i].old, iv); memcpy(u->tuple, entries[i].tuple, PIV_TUPLE_BYTES);
@@ -254,12 +264,14 @@ static int pn_setup_poll(void)
 static int pn_setup(struct piv_control *p, struct file *controller, struct piv_native_setup *s)
 {
  struct piv_native *n;
- u8 *zero;
- u64 i;
- u32 group = PN_CARRIER / p->profile.iv_size;
+ u8 *zero, *carrier = NULL, *ivs = NULL;
+ u64 i, probe = 0;
+ u32 iv = p->profile.iv_size, group = PN_CARRIER / iv, j;
+ bool keyed = s->flags & (PIV_SETUP_INITIALIZE | PIV_SETUP_UNINITIALIZED), mutated;
  int r;
  if (s->version != 3 || s->size != sizeof(*s) || s->generation != p->profile.generation ||
-     s->context_length > 120 || !s->context_length || (s->flags & ~1U) ||
+     s->context_length > 120 || !s->context_length ||
+     (s->flags & ~(PIV_SETUP_INITIALIZE | PIV_SETUP_UNINITIALIZED)) ||
      memchr_inv(s->reserved, 0, sizeof(s->reserved))) return -EINVAL;
  if (p->native || !piv_quiesced(p) || !p->transaction || p->controller != controller || p->failed) return -EBUSY;
  /* Bound every primary byte offset by the kernel's signed file limit.
@@ -277,19 +289,45 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
  if (IS_ERR(n->record_cipher) || IS_ERR(n->hmac)) { r = -ENOENT; goto bad; }
  r = crypto_aead_setauthsize(n->record_cipher, 16); if (r) goto bad;
  p->native = n;
- /* Hidden availability must not decide whether the decoy can be opened. */
+ /* Wrong-key guard: a decoy write with a wrong hidden key would overwrite valid
+  * records with invalid markers. Unless the caller asserts a fresh carrier or
+  * initializes, require one record to authenticate under the key (data or an
+  * invalid marker). Carriers are collected from the mandatory primary scan:
+  * no extra I/O or primary crypto, and probing stops at the first success.
+  * Damaged/absent records remain local EIO once the key is proven.
+  */
+ if (!keyed) {
+  carrier = kzalloc(PN_CARRIER + PN_DATA, GFP_NOIO);
+  ivs = kmalloc(PIV_READ_BYTES / 512 * 16, GFP_NOIO);
+  if (!carrier || !ivs) { r = -ENOMEM; goto bad; }
+ }
  for (i = 0; i < p->profile.sectors;) {
   u32 count = min_t(u64, p->profile.sectors - i, PIV_READ_BYTES / p->profile.sector_size);
   r = pn_setup_poll(); if (r) goto bad;
-  r = piv_read_range(p, i, count, NULL, NULL); if (r) goto bad;
+  r = piv_read_range(p, i, count, NULL, keyed ? NULL : ivs); if (r) goto bad;
+  for (j = 0; !keyed && j < count; j++) {
+   u64 sector = i + j;
+   if (sector / group != probe) continue;
+   memcpy(carrier + (sector % group) * iv, ivs + j * iv, iv);
+   if (sector % group != group - 1) continue;
+   r = pn_record(n, probe, carrier, carrier + PN_CARRIER, false, false);
+   if (!r || r == PN_INVALID) keyed = true;
+   else if (r == PN_UNAVAILABLE) probe++;
+   else goto bad;
+   r = 0;
+  }
   i += count;
  }
- if (s->flags & 1) {
+ /* Hidden availability must not decide whether the decoy can be opened, but an
+  * unproven key must not be allowed to destroy hidden data through decoy writes.
+  */
+ if (!keyed) { r = -EKEYREJECTED; goto bad; }
+ if (s->flags & PIV_SETUP_INITIALIZE) {
   zero = kzalloc(PN_DATA, GFP_NOIO);
   if (!zero) { r = -ENOMEM; goto bad; }
   for (i = 0; i < n->hidden_bytes / PN_DATA; i++) {
    r = pn_setup_poll(); if (r) break;
-   r = pn_write(p, true, i * PN_DATA, zero, PN_DATA); if (r) break;
+   r = pn_write(p, true, i * PN_DATA, zero, PN_DATA, &mutated); if (r) break;
   }
   kfree_sensitive(zero); if (r) goto bad;
  }
@@ -297,8 +335,10 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
  r = piv_checkpoint(p->cc); if (r) goto bad;
  r = pn_setup_poll(); if (r) goto bad;
  n->ready = true; p->transaction = false; p->controller = NULL;
+ kfree_sensitive(carrier); kfree_sensitive(ivs);
  return 0;
 bad:
+ kfree_sensitive(carrier); kfree_sensitive(ivs);
  p->native = NULL; pn_free(n);
  return r;
 }
@@ -349,11 +389,13 @@ static void pn_worker(struct work_struct *work)
 	u32 bytes = bio->bi_iter.bi_size;
 	u8 *buffer = NULL;
 	unsigned int noio;
+	bool mutated = false, flushing = false;
 	int r = -EIO;
 	mutex_lock(&p->lock); noio = memalloc_noio_save();
 	if (!p->live || !p->native || !p->native->ready || p->native->failed ||
 	    p->blocked || p->transaction || p->failed) goto done;
 	if (!bytes && (bio_op(bio) == REQ_OP_FLUSH || (bio->bi_opf & REQ_PREFLUSH))) {
+		flushing = true;
 		r = blkdev_issue_flush(p->cc->dev->bdev);
 	} else {
 		u64 limit = w->hidden ? p->native->hidden_bytes : p->profile.sectors * p->profile.sector_size;
@@ -369,14 +411,23 @@ static void pn_worker(struct work_struct *work)
 			/* Drain earlier journal writes before a WRITE|PREFLUSH payload.
 			 * pn_write flushes each batch before completion, satisfying FUA too.
 			 */
-			r = (bio->bi_opf & REQ_PREFLUSH) ? blkdev_issue_flush(p->cc->dev->bdev) : 0;
-			if (!r) r = pn_write(p, w->hidden, w->offset, buffer, bytes);
+			flushing = bio->bi_opf & REQ_PREFLUSH;
+			r = flushing ? blkdev_issue_flush(p->cc->dev->bdev) : 0;
+			if (!r) {
+				flushing = false;
+				r = pn_write(p, w->hidden, w->offset, buffer, bytes, &mutated);
+			}
 		} else r = -EOPNOTSUPP;
 	}
-	if (r && r != PN_UNAVAILABLE) { p->failed = true; p->native->failed = true; }
+	/* Scoped isolation: reads, validation, authentication, allocation, nonce
+	 * and preparation failures change no storage and fail only this bio. A
+	 * failed flush leaves earlier durability unknown, and an APPLY-loop failure
+	 * may have partially written; both still stop the shared owner.
+	 */
+	if (r < 0 && (mutated || flushing)) { p->failed = true; p->native->failed = true; }
 done:
 	kfree_sensitive(buffer); memalloc_noio_restore(noio); mutex_unlock(&p->lock);
-	bio->bi_status = errno_to_blk_status(r == PN_UNAVAILABLE ? -EIO : r); bio_endio(bio);
+	bio->bi_status = errno_to_blk_status(r > 0 ? -EIO : r); bio_endio(bio);
 	kref_put(&p->refs, piv_free); kfree(w);
 }
 

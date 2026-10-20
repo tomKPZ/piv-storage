@@ -162,7 +162,7 @@ try:
     def counted_setup(*args, **kwargs):
         counted('setup-ioctl', lambda: original_setup(*args, **kwargs),
                 dict(load=1, range=(sectors + 16384 // unit - 1) // (16384 // unit),
-                     crypto=sectors + 1, record=0, write=0, checkpoint=1))
+                     crypto=sectors + 1, record=1, write=0, checkpoint=1))  # wrong-key guard: first record proves the key
     blocks.native_setup = counted_setup
     views = blocks.open_blocks('/dev/vdb', KEY, HKEY)
     blocks.native_setup = original_setup

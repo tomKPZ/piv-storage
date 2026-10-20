@@ -1,4 +1,5 @@
 """Configure stateless paired native DM views; no persistent userspace state."""
+import errno
 import fcntl
 import os
 import struct
@@ -9,6 +10,11 @@ from .kernel_api import command, dm, mapping_identity, remove_mapping
 from .kernel_owner import GuestOwner
 
 SETUP = struct.Struct('=IIQII32s128s2I')
+SETUP_INITIALIZE = 1
+# Accept a carrier with no record authenticating under the hidden key. Without
+# this (or initialize) the kernel rejects setup with EKEYREJECTED, because decoy
+# writes under a wrong hidden key would destroy valid hidden records.
+SETUP_UNINITIALIZED = 2
 STATUS = struct.Struct('=QQQQIIII')
 
 
@@ -22,10 +28,11 @@ def native_status(device):
                 hidden_bytes=hidden, encryptions=encryptions, invalidations=invalidations)
 
 
-def native_setup(device, hidden_key, identity, *, initialize=False):
+def native_setup(device, hidden_key, identity, *, initialize=False, uninitialized=False):
     if len(hidden_key) != 32 or not 0 < len(identity) <= 120:
         raise ValueError('Invalid native key/context size')
-    data = bytearray(SETUP.pack(3, SETUP.size, device.generation, int(initialize),
+    flags = (SETUP_INITIALIZE if initialize else 0) | (SETUP_UNINITIALIZED if uninitialized else 0)
+    data = bytearray(SETUP.pack(3, SETUP.size, device.generation, flags,
                               len(identity), hidden_key, identity, 0, 0))
     try:
         fcntl.ioctl(device.fd, command(12, SETUP.size, 1), data, True)
@@ -37,7 +44,8 @@ def native_detach(device):
     fcntl.ioctl(device.fd, command(13, 48, 1), device.request(), True)
 
 
-def open_blocks(source, key_file, hidden_key, *, name='piv-native', initialize=False, allow_test_stack=False):
+def open_blocks(source, key_file, hidden_key, *, name='piv-native', initialize=False,
+                uninitialized=False, allow_test_stack=False):
     if len(hidden_key) != 32:
         raise ValueError('Hidden key must contain exactly 32 bytes')
     owner = GuestOwner(source, key_file, name, allow_test_stack=allow_test_stack)
@@ -54,7 +62,14 @@ def open_blocks(source, key_file, hidden_key, *, name='piv-native', initialize=F
             primary_bytes=owner.device.sectors * owner.device.sector_size, sector_size=owner.device.sector_size)))
         owner.device.validate()
         owner.device.suspend(); owner.device.begin()
-        native_setup(owner.device, hidden_key, identity, initialize=initialize)
+        try:
+            native_setup(owner.device, hidden_key, identity, initialize=initialize,
+                         uninitialized=uninitialized)
+        except OSError as error:
+            if error.errno == errno.EKEYREJECTED:
+                error.add_note('No hidden record authenticated: wrong hidden key, or an '
+                               'uninitialized carrier (use --initialize or --uninitialized)')
+            raise
         owner.device.resume()
         status = native_status(owner.device)
         for role, sectors in (('decoy', owner.device.sectors * (owner.device.sector_size // 512)), ('hidden', status['hidden_bytes'] // 512)):

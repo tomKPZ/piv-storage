@@ -67,8 +67,12 @@ safety defects take precedence over this ordering whenever discovered.
    seeded randomness and exclusive ownership remain mandatory. Completed records
    remain changed; cancellation is not rollback or a hard latency guarantee. See
    docs/cancellation.md and the final handoff for limits and evidence.
-3. **Finer error isolation and wrong-key guard (next; prioritized by the user
-   2026-10-20).** Pair each with fault-injection tests using existing scaffolding.
+3. **Finer error isolation and wrong-key guard — complete (2026-10-20).**
+   Failures before the first APPLY are local to the bio; APPLY/flush failures
+   still stop the owner. Setup refuses (EKEYREJECTED) when no record
+   authenticates unless `--uninitialized` or `--initialize` is given. See the
+   handoff below. Group-scoped poisoning was deliberately not added: lower write
+   faults already put dm-integrity into its sticky failed state. Original plan:
    - *Error isolation.* Any non-UNAVAILABLE error currently fails the whole
      owner (piv-native.inc). Target policy: primary authentication failure on
      reads or during PREPARE fails only that bio (nothing mutated); only
@@ -1268,3 +1272,64 @@ alternative openings, rollback, multi-snapshot observers. AGENTS.md now lists
 these as planned changes; existing rules apply until each lands with tests. No
 code changed; no tests run. Next: roadmap item 3, starting with a fault-class
 inventory of the current fail-stop path and its injection tests.
+
+## Session handoff: scoped error isolation and wrong-key guard (2026-10-20)
+
+Completed roadmap item 3's two follow-ups on a new development host (no KVM;
+all guest runs under QEMU TCG, the same pinned Debian 6.12.113 guest).
+
+Kernel (piv-native.inc, piv-control.h):
+- pn_write reports whether its APPLY loop began. pn_worker stops the shared
+  owner only for negative errors after that point or for failed flushes
+  (standalone, PREFLUSH, batch). Reads, request validation, carrier/primary
+  authentication, allocation, nonce retries, the encryption cap and PREPARE
+  failures now fail only that bio. Preparation can still spend encryptions.
+- PN_INVALID distinguishes an authenticated invalid marker from an
+  unauthenticated record; both remain local EIO.
+- Wrong-key guard: setup collects carrier IVs from the mandatory primary scan
+  and decrypts groups until one record authenticates (data or invalid marker).
+  Without PIV_SETUP_INITIALIZE (1) or the new PIV_SETUP_UNINITIALIZED (2) flag,
+  setup returns EKEYREJECTED. ABI 3 struct size unchanged; unknown flags still
+  rejected. No extra I/O or primary crypto: the profile run measured exactly one
+  record decrypt with unchanged range/crypto counts on an initialized volume.
+
+Userspace: open_blocks(uninitialized=...) and `open-blocks --uninitialized`; an
+EKEYREJECTED note explains the cause; failed setup unwinds as before.
+
+Evidence (fresh fixture artifacts/control-001, AES-GCM/4096, 128 MiB; module
+experimental-dm-piv.ko SHA-256
+a26931bfacf5faef0b8784125920d639f618b113df1e50207ec313fb2259247c, built in-guest
+without warnings or config/symbol mismatches; cryptsetup 2:2.7.5-2):
+- guard-native-001 (dual test): stock carrier rejected without --uninitialized
+  with no mappings left, opened with it; wrong hidden key rejected with
+  EKEYREJECTED and no mappings, decoy still openable with --uninitialized;
+  existing isolation, RMW, filesystem, reopen and stock readback checks passed.
+- guard-early-001: RAM-root initramfs activation passed (guard accepts the
+  initialized volume).
+- guard-faults-001: error_reads on decoy and hidden: EIO, zero encryptions, a
+  write needing the same carrier also EIO with zero encryptions, owner healthy;
+  after restoration the SAME generation read/rewrote the range and passed full
+  oracles without repair. error_writes: 48 encryptions spent, owner failed,
+  dm-integrity logged "Error on writing journal: -5", recreation and oracles
+  passed. Late-sector corruption: sentinel buffer untouched, owner healthy,
+  overlapping write rejected before any encryption, unrelated requests on both
+  views succeeded during the fault, same-owner oracles passed afterwards.
+  Setup-scan corruption, setup-phase cleanup and invalid-marker checks passed.
+- guard-profile-001 and guard-cancel-001 passed with the updated expectation
+  (setup record=1).
+- Host: 49 tests (2 new) pass with PIV_FIXTURE=artifacts/control-001; only the
+  optional AEGIS reference test skipped. Independent host verification
+  authenticated all 28,244 primary sectors of dual-final, fault-final,
+  profile-final and cancel-final (identical primary hash), and hidden unpack of
+  dual-final and fault-final matched the oracle byte-for-byte.
+
+Not tested this session: 512-byte, ChaCha and AEGIS profiles; lifecycle, batch,
+power-cut, large-volume and controls suites (no code paths they assert on
+changed except setup flags, which they do not use without initialize on stock
+carriers). An invalid-marker-only volume passing the guard is covered by code
+path review, not a dedicated test. TCG timings are not comparable with earlier
+handoffs from different hardware.
+
+Next: roadmap item 4 (standalone target replacing the dm-crypt fork). Test
+throughput on this host is TCG-bound; caching a provisioned guest image and
+running independent suites in parallel are candidate harness improvements.

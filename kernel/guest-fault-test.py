@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Disposable guest: setup ownership, direct lower EIO, fail-stop and recreation."""
+"""Disposable guest: setup ownership, scoped lower EIO isolation, fail-stop and recreation."""
 import errno
 import hashlib
 import json
@@ -178,32 +178,56 @@ for role in ('decoy', 'hidden'):
         if mode == 'reads': assert rejected(lambda: direct(SOURCE)).errno == errno.EIO
         failure = rejected(lambda: direct(v[role], write=old if mode == 'writes' else None, offset=offset, size=size))
         assert failure.errno == errno.EIO
-        failed = blocks.native_status(handle.device)
-        assert failed['failed']
-        spent = failed['encryptions'] - before_count
-        assert (spent > 0) if mode == 'writes' else (spent == 0)
-        fault()
-        # Removing the fault does not clear the shared owner's fail-stop.
-        for other in ('decoy', 'hidden'):
-            assert rejected(lambda: direct(v[other])).errno == errno.EIO
-            assert rejected(lambda: direct(v[other], write=old[:512])).errno == errno.EIO
-        handle.close()
-        close_views(); absent()
-        v = open_views()
-        handle = owner()
-        assert handle.device.generation != generation and not blocks.native_status(handle.device)['failed']
-        handle.close()
-        repaired = verify(v, unavailable=affected)
+        status = blocks.native_status(handle.device)
+        spent = status['encryptions'] - before_count
+        if mode == 'writes':
+            # APPLY reached a failing lower write: storage may be partial, so the
+            # shared owner still fails stop.
+            assert status['failed'] and spent > 0
+            fault()
+            # Removing the fault does not clear the shared owner's fail-stop.
+            for other in ('decoy', 'hidden'):
+                assert rejected(lambda: direct(v[other])).errno == errno.EIO
+                assert rejected(lambda: direct(v[other], write=old[:512])).errno == errno.EIO
+            handle.close()
+            close_views(); absent()
+            v = open_views()
+            handle = owner()
+            assert handle.device.generation != generation and not blocks.native_status(handle.device)['failed']
+            handle.close()
+            repaired = verify(v, unavailable=affected)
+        else:
+            # Nothing was mutated: only the request fails. A write needing the
+            # same carrier also fails while collecting it, before any encryption.
+            assert not status['failed'] and spent == 0
+            assert rejected(lambda: direct(v[role], write=old, offset=offset, size=size)).errno == errno.EIO
+            status = blocks.native_status(handle.device)
+            assert not status['failed'] and status['encryptions'] == before_count
+            fault()
+            # The SAME owner generation serves both views once the fault clears.
+            assert direct(v[role], offset=offset, size=size) == old
+            direct(v[role], write=old, offset=offset, size=size)
+            status = blocks.native_status(handle.device)
+            assert not status['failed'] and status['encryptions'] > before_count
+            assert handle.device.generation == generation
+            handle.close()
+            repaired = verify(v)
+            assert repaired is False
         close_views(); absent()
         results.append(dict(view=role, fault=mode, bytes=size, offset=offset,
-                            failed_both_views=True, recreated=True, repaired=repaired, prepared_encryptions=spent))
-        print(f'{role} lower {mode}: fail-stop, teardown, replay and recreation passed', flush=True)
+                            failed_both_views=mode == 'writes', recreated=mode == 'writes',
+                            same_owner_continued=mode == 'reads', repaired=repaired,
+                            prepared_encryptions=spent))
+        print(f'{role} lower {mode}: ' + ('fail-stop, teardown, replay and recreation passed' if mode == 'writes'
+              else 'local EIO, no encryption, same-owner continuation passed'), flush=True)
 
 # Corrupt the last authenticated sector of one read work item. Earlier sectors
 # may have decrypted internally; none of that item's bytes may reach the caller.
+# Authentication failure mutates nothing, so it is local to the request.
 for role in ('decoy', 'hidden'):
     v = open_views()
     handle = owner()
+    generation = handle.device.generation
     unit, group = handle.device.sector_size, 576 // handle.device.iv_size
     size = 16384 if role == 'decoy' else 512
     offset = ((10 * group * unit + size - 1) // size) * size if role == 'decoy' else 10 * 512
@@ -223,17 +247,26 @@ for role in ('decoy', 'hidden'):
             assert buf[:] == sentinel, 'Failed authenticated work item exposed bytes'
         finally:
             os.close(fd)
-    assert blocks.native_status(handle.device)['failed']
+    status = blocks.native_status(handle.device)
+    assert not status['failed']
+    before_count = status['encryptions']
+    # A write overlapping the corrupt carrier authenticates first and must fail
+    # before encrypting or changing anything.
+    assert rejected(lambda: direct(v[role], write=b'\x5a' * size, offset=offset, size=size)).errno == errno.EIO
+    status = blocks.native_status(handle.device)
+    assert not status['failed'] and status['encryptions'] == before_count
+    # Unrelated requests on both views continue during the fault.
+    assert direct(v['hidden'], offset=0) == EXPECTED[:512]
+    direct(v['decoy'], offset=0)
     fault()
-    for other in ('decoy', 'hidden'):
-        assert rejected(lambda: direct(v[other])).errno == errno.EIO
+    assert handle.device.generation == generation
     handle.close()
-    close_views(); absent()
-    v = open_views(); assert verify(v) is False
+    assert verify(v) is False
     close_views(); absent()
     results.append(dict(corrupt_read=role, bytes=size, withheld_entire_work_item=True,
-                        failed_both_views=True, recreated=True))
-    print(f'{role} late primary corruption: no output, shared fail-stop and recreate passed', flush=True)
+                        failed_both_views=False, overlapping_write_rejected_without_encryption=True,
+                        same_owner_continued=True))
+    print(f'{role} late primary corruption: no output, local EIO, unchanged storage and continuation passed', flush=True)
 
 # The full setup scan must also reject a later corrupt sector, before views exist.
 corrupt_read(physical // 512, replacement)
@@ -272,4 +305,4 @@ subprocess.run(['dd', 'if=/dev/vdb', 'of=' + str(W / 'fault-final.img'), 'bs=1M'
 subprocess.run(['rmmod', 'dm_piv'], check=True)
 assert Path('/sys/module/dm_crypt').is_dir()
 (W / 'fault-results.json').write_text(json.dumps(results, indent=2) + '\n')
-(W / 'result.txt').write_text('Setup cleanup, foreign-name protection, direct lower read/write errors, fail-stop and recreation passed\n')
+(W / 'result.txt').write_text('Setup cleanup, foreign-name protection, scoped lower read/auth isolation, write fail-stop and recreation passed\n')

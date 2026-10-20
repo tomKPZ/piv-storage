@@ -16,12 +16,25 @@ W = Path('/mnt/piv-work')
 DECOY = '/dev/mapper/piv-native-decoy'
 HIDDEN = '/dev/mapper/piv-native-hidden'
 
-def setup(initialize=False):
+NAMES = ('piv-native-hidden', 'piv-native-decoy', 'piv-native', 'piv-native_dif')
+
+def absent():
+    for name in NAMES:
+        assert subprocess.run(['dmsetup', 'info', name], capture_output=True).returncode, name
+
+def setup(initialize=False, uninitialized=False, rejected=False):
     args = ['python3', '-m', 'pivstore', 'open-blocks', '--device', '/dev/vdb',
             '--key-file', str(W / 'passphrase.key'), '--hidden-key-file', str(W / 'hidden.key'),
             ]
     if initialize: args.append('--initialize')
+    if uninitialized: args.append('--uninitialized')
     result = subprocess.run(args, capture_output=True, text=True)
+    if rejected:
+        # Wrong-key guard: no record authenticates, so setup must refuse and
+        # remove every mapping it created rather than expose a destructive decoy.
+        assert result.returncode == 1 and 'No hidden record authenticated' in result.stderr, result
+        absent()
+        return None
     assert result.returncode == 0, result.stderr
     value = json.loads(result.stdout)
     primary_bytes = int(subprocess.check_output(['blockdev', '--getsize64', DECOY]))
@@ -36,8 +49,12 @@ def close():
     subprocess.run(['python3', '-m', 'pivstore', 'close-blocks', '--device', '/dev/vdb',
                     '--key-file', str(W / 'passphrase.key')], check=True)
 
-# A stock random-IV carrier is not a valid hidden block. That must not gate decoy.
-setup()
+# A stock random-IV carrier is not a valid hidden block. Without an explicit
+# fresh-carrier assertion the wrong-key guard refuses it; with one, hidden
+# unavailability must not gate the decoy.
+absent()
+setup(rejected=True)
+setup(uninitialized=True)
 fd = os.open(HIDDEN, os.O_RDONLY)
 try:
     os.pread(fd, 512, 0)
@@ -158,9 +175,19 @@ page = mmap.mmap(-1, 512); page[:] = before_hidden[:512]
 os.pwritev(fd, [page], 0); os.fsync(fd); os.close(fd); page.close()
 assert Path(HIDDEN).read_bytes() == before_hidden
 close()
-# A wrong hidden key must not make the decoy unavailable; no writes in this case.
+# A wrong hidden key is rejected before any view exists (the guard), and the
+# primary is unchanged. An explicit fresh-carrier assertion still opens the
+# decoy without hidden data; no writes in this case.
+import errno
 from pivstore.blocks import open_blocks, close_blocks
-open_blocks('/dev/vdb', W / 'passphrase.key', bytes(32))
+try:
+    open_blocks('/dev/vdb', W / 'passphrase.key', bytes(32))
+except OSError as exc:
+    assert exc.errno == errno.EKEYREJECTED, exc
+else:
+    raise AssertionError('Wrong hidden key was accepted')
+absent()
+open_blocks('/dev/vdb', W / 'passphrase.key', bytes(32), uninitialized=True)
 unavailable(0)
 assert subprocess.check_output(['sha256sum', DECOY], text=True).split()[0] == (W / 'primary-before.sha256').read_text().strip()
 close_blocks('/dev/vdb', W / 'passphrase.key')

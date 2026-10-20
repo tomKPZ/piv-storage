@@ -120,3 +120,35 @@ class CleanupTests(unittest.TestCase):
         self.assertIs(raised.exception, error)
         self.assertIn('cleanup incomplete', error.__notes__[0])
         owner.close.assert_called_once()
+
+
+class SetupFlagTests(unittest.TestCase):
+    def test_setup_flags_match_kernel_abi(self):
+        from pivstore.blocks import SETUP, native_setup
+        for initialize, uninitialized, expected in ((False, False, 0), (True, False, 1),
+                                                    (False, True, 2), (True, True, 3)):
+            with self.subTest(initialize=initialize, uninitialized=uninitialized):
+                seen = []
+                def capture(fd, command, data, mutate):
+                    seen.append(SETUP.unpack(bytes(data))[3])
+                with patch('pivstore.blocks.fcntl.ioctl', side_effect=capture):
+                    native_setup(Mock(fd=7, generation=1), bytes(32), b'test context',
+                                 initialize=initialize, uninitialized=uninitialized)
+                self.assertEqual(seen, [expected])
+
+    def test_rejected_key_unwinds_and_explains(self):
+        owner = Mock(created=True, uuid='00000000-0000-0000-0000-000000000000')
+        owner.device.sectors = 96
+        owner.device.sector_size = 4096
+        error = OSError(errno.EKEYREJECTED, 'Key was rejected by service')
+        with patch('pivstore.blocks.GuestOwner', return_value=owner), \
+             patch('pivstore.blocks.native_status', return_value={'active': False}), \
+             patch('pivstore.blocks.mapping_identity', return_value=None), \
+             patch('pivstore.blocks.native_setup', side_effect=error) as setup:
+            with self.assertRaises(OSError) as raised:
+                open_blocks('/dev/vdb', 'private-key-file', bytes(32))
+        self.assertIs(raised.exception, error)
+        self.assertEqual(setup.call_args.kwargs, {'initialize': False, 'uninitialized': False})
+        self.assertIn('No hidden record authenticated', error.__notes__[0])
+        owner.remove.assert_called_once_with(abort=True)
+        owner.close.assert_called_once()

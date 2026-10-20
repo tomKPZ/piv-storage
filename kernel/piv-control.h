@@ -61,7 +61,7 @@ struct piv_devices {
 struct piv_native_setup {
  __u32 version, size;
  __u64 generation;
- __u32 flags, context_length; /* flags bit 0: destructive initialize to zeros */
+ __u32 flags, context_length; /* see PIV_SETUP_* */
  __u8 key[32], context[128];
  __u32 reserved[2];
 };
@@ -69,6 +69,12 @@ struct piv_native_status {
  __u64 generation, hidden_bytes, encryptions, invalidations;
  __u32 active, views, failed, version;
 };
+/* Destructively initialize every hidden block to authenticated zeros. */
+#define PIV_SETUP_INITIALIZE 1U
+/* Accept a carrier in which no record authenticates under the hidden key
+ * (fresh/uninitialized). Without it or INITIALIZE, setup returns EKEYREJECTED.
+ */
+#define PIV_SETUP_UNINITIALIZED 2U
 #define PIV_NATIVE_SETUP _IOW('P', 12, struct piv_native_setup)
 #define PIV_NATIVE_DETACH _IOW('P', 13, struct piv_read_iv)
 #define PIV_NATIVE_STATUS _IOR('P', 14, struct piv_native_status)

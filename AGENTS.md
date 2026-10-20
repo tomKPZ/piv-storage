@@ -51,8 +51,6 @@ resolved from context/evidence, not for routine implementation decisions.
   locks are volatile. Early activation must be possible from an initramfs.
 - User-approved planned changes (2026-10-20; see ROADMAP.md items 3-8). Until
   each lands with tests, the current rules below remain in force:
-  - Scoped error isolation replaces whole-owner fail-stop where nothing was
-    mutated; a stateless wrong-key activation guard.
   - A standalone AEAD-sector target replaces the vendored dm-crypt fork.
   - Format v4: fragment-local re-randomization of touched IVs; an encrypted
     in-IV hidden header (indistinguishable, no public magic; fast key check,
@@ -79,8 +77,13 @@ resolved from context/evidence, not for routine implementation decisions.
   rollback and clones. Do not resurrect an observable nonce ledger.
 - Preserve authenticated PREPARE/exact-tuple APPLY and owner lifetime gates.
   Apply through the ordinary lower dm-integrity journal; its per-sector atomicity
-  does not make a hidden record atomic. Storage/primary-auth errors stop the
-  shared owner. Local hidden unavailability must not stop the decoy.
+  does not make a hidden record atomic. Failure scope follows mutation: errors
+  before the first APPLY (reads, authentication, allocation, preparation) fail
+  only that bio; APPLY-time and flush errors stop the shared owner. Local hidden
+  unavailability must not stop the decoy.
+- Wrong-key guard: setup without initialize requires one record (data or invalid
+  marker) to authenticate, using carriers from the mandatory scan, unless the
+  explicit uninitialized-carrier flag is given. Never add extra I/O for it.
 - Decoy bios are bounded to 16 KiB at power-of-two DM split boundaries, hidden
   bios to 512 bytes. Retain the two-carrier-group/96-tuple preparation bound,
   ordered work and lower preflush/completion-flush semantics. Batching is within

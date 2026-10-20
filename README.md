@@ -68,7 +68,11 @@ preserved, and cleanup failures are reported with the original error. Close also
 validates both view mappings before removal and can release an idle private owner.
 Cleanup releases resources; it does not roll back a partial initialization.
 
-A stock, uninitialized carrier can be opened without initialization: decoy I/O
+Opening without `--initialize` requires at least one hidden record (data or an
+encrypted invalid marker) to authenticate under the hidden key; otherwise setup
+fails with EKEYREJECTED and removes its mappings. This **wrong-key guard** checks
+records collected during the mandatory primary scan, adding no I/O. A stock,
+uninitialized carrier therefore needs an explicit `--uninitialized`: decoy I/O
 works, hidden reads return EIO, and full hidden-block writes initialize individual
 blocks. Repair of an unavailable block should use a complete 512-byte direct-I/O
 write: a smaller buffered write can trigger a page-sized read that also includes
@@ -76,8 +80,10 @@ unavailable neighbors. Initialize the full hidden volume before ordinary
 filesystem use. A damaged or wrong-key hidden record likewise returns EIO locally.
 Decoy writes preserve valid hidden data; touching an unavailable hidden record
 writes a fresh encrypted invalid marker, so it cannot silently become valid zeros.
-A wrong hidden key cannot be distinguished from damaged/absent data. **Decoy writes
-with a wrong hidden key can destroy hidden data.** Key provisioning must be correct.
+Per record, a wrong hidden key cannot be distinguished from damaged/absent data.
+The guard only proves the key against one record. **With `--uninitialized`, or a
+volume whose every record is damaged, decoy writes under a wrong hidden key can
+destroy hidden data.** Key provisioning must still be correct.
 
 There is no compatibility with previous hidden formats or external state. Old
 volumes must be extracted using the old Git revision before migration. There is
@@ -101,8 +107,12 @@ rollback protection, redundancy or hidden filesystem recovery is promised.
 A whole hidden block authenticates before any of its bytes are returned. This
 prevents silent authenticated fragment mixing, but cannot detect whole-block
 rollback or a mixture of independently valid blocks from different times.
-Primary I/O/authentication failures stop the shared owner; remove and recreate
-the stack after fixing the underlying fault. Hidden unavailability alone does not.
+Failures that leave storage unchanged are local to the request: lower read
+errors, primary or hidden authentication failures, allocation and preparation
+failures return EIO (or the specific error) and both views keep serving other
+requests. A failed flush, or any failure once a write has begun applying tuples,
+leaves storage or durability unknown and stops the shared owner; remove and
+recreate the stack after fixing the underlying fault.
 
 Primary IV uniqueness is probabilistic (96 bits for AES-GCM/ChaCha20-Poly1305;
 128 bits for AEGIS-128). Every encoding uses fresh seeded
