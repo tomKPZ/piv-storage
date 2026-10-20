@@ -152,6 +152,13 @@ Stock cryptsetup selections (when formatting a new volume) are:
 | ChaCha20-Poly1305 | `--cipher chacha20-random` | `--integrity poly1305` | 256 bits |
 | Original AEGIS-128 | `--cipher aegis128-random` | `--integrity aead` | 128 bits |
 
+**Original AEGIS-128 is the recommended profile.** Its 128-bit random IVs make
+the IV birthday term negligible at practical write volumes (about 2^-33 even
+after 2^48 encryptions), and its 36-IV records give more hidden capacity and
+less amplification. AES-GCM is the budget-limited option: NIST's random-IV
+limit of 2^32 encryptions per key applies across the key's whole lifetime.
+ChaCha20-Poly1305 shares the 96-bit IV collision term.
+
 AES-GCM and ChaCha20-Poly1305 use the same 12-byte IV/16-byte tag layout and have the same carrier
 capacity and probabilistic nonce-collision limits. Hidden records continue to
 use their independent ChaCha20-Poly1305 keys regardless of the primary cipher.

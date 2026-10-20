@@ -49,6 +49,21 @@ resolved from context/evidence, not for routine implementation decisions.
   LUKS/dm-integrity structures and encrypted records inside IVs. No separate
   partition, root-ext4 file or hidden-volume metadata dependency. /run ownership
   locks are volatile. Early activation must be possible from an initramfs.
+- User-approved planned changes (2026-10-20; see ROADMAP.md items 3-8). Until
+  each lands with tests, the current rules below remain in force:
+  - Scoped error isolation replaces whole-owner fail-stop where nothing was
+    mutated; a stateless wrong-key activation guard.
+  - A standalone AEAD-sector target replaces the vendored dm-crypt fork.
+  - Format v4: fragment-local re-randomization of touched IVs; an encrypted
+    in-IV hidden header (indistinguishable, no public magic; fast key check,
+    key wrapping, version/flags) without any persistent encryption counter;
+    optional A/B record slots; support for stock `--integrity-no-journal`
+    (default decided after the journal-atomicity experiment).
+  - AEGIS-128 becomes the recommended default profile.
+  - Setup userspace may later be ported to Rust; Python diagnostics remain.
+  Multi-snapshot observers, rollback resistance and alternative hidden openings
+  under coercion are out of scope. Never put host-specific (e.g. corporate
+  kernel) identifiers in the repository.
 - One authenticated record covers exactly one hidden 512-byte logical block in
   48 primary IVs for AES/ChaCha or 36 for original AEGIS-128. Full-block authentication prevents old/new fragment mixing;
   cross-block transactions, hidden crash recovery and rollback resistance are

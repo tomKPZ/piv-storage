@@ -36,6 +36,11 @@ against malicious storage firmware. VM shares, keys, snapshots, swap, crash dump
 Python objects and installed tools are separate operational evidence. Test keys
 and deliberately cheap fixture keyslots are unsuitable for real data.
 
+Out of scope by user decision (2026-10-20): multi-snapshot observers, rollback
+resistance and coercion-resistant alternative hidden openings. The latter would
+only move coercion from one hidden key to the next. Retained single-image
+journal history remains in scope (see below).
+
 ## Encoding review
 
 The exact bytes are specified in [hidden-format.md](hidden-format.md).

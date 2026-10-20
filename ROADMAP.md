@@ -67,80 +67,102 @@ safety defects take precedence over this ordering whenever discovered.
    seeded randomness and exclusive ownership remain mandatory. Completed records
    remain changed; cancellation is not rollback or a hard latency guarantee. See
    docs/cancellation.md and the final handoff for limits and evidence.
-3. **Core resource/lifecycle hardening (next implementation).** Review and improve allocation failure,
-   queue/resource bounds, lifetime and teardown handling where concrete evidence
-   requires module changes. Pair changes with targeted injection/concurrency
-   tests, and debug-kernel checks when an appropriate test kernel is available.
-   Do not add speculative machinery or build a large debug kernel merely to
-   manufacture a source change. A test revealing no defect is still useful,
-   but standalone test expansion comes after identified core implementation work.
-   Review follow-ups (2026-10-19) belonging here:
-   - **Finer error isolation.** Any non-UNAVAILABLE error currently fails the
-     whole owner (piv-native.inc). Candidate policy: primary authentication
-     failure on reads or during PREPARE fails only that bio (nothing mutated);
-     only APPLY-time or unknown-state lower errors poison state, ideally scoped
-     to the affected group. Requires fault-injection evidence for each class.
-   - **Wrong-key activation guard.** A wrong hidden key makes decoy writes
-     destroy hidden data. Setup already authenticates every record; refuse
-     hidden-aware activation when none authenticate unless an explicit
-     fresh/uninitialized-carrier flag is given. Stateless; no header.
-4. **Kernel compatibility and maintenance.** Deliberately port the private fork to
-   another selected supported kernel, reviewing upstream dm-crypt fixes and API
-   differences. Keep stock crypt coexistence and exact source/config/symbol
-   validation. This is an actual porting task, not a promise of one binary module
-   working across kernels; select the additional version before downloading or
-   building another large environment. Proposed target: the development host's
-   kernel series (7.1.x at review time), built and loaded only inside a guest.
-   The patch is small (about 100 dm-crypt.c lines; the native code uses only
-   crypt_convert_block_aead_iv, crypt_convert_init, crypt_integrity_io_alloc,
+3. **Finer error isolation and wrong-key guard (next; prioritized by the user
+   2026-10-20).** Pair each with fault-injection tests using existing scaffolding.
+   - *Error isolation.* Any non-UNAVAILABLE error currently fails the whole
+     owner (piv-native.inc). Target policy: primary authentication failure on
+     reads or during PREPARE fails only that bio (nothing mutated); only
+     APPLY-time or unknown-state lower errors poison state, ideally scoped to
+     the affected group. Exit: per-class injection evidence that unaffected
+     decoy/hidden I/O continues and poisoned ranges stay EIO until recreation.
+   - *Wrong-key guard.* A wrong hidden key makes decoy writes destroy hidden
+     data. Until the header (item 5) exists, refuse hidden-aware activation when
+     no record authenticates unless an explicit fresh/uninitialized-carrier flag
+     is given. The header later provides a fast key check.
+   Broader resource/lifecycle hardening (allocation failure, queue bounds,
+   teardown concurrency) continues evidence-led alongside, without speculative
+   machinery or a large debug kernel built only to manufacture a change.
+4. **Standalone target replacing the dm-crypt fork (prioritized by the user).**
+   The current patch is small (about 100 dm-crypt.c lines; the native code uses
+   only crypt_convert_block_aead_iv, crypt_convert_init, crypt_integrity_io_alloc,
    req_pool and config fields), but vendoring all of dm-crypt.c forces exact
-   matching and upstream fix tracking. Evaluate a standalone AEAD-sector target
-   over dm-integrity (stable Linux AAD/IV/tag layout) to remove the fork.
-5. **Further core performance work, only when justified.** Current bounded
+   source matching and upstream fix tracking. Implement the per-sector AEAD path
+   directly with the crypto API and bio integrity payloads over dm-integrity,
+   reproducing the stable Linux AAD/IV/tag layout. Exit: existing native,
+   fault, lifecycle, power and control suites pass unchanged on the pinned
+   guest; stock crypt coexistence retained; cross-checks agree byte-for-byte.
+   Then port/test on one newer public distribution kernel series, inside a guest
+   only (never the host), to demonstrate build portability.
+5. **Format v4 (design document first, then implementation).** User decisions
+   (2026-10-20) to design together, because they share the record encoding:
+   - *Fragment-local re-randomization (the real footprint fix; implement).* A
+     decoy write re-randomizes only the IVs it touches plus required
+     authentication material, not the whole group. Primarily for 16-byte IVs
+     (e.g. ~8 random + ~8 payload bytes per sector). Analyze nonce uniqueness
+     per sector, authentication without old/new mixing, capacity and whether
+     AES/ChaCha 12-byte IVs remain viable. Attacks the 192-vs-7 footprint,
+     nonce-budget use, write throughput and wear together.
+   - *Encrypted hidden header (approved).* Indistinguishable from carrier IVs;
+     no public magic. Provides fast key check, key wrapping (passphrase change /
+     multiple passphrases without rewriting records, KDF salt/params) and format
+     version/flags/metadata. No persistent encryption counter (rejected).
+     Address header corruption (e.g. replicas) as a single point of failure.
+   - *A/B record slots (option, possibly default).* Two slots per hidden block
+     with an encrypted generation; reads return the newest valid slot so a torn
+     write leaves the previous version readable. Half capacity, double scan reads.
+   - *Journal mode.* Support stock `--integrity-no-journal` (removes on-disk
+     history; likely default). Before fixing the default, run the concrete
+     experiment below, since journal-provided group atomicity could change it.
+6. **Journal atomicity experiment (investigate concretely, later).** Determine
+   whether a whole carrier group submitted as one bio commits within a single
+   dm-integrity journal transaction across power loss. If so, journaled mode
+   may give atomic hidden records at no capacity cost, trading against history
+   retention. Record evidence before choosing the format v4 journal default.
+7. **AEGIS-128 as the recommended default profile (user decision).** 128-bit
+   IVs make the random-IV birthday term negligible and give more capacity and
+   less amplification. Document AES-GCM as the budget-limited option; update
+   fixtures/docs/examples to lead with AEGIS-128. Investigate stock
+   `aes-xts-random` + `--integrity hmac-sha256` as a further profile (16-byte
+   random IVs; IV repetition under XTS reveals equality rather than enabling
+   forgery). Unverified; check cryptsetup support and layout first.
+8. **Further core performance work, only when justified.** Current bounded
    authenticated read batching and 16 KiB decoy write batching are complete.
-   Use measurements to select any remaining allocation/crypto/I/O changes.
-   Concurrency, cross-bio coalescing and caches are optional architectural work,
-   not requirements to implement by default. Preserve authentication, fresh-IV
-   coordination, error isolation and flush/completion semantics. Write
-   throughput/latency and wear amplification have not been measured; add write
-   profiling before selecting write-path changes.
+   Add write throughput/latency and wear-amplification profiling (user
+   approved) before selecting write-path changes. Concurrency, cross-bio
+   coalescing and caches are optional. Preserve authentication, fresh-IV
+   coordination, error isolation and flush/completion semantics.
 
 ## Work following core implementation
 
+- **Rekey/migration tooling (concrete; promoted).** Offline copy into a freshly
+  formatted volume: format the target (new primary key, chosen cipher, sector
+  size and size), activate both paired stacks, copy decoy and hidden contents
+  through their views, verify both independently (primary verification and
+  hidden unpack hashes), then let the user retire the source. This one workflow
+  provides primary rekey, cipher change and **offline resize** (hidden AAD binds
+  geometry, so live resize stays unsupported). Tests need a second pinned guest
+  disk; extend fixture guards only explicitly. Hidden-key change becomes a
+  header rewrap once format v4 exists. Publish per-cipher lifetime-budget
+  guidance; no on-disk ledger or online rekey.
+- **Hidden-key KDF.** Argon2id (or stdlib scrypt meanwhile) from a passphrase in
+  userspace setup. Before the header exists, use the LUKS UUID as salt with
+  fixed or user-supplied parameters; the header then stores a random salt and
+  parameters for wrapped keys.
+- **Userspace setup port to Rust.** Zeroizing/mlocked key buffers, Argon2id and
+  a static initramfs binary. Changes the current Python-standard-library setup
+  rule; retain the independent Python diagnostics as a cross-check.
 - Security/test expansion: active on-disk metadata/journal negative fixtures,
   broader interruption and scheduling/storage coverage, and a refreshed full
-  six-profile matrix. Targeted versions of these tests move forward whenever
-  needed to validate a core change or investigate a suspected defect.
-- Independent cryptographic review of the whole encoding and per-cipher usage
-  policy. External review can proceed in parallel if available; findings that
-  affect integrity, confidentiality or encoding override the implementation order.
-- **Rekey/migration tooling (promoted priority within this list).** Explicit
-  lifetime-budget guidance plus copy-into-fresh-volume migration, which also
-  serves offline resize (hidden AAD binds geometry, so live resize stays
-  unsupported) and cipher changes. The resetting owner counter cannot enforce
-  key-lifetime usage across stock writes, clones or recreations. Define the
-  policy/workflow before deciding whether extra kernel controls are useful; do
-  not invent an on-disk ledger or online-rekey feature.
-- Journal history mitigation (docs/security-review.md): evaluate stock
-  `--integrity-no-journal` support and power-loss behavior; verify whether
-  journal encryption is available for LUKS2 AEAD.
-- Hidden-key KDF without a header: e.g. Argon2id/scrypt with the LUKS UUID as
-  salt and fixed or user-supplied parameters, performed in userspace setup.
-- Userspace setup port to Rust (zeroizing/mlocked key buffers, Argon2id, static
-  initramfs binary). Changes the current "Python standard library" setup rule;
-  retain independent Python diagnostics as a cross-check.
+  profile matrix. Targeted versions move forward whenever a core change needs them.
+- Independent cryptographic review of the whole encoding (including format v4)
+  and per-cipher usage policy; findings override implementation order.
 - General device deployment, packaging/signing, boot-time key provisioning and
   documentation consolidation. Actual RAM-root activation is already verified;
   production boot integration and unrestricted host deployment are not.
 
-Pending user design decisions (do not implement before a decision): an encrypted
-hidden header (key wrapping/passphrase change; reverses the stateless choice and
-adds a single point of failure); A/B record slots for atomic hidden writes at
-half capacity; experiment on single-bio group atomicity through the dm-integrity
-journal; a record format that re-randomizes only touched IVs (reduces the group
-footprint, nonce budget use and wear at a capacity cost); making AEGIS-128 the
-default profile (128-bit IVs remove the practical birthday budget concern);
-investigating stock `aes-xts-random` + `hmac-sha256` as a profile (unverified).
+Out of scope (user, 2026-10-20): multi-snapshot observers, rollback resistance
+(requires trusted external state) and coercion-resistant alternative hidden
+openings (they only move the coercion to the next key).
 
 Current evidence and limits remain in docs/security-review.md,
 docs/read-performance.md, docs/detectability.md and the handoffs below. Broader
@@ -1232,3 +1254,17 @@ and a standalone-target evaluation; later work promotes rekey/migration and adds
 journal mitigation, a UUID-salted KDF, write profiling and a Rust setup port.
 Design choices awaiting the user are listed above the handoffs. Next remains the
 evidence-led core resource/lifecycle work, now including the two follow-ups.
+
+## Session handoff: user design decisions (2026-10-20)
+
+Documentation/roadmap-only update recording the user's decisions on the review.
+Approved: scoped error isolation and the standalone target as top priorities;
+format v4 (fragment-local re-randomization, encrypted in-IV header with fast
+key check/key wrapping/version flags but no counter, optional A/B slots,
+`--integrity-no-journal` support); AEGIS-128 as recommended profile; concrete
+rekey/migration including offline resize; hidden-key KDF; write profiling; Rust
+setup port; investigating aes-xts-random + hmac-sha256. Out of scope: coercion
+alternative openings, rollback, multi-snapshot observers. AGENTS.md now lists
+these as planned changes; existing rules apply until each lands with tests. No
+code changed; no tests run. Next: roadmap item 3, starting with a fault-class
+inventory of the current fail-stop path and its injection tests.
