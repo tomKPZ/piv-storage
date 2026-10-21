@@ -39,7 +39,11 @@ struct pn_entry {
  __le32 primary;
  u8 old[16], tuple[PIV_TUPLE_BYTES];
 } __packed;
+#if PIV_AES_KEY_API
+struct pn_lrw { struct aes_enckey tweak; struct aes_key prp; };
+#else
 struct pn_lrw { struct crypto_aes_ctx tweak, prp; };
+#endif
 struct piv_native {
  struct crypto_shash *hmac;
  /* record outer keys, keyslot outer keys from the directory */
@@ -118,8 +122,13 @@ static void pn_v4_decode(const struct pn_lrw *k, u64 sector, const u8 iv[16], u8
 
 static int pn_lrw_init(struct pn_lrw *k, const u8 tweak[32], const u8 prp[32])
 {
+#if PIV_AES_KEY_API
+	int r = aes_prepareenckey(&k->tweak, tweak, 32);
+	return r ? r : aes_preparekey(&k->prp, prp, 32);
+#else
 	int r = aes_expandkey(&k->tweak, tweak, 32);
 	return r ? r : aes_expandkey(&k->prp, prp, 32);
+#endif
 }
 
 /* tag = HMAC-SHA256(mac, context || label(8|9) || LE64(id) || plain)[0:16] */

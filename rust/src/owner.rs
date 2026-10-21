@@ -19,10 +19,15 @@ pub const PINNED_KERNEL: &str = "6.12.113+deb13-amd64";
 /// Sanitizer build of the same source; accepted only on a guest image that
 /// scripts/build_debug_kernel.py explicitly marked with /etc/piv-debug-kernel.
 pub const DEBUG_KERNEL: &str = "6.12.113+deb13-amd64-pivdbg";
+/// Newer-kernel port target (Debian trixie-backports); accepted only on a guest
+/// image that scripts/build_port_image.py explicitly marked with /etc/piv-port-kernel.
+pub const PORT_KERNEL: &str = "7.2.9+deb13-amd64";
 const MIB: u64 = 1024 * 1024;
 
 fn pinned_release(release: &str) -> bool {
-    release == PINNED_KERNEL || (release == DEBUG_KERNEL && Path::new("/etc/piv-debug-kernel").exists())
+    release == PINNED_KERNEL
+        || (release == DEBUG_KERNEL && Path::new("/etc/piv-debug-kernel").exists())
+        || (release == PORT_KERNEL && Path::new("/etc/piv-port-kernel").exists())
 }
 
 /// (major, minor, DM UUID) of a mapping, without reading any key-containing table.

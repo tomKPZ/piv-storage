@@ -18,11 +18,16 @@ PINNED_KERNEL = '6.12.113+deb13-amd64'
 # Sanitizer (KASAN/UBSAN/lockdep) build of the same source, accepted only on a
 # guest image explicitly marked by scripts/build_debug_kernel.py.
 DEBUG_KERNEL = PINNED_KERNEL + '-pivdbg'
+# Newer-kernel port target (Debian trixie-backports), accepted only on a guest
+# image explicitly marked by scripts/build_port_image.py.
+PORT_KERNEL = '7.2.9+deb13-amd64'
 
 
 def pinned_release():
     release = os.uname().release
-    return release == PINNED_KERNEL or (release == DEBUG_KERNEL and Path('/etc/piv-debug-kernel').exists())
+    return (release == PINNED_KERNEL or
+            (release == DEBUG_KERNEL and Path('/etc/piv-debug-kernel').exists()) or
+            (release == PORT_KERNEL and Path('/etc/piv-port-kernel').exists()))
 
 
 def guest_guard(source, allow_test_stack=False, allow_second_disk=False):

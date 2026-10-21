@@ -27,6 +27,14 @@ class GuestGuardTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.guarded(size, kernel='6.12.113+deb13-amd64-other', debug_marker=True)
 
+    def test_port_kernel_needs_explicit_image_marker(self):
+        size = 128 * 1024 * 1024
+        with self.assertRaises(ValueError):
+            self.guarded(size, kernel='7.2.9+deb13-amd64')
+        self.assertEqual(self.guarded(size, kernel='7.2.9+deb13-amd64', debug_marker=True), size)
+        with self.assertRaises(ValueError):
+            self.guarded(size, kernel='7.2.10+deb13-amd64', debug_marker=True)
+
     def test_only_explicit_fixture_sizes(self):
         for mib in (128, 512):
             self.assertEqual(self.guarded(mib * 1024 * 1024), mib * 1024 * 1024)

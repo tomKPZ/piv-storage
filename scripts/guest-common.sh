@@ -2,10 +2,12 @@
 set -euo pipefail
 umask 077
 test "$(id -u)" = 0
-# The pinned kernel, or its sanitizer build only on an explicitly marked debug image.
+# The pinned kernel, its sanitizer build only on an explicitly marked debug
+# image, or the newer-kernel port target only on a marked port image.
 case "$(uname -r)" in
     6.12.113+deb13-amd64) ;;
     6.12.113+deb13-amd64-pivdbg) test -e /etc/piv-debug-kernel ;;
+    7.2.9+deb13-amd64) test -e /etc/piv-port-kernel ;;
     *) echo "Unsupported guest kernel" >&2; exit 1 ;;
 esac
 test "$(findmnt -n -o FSTYPE /mnt/piv-work)" = 9p
@@ -57,7 +59,7 @@ guest_build_module() {
         return
     fi
     cp /lib/modules/"$(uname -r)"/build/.config headers.config
-    python3 check-config.py kernel.config headers.config
+    python3 check-config.py kernel.config headers.config "$(uname -r)"
 }
 
 # A disposable ordinary encrypted filesystem remains mounted throughout our tests.

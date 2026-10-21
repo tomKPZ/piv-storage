@@ -23,6 +23,10 @@
 #include <linux/compat.h>
 #include <linux/sched/mm.h>
 #include <linux/kernel.h>
+#include <linux/version.h>
+#if __has_include(<linux/hex.h>)
+#include <linux/hex.h>	/* hex2bin moved out of kernel.h in newer kernels */
+#endif
 #include <crypto/aead.h>
 #include <crypto/aes.h>
 #include <crypto/skcipher.h>
@@ -30,6 +34,22 @@
 #include <crypto/hash.h>
 #include <linux/device-mapper.h>
 #include "piv-control.h"
+
+/*
+ * Kernel API differences. Verified on Debian 6.12.113 (pinned) and the
+ * trixie-backports 7.2.9 port target only; the version thresholds below are
+ * where the upstream changes are believed to have landed, untested elsewhere.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
+#define PIV_BI_TUPLE_SIZE(bi) ((bi)->metadata_size)	/* renamed from tuple_size */
+#else
+#define PIV_BI_TUPLE_SIZE(bi) ((bi)->tuple_size)
+#endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+#define PIV_AES_KEY_API 1	/* struct aes_key/aes_enckey and aes_preparekey() */
+#else
+#define PIV_AES_KEY_API 0	/* struct crypto_aes_ctx and aes_expandkey() */
+#endif
 
 #define DM_MSG_PREFIX "piv-crypt"
 
@@ -313,12 +333,12 @@ static int piv_crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 	r = -EINVAL;
 	bi = blk_get_integrity(cc->dev->bdev->bd_disk);
-	if (!bi || bi->csum_type != BLK_INTEGRITY_CSUM_NONE || bi->tuple_size != tag ||
+	if (!bi || bi->csum_type != BLK_INTEGRITY_CSUM_NONE || PIV_BI_TUPLE_SIZE(bi) != tag ||
 	    1U << bi->interval_exp != cc->sector_size) {
 		ti->error = "Lower integrity profile does not match";
 		goto bad;
 	}
-	cc->tuple_size = bi->tuple_size;
+	cc->tuple_size = PIV_BI_TUPLE_SIZE(bi);
 	cc->tfm = crypto_alloc_aead(profile->algorithm, 0, 0);
 	if (IS_ERR(cc->tfm)) {
 		r = PTR_ERR(cc->tfm);

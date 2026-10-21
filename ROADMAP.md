@@ -98,7 +98,8 @@ them. Known integrity or memory-safety defects still override this order.
    - in-guest syzkaller-style fuzzing of the control ioctls — first pass done
      (2026-10-21, kernel/guest-ioctl-fuzz.py, suite `fuzz`; see the handoff).
 3. **Then the remaining core items** below: no-journal (once the torn-sector
-   policy is decided) and the newer-kernel port. (The v4 default is done; v3,
+   policy is decided); the newer-kernel port is done (7.2.9, docs/kernel-port.md).
+   (The v4 default is done; v3,
    AES-GCM/ChaCha20-Poly1305 and therefore the xts/hmac idea were removed by
    the user's 2026-10-21 option A decision.)
 
@@ -165,7 +166,8 @@ safety defects take precedence over this ordering whenever discovered.
    teardown concurrency) continues evidence-led alongside, without speculative
    machinery or a large debug kernel built only to manufacture a change.
 4. **Standalone target replacing the dm-crypt fork — implemented (2026-10-20);
-   newer-kernel port still open.** kernel/dm-piv.c implements the owner target
+   newer-kernel port done 2026-10-21 (Debian backports 7.2.9, docs/kernel-port.md).**
+   kernel/dm-piv.c implements the owner target
    and per-sector AEAD (piv_aead) itself; no dm-crypt source is vendored or
    patched. See the handoff below for the matrix evidence. Original plan:
    The current patch is small (about 100 dm-crypt.c lines; the native code uses
@@ -1763,3 +1765,26 @@ and suite-042-fuzz-sanitizer, 4/4 each, no kernel reports.
 Next: kunit-style helper tests need CONFIG_KUNIT, which the localmodconfig
 sanitizer kernel lacks (unchecked on the stock config); the Python cross-checks
 already cover the helpers end to end. Remaining: newer-kernel port, no-journal (policy), AEGIS-128 lifetime-budget guidance.
+
+## Session handoff: suite tiers and the newer-kernel port (2026-10-21)
+
+suite.py gained tiers (`--suites routine`, the default: faults, profile, cancel,
+lifecycle, batch, early, power, v4; `all` adds controls, sector, migrate, fuzz),
+`--suites-for PROFILE=LIST` and `--reuse-native PREFIX` (summary.json records the
+module-input SHA-256; reuse requires a matching input and base image). A
+targeted rerun now takes about 30 s on KVM. Rerun policy is in
+docs/development.md; routine sanitizer runs use `--suites-for aegis-512=faults`.
+
+Newer-kernel port (user's core item 4): Debian trixie-backports 7.2.9 in a
+marked, derived guest image (scripts/build_port_image.py). Four API changes were
+needed (hex.h, blk_integrity metadata_size, the new AES library key types and
+renamed chacha/sha256 modules in the early initramfs); one source tree builds on
+both kernels. Evidence and limits in docs/kernel-port.md: suite-046-port all
+suites except the stock-only sector suite (16/16 host checks, early fixed in
+suite-048), and suite-047/049 on 6.12 after the change. KUNIT is disabled in
+both Debian configs, so kunit helper tests would require a custom kernel; not
+pursued (the Python cross-checks cover the helpers end to end).
+
+Remaining roadmap items need user input or are documentation: no-journal
+(torn-sector policy decision), AEGIS-128 lifetime-budget guidance, optional
+sanitizer build of 7.2, external crypto review.
