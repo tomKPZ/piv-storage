@@ -850,6 +850,27 @@ out:
  return r;
 }
 
+/* v4 fast key check once the scan has collected every keyslot IV. On success
+ * the volume is v4 (a v3 record probe is no longer needed); PN_UNAVAILABLE
+ * leaves the v3 guard in charge. Same outcome as checking after the scan, but
+ * a v4 open no longer attempts every v3 record first.
+ */
+static int pn_setup_unlock(struct piv_control *p, struct piv_native *n, const u8 key[32],
+                           const u8 *ks_ivs, bool v4, bool *keyed, bool *probe_v3)
+{
+ int r = pn_v4_unlock(n, key, ks_ivs);
+ if (!r) {
+  *keyed = true;
+  *probe_v3 = false;
+  r = pn_v4_keys(n, p->profile.sectors);
+  if (!r) r = pn_dir_load(p);
+  return r;
+ }
+ if (r != PN_UNAVAILABLE) return r;
+ if (v4) *keyed = *probe_v3 = false; /* the caller required v4; a v3 record is no proof */
+ return 0;
+}
+
 static int pn_setup(struct piv_control *p, struct file *controller, struct piv_native_setup *s)
 {
  struct piv_native *n;
@@ -858,7 +879,7 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
  u32 iv = p->profile.iv_size, group = PN_CARRIER / iv, j;
  bool initialize = s->flags & PIV_SETUP_INITIALIZE, v4 = s->flags & PIV_SETUP_FORMAT_V4;
  bool ab = s->flags & PIV_SETUP_AB, keyed = s->flags & (PIV_SETUP_INITIALIZE | PIV_SETUP_UNINITIALIZED);
- bool probe_v3 = !keyed && !v4, mutated;
+ bool probe_v3 = !keyed && !v4, mutated, ks_done = false;
  int r;
  if (s->version != 3 || s->size != sizeof(*s) || s->generation != p->profile.generation ||
      s->context_length > 120 || !s->context_length ||
@@ -925,20 +946,15 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
    r = 0;
   }
   i += count;
- }
- if (ks_ivs) {
-  r = pn_v4_unlock(n, s->key, ks_ivs);
-  if (!r) {
-   keyed = true;
-   r = pn_v4_keys(n, p->profile.sectors);
-   if (!r) r = pn_dir_load(p);
+  if (ks_ivs && !ks_done && i >= PN_V4_KEYSLOT_AREA) {
+   ks_done = true;
+   r = pn_setup_unlock(p, n, s->key, ks_ivs, v4, &keyed, &probe_v3);
    if (r) goto bad;
-  } else if (r != PN_UNAVAILABLE) {
-   goto bad;
-  } else if (v4) {
-   keyed = false;	/* the caller required v4; a v3 record is no proof */
   }
-  r = 0;
+ }
+ if (ks_ivs && !ks_done) {
+  r = pn_setup_unlock(p, n, s->key, ks_ivs, v4, &keyed, &probe_v3);
+  if (r) goto bad;
  }
  /* Hidden availability must not decide whether the decoy can be opened, but an
   * unproven key must not be allowed to destroy hidden data through decoy writes.

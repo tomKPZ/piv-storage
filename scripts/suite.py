@@ -33,6 +33,12 @@ DEFAULT_SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early')
 lock = threading.Lock()
 
 
+def default_format(control):
+    """Initialization default: v4 on 16-byte-IV (AEGIS-128) profiles, else v3."""
+    segment = json.loads((control / 'share/luks.json').read_text())['segments']['0']
+    return 4 if segment['encryption'] == 'aegis128-random' else 3
+
+
 def log(message):
     with lock:
         print(time.strftime('%H:%M:%S'), message, flush=True)
@@ -68,7 +74,9 @@ class Matrix:
         with lock:
             self.results.setdefault(name, {}).update(value)
 
-    def host_check(self, name, image, control, oracle_primary, oracle_hidden, format=3):
+    def host_check(self, name, image, control, oracle_primary, oracle_hidden, format=None):
+        if format is None:
+            format = default_format(control)
         command = [sys.executable, str(ROOT / 'scripts/check_stateless.py'), str(image),
                    *([] if format == 3 else ['--format', str(format)]),
                    '--volume-key-file', str(control / 'share/volume.key'),
@@ -155,8 +163,7 @@ class Matrix:
             if name == 'sector' and not build:
                 self.record(key, dict(passed=False, note='sector suite needs --scaffold'))
                 return
-            if name == 'v4' and json.loads((control / 'share/luks.json').read_text())['segments']['0'][
-                    'encryption'] != 'aegis128-random':
+            if name == 'v4' and default_format(control) != 4:
                 self.record(key, dict(passed=True, skipped='format v4 needs a 16-byte IV profile'))
                 return
             if name == 'early':

@@ -153,9 +153,34 @@ def open_views(initialize=False):
     return v
 
 
-def verify(v):
+def verify(v, unavailable_from=None):
     assert subprocess.check_output(['sha256sum', v['decoy']], text=True).split()[0] == PRIMARY
-    assert Path(v['hidden']).read_bytes() == expected
+    if unavailable_from is None:
+        assert Path(v['hidden']).read_bytes() == expected
+        return
+    # Interrupted v4 re-initialization: a new master key was written first, so
+    # completed leading blocks are zeros and every later block is unavailable
+    # (old records no longer authenticate) rather than retaining old content.
+    # Exact O_DIRECT reads: buffered page reads would include unavailable neighbours.
+    fd = os.open(v['hidden'], os.O_RDONLY | os.O_DIRECT)
+    try:
+        with mmap.mmap(-1, unavailable_from * 512) as buf:
+            assert os.preadv(fd, [buf], 0) == unavailable_from * 512
+            assert buf[:] == expected[:unavailable_from * 512]
+    finally:
+        os.close(fd)
+    for index in (unavailable_from, len(expected) // 512 - 1):
+        fd = os.open(v['hidden'], os.O_RDONLY | os.O_DIRECT)
+        try:
+            with mmap.mmap(-1, 512) as buf:
+                try:
+                    os.preadv(fd, [buf], index * 512)
+                except OSError as exc:
+                    assert exc.errno == errno.EIO
+                else:
+                    raise AssertionError(f'Block {index} after interrupted v4 initialization was readable')
+        finally:
+            os.close(fd)
 
 
 absent()
@@ -211,14 +236,23 @@ try:
         v = open_views()
         handle = GuestOwner(SOURCE, KEY, allow_test_stack=True)
         group = 576 // handle.device.iv_size
+        v4 = handle.device.iv_size == 16  # default-initialized fixtures: v4 on 16-byte IVs
         handle.close()
+        unavailable_from = None
         if phase == 'scan':
             assert status['encryptions'] == 0
+        elif v4:
+            # Keyslot 0 (2 x 14 sectors) and the directory (90) precede the
+            # 90-sector zero records.
+            completed, remainder = divmod(status['encryptions'] - 2 * 14 - 90, 90)
+            assert not remainder and 2 <= completed < min(64, len(expected) // 512), status
+            expected[:completed * 512] = bytes(completed * 512)
+            unavailable_from = completed
         else:
             completed, remainder = divmod(status['encryptions'], group)
             assert not remainder and 2 <= completed < min(64, len(expected) // 512), completed
             expected[:completed * 512] = bytes(completed * 512)
-        verify(v)
+        verify(v, unavailable_from)
         blocks.close_blocks(SOURCE, KEY, allow_test_stack=True)
         results.append(dict(phase=phase, interrupted_seconds=elapsed,
                             encryptions=status['encryptions'], no_native_state=True,
@@ -242,7 +276,9 @@ finally:
 
 # Exercise normal initialization completion too, on the smaller fixture. Large
 # initialization was already verified in large-*; do not repeat an eight-minute run.
-if raw_bytes == 128 * 1024 * 1024:
+# v4 always completes it: an interrupted v4 initialization leaves later blocks
+# unavailable, which no whole-volume oracle can describe.
+if raw_bytes == 128 * 1024 * 1024 or v4:
     v = open_views(initialize=True)
     expected[:] = bytes(len(expected))
     verify(v)

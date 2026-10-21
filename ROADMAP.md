@@ -169,7 +169,8 @@ safety defects take precedence over this ordering whenever discovered.
 5. **Format v4 — phases 1-3 implemented (2026-10-20); phase 4 (no-journal)
    open.** Fragments, SIV records, keyslots with directory, passphrase KEKs,
    keyslot add/remove and A/B slots work in the kernel and the independent
-   Python decoder (docs/format-v4.md). Initialization still defaults to v3.
+   Python decoder (docs/format-v4.md). Initialization defaults to v4 on
+   16-byte-IV profiles since 2026-10-21 (v3 otherwise).
    Phase 4 is blocked on a policy decision (docs/journal-atomicity.md).
    Original plan: User decisions
    (2026-10-20) to design together, because they share the record encoding:
@@ -1517,3 +1518,36 @@ vm.py no longer attaches a second disk.
 Verified by artifacts/suite-005 (KVM, reusing suite-004 AEGIS/4096 and AES/512
 fixtures): native, faults, profile, cancel, lifecycle, batch, early, power and
 v4 passed (18/18 VMs, all host checks verified); 61 host unit tests pass.
+
+## Session handoff: v4 default for 16-byte-IV profiles (2026-10-21)
+
+User decision: newly initialized AEGIS-128 volumes default to format v4 (12-byte
+IV profiles stay v3; `--format 3` still selects v3 on AEGIS).
+
+- Setup (pivstore/blocks.py, CLI help): initialize without --format picks 4 on
+  16-byte IVs, else 3.
+- Kernel (piv-native.inc, pn_setup_unlock): the v4 keyslot check now runs as
+  soon as the scan has collected the 112 keyslot sectors, and a successful
+  unlock stops v3 record probing. Before, a v4 open probed every v3 record
+  (5,916 record decrypts on AEGIS/512) because no v3 record authenticates on a
+  v4 volume. Same outcome and I/O; now 3 probes. Found via the profile suite.
+- Suites updated for v4 semantics on AEGIS: dual (capacity, damage at block 0's
+  record sector 292 not keyslot sector 0, no invalid markers on decoy writes,
+  1 KiB ext2 blocks for the 158,720-byte hidden view), faults (record geometry
+  helpers), profile (exact v4 kprobe counts), cancel (28 + 90 + 90k
+  encryptions; interrupted v4 re-initialization leaves later blocks EIO because
+  the master key changes first), batch (one encryption per touched sector),
+  power (block 0 carrier at sectors 292-381, 90 IVs), controls and
+  analyze_controls (native v4 IV footprint equals the stock arm; v3 equals the
+  stock-refresh arm), suite host checks pick the format from the profile.
+- Docs: README capacity table, format-v4.md, hidden-format.md, cancellation.md,
+  AGENTS.md.
+
+Evidence (KVM, suite-004 fixtures): suite-008 AEGIS/4096, AEGIS/512 and
+AES/512 (v3 control) passed native, faults, profile, lifecycle, batch, early,
+power, controls and v4 with every closed image host-verified (v4 decode via
+keyslot); cancel passed in suite-009 after switching its leading-block check to
+O_DIRECT (buffered page reads include unavailable neighbours). v4 setup probe
+count: record=3 on both AEGIS geometries. Power on AEGIS/4096 observed 32/90
+changed carrier IVs and recovered to local EIO. 61 host tests pass.
+Not rerun: ChaCha profiles and AES/4096 (test-only changes on v3 paths).

@@ -17,6 +17,10 @@ DECOY = '/dev/mapper/piv-native-decoy'
 HIDDEN = '/dev/mapper/piv-native-hidden'
 
 NAMES = ('piv-native-hidden', 'piv-native-decoy', 'piv-native', 'piv-native_dif')
+# Format v4 layout (docs/format-v4.md): 112 keyslot sectors, 90-sector records,
+# two directory groups; hidden block 0 starts at primary sector 112 + 2 * 90.
+V4_KEYSLOT_AREA, V4_GROUP = 112, 90
+V4_BLOCK0 = V4_KEYSLOT_AREA + 2 * V4_GROUP
 
 def absent():
     for name in NAMES:
@@ -41,7 +45,14 @@ def setup(initialize=False, uninitialized=False, rejected=False):
     segment = json.loads(crypt('luksDump', '--dump-json-metadata', '/dev/vdb').stdout)['segments']['0']
     sector_size = segment['sector_size']
     iv_size = 16 if segment['encryption'] == 'aegis128-random' else 12
-    assert value['hidden_bytes'] == primary_bytes // sector_size // (576 // iv_size) * 512
+    sectors = primary_bytes // sector_size
+    # Initialization defaults to v4 on 16-byte-IV profiles; a stock carrier
+    # opened as uninitialized has no keyslot and is served as v3.
+    if iv_size == 16 and not uninitialized:
+        expected = ((sectors - V4_KEYSLOT_AREA) // V4_GROUP - 2) * 512
+    else:
+        expected = sectors // (576 // iv_size) * 512
+    assert value['hidden_bytes'] == expected, (value, expected)
     assert value['decoy'] == DECOY and value['hidden'] == HIDDEN
     return value
 
@@ -142,13 +153,17 @@ assert Path(HIDDEN).read_bytes() == before_hidden
 print('Native block RMW, hidden preservation and reopen passed', flush=True)
 # Re-encode one primary sector with a different IV through the authenticated
 # control helper, simulating a legitimate stock write that destroys one record.
+# v3 block 0 starts at primary sector 0; in v4 sector 0 is a keyslot replica,
+# so damage the first sector of hidden block 0's record instead.
 close()
 owner = GuestOwner('/dev/vdb', W / 'passphrase.key')
+v4 = owner.device.iv_size == 16
+damaged = V4_BLOCK0 if v4 else 0
 owner.device.suspend(); owner.device.begin()
-old_iv = owner.device.read_iv(0, quiesced=True)
+old_iv = owner.device.read_iv(damaged, quiesced=True)
 new_iv = os.urandom(owner.device.iv_size)
-prepared = owner.device.prepare(0, old_iv, new_iv)
-owner.device.apply(0, old_iv, prepared)
+prepared = owner.device.prepare(damaged, old_iv, new_iv)
+owner.device.apply(damaged, old_iv, prepared)
 owner.device.end(); owner.device.resume(); owner.remove(); owner.close()
 setup()
 def unavailable(index):
@@ -161,13 +176,19 @@ def unavailable(index):
 unavailable(0)
 assert Path(HIDDEN).open('rb').read(0) == b''
 fd = os.open(DECOY, os.O_RDWR)
-original = os.pread(fd, 4096, 0)
-os.pwrite(fd, original, 0); os.fsync(fd); os.close(fd)
-# Decoy write marks unavailable data invalid; it must not manufacture zeros.
+decoy_offset = damaged * sector_size // 4096 * 4096
+original = os.pread(fd, 4096, decoy_offset)
+os.pwrite(fd, original, decoy_offset); os.fsync(fd); os.close(fd)
+# Decoy write keeps unavailable data unavailable; it must not manufacture zeros.
+# v3 rewrites the group with an encrypted invalid marker; v4 re-randomizes only
+# the written sectors and preserves their (damaged) fragments, so no marker.
 subprocess.run(['blockdev', '--flushbufs', HIDDEN], check=True)
 unavailable(0)
 owner = GuestOwner('/dev/vdb', W / 'passphrase.key')
-assert native_status(owner.device)['invalidations'] >= 1
+if v4:
+    assert native_status(owner.device)['invalidations'] == 0
+else:
+    assert native_status(owner.device)['invalidations'] >= 1
 assert not native_status(owner.device)['failed']
 owner.close()
 fd = os.open(HIDDEN, os.O_RDWR | os.O_DIRECT)
@@ -197,7 +218,9 @@ print('Damaged-record isolation, invalid-marker preservation, repair and wrong-k
 # Real filesystems mounted on BOTH native block devices, simultaneously.
 primary = Path('/run/piv-primary'); primary.mkdir(exist_ok=True)
 hidden = Path('/run/piv-hidden-volume'); hidden.mkdir(exist_ok=True)
-subprocess.run(['mkfs.ext2', '-q', '-F', '-b', '4096', '-N', '32', HIDDEN], check=True)
+# v4 on 4096-byte sectors gives only 158,720 hidden bytes: use 1 KiB blocks there.
+block = '4096' if capacity >= 256 * 1024 else '1024'
+subprocess.run(['mkfs.ext2', '-q', '-F', '-b', block, '-N', '32', HIDDEN], check=True)
 subprocess.run(['mount', DECOY, str(primary)], check=True)
 subprocess.run(['mount', HIDDEN, str(hidden)], check=True)
 errors = []

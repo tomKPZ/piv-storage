@@ -21,16 +21,24 @@ views = open_blocks('/dev/mapper/piv-test-delay', w / 'passphrase.key',
 owner = GuestOwner('/dev/mapper/piv-test-delay', w / 'passphrase.key', allow_test_stack=True)
 layout = owner.layout
 owner.close()
-base = layout.offsets(0)[1]
-assert base % 512 == 0
+# Hidden block 0's carrier: v3 starts at sector 0 with 576 // iv sectors; the
+# default v4 initialization on 16-byte IVs puts it after 112 keyslot sectors
+# and two 90-sector directory groups.
+if layout.iv_bytes == 16:
+    first, group = 112 + 2 * 90, 90
+else:
+    first, group = 0, 576 // layout.iv_bytes
+start = layout.offsets(first)[1]
+base = start // 512 * 512
+skip = start - base
+assert layout.offsets(first + group - 1)[1] == start + (group - 1) * layout.tuple_bytes
 raw = os.open('/dev/vdb', os.O_RDONLY | os.O_DIRECT)
-group = 576 // layout.iv_bytes
 tuple_size = layout.tuple_bytes
-carrier_bytes = ((group * tuple_size + 511) // 512) * 512
+carrier_bytes = ((skip + group * tuple_size + 511) // 512) * 512
 buffer = mmap.mmap(-1, carrier_bytes)
 def carrier():
     assert os.preadv(raw, [buffer], base) == carrier_bytes
-    return [buffer[i * tuple_size + 16:(i + 1) * tuple_size] for i in range(group)]
+    return [buffer[skip + i * tuple_size + 16:skip + (i + 1) * tuple_size] for i in range(group)]
 before = carrier()
 journal_base = layout.integrity_offset + 8 * 512
 journal_bytes = layout.journal_sections * layout.journal_section_sectors * 512
@@ -52,8 +60,9 @@ def committed_new_ivs():
             for entry in range(504 // stride):
                 at = section_base + header * 512 + entry * stride
                 sector = int.from_bytes(journal[at:at + 8], 'little')
-                if sector % factor or sector >= group * factor: continue
-                index = sector // factor
+                if sector % factor: continue
+                index = sector // factor - first
+                if not 0 <= index < group: continue
                 if journal[at + iv_at:at + iv_at + layout.iv_bytes] != before[index]: changed.add(index)
     return changed
 old = (w / 'expected-hidden-volume').read_bytes()

@@ -23,6 +23,12 @@ still authenticates the entire primary; it does not adopt an incomplete scan.
 Cancellation during --initialize waits for the current pn_write call to finish,
 then stops before another record starts. Under healthy I/O, completed leading
 records contain authenticated zeros and the remainder retains its earlier state.
+For format v4 (the default on 16-byte-IV profiles) the new master key, keyslot 0
+and directory are written before any record, so the remainder instead returns
+EIO: earlier records no longer authenticate under the new key. Setup does not
+poll between the keyslot and directory writes; only a crash there could leave a
+keyslot without a directory, which later opens refuse until --initialize is
+retried.
 This is destructive partial initialization, not rollback or persistent progress.
 Reopening without --initialize exposes that mixed content. Retrying --initialize
 starts from block zero with fresh random encodings; it is not resume and consumes

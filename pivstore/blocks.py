@@ -103,8 +103,8 @@ def open_blocks(source, key_file, hidden_key, *, name='piv-native', initialize=F
                 hidden_passphrase=None):
     """Open paired views. On 16-byte-IV profiles the hidden key is a format v4
     keyslot KEK (or derived from @hidden_passphrase) and the format is detected:
-    a v4 keyslot, else a v3 record. format=4 requires v4; initialization uses
-    format (default 3) and ab.
+    a v4 keyslot, else a v3 record. format=4 requires v4. Initialization uses
+    format and ab; its default is 4 on 16-byte-IV profiles and 3 otherwise.
     """
     if hidden_passphrase is None and len(hidden_key) != 32:
         raise ValueError('Hidden key must contain exactly 32 bytes')
@@ -120,6 +120,8 @@ def open_blocks(source, key_file, hidden_key, *, name='piv-native', initialize=F
                 raise FileExistsError('Public view name is already in use')
         if format == 4 and owner.device.iv_size != 16:
             raise ValueError('Format v4 requires a 16-byte IV (AEGIS-128) primary profile')
+        if initialize and format is None:
+            format = 4 if owner.device.iv_size == 16 else 3
         identity = base_identity(owner)
         if hidden_passphrase is not None:
             if owner.device.iv_size != 16:

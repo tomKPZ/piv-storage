@@ -44,10 +44,11 @@ def main():
             if action == 'open-blocks':
                 block.add_argument('--initialize', action='store_true')
                 block.add_argument('--format', type=int, choices=(3, 4),
-                                   help='Initialization format (default 3); at open, 4 requires a v4 '
-                                        'keyslot (otherwise detected). 4 needs a 16-byte IV profile')
+                                   help='Initialization format (default 4 on 16-byte-IV profiles, else 3); '
+                                        'at open, 4 requires a v4 keyslot (otherwise detected). '
+                                        '4 needs a 16-byte IV profile')
                 block.add_argument('--ab', action='store_true',
-                                   help='With --initialize --format 4: A/B record slots')
+                                   help='With --initialize on format 4: A/B record slots')
                 block.add_argument('--uninitialized', action='store_true',
                                    help='Accept a carrier with no authenticating hidden record; '
                                         'decoy writes then cannot preserve hidden data under a wrong key')

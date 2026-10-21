@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from control_metrics import workload, payload, byte_statistics, region, trace_summary, journal_sample
 from pivstore.profile import Image
 from pivstore.records import decode_image
+from pivstore.records_v4 import decode_image as decode_v4
 from pivstore.sector import SectorCodec
 
 
@@ -59,7 +60,13 @@ def analyze(root, primary_key, hidden_key):
                 if old_tuple[16:] != new_tuple[16:]:
                     changed_iv.append(index)
                     if old == new: same_plain_reencrypted.append(index)
-            assert set(changed_iv) == (requested if name == 'stock' else expanded)
+            # Native arms are default-initialized: format v4 on 16-byte IVs, whose
+            # decoy writes change only the requested sectors' IVs (like stock);
+            # v3 refreshes whole carrier groups (like the stock-refresh control).
+            v4 = layout.iv_bytes == 16
+            footprint = {'stock': requested, 'stock-refresh': expanded,
+                         'native': requested if v4 else expanded}[name]
+            assert set(changed_iv) == footprint, (name, sorted(set(changed_iv) ^ footprint)[:16])
             assert len(set(ivs)) == len(ivs), 'Duplicate CURRENT IV'
             primary_before, primary_after = digest_before.hexdigest(), digest_after.hexdigest()
             assert primary_before == entry['before_primary'] and primary_after == entry['after_primary']
@@ -74,7 +81,12 @@ def analyze(root, primary_key, hidden_key):
             physical = Counter()
             for offset in range(0, before.size, 512):
                 if before.read(512, offset) != after.read(512, offset): physical[region(layout, offset)] += 1
-            hidden = decode_image(after, hidden_key) if name == 'native' else None
+            if name != 'native':
+                hidden = None
+            elif v4:
+                hidden = decode_v4(after, hidden_key)
+            else:
+                hidden = decode_image(after, hidden_key)
             if hidden is not None: assert hidden == bytes(len(hidden))
             physical_io = trace_summary((root / (name + '.trace')).read_text(), layout, entry['trace_device'], before.size)
             assert physical_io['total_queued_write_bytes'] > 0, 'Write workload has no captured lower writes'
@@ -89,9 +101,13 @@ def analyze(root, primary_key, hidden_key):
                 live_journal=journal_sample((root / (name + '-journal.bin')).read_bytes(), layout),
                 native_hidden_bytes_verified=len(hidden) if hidden is not None else None)
     if set(arms) != {'stock', 'stock-refresh', 'native'}: raise ValueError('Missing control arm')
-    assert arms['native']['changed_iv_indices'] == arms['stock-refresh']['changed_iv_indices']
+    native_format = 4 if common_layout.iv_bytes == 16 else 3
+    matched = 'stock' if native_format == 4 else 'stock-refresh'
+    assert arms['native']['changed_iv_indices'] == arms[matched]['changed_iv_indices']
     return dict(layout=manifest['layout'], encryption=manifest['encryption'], luks_header_sha256=header,
-                arms=arms, conclusion='Matched-workload footprints differ; stock same-data refresh can match IV-change support. No indistinguishability proof.',
+                native_format=native_format, native_iv_footprint_matches=matched,
+                arms=arms, conclusion=('Matched-workload IV footprints: native v4 equals stock; native v3 equals the '
+                                       'stock same-data refresh control. No indistinguishability proof.'),
                 limits=['One synthetic volume per profile; sequential same-key arms and fresh evolving CRNG.',
                         'Native initialization precedes its baseline; initialization itself is excluded from workload trace.',
                         'Trace counts are submissions in a bounded window, not physical media bytes or stable timing.',

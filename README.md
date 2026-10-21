@@ -49,20 +49,20 @@ blocks. For our 128 MiB disk fixtures:
 | --- | ---: | ---: | ---: |
 | AES-GCM / ChaCha20-Poly1305 | 4096 | 115,687,424 | 301,056 |
 | AES-GCM / ChaCha20-Poly1305 | 512 | 109,977,600 | 2,291,200 |
-| AEGIS-128 | 4096 | 115,572,736 | 400,896 |
-| AEGIS-128 | 512 | 109,060,096 | 3,028,992 |
+| AEGIS-128 (default v4) | 4096 | 115,572,736 | 158,720 |
+| AEGIS-128 (default v4) | 512 | 109,060,096 | 1,209,856 |
 
-For AEGIS-128 volumes, `--initialize --format 4` creates the
-[fragment-local format v4](docs/format-v4.md): a decoy write re-randomizes only
-the IVs of the sectors it writes (one primary encryption per written sector, as
-stock dm-crypt), at lower hidden capacity: 158,720 bytes (4096-byte sectors) or
-1,209,856 bytes (512-byte sectors) on these fixtures. Adding `--ab` keeps two
-record slots per block so an interrupted hidden write leaves the previous
-version readable, at half that capacity. v4 stores a random master key in up to
-four encrypted keyslots (no public header); the hidden key file is a keyslot
-key, or use `--hidden-passphrase-file` (scrypt). Later opens detect the format
-and layout from the keyslot. `python3 -m pivstore keyslot add|remove --slot N`
-adds or retires keys on active views without rewriting hidden data.
+AEGIS-128 volumes are initialized with the
+[fragment-local format v4](docs/format-v4.md) by default (since 2026-10-21): a
+decoy write re-randomizes only the IVs of the sectors it writes (one primary
+encryption per written sector, as stock dm-crypt), at lower hidden capacity than
+v3 (`--format 3`: 400,896 or 3,028,992 bytes on these fixtures). Adding `--ab`
+keeps two record slots per block so an interrupted hidden write leaves the
+previous version readable, at half the v4 capacity. v4 stores a random master
+key in up to four encrypted keyslots (no public header); the hidden key file is
+a keyslot key, or use `--hidden-passphrase-file` (scrypt). Later opens detect
+the format and layout from the keyslot. `python3 -m pivstore keyslot add|remove
+--slot N` adds or retires keys on active views without rewriting hidden data.
 
 The hidden volume is already encrypted underneath its block interface. Setup
 never creates filesystems. **--initialize destroys all existing hidden contents**

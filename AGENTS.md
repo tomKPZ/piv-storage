@@ -54,7 +54,8 @@ resolved from context/evidence, not for routine implementation decisions.
   payload bytes per IV), 90-fragment SIV records, encrypted keyslots (no
   public magic) with a directory, scrypt passphrase KEKs and optional A/B
   slots. Never add a persistent encryption counter. v3 remains for 12-byte
-  IVs and is still the initialization default. Still planned: stock
+  IVs; initialization defaults to v4 on 16-byte-IV profiles (user decision
+  2026-10-21) and v3 otherwise. Still planned: stock
   `--integrity-no-journal` support (needs a torn-sector policy decision, see
   docs/journal-atomicity.md) and a Rust setup port (Python diagnostics remain).
   AEGIS-128 is the recommended profile.

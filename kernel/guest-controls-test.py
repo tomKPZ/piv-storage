@@ -118,7 +118,11 @@ for arm in ('stock', 'stock-refresh', 'native'):
     assert not re.search(r'(?:overrun|dropped events):\s*[1-9]', stats), stats
     after_hash = subprocess.check_output(['sha256sum', path], text=True).split()[0]
     if arm == 'native':
-        assert Path('/dev/mapper/piv-native-hidden').read_bytes() == bytes(layout.sectors // (576 // layout.iv_bytes) * 512)
+        # Default initialization: v4 on 16-byte IVs (112 keyslot sectors, two
+        # directory groups, 90-sector records), else v3.
+        records = ((layout.sectors - 112) // 90 - 2 if layout.iv_bytes == 16
+                   else layout.sectors // (576 // layout.iv_bytes))
+        assert Path('/dev/mapper/piv-native-hidden').read_bytes() == bytes(records * 512)
     closed(arm)
     copy_disk(arm + '-after.img')
     if arm == 'native': subprocess.run(['rmmod', 'dm_piv'], check=True)

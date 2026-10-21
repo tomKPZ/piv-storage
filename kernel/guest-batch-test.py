@@ -20,6 +20,9 @@ subprocess.run(['udevadm', 'settle'], check=True)
 owner = GuestOwner('/dev/vdb', KEY)
 unit = owner.device.sector_size
 group = 576 // owner.device.iv_size
+# Closed native fixtures are default-initialized: v4 on 16-byte-IV profiles.
+# A v4 decoy write re-encrypts only the sectors it touches (no group refresh).
+v4 = owner.device.iv_size == 16
 size = owner.device.sectors * unit
 groups_end = owner.device.sectors // group * group * unit
 # Current target contract; historical pre-batching runs retain frozen harnesses.
@@ -46,6 +49,10 @@ def expected_count(offset, count):
     while offset < end:
         stop = min(end, (offset // quantum + 1) * quantum)
         first, last = offset // unit, (stop - 1) // unit
+        if v4:
+            total += last - first + 1
+            offset = stop
+            continue
         full = owner.device.sectors // group
         total += max(0, min(last // group, full - 1) - first // group + 1) * group
         total += max(0, last - max(first, full * group) + 1)
@@ -89,5 +96,5 @@ assert subprocess.check_output(['sha256sum', '/dev/mapper/piv-stock'], text=True
 subprocess.run(['cryptsetup', 'close', 'piv-stock'], check=True)
 subprocess.run(['dd', 'if=/dev/vdb', 'of=' + str(W / 'batch-final.img'), 'bs=1M', 'status=none'], check=True)
 (W / 'batch-results.json').write_text(json.dumps(dict(batched=batched, primary_sector=unit,
-    group=group, cases=results), indent=2) + '\n')
+    format=4 if v4 else 3, group=group, cases=results), indent=2) + '\n')
 (W / 'result.txt').write_text('Batch counts, direct read/write/restore, full oracles, reopen and stock verification passed\n')

@@ -98,6 +98,7 @@ for repeat in range(3):
     if repeat == 0:
         owner = GuestOwner('/dev/vdb', KEY)
         sectors, unit, group = owner.device.sectors, owner.device.sector_size, 576 // owner.device.iv_size
+        owner_iv = owner.device.iv_size
         before = blocks.native_status(owner.device)['encryptions']
         measure_reads(views['decoy'], primary, 'native-decoy')
         measure_reads(views['hidden'], EXPECTED, 'hidden')
@@ -159,17 +160,35 @@ try:
         probe_command(f'p:piv_profile/{event} {function}')
         registered.append(event)
     (T / 'events/piv_profile/enable').write_text('1')
+    per_range = 16384 // unit
+    # Closed native fixtures are default-initialized: v4 on 16-byte-IV profiles.
+    v4 = owner_iv == 16
+    v4_ranges = (90 + per_range - 1) // per_range  # one 90-sector v4 record
+    if v4:
+        # v4: the keyslot check runs once the scan passes the 112 keyslot
+        # sectors; only v3 records completed before then are probed. The
+        # directory (groups 0 and 1) is then read and authenticated.
+        unlock_at = (112 + per_range - 1) // per_range * per_range
+        setup_expected = dict(load=1, range=(sectors + per_range - 1) // per_range + 2 * v4_ranges,
+                              crypto=sectors + 1 + 2 * 90, record=unlock_at // group, write=0, checkpoint=1)
+    else:
+        # Wrong-key guard: the first v3 record proves the key.
+        setup_expected = dict(load=1, range=(sectors + per_range - 1) // per_range,
+                              crypto=sectors + 1, record=1, write=0, checkpoint=1)
     def counted_setup(*args, **kwargs):
-        counted('setup-ioctl', lambda: original_setup(*args, **kwargs),
-                dict(load=1, range=(sectors + 16384 // unit - 1) // (16384 // unit),
-                     crypto=sectors + 1, record=1, write=0, checkpoint=1))  # wrong-key guard: first record proves the key
+        counted('setup-ioctl', lambda: original_setup(*args, **kwargs), setup_expected)
     blocks.native_setup = counted_setup
     views = blocks.open_blocks('/dev/vdb', KEY, HKEY)
     blocks.native_setup = original_setup
     subprocess.run(['udevadm', 'settle'], check=True)
-    for role, count, loads, records in (('decoy', 512, 1, 0),
-            ('decoy', 16384, 16384 // unit, 0), ('hidden', 512, group, 1),
-            ('hidden', 4096, 8 * group, 8)):
+    if v4:
+        # v4 hidden reads authenticate each block's 90 sectors (no v3 record path).
+        hidden_cases = (('hidden', 512, 90, 0, v4_ranges), ('hidden', 4096, 8 * 90, 0, 8 * v4_ranges))
+    else:
+        v3_ranges = (group + per_range - 1) // per_range
+        hidden_cases = (('hidden', 512, group, 1, v3_ranges), ('hidden', 4096, 8 * group, 8, 8 * v3_ranges))
+    for role, count, loads, records, ranges in (('decoy', 512, 1, 0, 1),
+            ('decoy', 16384, per_range, 0, 1)) + hidden_cases:
         def read():
             with mmap.mmap(-1, count) as buf:
                 fd = os.open(views[role], os.O_RDONLY | os.O_DIRECT)
@@ -178,8 +197,7 @@ try:
                     assert buf[:] == (primary if role == 'decoy' else EXPECTED)[:count]
                 finally:
                     os.close(fd)
-        counted(f'{role}-{count}', read, dict(load=0, range=(records * ((group + 16384 // unit - 1) // (16384 // unit))
-                                   if records else 1),
+        counted(f'{role}-{count}', read, dict(load=0, range=ranges,
                 crypto=loads, record=records, write=0, checkpoint=0))
     (W / 'profile-kprobe-counts.txt').write_text((T / 'kprobe_profile').read_text())
 finally:
@@ -196,7 +214,7 @@ crypt('open', '--readonly', '--key-file', KEY, '/dev/vdb', 'piv-stock-profile')
 assert subprocess.check_output(['sha256sum', '/dev/mapper/piv-stock-profile'], text=True).split()[0] == PRIMARY
 crypt('close', 'piv-stock-profile')
 subprocess.run(['dd', 'if=/dev/vdb', 'of=' + str(W / 'profile-final.img'), 'bs=1M', 'status=none'], check=True)
-results.update(primary_sector=unit, primary_sectors=sectors, group=group,
+results.update(primary_sector=unit, primary_sectors=sectors, group=group, format=4 if v4 else 3,
                cache_state='warm guest/host caches; O_DIRECT bypasses public page cache only',
                timings_include_python_comparison=True, probes_used_during_timing=False, bounded_range_reads=True)
 (W / 'profile-results.json').write_text(json.dumps(results, indent=2) + '\n')

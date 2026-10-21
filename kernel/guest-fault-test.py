@@ -22,6 +22,25 @@ PRIMARY = (W / 'expected-primary.sha256').read_text().strip()
 NAMES = ('piv-native-hidden', 'piv-native-decoy', 'piv-native', 'piv-native_dif')
 results = []
 
+# Closed native fixtures are default-initialized: format v4 on 16-byte-IV
+# profiles (112 keyslot sectors, two directory groups, 90-sector records),
+# v3 otherwise (576 // iv_size sectors per record from sector 0).
+def record_span(device, block):
+    """First and last primary sector carrying hidden block @block."""
+    if device.iv_size == 16:
+        first = 112 + 90 * (2 + block)
+        return first, first + 89
+    group = 576 // device.iv_size
+    return block * group, block * group + group - 1
+
+def blocks_touched(device, first, last):
+    """Hidden blocks with a fragment in primary sectors first..last."""
+    if device.iv_size == 16:
+        low, high = (first - 112) // 90 - 2, (last - 112) // 90 - 2
+        return range(max(0, low), high + 1) if last >= 112 + 180 else range(0)
+    group = 576 // device.iv_size
+    return range(first // group, last // group + 1)
+
 def open_views():
     value = blocks.open_blocks(SOURCE, KEY, HKEY, allow_test_stack=True)
     subprocess.run(['udevadm', 'settle'], check=True)
@@ -166,11 +185,12 @@ for role in ('decoy', 'hidden'):
         generation = handle.device.generation
         # Sector0 may be served from dm-integrity's cached setup checkpoint.
         # Choose record10, which setup did not write, and witness the raw fault.
-        carrier_bytes = (576 // handle.device.iv_size) * handle.device.sector_size
+        unit = handle.device.sector_size
         size = 512 if role == 'hidden' else 16384
-        offset = 10 * 512 if role == 'hidden' else ((10 * carrier_bytes + size - 1) // size) * size
+        start = record_span(handle.device, 10)[0] * unit
+        offset = 10 * 512 if role == 'hidden' else ((start + size - 1) // size) * size
         affected = (range(10, 11) if role == 'hidden' else
-                    range(offset // carrier_bytes, (offset + size - 1) // carrier_bytes + 1))
+                    blocks_touched(handle.device, offset // unit, (offset + size - 1) // unit))
         old = direct(v[role], offset=offset, size=size)
         before_count = blocks.native_status(handle.device)['encryptions']
         print(f'Injecting lower {mode} through {role}, {size} bytes at offset {offset}', flush=True)
@@ -228,10 +248,11 @@ for role in ('decoy', 'hidden'):
     v = open_views()
     handle = owner()
     generation = handle.device.generation
-    unit, group = handle.device.sector_size, 576 // handle.device.iv_size
+    unit = handle.device.sector_size
     size = 16384 if role == 'decoy' else 512
-    offset = ((10 * group * unit + size - 1) // size) * size if role == 'decoy' else 10 * 512
-    last = ((offset + size - 1) // unit if role == 'decoy' else 11 * group - 1)
+    first10, last10 = record_span(handle.device, 10)
+    offset = ((first10 * unit + size - 1) // size) * size if role == 'decoy' else 10 * 512
+    last = ((offset + size - 1) // unit if role == 'decoy' else last10)
     physical = handle.layout.offsets(last)[0]
     original = direct('/dev/vdb', offset=physical, size=512)
     replacement = original[0] ^ 1
@@ -281,15 +302,19 @@ results.append('late primary corruption rejected during setup, cleanup and reope
 
 # A legitimate fresh-IV primary rewrite destroys one hidden record only.
 handle = owner(); dev = handle.device
+damaged = record_span(dev, 0)[0]  # v3: sector 0; v4: sector 0 is a keyslot replica
 handle.device.suspend(); dev.begin()
-old = dev.read_iv(0, quiesced=True)
-value = dev.prepare(0, old, os.urandom(dev.iv_size))
-dev.apply(0, old, value); dev.end(); dev.resume(); handle.remove(); handle.close()
+old = dev.read_iv(damaged, quiesced=True)
+value = dev.prepare(damaged, old, os.urandom(dev.iv_size))
+dev.apply(damaged, old, value); dev.end(); dev.resume(); handle.remove(); handle.close()
 v = open_views()
 assert rejected(lambda: direct(v['hidden'])).errno == errno.EIO
 assert direct(v['hidden'], offset=512) == EXPECTED[512:1024]
 handle = owner(); assert not blocks.native_status(handle.device)['failed']; handle.close()
-direct(v['decoy'], write=direct(v['decoy']))
+# Rewrite the decoy bytes carrying that sector (v3: refreshes the group with an
+# invalid marker; v4: re-randomizes only that sector, preserving the damage).
+decoy_offset = damaged * dev.sector_size // 4096 * 4096
+direct(v['decoy'], write=direct(v['decoy'], offset=decoy_offset), offset=decoy_offset)
 assert rejected(lambda: direct(v['hidden'])).errno == errno.EIO
 handle = owner(); assert not blocks.native_status(handle.device)['failed']; handle.close()
 direct(v['hidden'], write=EXPECTED[:512]); assert verify(v) is False
