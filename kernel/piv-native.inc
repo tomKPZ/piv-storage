@@ -230,22 +230,31 @@ static int pn_v4_tag(struct piv_native *n, const u8 mac[32], const u8 *context, 
 }
 
 /* ChaCha20(enc, counter 0, nonce = tag[0:12]) in place on a heap buffer. */
+/* ChaCha20 keystream XOR over @buffer. Callers may pass stack memory, which a
+ * scatterlist must never reference (VMAP_STACK: virt_to_page() of a vmalloc
+ * address names the wrong page; CONFIG_DEBUG_SG BUG()s). Bounce through the
+ * linear heap. Found by the KASAN/DEBUG_SG sanitizer guest (2026-10-21).
+ */
 static int pn_v4_stream(struct piv_native *n, const u8 enc[32], const u8 tag[16], u8 *buffer, size_t length)
 {
 	struct skcipher_request *req;
 	struct scatterlist sg;
 	DECLARE_CRYPTO_WAIT(wait);
-	u8 iv[16] = {};
+	u8 iv[16] = {}, *bounce;
 	int r = crypto_skcipher_setkey(n->chacha, enc, 32);
 	if (r) return r;
+	bounce = kmemdup(buffer, length, GFP_NOIO);
 	req = skcipher_request_alloc(n->chacha, GFP_NOIO);
-	if (!req) return -ENOMEM;
+	if (!bounce || !req) { r = -ENOMEM; goto out; }
 	memcpy(iv + 4, tag, 12);
-	sg_init_one(&sg, buffer, length);
+	sg_init_one(&sg, bounce, length);
 	skcipher_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG, crypto_req_done, &wait);
 	skcipher_request_set_crypt(req, &sg, &sg, length, iv);
 	r = crypto_wait_req(crypto_skcipher_encrypt(req), &wait);
+	if (!r) memcpy(buffer, bounce, length);
+out:
 	skcipher_request_free(req);
+	kfree_sensitive(bounce);
 	return r;
 }
 

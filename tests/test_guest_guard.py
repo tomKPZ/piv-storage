@@ -9,13 +9,22 @@ from pivstore.kernel_owner import guest_guard
 
 class GuestGuardTests(unittest.TestCase):
     def guarded(self, size, source='/dev/vdb', allow_test_stack=False, *, mode=stat.S_IFBLK,
-                vendor='QEMU', kernel='6.12.113+deb13-amd64', uid=0):
+                vendor='QEMU', kernel='6.12.113+deb13-amd64', uid=0, debug_marker=False):
         with patch('pivstore.kernel_owner.os.geteuid', return_value=uid), \
              patch('pivstore.kernel_owner.os.uname', return_value=SimpleNamespace(release=kernel)), \
              patch('pivstore.kernel_owner.Path.read_text', return_value=vendor), \
+             patch('pivstore.kernel_owner.Path.exists', return_value=debug_marker), \
              patch('pivstore.kernel_owner.Path.stat', return_value=SimpleNamespace(st_mode=mode)), \
              patch('pivstore.kernel_owner.subprocess.check_output', return_value=str(size)):
             return guest_guard(source, allow_test_stack)
+
+    def test_debug_kernel_needs_explicit_image_marker(self):
+        size = 128 * 1024 * 1024
+        with self.assertRaises(ValueError):
+            self.guarded(size, kernel='6.12.113+deb13-amd64-pivdbg')
+        self.assertEqual(self.guarded(size, kernel='6.12.113+deb13-amd64-pivdbg', debug_marker=True), size)
+        with self.assertRaises(ValueError):
+            self.guarded(size, kernel='6.12.113+deb13-amd64-other', debug_marker=True)
 
     def test_only_explicit_fixture_sizes(self):
         for mib in (128, 512):

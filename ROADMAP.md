@@ -1613,3 +1613,39 @@ cancellation (same handler as SIGINT, no dedicated test).
 Next: sanitizer (KASAN/UBSAN/lockdep) guest kernel (approved; needs vm.py
 CPU/RAM/disk options, a debug kernel package and an explicit guard opt-in for
 its release string), then kunit/fuzzing, then the newer-kernel port.
+
+## Session handoff: sanitizer guest and a v4 scatterlist defect (2026-10-21)
+
+Approved C-hardening step: a KASAN/UBSAN/lockdep/DEBUG_SG/kmemleak build of the
+pinned 6.12.113 kernel, built and used only inside disposable guests
+(docs/sanitizer.md). scripts/build_debug_kernel.py builds the packages (~3 min
+under KVM), installs them into a derived read-only image
+`downloads/debug-kernel-<hash>.qcow2` with an explicit `/etc/piv-debug-kernel`
+marker that the guest guards (shell, Python, Rust) require for the
+`6.12.113+deb13-amd64-pivdbg` release, and verifies the boot. vm.py gained
+`--smp/--memory-mib/--base-image` and keeps logging after kernel faults;
+suite.py gained `--base-image/--memory-mib` and now fails any run with a
+kernel self-report (KASAN/UBSAN/lockdep/BUG/WARNING/kmemleak) in its console
+or dmesg (no false positives across the 74 stock suite-016 runs).
+
+**Defect found and fixed (concrete memory-safety class, overrides ordering):**
+pn_v4_stream built a scatterlist over caller memory, and keyslot unlock passed
+a stack buffer. Under VMAP_STACK that is invalid; DEBUG_SG BUG()ed on the first
+v4 open. Stock x86-64 software ChaCha happened to round-trip the address (all
+stock results were correct), so no corruption was observed, but the code was
+wrong. Fix: bounce every call through kmalloc.
+
+Evidence: suite-018-sanitizer (pre-fix) — AES/ChaCha all suites passed on the
+sanitizer kernel; both AEGIS natives hit the BUG (full trace captured in
+artifacts/dbg-repro-001). suite-019-sanitizer (fix) — AEGIS/4096 native plus
+faults, profile, cancel, lifecycle, batch, early, power, controls and v4 passed
+with no kernel reports; every 4096-byte profile passed fully. The three
+512-byte natives (the only runs longer than kmemleak's 600 s scan interval)
+passed functionally but printed "kmemleak: 6 new suspected memory leaks";
+their dependent suites were not run. suite-020 (stock kernel, fix): 66/66 VMs,
+44/44 host checks.
+
+Open: triage the kmemleak report (guest_record now forces a final scan and
+saves /sys/kernel/debug/kmemleak; reproduction runs in artifacts/dbg-repro-002),
+then rerun the 512-byte sanitizer suites. Afterwards: kunit/fuzzing, newer
+kernel port.

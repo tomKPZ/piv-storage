@@ -16,7 +16,14 @@ use crate::json;
 use crate::profile::{self, Layout};
 
 pub const PINNED_KERNEL: &str = "6.12.113+deb13-amd64";
+/// Sanitizer build of the same source; accepted only on a guest image that
+/// scripts/build_debug_kernel.py explicitly marked with /etc/piv-debug-kernel.
+pub const DEBUG_KERNEL: &str = "6.12.113+deb13-amd64-pivdbg";
 const MIB: u64 = 1024 * 1024;
+
+fn pinned_release(release: &str) -> bool {
+    release == PINNED_KERNEL || (release == DEBUG_KERNEL && Path::new("/etc/piv-debug-kernel").exists())
+}
 
 /// (major, minor, DM UUID) of a mapping, without reading any key-containing table.
 pub type Identity = (String, String, String);
@@ -63,7 +70,7 @@ pub fn guest_guard(source: &Path, allow_test_stack: bool) -> Result<u64> {
     // SAFETY: geteuid has no preconditions.
     let euid = unsafe { libc::geteuid() };
     let vendor = fs::read_to_string("/sys/class/dmi/id/sys_vendor").unwrap_or_default();
-    if euid != 0 || uname_release() != PINNED_KERNEL || vendor.trim() != "QEMU" {
+    if euid != 0 || !pinned_release(&uname_release()) || vendor.trim() != "QEMU" {
         bail!("Kernel setup is restricted to the pinned disposable QEMU guest");
     }
     let mut allowed = vec!["/dev/vdb"];

@@ -2,7 +2,12 @@
 set -euo pipefail
 umask 077
 test "$(id -u)" = 0
-test "$(uname -r)" = 6.12.113+deb13-amd64
+# The pinned kernel, or its sanitizer build only on an explicitly marked debug image.
+case "$(uname -r)" in
+    6.12.113+deb13-amd64) ;;
+    6.12.113+deb13-amd64-pivdbg) test -e /etc/piv-debug-kernel ;;
+    *) echo "Unsupported guest kernel" >&2; exit 1 ;;
+esac
 test "$(findmnt -n -o FSTYPE /mnt/piv-work)" = 9p
 test -b /dev/vdb
 case "$(blockdev --getsize64 /dev/vdb)" in
@@ -44,6 +49,13 @@ guest_build_module() {
     modinfo /root/piv-module/dm-piv.ko > module-info.txt
     sha256sum /lib/modules/"$(uname -r)"/build/Module.symvers > symvers.sha256
     cp /boot/config-"$(uname -r)" kernel.config
+    if test -e /etc/piv-debug-kernel; then
+        # Sanitizer build: bindeb-pkg headers ship no .config; require instead
+        # that the module's vermagic names exactly the running debug kernel.
+        test "$(modinfo -F vermagic /root/piv-module/dm-piv.ko | cut -d ' ' -f 1)" = "$(uname -r)"
+        grep -q '^CONFIG_KASAN=y' kernel.config
+        return
+    fi
     cp /lib/modules/"$(uname -r)"/build/.config headers.config
     python3 check-config.py kernel.config headers.config
 }
@@ -89,6 +101,12 @@ guest_load_module() {
 guest_record() {
     guest_stock_live_check
     printf 'Stock crypt stayed loaded with a writable mounted encrypted filesystem.\n' > /mnt/piv-work/coexistence-result.txt
+    # Sanitizer kernels: force a final kmemleak scan and keep the full report
+    # (backtraces name the allocating code) for triage of any suspected leak.
+    if test -w /sys/kernel/debug/kmemleak; then
+        echo scan > /sys/kernel/debug/kmemleak
+        cat /sys/kernel/debug/kmemleak > /mnt/piv-work/kmemleak.txt
+    fi
     dmesg > /mnt/piv-work/dmesg.txt
     dpkg-query -W -f='${Package}\t${Version}\n' > /mnt/piv-work/packages.tsv
     sync

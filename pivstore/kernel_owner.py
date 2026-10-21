@@ -14,8 +14,19 @@ from .kernel_api import KernelDevice, dm, mapping_identity, remove_mapping, vali
 from .profile import parse_superblock, validate_segment
 
 
+PINNED_KERNEL = '6.12.113+deb13-amd64'
+# Sanitizer (KASAN/UBSAN/lockdep) build of the same source, accepted only on a
+# guest image explicitly marked by scripts/build_debug_kernel.py.
+DEBUG_KERNEL = PINNED_KERNEL + '-pivdbg'
+
+
+def pinned_release():
+    release = os.uname().release
+    return release == PINNED_KERNEL or (release == DEBUG_KERNEL and Path('/etc/piv-debug-kernel').exists())
+
+
 def guest_guard(source, allow_test_stack=False):
-    if (os.geteuid() != 0 or os.uname().release != '6.12.113+deb13-amd64' or
+    if (os.geteuid() != 0 or not pinned_release() or
             Path('/sys/class/dmi/id/sys_vendor').read_text().strip() != 'QEMU'):
         raise ValueError('Kernel setup is restricted to the pinned disposable QEMU guest')
     allowed = ['/dev/vdb']

@@ -97,10 +97,23 @@ class Console:
         self.process.stdin.write(value.encode())
         self.process.stdin.flush()
 
+    def drain(self, seconds):
+        """Keep logging console output for a while (e.g. a kernel fault's trace)."""
+        stop = time.monotonic() + seconds
+        while time.monotonic() < stop and self.selector.select(timeout=0.5):
+            chunk = os.read(self.process.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            if self.log:
+                self.log.write(chunk)
+                self.log.flush()
+
     def expect(self, pattern):
         regex = re.compile(pattern, re.I)
         while True:
             if re.search(rb"kernel BUG at|Oops:|Kernel panic", self.buffer):
+                # Capture the complete report before discarding the run.
+                self.drain(10)
                 raise RuntimeError("Guest kernel fault; inspect console.log and discard run")
             match = regex.search(self.buffer)
             if match:
@@ -124,8 +137,9 @@ class Console:
 
 
 def qemu_command(args, overlay, data, share, extra=()):
+    smp, memory = getattr(args, 'smp', 2), getattr(args, 'memory_mib', 1024)
     return ["qemu-system-x86_64", "-machine", "q35,accel=" + args.accel,
-            "-cpu", "max", "-smp", "2", "-m", "1024",
+            "-cpu", "max", "-smp", str(smp), "-m", str(memory),
             "-drive", f"file={overlay},format=qcow2,if=virtio",
             *(["-drive", f"file={data},format=raw,if=virtio"] if data else []),
             "-nic", "user,model=virtio-net-pci",
@@ -227,6 +241,14 @@ def run(args):
         image = provisioned_path()
         if not image.exists():
             raise FileNotFoundError("Provisioned image missing; run: python3 scripts/vm.py provision")
+    if args.base_image:
+        # A derived, read-only guest image (e.g. the sanitizer-kernel image from
+        # scripts/build_debug_kernel.py). It must boot with serial autologin like
+        # the provisioned image and carry a .json provenance record.
+        image = args.base_image.resolve()
+        if os.access(image, os.W_OK) or not image.with_suffix('.json').is_file():
+            raise ValueError('Base image must be read-only with a .json provenance record')
+        args.provisioned = True
     run_dir = args.run_dir.resolve()
     # Never reuse/overwrite an experiment or attach arbitrary host devices.
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -364,6 +386,10 @@ def main():
     task.add_argument("--share-file", type=Path, action='append', default=[])
     task.add_argument("--code", action='store_true', help='Export package source read-only to the guest')
     task.add_argument("--accel", choices=("tcg", "kvm"), default="tcg")
+    task.add_argument("--smp", type=int, default=2, choices=range(1, 65), metavar="1-64")
+    task.add_argument("--memory-mib", type=int, default=1024)
+    task.add_argument("--base-image", type=Path,
+                      help="Read-only derived guest image with autologin (implies --provisioned boot)")
     task.add_argument("--timeout", type=int, default=1200)
     task.add_argument("--provisioned", action="store_true",
                       help="Boot the cached provisioned image (see provision) instead of first boot")

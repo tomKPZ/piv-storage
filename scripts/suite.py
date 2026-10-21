@@ -13,6 +13,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import re
 import os
 from pathlib import Path
 import subprocess
@@ -40,6 +41,22 @@ def default_format(control):
     return 4 if segment['encryption'] == 'aegis128-random' else 3
 
 
+# Kernel self-reports that fail any run (stock or sanitizer kernel alike).
+KERNEL_REPORT = re.compile(r'BUG: KASAN|UBSAN:|possible circular locking|possible recursive locking|'
+                           r'inconsistent lock state|BUG: sleeping function|BUG: unable to handle|'
+                           r'WARNING: CPU|kernel BUG at|Oops|unreferenced object|suspected memory leak|general protection fault')
+
+
+def kernel_reports(run_dir):
+    found = []
+    for path in (run_dir / 'console.log', run_dir / 'share/dmesg.txt', run_dir / 'share/reboot-dmesg.txt'):
+        if path.exists():
+            for line in path.read_text(errors='replace').splitlines():
+                if KERNEL_REPORT.search(line):
+                    found.append(f'{path.name}: {line.strip()[:200]}')
+    return found[:20]
+
+
 def log(message):
     with lock:
         print(time.strftime('%H:%M:%S'), message, flush=True)
@@ -54,8 +71,12 @@ class Matrix:
     def vm(self, name, script, run_dir, *, data=None, shares=(), timeout=3600, extra=()):
         command = [sys.executable, str(ROOT / 'scripts/vm.py'), 'run', '--script', str(script),
                    '--run-dir', str(run_dir), '--timeout', str(timeout), '--accel', self.args.accel, *extra]
-        if self.args.provisioned:
+        if self.args.base_image:
+            command += ['--base-image', str(self.args.base_image)]
+        elif self.args.provisioned:
             command.append('--provisioned')
+        if self.args.memory_mib:
+            command += ['--memory-mib', str(self.args.memory_mib)]
         if data:
             command += ['--data-image', str(data)]
         for path in (*shares, self.args.pivsetup):
@@ -67,9 +88,11 @@ class Matrix:
             with open(str(run_dir) + '.log', 'wb') as output:
                 code = subprocess.run(command, cwd=ROOT, stdout=output, stderr=subprocess.STDOUT).returncode
         elapsed = round(time.monotonic() - started, 1)
-        log(f'{"PASS" if code == 0 else "FAIL"} {name} ({elapsed} s)')
-        self.record(name, dict(run_dir=str(run_dir), passed=code == 0, seconds=elapsed))
-        return code == 0
+        reports = kernel_reports(run_dir)
+        passed = code == 0 and not reports
+        log(f'{"PASS" if passed else "FAIL"} {name} ({elapsed} s)' + (' KERNEL REPORTS' if reports else ''))
+        self.record(name, dict(run_dir=str(run_dir), passed=passed, seconds=elapsed, kernel_reports=reports))
+        return passed
 
     def record(self, name, value):
         with lock:
@@ -177,11 +200,13 @@ class Matrix:
                                                '--kernel', str(share / 'early-test.vmlinuz'),
                                                '--initrd', str(share / 'early-test.initrd'),
                                                '--data-image', str(final), '--run-dir', str(run_dir),
-                                               '--accel', self.args.accel],
+                                               '--accel', self.args.accel,
+                                               '--memory-mib', str(self.args.memory_mib or 1024)],
                                               cwd=ROOT, stdout=output, stderr=subprocess.STDOUT).returncode
-                log(f'{"PASS" if code == 0 else "FAIL"} {key}')
-                self.record(key, dict(run_dir=str(run_dir), passed=code == 0,
-                                      seconds=round(time.monotonic() - started, 1)))
+                reports = kernel_reports(run_dir)
+                log(f'{"PASS" if code == 0 and not reports else "FAIL"} {key}')
+                self.record(key, dict(run_dir=str(run_dir), passed=code == 0 and not reports,
+                                      seconds=round(time.monotonic() - started, 1), kernel_reports=reports))
                 return
             script, data, files, output = plans[name]
             run_dir = self.args.prefix / f'{profile}-{name}'
@@ -226,6 +251,9 @@ def main():
                         help='Maximum concurrent VMs')
     parser.add_argument('--fresh', dest='provisioned', action='store_false',
                         help='Use per-run first boot and apt instead of the provisioned image')
+    parser.add_argument('--base-image', type=Path,
+                        help='Read-only derived guest image, e.g. the sanitizer kernel (build_debug_kernel.py)')
+    parser.add_argument('--memory-mib', type=int, help='Guest RAM (sanitizer kernels need more than 1024)')
     kvm = os.access('/dev/kvm', os.R_OK | os.W_OK)
     parser.add_argument('--accel', choices=('tcg', 'kvm'), default='kvm' if kvm else 'tcg',
                         help='QEMU accelerator for every VM (default: kvm when /dev/kvm is usable)')
@@ -251,6 +279,7 @@ def main():
     with ThreadPoolExecutor(max_workers=len(work)) as pool:
         list(pool.map(lambda item: matrix.profile(*item), work))
     summary = dict(provisioned=args.provisioned, accel=args.accel, pivsetup_sha256=pivsetup_sha256,
+                   base_image=str(args.base_image) if args.base_image else None,
                    suites=args.suites, results=matrix.results)
     (args.prefix / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     failed = [k for k, v in matrix.results.items() if not v.get('passed') or v.get('host_verified') is False]
