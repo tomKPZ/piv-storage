@@ -3,15 +3,18 @@
 Independent userspace reference/decoder for fragments, records (optionally A/B),
 keyslots and the keyslot directory.
 """
+import os
+from pathlib import Path
 import secrets
 import struct
+import tempfile
 
 from cryptography.hazmat.primitives import hashes, hmac
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from .format import context_v4
-from .profile import UnsupportedImage
+from .profile import Image, UnsupportedImage
 
 IV_BYTES = 16
 RANDOM_BYTES = 10
@@ -309,3 +312,31 @@ def open_volume(image, kek):
                                                       image.layout.sector_size, ab), master, ab=ab)
     directory = parse_directory(records.decode_directory(ivs))
     return records, directory, slot, ivs
+
+
+def unpack(source, output, kek):
+    """Open a keyslot with @kek, authenticate every hidden block and publish
+    a new private output file only after success; no primary key is needed."""
+    output = Path(output)
+    if output.exists() or output.is_symlink():
+        raise FileExistsError('Output must not exist')
+    with Image(source) as image:
+        payload = decode_image(image, kek)
+        image.check_unchanged()
+        fd, name = tempfile.mkstemp(prefix='.pivstore-', suffix='.partial', dir=output.parent)
+        temporary = Path(name)
+        try:
+            with os.fdopen(fd, 'wb') as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.link(temporary, output)
+            temporary.unlink()
+            directory = os.open(output.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return {'extracted_payload_bytes': len(payload)}

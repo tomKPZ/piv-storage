@@ -7,10 +7,10 @@ use crate::error::Result;
 use crate::json::Value;
 
 /// LUKS encryption name -> (LUKS integrity type, exact dm-crypt cipher spec).
-pub const PRIMARY_PROFILES: [(&str, &str, &str); 3] = [
-    ("aes-gcm-random", "aead", "capi:gcm(aes)-random"),
+/// AEGIS-128 only: format v4 needs 16-byte IVs (AES-GCM and ChaCha20-Poly1305
+/// with 12-byte IVs were removed with format v3 on 2026-10-21).
+pub const PRIMARY_PROFILES: [(&str, &str, &str); 1] = [
     ("aegis128-random", "aead", "capi:aegis128-random"),
-    ("chacha20-random", "poly1305", "capi:rfc7539(chacha20,poly1305)-random"),
 ];
 
 pub fn profile(encryption: &str) -> Option<(&'static str, &'static str)> {
@@ -72,7 +72,7 @@ pub fn parse_superblock(header: &[u8], offset: u64, file_size: u64) -> Result<La
     let flags = le_u32(header, 24);
     let block = header[28];
     if magic != b"integrt\0" || version != 4 || interleave != 15 || flags != 8
-        || !(tuple_size == 28 || tuple_size == 32) || !(block == 0 || block == 3) {
+        || tuple_size != 32 || !(block == 0 || block == 3) {
         bail!("Unsupported integrity superblock profile");
     }
     if offset < 32768 || offset % 4096 != 0 || offset.checked_add(4096).map_or(true, |e| e > file_size) {
@@ -147,7 +147,7 @@ pub fn validate_segment(metadata: &Value) -> Result<u64> {
 /// The stock lower dm-integrity table produced by pinned cryptsetup.
 pub fn validate_integrity_table(table: &str, sectors: u64, raw_major: u32, raw_minor: u32, offset: u64,
                                 sector_size: u64, journal_sectors: u64, tuple_size: u64) -> Result<()> {
-    if tuple_size != 28 && tuple_size != 32 {
+    if tuple_size != 32 {
         bail!("Unsupported lower tuple size");
     }
     let words: Vec<&str> = table.split_whitespace().collect();
@@ -160,7 +160,7 @@ pub fn validate_integrity_table(table: &str, sectors: u64, raw_major: u32, raw_m
         bail!("Unsupported lower integrity mapping");
     }
     let options = &words[8..];
-    let buffer = if sector_size == 512 || tuple_size == 32 { "buffer_sectors:128" } else { "buffer_sectors:32" };
+    let buffer = "buffer_sectors:128";
     let mut required = vec!["interleave_sectors:32768", buffer, "journal_watermark:50", "commit_time:10000", "fix_padding"];
     match sector_size {
         4096 => required.push("block_size:4096"),
@@ -185,18 +185,11 @@ pub fn validate_integrity_table(table: &str, sectors: u64, raw_major: u32, raw_m
     Ok(())
 }
 
-/// Format v3 public context: "pivstore/volume/v3\0" UUID NUL LE64 bytes LE64 sector.
-pub fn context_v3(uuid: &str, primary_bytes: u64, sector_size: u64) -> Vec<u8> {
-    context(b"pivstore/volume/v3\0", uuid, primary_bytes, sector_size)
-}
-
-/// Format v4 base context (docs/format-v4.md); the kernel appends "/ab" itself.
+/// Format v4 base context (docs/format-v4.md):
+/// "pivstore/volume/v4\0" UUID NUL LE64 primary bytes LE64 sector size.
+/// The kernel appends "/ab" itself for the A/B layout.
 pub fn context_v4(uuid: &str, primary_bytes: u64, sector_size: u64) -> Vec<u8> {
-    context(b"pivstore/volume/v4\0", uuid, primary_bytes, sector_size)
-}
-
-fn context(prefix: &[u8], uuid: &str, primary_bytes: u64, sector_size: u64) -> Vec<u8> {
-    let mut value = prefix.to_vec();
+    let mut value = b"pivstore/volume/v4\0".to_vec();
     value.extend_from_slice(uuid.as_bytes());
     value.push(0);
     value.extend_from_slice(&primary_bytes.to_le_bytes());
@@ -224,19 +217,20 @@ mod tests {
 
     #[test]
     fn superblock_geometry_matches_python_reference() {
-        // Values from tests/test_profile.py (4096-byte AES-GCM fixture shape).
-        let layout = parse_superblock(&superblock(28, 7, 231_456, 3), 16_777_216, 1 << 30).unwrap();
-        assert_eq!((layout.sector_size, layout.iv_bytes, layout.sectors()), (4096, 12, 28_932));
+        // AEGIS-128 4096-byte fixture shape (32-byte tuples, as tests/test_profile.py).
+        let layout = parse_superblock(&superblock(32, 7, 231_456, 3), 16_777_216, 1 << 30).unwrap();
+        assert_eq!((layout.sector_size, layout.iv_bytes, layout.sectors()), (4096, 16, 28_932));
         assert_eq!(layout.journal_section_sectors, (504 / 104) * 64 + 8);
         assert_eq!(layout.initial_sectors, 8 + layout.journal_section_sectors * 7);
-        assert_eq!(layout.metadata_run_sectors, (28 * 4096u64).div_ceil(4096) * 8);
+        assert_eq!(layout.metadata_run_sectors, (32 * 4096u64).div_ceil(4096) * 8);
         let layout = parse_superblock(&superblock(32, 7, 2048, 0), 16_777_216, 1 << 30).unwrap();
         assert_eq!((layout.sector_size, layout.iv_bytes), (512, 16));
-        for bad in [superblock(30, 7, 2048, 0), superblock(28, 0, 2048, 0), superblock(28, 7, 2049, 3)] {
+        for bad in [superblock(28, 7, 2048, 0), superblock(30, 7, 2048, 0), superblock(32, 0, 2048, 0),
+                    superblock(32, 7, 2049, 3)] {
             assert!(parse_superblock(&bad, 16_777_216, 1 << 30).is_err());
         }
-        assert!(parse_superblock(&superblock(28, 7, 2048, 0), 1000, 1 << 30).is_err());
-        assert!(parse_superblock(&superblock(28, 7, 1 << 40, 0), 16_777_216, 1 << 30).is_err());
+        assert!(parse_superblock(&superblock(32, 7, 2048, 0), 1000, 1 << 30).is_err());
+        assert!(parse_superblock(&superblock(32, 7, 1 << 40, 0), 16_777_216, 1 << 30).is_err());
     }
 
     fn metadata(encryption: &str, integrity: &str, extra: &str) -> Value {
@@ -249,22 +243,24 @@ mod tests {
     #[test]
     fn segment_validation() {
         assert_eq!(validate_segment(&metadata("aegis128-random", "aead", "")).unwrap(), 16_777_216);
-        assert_eq!(validate_segment(&metadata("chacha20-random", "poly1305", "")).unwrap(), 16_777_216);
-        assert!(validate_segment(&metadata("chacha20-random", "aead", "")).is_err());
+        assert!(validate_segment(&metadata("chacha20-random", "poly1305", "")).is_err());
+        assert!(validate_segment(&metadata("aes-gcm-random", "aead", "")).is_err());
+        assert!(validate_segment(&metadata("aegis128-random", "poly1305", "")).is_err());
         assert!(validate_segment(&metadata("aes-xts-plain64", "aead", "")).is_err());
-        assert!(validate_segment(&metadata("aes-gcm-random", "aead", r#","flags":[]"#)).is_err());
+        assert!(validate_segment(&metadata("aegis128-random", "aead", r#","flags":[]"#)).is_err());
         let required = parse(r#"{"config":{"requirements":{"mandatory":["online-reencrypt"]}},"segments":{}}"#).unwrap();
         assert!(validate_segment(&required).is_err());
     }
 
     #[test]
     fn integrity_table_validation() {
-        let table = "0 231456 integrity 254:16 32768 28 J 7 journal_sectors:1848 interleave_sectors:32768 \
-                     buffer_sectors:32 journal_watermark:50 commit_time:10000 fix_padding block_size:4096";
-        validate_integrity_table(table, 28_932, 254, 16, 16_777_216, 4096, 1848, 28).unwrap();
-        assert!(validate_integrity_table(table, 28_932, 254, 16, 16_777_216, 4096, 1849, 28).is_err());
-        assert!(validate_integrity_table(&table.replace(" J ", " D "), 28_932, 254, 16, 16_777_216, 4096, 1848, 28).is_err());
-        assert!(validate_integrity_table(&table.replace("fix_padding", "fix_hmac"), 28_932, 254, 16, 16_777_216, 4096, 1848, 28).is_err());
+        let table = "0 231456 integrity 254:16 32768 32 J 7 journal_sectors:1848 interleave_sectors:32768 \
+                     buffer_sectors:128 journal_watermark:50 commit_time:10000 fix_padding block_size:4096";
+        validate_integrity_table(table, 28_932, 254, 16, 16_777_216, 4096, 1848, 32).unwrap();
+        assert!(validate_integrity_table(table, 28_932, 254, 16, 16_777_216, 4096, 1849, 32).is_err());
+        assert!(validate_integrity_table(table, 28_932, 254, 16, 16_777_216, 4096, 1848, 28).is_err());
+        assert!(validate_integrity_table(&table.replace(" J ", " D "), 28_932, 254, 16, 16_777_216, 4096, 1848, 32).is_err());
+        assert!(validate_integrity_table(&table.replace("fix_padding", "fix_hmac"), 28_932, 254, 16, 16_777_216, 4096, 1848, 32).is_err());
     }
 
     #[test]
@@ -273,6 +269,6 @@ mod tests {
         let v4 = context_v4(uuid, 128 << 20, 4096);
         assert!(v4.starts_with(b"pivstore/volume/v4\0") && v4.len() == 19 + 36 + 1 + 16);
         assert_eq!(&v4[56..64], &(128u64 << 20).to_le_bytes());
-        assert_eq!(context_v3(uuid, 1, 512)[..19], *b"pivstore/volume/v3\0");
+        assert_eq!(&v4[64..72], &4096u64.to_le_bytes());
     }
 }

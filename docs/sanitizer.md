@@ -58,4 +58,10 @@ logging for 10 seconds after a kernel fault so the trace is preserved.
 - Before the fix, AES-GCM and ChaCha20-Poly1305 profiles already passed every
   suite on the sanitizer kernel without reports (suite-018).
 - kmemleak reported "6 new suspected memory leaks" in the three longest
-  (512-byte-sector) native runs, at its automatic 600-second scan; triage below.
+  (512-byte-sector) native runs, at its automatic 600-second scan. Triage
+  (forced scans in artifacts/dbg-repro-003, short and long runs alike): all six
+  objects are 4 KiB execmem allocations made by swapper/0 in start_kernel
+  (apply_retpolines), before dm-piv is loaded; no backtrace contains a dm_piv
+  frame. This is a kernel-internal false positive. suite.py therefore judges
+  kmemleak by the saved report: boot-time swapper/start_kernel objects are
+  ignored, any other suspected leak (or any dm_piv frame) fails the run.

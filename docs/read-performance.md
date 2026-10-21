@@ -1,5 +1,11 @@
 # Authenticated read and activation profiling
 
+> [!NOTE]
+> 2026-10-21: format v3 and the AES-GCM / ChaCha20-Poly1305 profiles were
+> removed (AEGIS-128 with [format v4](format-v4.md) is the only supported
+> configuration). Results below that mention them are historical evidence for
+> the code at that time; see ROADMAP.md for current runs.
+
 The bounded profile separates uninstrumented elapsed time from kernel call counts.
 Baseline profiling did not change the runtime. The subsequent bounded read
 implementation below changes I/O gathering, preserving the format, ABI and

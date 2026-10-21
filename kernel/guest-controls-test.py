@@ -25,7 +25,6 @@ offset = validate_segment(metadata)
 raw = os.open('/dev/vdb', os.O_RDONLY)
 layout = parse_superblock(os.pread(raw, 4096, offset), offset, 128 * 1024 * 1024)
 os.close(raw)
-span = (576 // layout.iv_bytes) * layout.sector_size
 subprocess.run(['dd', 'if=/dev/vdb', 'of=/var/tmp/piv-control-original.img', 'bs=1M', 'status=none'], check=True)
 
 def copy_disk(name):
@@ -59,7 +58,7 @@ def trace_value(name, value): (T / name).write_text(str(value))
 
 results = []
 original_primary = None
-for arm in ('stock', 'stock-refresh', 'native'):
+for arm in ('stock', 'native'):
     assert not list(Path('/sys/class/block/vdb/holders').iterdir())
     # Restore ONLY the guest's synthetic disk with ALL its mappings closed.
     subprocess.run(['dd', 'if=/var/tmp/piv-control-original.img', 'of=/dev/vdb', 'bs=1M', 'conv=fsync', 'status=none'], check=True)
@@ -88,16 +87,7 @@ for arm in ('stock', 'stock-refresh', 'native'):
     try:
         for label, start, size, same in workload(layout):
             value = io(path, start, size) if same else payload(label, size)
-            if arm == 'stock-refresh':
-                lo, hi = start // span * span, ((start + size + span - 1) // span) * span
-                expanded = bytearray(io(path, lo, hi - lo))
-                expanded[start - lo:start - lo + size] = value
-                # Ordinary stock same-plaintext rewrites, in 32-sector chunks.
-                step = 32 * layout.sector_size
-                for at in range(0, len(expanded), step):
-                    chunk = expanded[at:at + step]
-                    io(path, lo + at, len(chunk), chunk)
-            else: io(path, start, size, value)
+            io(path, start, size, value)
             assert io(path, start, size) == value
         elapsed = time.monotonic() - start_time
         # Sample after successful fsync. Journal background activity may race;
@@ -118,10 +108,8 @@ for arm in ('stock', 'stock-refresh', 'native'):
     assert not re.search(r'(?:overrun|dropped events):\s*[1-9]', stats), stats
     after_hash = subprocess.check_output(['sha256sum', path], text=True).split()[0]
     if arm == 'native':
-        # Default initialization: v4 on 16-byte IVs (112 keyslot sectors, two
-        # directory groups, 90-sector records), else v3.
-        records = ((layout.sectors - 112) // 90 - 2 if layout.iv_bytes == 16
-                   else layout.sectors // (576 // layout.iv_bytes))
+        # Format v4: 112 keyslot sectors, two directory groups, 90-sector records.
+        records = (layout.sectors - 112) // 90 - 2
         assert Path('/dev/mapper/piv-native-hidden').read_bytes() == bytes(records * 512)
     closed(arm)
     copy_disk(arm + '-after.img')
@@ -136,4 +124,4 @@ for arm in ('stock', 'stock-refresh', 'native'):
 assert len({r['after_primary'] for r in results}) == 1
 (W / 'control-results.json').write_text(json.dumps(dict(layout=asdict(layout), encryption=metadata['segments']['0']['encryption'],
     operations=workload(layout), arms=results, live_journal_atomic=False), indent=2) + '\n')
-(W / 'result.txt').write_text('Three matched arms, equal authenticated primary outputs and preserved native hidden zeros passed\n')
+(W / 'result.txt').write_text('Matched stock and native arms, equal authenticated primary outputs and preserved native hidden zeros passed\n')

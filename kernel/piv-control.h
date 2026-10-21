@@ -58,26 +58,25 @@ struct piv_devices {
 #define PIV_READ_PRIMARY _IOWR('P', 9, struct piv_update)
 #define PIV_PREPARE_PRIMARY _IOWR('P', 10, struct piv_update)
 #define PIV_APPLY_PRIMARY _IOW('P', 11, struct piv_update)
+/* Native SETUP ABI version 4 (2026-10-21): format v4 only (AEGIS-128). */
 struct piv_native_setup {
  __u32 version, size;
  __u64 generation;
- __u32 flags, context_length; /* see PIV_SETUP_* */
- __u8 key[32], context[128];
+ __u32 flags, context_length; /* see PIV_SETUP_*; context = v4 base context */
+ __u8 key[32], context[128];   /* key: keyslot KEK */
  __u32 reserved[2];
 };
 struct piv_native_status {
+ /* invalidations: always 0 since v3 invalid markers were removed (ABI kept). */
  __u64 generation, hidden_bytes, encryptions, invalidations;
  __u32 active, views, failed, version;
 };
-/* Destructively initialize every hidden block to authenticated zeros. */
-#define PIV_SETUP_INITIALIZE 1U
-/* Accept a carrier in which no record authenticates under the hidden key
- * (fresh/uninitialized). Without it or INITIALIZE, setup returns EKEYREJECTED.
+/* Destructively initialize: new master key, keyslot 0 under the KEK, the
+ * directory, then authenticated zeros in every hidden block. Without it, a
+ * keyslot must authenticate under the KEK or setup returns EKEYREJECTED.
  */
-#define PIV_SETUP_UNINITIALIZED 2U
-/* Format v4 fragment-local records (16-byte IV profiles only; docs/format-v4.md). */
-#define PIV_SETUP_FORMAT_V4 4U
-/* v4 A/B record slots: atomic per-block hidden writes at half capacity. */
+#define PIV_SETUP_INITIALIZE 1U
+/* With INITIALIZE: A/B record slots (atomic per-block hidden writes, half capacity). */
 #define PIV_SETUP_AB 8U
 #define PIV_NATIVE_SETUP _IOW('P', 12, struct piv_native_setup)
 #define PIV_NATIVE_DETACH _IOW('P', 13, struct piv_read_iv)

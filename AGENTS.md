@@ -49,30 +49,25 @@ resolved from context/evidence, not for routine implementation decisions.
   LUKS/dm-integrity structures and encrypted records inside IVs. No separate
   partition, root-ext4 file or hidden-volume metadata dependency. /run ownership
   locks are volatile. Early activation must be possible from an initramfs.
-- Format v4 (docs/format-v4.md, user-approved 2026-10-20) is implemented for
-  16-byte-IV (AEGIS-128) profiles: LRW-randomized fragments (10 random + 6
-  payload bytes per IV), 90-fragment SIV records, encrypted keyslots (no
-  public magic) with a directory, Argon2id (default) or scrypt passphrase
-  KEKs and optional A/B
-  slots. Never add a persistent encryption counter. v3 remains for 12-byte
-  IVs; initialization defaults to v4 on 16-byte-IV profiles (user decision
-  2026-10-21) and v3 otherwise. Still planned: stock
-  `--integrity-no-journal` support (deferred by the user 2026-10-21; needs a
-  torn-sector policy decision, see docs/journal-atomicity.md).
-  AEGIS-128 is the recommended profile.
+- Format v4 (docs/format-v4.md, user-approved 2026-10-20) is the only hidden
+  format: LRW-randomized fragments (10 random + 6 payload bytes per 16-byte
+  IV), 90-fragment SIV records, encrypted keyslots (no public magic) with a
+  directory, Argon2id (default) or scrypt passphrase KEKs and optional A/B
+  slots. Never add a persistent encryption counter. Format v3, its invalid
+  markers and the 12-byte-IV AES-GCM/ChaCha20-Poly1305 profiles were removed
+  by user decision (2026-10-21, "option A"); do not reintroduce them. Still
+  planned: stock `--integrity-no-journal` support (deferred by the user
+  2026-10-21; needs a torn-sector policy decision, see docs/journal-atomicity.md).
   Multi-snapshot observers, rollback resistance and alternative hidden openings
   under coercion are out of scope. Never put host-specific (e.g. corporate
   kernel) identifiers in the repository.
 - One authenticated record covers exactly one hidden 512-byte logical block in
-  48 primary IVs for AES/ChaCha or 36 for original AEGIS-128 (v3), or 90 IVs
-  (v4, A/B: two records per block). Full-block authentication prevents old/new fragment mixing;
+  90 primary IVs (A/B: two records per block). Full-block authentication prevents old/new fragment mixing;
   cross-block transactions, hidden crash recovery and rollback resistance are
   NOT goals. Interrupted updates may leave hidden blocks returning EIO.
-- Decoy access must not depend on hidden-record authentication. A v3 decoy write
-  refreshes valid hidden records, or writes a fresh encrypted invalid marker for
-  absent/damaged/wrong-key records. A v4 decoy write re-randomizes only the
-  written sectors' IVs and preserves their fragments (damage stays damage). Never turn corruption into authenticated
-  zeros. Full hidden writes may repair a block after primary authentication.
+- Decoy access must not depend on hidden-record authentication. A decoy write
+  re-randomizes only the written sectors' IVs and preserves their fragments
+  (damage stays damage). Never turn corruption into authenticated zeros. Full hidden writes may repair a block after primary authentication.
 - Fresh seeded CRNG entropy is mandatory. Local proposed/replaced IV collision
   rejection is only a small check, not lifetime nonce history. The 2^32 per-owner
   encryption counter resets at recreation and does not enforce the per-key
@@ -84,12 +79,13 @@ resolved from context/evidence, not for routine implementation decisions.
   before the first APPLY (reads, authentication, allocation, preparation) fail
   only that bio; APPLY-time and flush errors stop the shared owner. Local hidden
   unavailability must not stop the decoy.
-- Wrong-key guard: setup without initialize requires a v4 keyslot, or one v3
-  record (data or invalid marker), to authenticate, using IVs from the
-  mandatory scan, unless the explicit uninitialized-carrier flag is given.
-  Never add extra I/O for it. v4 also refuses without its keyslot directory.
+- Wrong-key guard: setup without initialize requires a keyslot to
+  authenticate, using IVs from the mandatory scan, and refuses without the
+  keyslot directory. Never add extra I/O for it. There is no
+  uninitialized-carrier mode (removed with v3); stock carriers must be
+  initialized.
 - Decoy bios are bounded to 16 KiB at power-of-two DM split boundaries, hidden
-  bios to 512 bytes. Retain the two-carrier-group/96-tuple preparation bound,
+  bios to 512 bytes. Retain the 96-tuple preparation bound,
   ordered work and lower preflush/completion-flush semantics. Batching is within
   one bio, not cross-bio writeback. Tail primary sectors have no hidden record.
 - Setup polls pending signals and yields between authenticated ranges and
@@ -115,10 +111,8 @@ resolved from context/evidence, not for routine implementation decisions.
   only in disposable guests with exact header/config/symbol matches. Never
   install host modules or touch real disks. scripts/fetch_kernel.py (or
   kernel/prepare.py) stages the complete module source.
-- Supported profiles: LUKS2 AES-GCM/random (integrity aead) or ChaCha20-Poly1305
-  via chacha20-random (integrity poly1305), or original aegis128-random
-  (integrity aead). All support 512/4096-byte sectors and 16-byte tags; AES/ChaCha
-  use 32-byte keys and 12-byte IVs, AEGIS uses 16-byte keys and 16-byte IVs.
+- Supported profile: LUKS2 original aegis128-random (integrity aead; not
+  AEGIS-128L), 512/4096-byte sectors, 16-byte keys, IVs and tags.
   Integrity v4 fixed padding and the ordinary journal are required. Validate geometry,
   AAD, extents and arithmetic. Offline diagnostics reject dirty journals; native
   setup delegates replay to Linux before authenticated access.
@@ -179,9 +173,10 @@ Live journal samples are not atomic; byte statistics are descriptive, not a
 security acceptance test. Retain observed snapshot/I/O distinctions in claims.
 
 Retain the observer boundaries in docs/security-review.md. A single raw image
-can include journal history; high-entropy hidden keys are required because records
-provide an offline guessing oracle. The owner counter does not enforce the GCM
-per-key lifetime requirement. Internal source review is not external crypto review.
+can include journal history; high-entropy hidden keys are preferred because
+keyslots provide an offline guessing oracle (passphrases rely on the KDF cost).
+The owner counter does not enforce any per-key lifetime budget. Internal source
+review is not external crypto review.
 
 Keep correctness, crash safety and deniability claims separate. Multiple snapshots,
 journals, memory and host artifacts are explicit limitations. Statistical tests

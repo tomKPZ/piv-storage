@@ -1,5 +1,11 @@
 # Larger native geometry
 
+> [!NOTE]
+> 2026-10-21: format v3 and the AES-GCM / ChaCha20-Poly1305 profiles were
+> removed (AEGIS-128 with [format v4](format-v4.md) is the only supported
+> configuration). Results below that mention them are historical evidence for
+> the code at that time; see ROADMAP.md for current runs.
+
 The native module's former 256 MiB primary cap is removed. Setup instead rejects
 primary-sector counts exceeding MAX_LFS_FILESIZE / primary_sector_size. The
 pinned 64-bit kernel's signed file-offset domain bounds primary byte arithmetic;

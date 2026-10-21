@@ -1,5 +1,11 @@
 # Security and threat-model review
 
+> [!NOTE]
+> 2026-10-21: format v3 and the AES-GCM / ChaCha20-Poly1305 profiles were
+> removed (AEGIS-128 with [format v4](format-v4.md) is the only supported
+> configuration). Results below that mention them are historical evidence for
+> the code at that time; see ROADMAP.md for current runs.
+
 Internal source-led review, 2026-10-19, of runtime/format revision 1f4c94f.
 This is a bounded engineering assessment, not an independent cryptographic audit
 or certification. No new exploitable implementation defect was identified in

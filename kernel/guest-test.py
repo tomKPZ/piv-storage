@@ -43,7 +43,8 @@ segment = json.loads(subprocess.check_output(
     ['cryptsetup', 'luksDump', '--dump-json-metadata', '/dev/vdb'], text=True))['segments']['0']
 sector_size = segment['sector_size']
 expected_sector_size = sector_size
-iv_size = 16 if segment['encryption'] == 'aegis128-random' else 12
+assert segment['encryption'] == 'aegis128-random'  # the only supported profile
+iv_size = 16
 factor = sector_size // 512
 boundary = 32768 // factor
 # Feature disabled: stock writes still work (rewrite the same synthetic plaintext).
@@ -191,10 +192,9 @@ os.close(view)
 run('dmsetup', 'remove', '--retry', 'piv-view')
 # Prepared tuples are durable before the first apply in this sector experiment.
 from pivstore.kernel_api import KernelDevice, validate_integrity_table
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 from pivstore.aegis_reference import AEGIS128Reference
 os.environ['PIV_AEGIS_REFERENCE'] = '/mnt/piv-work/libaegis128-reference.so'
-algorithm = {'aes-gcm-random': AESGCM, 'chacha20-random': ChaCha20Poly1305, 'aegis128-random': AEGIS128Reference}[segment['encryption']]
+algorithm = AEGIS128Reference
 native = KernelDevice(controls[0], path)
 validate_integrity_table(subprocess.check_output(['dmsetup', 'table', 'piv-kernel_dif'], text=True),
                          sectors, os.stat('/dev/vdb').st_rdev, 16777216, sector_size,
@@ -231,14 +231,6 @@ if sector_size == 512:
     assert not any(value[512:4096])
     bad = bytearray(value); bad[512] = 1
     rejected(lambda: native.apply(index, old, bytes(bad)), {errno.EINVAL})
-if iv_size == 12:
-    # Widening the wire IV must not permit noncanonical suffixes for old ciphers.
-    from pivstore.kernel_api import UPDATE, command
-    bad = bytearray(value); bad[4124] = 1
-    rejected(lambda: native.apply(index, old, bytes(bad)), {errno.EINVAL})
-    request = bytearray(UPDATE.pack(2, UPDATE.size, generation, index,
-                                   old + b'\x01' + bytes(3), 0, value, 0))
-    rejected(lambda: fcntl.ioctl(native.fd, command(4, UPDATE.size, 1), request, True), {errno.EINVAL})
 rejected(lambda: native.apply(index, bytes([9]) * iv_size, value), {errno.ESTALE})
 bad = bytearray(value); bad[0] ^= 1
 rejected(lambda: native.apply(index, old, bytes(bad)), {errno.EBADMSG, errno.EIO})

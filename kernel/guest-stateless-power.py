@@ -21,13 +21,9 @@ views = open_blocks('/dev/mapper/piv-test-delay', w / 'passphrase.key',
 owner = GuestOwner('/dev/mapper/piv-test-delay', w / 'passphrase.key', allow_test_stack=True)
 layout = owner.layout
 owner.close()
-# Hidden block 0's carrier: v3 starts at sector 0 with 576 // iv sectors; the
-# default v4 initialization on 16-byte IVs puts it after 112 keyslot sectors
-# and two 90-sector directory groups.
-if layout.iv_bytes == 16:
-    first, group = 112 + 2 * 90, 90
-else:
-    first, group = 0, 576 // layout.iv_bytes
+# Hidden block 0's record: after 112 keyslot sectors and two 90-sector
+# directory groups (format v4).
+first, group = 112 + 2 * 90, 90
 start = layout.offsets(first)[1]
 base = start // 512 * 512
 skip = start - base

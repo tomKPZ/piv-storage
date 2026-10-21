@@ -18,13 +18,14 @@ import shutil
 import struct
 import subprocess
 import tempfile
-from types import SimpleNamespace
 
-from .format import context, context_v4
+from .format import context_v4
 from .kernel_api import command
 
 SETUP = struct.Struct('=IIQII32s128s2I')
-SETUP_INITIALIZE, SETUP_UNINITIALIZED, SETUP_FORMAT_V4, SETUP_AB = 1, 2, 4, 8
+# SETUP ABI 4 (format v4 only): flags INITIALIZE and AB.
+SETUP_VERSION = 4
+SETUP_INITIALIZE, SETUP_AB = 1, 8
 STATUS = struct.Struct('=QQQQIIII')
 KEYSLOT = struct.Struct('=IIQII32s2I')
 # Passphrase KEK parameters; must equal rust/src/blocks.rs. Argon2id (default):
@@ -79,14 +80,13 @@ def run(args, env=None):
 
 
 def open_args(source, key_file, secret_path, *, passphrase=False, name='piv-native', initialize=False,
-              uninitialized=False, format=None, ab=False, allow_test_stack=False, kdf=None):
+              ab=False, allow_test_stack=False, allow_second_disk=False, kdf=None):
     args = ['open-blocks', '--device', source, '--key-file', key_file, '--name', name,
             '--hidden-passphrase-file' if passphrase else '--hidden-key-file', secret_path]
     if initialize: args.append('--initialize')
-    if uninitialized: args.append('--uninitialized')
-    if format is not None: args += ['--format', format]
     if ab: args.append('--ab')
     if allow_test_stack: args.append('--allow-test-stack')
+    if allow_second_disk: args.append('--allow-second-disk')
     if kdf is not None: args += ['--kdf', kdf]
     return [str(a) for a in args]
 
@@ -118,9 +118,24 @@ def spawn_open(source, key_file, hidden_key, *, env, **options):
                 process.communicate()
 
 
-def close_blocks(source, key_file, *, name='piv-native', allow_test_stack=False):
+def close_blocks(source, key_file, *, name='piv-native', allow_test_stack=False, allow_second_disk=False):
     run(['close-blocks', '--device', source, '--key-file', key_file, '--name', name]
-        + (['--allow-test-stack'] if allow_test_stack else []))
+        + (['--allow-test-stack'] if allow_test_stack else [])
+        + (['--allow-second-disk'] if allow_second_disk else []))
+
+
+def migrate(source, source_key_file, source_hidden_key, target, target_key_file, target_hidden_key, *,
+            ab=False, allow_second_disk=False):
+    """pivsetup migrate: copy both views into a freshly formatted target that it
+    initializes, then re-read and compare both (rekey/resize/sector-size change).
+    Returns byte counts per view. Hidden keys are passed in private files."""
+    with secret_file(source_hidden_key) as source_path, secret_file(target_hidden_key) as target_path:
+        args = ['migrate', '--source', source, '--source-key-file', source_key_file,
+                '--source-hidden-key-file', source_path, '--target', target,
+                '--target-key-file', target_key_file, '--target-hidden-key-file', target_path]
+        if ab: args.append('--ab')
+        if allow_second_disk: args.append('--allow-second-disk')
+        return json.loads(run(args))
 
 
 def keyslot(source, key_file, slot, kek=None, *, name='piv-native', allow_test_stack=False, passphrase=None,
@@ -150,12 +165,8 @@ def native_status(device):
 
 
 def base_identity(owner):
-    """Cross-check of pivsetup's public context for an owner."""
-    primary_bytes = owner.device.sectors * owner.device.sector_size
-    if owner.device.iv_size == 16:
-        return context_v4(owner.uuid, primary_bytes, owner.device.sector_size)
-    return context(SimpleNamespace(uuid=owner.uuid, layout=SimpleNamespace(
-        primary_bytes=primary_bytes, sector_size=owner.device.sector_size)))
+    """Cross-check of pivsetup's public (v4 base) context for an owner."""
+    return context_v4(owner.uuid, owner.device.sectors * owner.device.sector_size, owner.device.sector_size)
 
 
 def passphrase_kek(passphrase, base_context, kdf='argon2id'):

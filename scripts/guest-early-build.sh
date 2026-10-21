@@ -35,12 +35,7 @@ manual_add_modules virtio_blk
 manual_add_modules dm_crypt
 manual_add_modules dm_integrity
 manual_add_modules aegis128
-manual_add_modules gcm
-manual_add_modules ghash_generic
-manual_add_modules ctr
 manual_add_modules chacha_generic
-manual_add_modules poly1305_generic
-manual_add_modules chacha20poly1305
 manual_add_modules hmac
 manual_add_modules sha256_generic
 HOOK

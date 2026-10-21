@@ -97,8 +97,7 @@ for repeat in range(3):
     subprocess.run(['udevadm', 'settle'], check=True)
     if repeat == 0:
         owner = GuestOwner('/dev/vdb', KEY)
-        sectors, unit, group = owner.device.sectors, owner.device.sector_size, 576 // owner.device.iv_size
-        owner_iv = owner.device.iv_size
+        sectors, unit = owner.device.sectors, owner.device.sector_size
         before = blocks.native_status(owner.device)['encryptions']
         measure_reads(views['decoy'], primary, 'native-decoy')
         measure_reads(views['hidden'], EXPECTED, 'hidden')
@@ -119,7 +118,7 @@ def symbol(stem):
     return 'dm_piv:' + matches[0]
 probes = {event: symbol(function) for event, function in dict(
     load='piv_load', range='piv_read_range', crypto='piv_aead',
-    record='pn_record', write='pn_write', checkpoint='piv_checkpoint').items()}
+    write='pn_write', checkpoint='piv_checkpoint').items()}
 
 
 def probe_command(value):
@@ -160,20 +159,11 @@ try:
         registered.append(event)
     (T / 'events/piv_profile/enable').write_text('1')
     per_range = 16384 // unit
-    # Closed native fixtures are default-initialized: v4 on 16-byte-IV profiles.
-    v4 = owner_iv == 16
-    v4_ranges = (90 + per_range - 1) // per_range  # one 90-sector v4 record
-    if v4:
-        # v4: the keyslot check runs once the scan passes the 112 keyslot
-        # sectors; only v3 records completed before then are probed. The
-        # directory (groups 0 and 1) is then read and authenticated.
-        unlock_at = (112 + per_range - 1) // per_range * per_range
-        setup_expected = dict(load=1, range=(sectors + per_range - 1) // per_range + 2 * v4_ranges,
-                              crypto=sectors + 1 + 2 * 90, record=unlock_at // group, write=0, checkpoint=1)
-    else:
-        # Wrong-key guard: the first v3 record proves the key.
-        setup_expected = dict(load=1, range=(sectors + per_range - 1) // per_range,
-                              crypto=sectors + 1, record=1, write=0, checkpoint=1)
+    v4_ranges = (90 + per_range - 1) // per_range  # one 90-sector record
+    # The keyslot check runs once the scan passes the 112 keyslot sectors (no
+    # extra I/O); the directory (groups 0 and 1) is then read and authenticated.
+    setup_expected = dict(load=1, range=(sectors + per_range - 1) // per_range + 2 * v4_ranges,
+                          crypto=sectors + 1 + 2 * 90, write=0, checkpoint=1)
     # Bracket exactly the SETUP ioctl with pivsetup's gate (before) and hold
     # (after) hooks; the binary waits at each point for our marker file.
     counted_gate = '/run/piv-profile-counted'
@@ -199,14 +189,9 @@ try:
         return json.loads(out)
     views = counted_open()
     subprocess.run(['udevadm', 'settle'], check=True)
-    if v4:
-        # v4 hidden reads authenticate each block's 90 sectors (no v3 record path).
-        hidden_cases = (('hidden', 512, 90, 0, v4_ranges), ('hidden', 4096, 8 * 90, 0, 8 * v4_ranges))
-    else:
-        v3_ranges = (group + per_range - 1) // per_range
-        hidden_cases = (('hidden', 512, group, 1, v3_ranges), ('hidden', 4096, 8 * group, 8, 8 * v3_ranges))
-    for role, count, loads, records, ranges in (('decoy', 512, 1, 0, 1),
-            ('decoy', 16384, per_range, 0, 1)) + hidden_cases:
+    # Hidden reads authenticate each block's 90 sectors.
+    hidden_cases = (('hidden', 512, 90, v4_ranges), ('hidden', 4096, 8 * 90, 8 * v4_ranges))
+    for role, count, loads, ranges in (('decoy', 512, 1, 1), ('decoy', 16384, per_range, 1)) + hidden_cases:
         def read():
             with mmap.mmap(-1, count) as buf:
                 fd = os.open(views[role], os.O_RDONLY | os.O_DIRECT)
@@ -215,8 +200,7 @@ try:
                     assert buf[:] == (primary if role == 'decoy' else EXPECTED)[:count]
                 finally:
                     os.close(fd)
-        counted(f'{role}-{count}', read, dict(load=0, range=ranges,
-                crypto=loads, record=records, write=0, checkpoint=0))
+        counted(f'{role}-{count}', read, dict(load=0, range=ranges, crypto=loads, write=0, checkpoint=0))
     (W / 'profile-kprobe-counts.txt').write_text((T / 'kprobe_profile').read_text())
 finally:
     if registered:
@@ -232,7 +216,7 @@ crypt('open', '--readonly', '--key-file', KEY, '/dev/vdb', 'piv-stock-profile')
 assert subprocess.check_output(['sha256sum', '/dev/mapper/piv-stock-profile'], text=True).split()[0] == PRIMARY
 crypt('close', 'piv-stock-profile')
 subprocess.run(['dd', 'if=/dev/vdb', 'of=' + str(W / 'profile-final.img'), 'bs=1M', 'status=none'], check=True)
-results.update(primary_sector=unit, primary_sectors=sectors, group=group, format=4 if v4 else 3,
+results.update(primary_sector=unit, primary_sectors=sectors, group=90, format=4,
                cache_state='warm guest/host caches; O_DIRECT bypasses public page cache only',
                timings_include_python_comparison=True, probes_used_during_timing=False, bounded_range_reads=True)
 (W / 'profile-results.json').write_text(json.dumps(results, indent=2) + '\n')

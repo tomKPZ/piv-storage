@@ -64,9 +64,18 @@ fn uname_release() -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// Explicit test-guest device opt-ins beyond the default /dev/vdb.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Allow {
+    /// The dm-delay/dm-flakey test stack over /dev/vdb.
+    pub test_stack: bool,
+    /// The pinned guest's second disposable disk (/dev/vdc), for migration tests.
+    pub second_disk: bool,
+}
+
 /// Restrict privileged setup to the pinned disposable QEMU guest and its
-/// explicitly supported 128/512 MiB /dev/vdb (or the opted-in test stack).
-pub fn guest_guard(source: &Path, allow_test_stack: bool) -> Result<u64> {
+/// explicitly supported 128/512 MiB /dev/vdb (or the opted-in test devices).
+pub fn guest_guard(source: &Path, allow: Allow) -> Result<u64> {
     // SAFETY: geteuid has no preconditions.
     let euid = unsafe { libc::geteuid() };
     let vendor = fs::read_to_string("/sys/class/dmi/id/sys_vendor").unwrap_or_default();
@@ -74,8 +83,11 @@ pub fn guest_guard(source: &Path, allow_test_stack: bool) -> Result<u64> {
         bail!("Kernel setup is restricted to the pinned disposable QEMU guest");
     }
     let mut allowed = vec!["/dev/vdb"];
-    if allow_test_stack {
+    if allow.test_stack {
         allowed.extend(["/dev/mapper/piv-test-delay", "/dev/mapper/piv-test-fault"]);
+    }
+    if allow.second_disk {
+        allowed.push("/dev/vdc");
     }
     let is_block = fs::metadata(source).map(|m| m.file_type().is_block_device()).unwrap_or(false);
     if !allowed.iter().any(|a| source.as_os_str().as_bytes() == a.as_bytes()) || !is_block {
@@ -119,11 +131,11 @@ pub struct GuestOwner {
 }
 
 impl GuestOwner {
-    pub fn open(source: &Path, passphrase_file: &Path, name: &str, allow_test_stack: bool) -> Result<Self> {
+    pub fn open(source: &Path, passphrase_file: &Path, name: &str, allow: Allow) -> Result<Self> {
         if !valid_piv_name(name, 40) {
             bail!("Invalid experimental mapping name");
         }
-        let raw_bytes = guest_guard(source, allow_test_stack)?;
+        let raw_bytes = guest_guard(source, allow)?;
         let source_text = path_str(source)?;
         let metadata = json::parse(&crypt(&["luksDump", "--dump-json-metadata", source_text])?)
             .map_err(|e| Error::new(format!("Invalid LUKS2 metadata: {e}")))?;
@@ -186,8 +198,7 @@ impl GuestOwner {
         read_exact_at(&raw, &mut header, self.offset)?;
         drop(raw);
         self.layout = profile::parse_superblock(&header, self.offset, raw_bytes)?;
-        let expected_iv = if encryption == "aegis128-random" { 16 } else { 12 };
-        if self.layout.iv_bytes != expected_iv {
+        if encryption != "aegis128-random" || self.layout.iv_bytes != 16 {
             bail!("LUKS and integrity IV sizes disagree");
         }
         if self.layout.sector_size != luks_sector {

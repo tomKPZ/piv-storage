@@ -1,5 +1,11 @@
 # Stateless failure semantics and experiments
 
+> [!NOTE]
+> 2026-10-21: format v3 and the AES-GCM / ChaCha20-Poly1305 profiles were
+> removed (AEGIS-128 with [format v4](format-v4.md) is the only supported
+> configuration). Results below that mention them are historical evidence for
+> the code at that time; see ROADMAP.md for current runs.
+
 The external recovery/history protocol and its root-ext4 ENOSPC/compaction tests
 were removed with the stateless architecture. Historical results in Git do not
 establish the current crash behavior.

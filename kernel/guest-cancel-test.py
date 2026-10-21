@@ -43,7 +43,7 @@ def child(phase):
         info = json.loads((W / 'scan-ready.json').read_text())
         identity = bytes.fromhex(info['context'])
         fd = os.open(info['control'], os.O_RDWR)
-        data = bytearray(blocks.SETUP.pack(3, blocks.SETUP.size, info['generation'], 0,
+        data = bytearray(blocks.SETUP.pack(blocks.SETUP_VERSION, blocks.SETUP.size, info['generation'], 0,
                                          len(identity), HKEY, identity, 0, 0))
         interrupted = False
         try:
@@ -230,23 +230,17 @@ try:
         assert mapping_identity('piv-test-delay') == wrapper
         v = open_views()
         handle = GuestOwner(SOURCE, KEY, allow_test_stack=True)
-        group = 576 // handle.device.iv_size
-        v4 = handle.device.iv_size == 16  # default-initialized fixtures: v4 on 16-byte IVs
         handle.close()
         unavailable_from = None
         if phase == 'scan':
             assert status['encryptions'] == 0
-        elif v4:
+        else:
             # Keyslot 0 (2 x 14 sectors) and the directory (90) precede the
             # 90-sector zero records.
             completed, remainder = divmod(status['encryptions'] - 2 * 14 - 90, 90)
             assert not remainder and 2 <= completed < min(64, len(expected) // 512), status
             expected[:completed * 512] = bytes(completed * 512)
             unavailable_from = completed
-        else:
-            completed, remainder = divmod(status['encryptions'], group)
-            assert not remainder and 2 <= completed < min(64, len(expected) // 512), completed
-            expected[:completed * 512] = bytes(completed * 512)
         verify(v, unavailable_from)
         blocks.close_blocks(SOURCE, KEY, allow_test_stack=True)
         results.append(dict(phase=phase, interrupted_seconds=elapsed,
@@ -271,14 +265,14 @@ finally:
 
 # Exercise normal initialization completion too, on the smaller fixture. Large
 # initialization was already verified in large-*; do not repeat an eight-minute run.
-# v4 always completes it: an interrupted v4 initialization leaves later blocks
-# unavailable, which no whole-volume oracle can describe.
-if raw_bytes == 128 * 1024 * 1024 or v4:
-    v = open_views(initialize=True)
-    expected[:] = bytes(len(expected))
-    verify(v)
-    blocks.close_blocks(SOURCE, KEY, allow_test_stack=True)
-    results.append(dict(phase='normal-initialization', complete_oracles=True))
+# Always complete it: an interrupted initialization leaves later blocks
+# unavailable (the master key changed first), which no whole-volume oracle can
+# describe.
+v = open_views(initialize=True)
+expected[:] = bytes(len(expected))
+verify(v)
+blocks.close_blocks(SOURCE, KEY, allow_test_stack=True)
+results.append(dict(phase='normal-initialization', complete_oracles=True))
 absent()
 dm('remove', '--retry', 'piv-test-delay')
 subprocess.run(['rmmod', 'dm_piv'], check=True)

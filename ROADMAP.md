@@ -9,12 +9,14 @@ are historical evidence, not requirements for the current implementation.
 
 Architecture: one coordinated kernel owner, two writable native block devices,
 ordinary stock dm-integrity persistence, no separate history/WAL/partition.
-Each 512-byte hidden block is one address-bound authenticated record in 48 IVs
-for AES/ChaCha or 36 IVs for original AEGIS-128.
-Fresh salts/encodings replace persistent nonce reservations. Hidden damage is
-local EIO; decoy writes preserve an encrypted invalid marker for unavailable
-hidden data. Full-block hidden writes repair those records. Initialization is an
-explicit destructive reset, not an inferred one-time adoption operation.
+Since 2026-10-21 (option A) the only configuration is LUKS2 original AEGIS-128
+with hidden format v4: each 512-byte hidden block is one address-bound SIV
+record in 90 LRW-randomized IV fragments (docs/format-v4.md), behind encrypted
+keyslots. Fresh randomness replaces persistent nonce reservations. Hidden damage
+is local EIO; decoy writes preserve damaged fragments. Full-block hidden writes
+repair those records. Initialization is an explicit destructive reset, not an
+inferred one-time adoption operation. The bullets below are the original
+stateless milestone (format v3 and the 12-byte-IV profiles were later removed).
 
 Implemented in this working tree:
 
@@ -95,7 +97,9 @@ them. Known integrity or memory-safety defects still override this order.
      suites (a scoped kernel build; confirm with the user first);
    - in-guest syzkaller-style fuzzing of the control ioctls.
 3. **Then the remaining core items** below: no-journal (once the torn-sector
-   policy is decided), newer-kernel port, optional v4 default for AEGIS, xts/hmac.
+   policy is decided) and the newer-kernel port. (The v4 default is done; v3,
+   AES-GCM/ChaCha20-Poly1305 and therefore the xts/hmac idea were removed by
+   the user's 2026-10-21 option A decision.)
 
 User answers (2026-10-21), binding for autonomous sessions:
 - *Crates:* a small pinned set from crates.io (e.g. libc, zeroize, later
@@ -108,6 +112,10 @@ User answers (2026-10-21), binding for autonomous sessions:
 - *No-journal:* deferred; journaled mode only for now.
 - *v4 default:* switch newly initialized 16-byte-IV (AEGIS-128) volumes to
   format v4 now and update suite expectations. 12-byte-IV profiles stay v3.
+  Superseded the same day by option A: v3, its invalid markers and the
+  AES-GCM/ChaCha20-Poly1305 profiles were removed outright; AEGIS-128 + v4 is
+  the only configuration. Migration (rekey/resize into a new volume) stays,
+  restored as `pivsetup migrate` (the earlier removal was a misunderstanding).
 
 Working order: v4 default (done), Rust port to parity and cutover (done),
 Argon2id (done), C W=1/sparse (done) and input review (first pass done),
@@ -204,7 +212,8 @@ safety defects take precedence over this ordering whenever discovered.
    dm-integrity journal transaction across power loss. If so, journaled mode
    may give atomic hidden records at no capacity cost, trading against history
    retention. Record evidence before choosing the format v4 journal default.
-7. **AEGIS-128 recommended — documentation done; xts/hmac investigated.**
+7. **AEGIS-128 only (option A, 2026-10-21) — the xts/hmac idea below is
+   obsolete.** Historical note:
    README leads with AEGIS-128 and v4 requires it. Pinned cryptsetup emits
    `capi:authenc(<auth>,<mode>)-<iv>` for non-AEAD integrity (e.g.
    aes-xts-random + hmac-sha256), and dm-crypt stores random IVs for it, so the
@@ -229,19 +238,22 @@ safety defects take precedence over this ordering whenever discovered.
 
 ## Work following core implementation
 
-- **Rekey/migration tooling — removed (user decision, 2026-10-21).** This is a
-  research prototype with no deployed volumes, so `pivstore migrate`, its guest
-  test and the second-disk (`/dev/vdc`) harness/guard opt-in were deleted to
-  reduce maintenance (they passed in suite-004 before removal). Recreate
-  volumes instead; v4 hidden-key changes use keyslot add/remove. Per-cipher
-  lifetime-budget guidance is still to write; no on-disk ledger or online rekey.
-- **Hidden-key KDF — implemented for v4 keyslots:** stdlib scrypt (N=2^17,
-  r=8, p=1, salt = base context || "/kek") via `--hidden-passphrase-file`;
-  Argon2id awaits the Rust port. Original plan: Argon2id (or stdlib scrypt meanwhile) from a passphrase in
+- **Rekey/migration tooling — restored in Rust (2026-10-21).** The user
+  clarified that the earlier removal (4162c74) was a misunderstanding: they had
+  meant v3 removal, not this offline copy. `pivsetup migrate` opens the source
+  as piv-src, initializes a freshly luksFormatted AEGIS-128 target as piv-dst
+  (optionally A/B), copies both views, re-reads both with O_DIRECT and compares
+  them byte for byte, then closes both. It covers primary rekey, resize and
+  sector-size change; v4 hidden-key changes still use keyslot add/remove. The
+  second disk (`/dev/vdc`) needs the explicit `--allow-second-disk` opt-in.
+  Lifetime-budget guidance is still to write; no on-disk ledger or online rekey.
+- **Hidden-key KDF — implemented for v4 keyslots:** Argon2id (default, RFC 9106
+  second recommendation) or scrypt (N=2^17, r=8, p=1) via
+  `--hidden-passphrase-file` and `--kdf`. Original plan: Argon2id (or stdlib scrypt meanwhile) from a passphrase in
   userspace setup. Before the header exists, use the LUKS UUID as salt with
   fixed or user-supplied parameters; the header then stores a random salt and
   parameters for wrapped keys.
-- **Userspace setup port to Rust — promoted to current priority 1 (2026-10-21).**
+- **Userspace setup port to Rust — done (2026-10-21).**
   Zeroizing/mlocked key buffers, Argon2id and a static initramfs binary. Changes
   the current Python-standard-library setup rule; retain the independent Python
   diagnostics as a cross-check.
@@ -1649,3 +1661,49 @@ Open: triage the kmemleak report (guest_record now forces a final scan and
 saves /sys/kernel/debug/kmemleak; reproduction runs in artifacts/dbg-repro-002),
 then rerun the 512-byte sanitizer suites. Afterwards: kunit/fuzzing, newer
 kernel port.
+
+## Session handoff: option A (AEGIS-128 + v4 only) and Rust migrate (2026-10-21)
+
+User decision ("option A"): remove format v3 and every 12-byte-IV profile
+rather than keep them as legacy. Removed: kernel v3 record/carrier/invalid-marker
+paths and the AES-GCM/ChaCha20-Poly1305 cipher table entries (SETUP ABI 4 now
+accepts only flags INITIALIZE=1 and AB=8, 16-byte IVs and a v4 context; there is
+no uninitialized-carrier mode); `pivsetup --format/--uninitialized`; Python
+records.py and its tests, the v3 unpack and check_stateless paths, the
+stock-refresh control arm and the AES/ChaCha control scripts; the early
+initramfs no longer carries gcm/ghash/ctr/poly1305/chacha20poly1305 (v4 still
+needs chacha20, hmac and sha256). Host tests now use 32-byte tuples only and
+still reject 28. Docs were rewritten for the single configuration; evidence
+docs carry a dated note that their AES/ChaCha/v3 results are historical.
+
+The user also clarified that the earlier migration removal (4162c74) was a
+misunderstanding, so migration is back, ported to Rust: `pivsetup migrate`
+(rust/src/migrate.rs, AEGIS v4 → AEGIS v4) opens the source as piv-src,
+initializes a freshly luksFormatted target as piv-dst (optionally `--ab`),
+refuses smaller target views, copies both views through a 1 MiB mlocked,
+zeroized O_DIRECT buffer, flushes, re-reads both devices and compares them byte
+for byte, then closes both (errors keep cleanup notes). The guard opt-ins are
+now an `Allow { test_stack, second_disk }`; `/dev/vdc` needs
+`--allow-second-disk` (Rust, Python guest_guard/GuestOwner and blocks wrappers;
+unit test added). vm.py regained `--second-blank-mib`; suite `migrate` runs
+kernel/guest-migrate-test.py: refusals (same device; /dev/vdc without opt-in,
+which also proves the opened source is cleaned up), migration to a rekeyed
+512 MiB, 512-byte-sector, A/B target (a sector-size change for the 4096-byte
+profile), source re-verification, wrong-key rejection on the target, target
+reopen (hidden prefix equal, remainder zero) and stock dm-crypt readback of the
+migrated primary after unloading dm_piv.
+
+Evidence (KVM, stock pinned guest, scaffold artifacts/optA-input-001):
+suite-022 (option A, before migrate) 22/22 VMs with all host checks verified;
+suite-024-migrate 4/4; suite-025 (final pivsetup 121321ad…) aegis-4096 and
+aegis-512 × native, faults, profile, cancel, lifecycle, batch, early, power,
+controls, sector, v4, migrate: 24/24 VMs, 14/14 host checks, no kernel reports.
+Host: 48 Python unit tests (with the AEGIS reference and the aegis-4096
+fixture) and 12 cargo tests pass. suite-021-sanitizer (pre-option-A code,
+512-byte profiles on the debug kernel) finished 30/30 with no kernel reports
+after the kmemleak triage (docs/sanitizer.md: the 6 boot-time execmem objects
+are ignored, no dm_piv frames).
+
+Open: option-A sanitizer matrix (suite-026-sanitizer, running at handoff time);
+kunit tests for the pure helpers; ioctl fuzzing; newer-kernel port; no-journal
+(awaiting the torn-sector policy); lifetime-budget guidance for AEGIS-128.

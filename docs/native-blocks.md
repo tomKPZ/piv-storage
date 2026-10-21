@@ -38,25 +38,25 @@ stay in mlocked, zeroized buffers and never reach argv). It invokes cryptsetup
 for ordinary LUKS opening and journal replay, suspends the new crypt mapping,
 reloads its private table as piv-crypt with piv_control, resumes it, then suspends
 and begins coordinated ownership, authenticates every primary sector,
-and loads the hidden key/context through ABI 3. Optional destructive initialization
-writes zero hidden blocks before exposing devices. Without initialization,
-setup requires one hidden record (data or invalid marker) to authenticate under
-the key, using carriers collected by the primary scan, unless the caller sets
-the uninitialized-carrier flag; otherwise it returns EKEYREJECTED. Hidden
-availability beyond that one record never gates the decoy. CRNG readiness is awaited before setup takes the
-owner lock. Runtime ownership locks use /run, which may be tmpfs.
+and loads the keyslot KEK and v4 base context through SETUP ABI 4.
+Optional destructive initialization writes a new master key, keyslot 0, the
+directory and zero hidden blocks before exposing devices. Without
+initialization, a keyslot must authenticate under the key, using keyslot IVs
+collected by the primary scan, and the directory must authenticate; otherwise
+setup fails (EKEYREJECTED for a wrong key). There is no uninitialized-carrier
+mode. Hidden availability of individual records never gates the decoy. CRNG
+readiness is awaited before setup takes the owner lock. Runtime ownership locks
+use /run, which may be tmpfs.
 
 The private piv-crypt mapping rejects ordinary bios while native ownership is active.
 Public piv-view map callbacks queue bounded work to an ordered reclaim-capable
 workqueue. Work runs under the shared lock and NOIO allocation scope. Hidden bios
-are split to 512 bytes, decoy bios at 16 KiB boundaries. Decoy writes use
-authenticated primary-sector RMW and refresh each intersecting carrier group
-once per work item. At most two carrier groups / 96 primary tuples are prepared;
-the 16 KiB limit is smaller than the smallest primary carrier span (36 * 512
-bytes).
-Incomplete tail sectors receive fresh random IVs without hidden records. No
-cross-bio accumulation, extra writeback cache, delay or on-disk format is added.
-Separate small writes can still refresh the same group repeatedly.
+are split to 512 bytes, decoy bios at 16 KiB boundaries. A decoy write performs
+authenticated primary-sector RMW and gives each written sector a fresh IV:
+keyslot (listed in the directory), directory and record sectors keep their
+fragment and redraw its random part; other sectors get uniformly random IVs. At
+most 32 primary tuples per work item are prepared (bound 96). No cross-bio
+accumulation, extra writeback cache, delay or on-disk format is added.
 
 No discard or write-zeroes bypass is advertised. WRITE|PREFLUSH drains the lower
 journal before its payload; each write batch flushes every 32 applied sectors and
@@ -64,64 +64,56 @@ at completion, satisfying FUA before completion as well. Flush bios reach the
 lower journal through the same ordered workqueue. Suspend/removal uses DM
 references and generation binding. Public-view concurrency, busy teardown and
 exact flush/FUA trace tests are described in [the lifecycle notes](native-faults.md#concurrent-lifecycle-and-explicit-flushfua-evidence).
-Larger batches are not atomic writes; an
-interrupted decoy batch may damage either touched hidden record. Opening still
-authenticates the full primary volume sector by sector; setup overhead remains.
+Batches are not atomic writes. Opening still authenticates the full primary
+volume sector by sector; setup overhead remains.
 
-On a write, authenticate the complete affected carrier groups, preserve valid
-hidden data (or mark unavailable data invalid), generate fresh encodings and
-prepare all primary tuples in RAM. Then apply exact tuples through the lower
-journal, flushing every 32 sectors and at completion. There is no durable
-cross-sector plan. A crash can destroy affected hidden blocks. Failures before
-the first applied tuple (reads, authentication, allocation, preparation) fail
-only that bio; APPLY-time or flush failures stop both views until teardown. See
-[failure scope](native-faults.md). Hidden authentication failure returns EIO for
-that block without stopping the owner.
+A hidden write reads and authenticates its 90-sector record (with A/B, both
+slots), seals the block with a fresh generation and fresh fragments, and
+prepares all primary tuples in RAM. Then exact tuples are applied through the
+lower journal, flushing every 32 sectors and at completion. There is no durable
+cross-sector plan; without A/B a crash can destroy the affected block. Failures
+before the first applied tuple (reads, authentication, allocation, preparation)
+fail only that bio; APPLY-time or flush failures stop both views until teardown.
+See [failure scope](native-faults.md). Hidden authentication failure returns EIO
+for that block without stopping the owner.
 
-ABI 3 SETUP is 192 bytes: version/size, generation, flags/context_length, hidden
-key32, context128, reserved2. Flag 1 destructively initializes all hidden blocks;
-flag 2 accepts a carrier where no record authenticates (fresh/uninitialized);
-flag 4 selects (with flag 1) or requires format v4; flag 8 selects A/B slots
-when initializing v4. Other flag bits are rejected. On 16-byte-IV profiles the
-key is a v4 keyslot KEK and the format is detected (docs/format-v4.md).
+SETUP ABI 4 is 192 bytes: version/size, generation, flags/context_length, key32
+(keyslot KEK), context128 (v4 base context), reserved2. Flag 1 destructively
+initializes; flag 8 selects A/B slots when initializing. Other flag bits
+(including the former v3-era 2 and 4) are rejected.
 KEYSLOT (ioctl 15, version 1, 64 bytes: version/size, generation, slot, op,
-kek32, reserved2) adds (op 1) or removes (op 2) a v4 keyslot on an active owner;
+kek32, reserved2) adds (op 1) or removes (op 2) a keyslot on an active owner;
 the last keyslot cannot be removed, and failures after a lower write fail-stop.
-STATUS is 48 bytes: generation, hidden_bytes, encryptions, invalidations (u64),
-active/views/failed/version (u32). Counters are volatile; invalidations count group writes in successfully
-completed invalid-marker requests, not durable lifetime history.
+STATUS is 48 bytes: generation, hidden_bytes, encryptions, invalidations (u64,
+always 0 since v3 invalid markers were removed), active/views/failed/version
+(u32). Counters are volatile, not durable lifetime history.
 No user paths or file descriptors enter the native persistence path.
 
-The primary cipher whitelist includes capi:gcm(aes)-random and
-capi:rfc7539(chacha20,poly1305)-random (32-byte keys, 12-byte stored IVs),
-and capi:aegis128-random (16-byte key, 16-byte IV). All use 16-byte tags. dm-piv.c's piv_aead reproduces dm-crypt's AEAD layout:
+The primary cipher whitelist is capi:aegis128-random only (16-byte key, 16-byte
+IV, 16-byte tag). dm-piv.c's piv_aead reproduces dm-crypt's AEAD layout:
 AAD LE64(address_in_512_byte_units) || IV. Setup checks the actual owner table
-against the validated LUKS cipher on creation and reuse. The independent verifier
-selects AESGCM, ChaCha20Poly1305 or the pinned diagnostic AEGIS-128 reference from the same validated public metadata; setup
-continues to need no userspace crypto beyond pivsetup's scrypt for v4 passphrase KEKs. The v3 hidden encoding is unchanged; AEGIS groups contain 36 primary sectors
-instead of 48. No persistent format is added outside the IVs.
+against the validated LUKS cipher on creation and reuse. The independent
+verifier uses the pinned diagnostic AEGIS-128 reference from the same validated
+public metadata. Setup needs no userspace crypto beyond pivsetup's passphrase
+KDFs. No persistent format is added outside the IVs.
 
 QUERY reports the primary sector size and encryption-sector count. Primary
 controls use version 2; old control requests are rejected. QUERY/READ remain
 48 bytes; UPDATE is 4176 bytes. Its tuple is 4128 bytes: ciphertext[S], zero
-padding up to 4096, tag16, IV[12 or 16], zero padding up to 16 IV bytes. Expected
-IV fields likewise have zero padding up to 16 bytes. All nonzero padding is
-rejected. Padding exists only in RAM, never on disk. The integrity tuple is
-28 or 32 bytes according to the validated primary profile. Native SETUP/STATUS
-retain ABI 3, separate from the primary-sector controls. The old 256 MiB primary
-cap has been replaced by checked kernel file-offset bounds. Public setup still permits only 128 or 512 MiB raw test disks; see
+padding up to 4096, tag16, IV16. All nonzero padding is rejected. Padding exists
+only in RAM, never on disk. The integrity tuple is 32 bytes. The old 256 MiB
+primary cap has been replaced by checked kernel file-offset bounds. Public setup
+still permits only 128 or 512 MiB raw test disks; see
 [larger geometry](large-volumes.md) for tested extents and limitations.
 
-Uninitialized/damaged blocks need a full 512-byte direct-I/O write for targeted
-repair. Buffered sub-page writes may first read a 4096-byte page containing
-unavailable blocks and fail before reaching the target. Destructive full-volume
-initialization avoids this issue for normal filesystem use.
+Damaged blocks need a full 512-byte direct-I/O write for targeted repair.
+Buffered sub-page writes may first read a 4096-byte page containing unavailable
+blocks and fail before reaching the target.
 
 Use the project close-blocks command to remove the private stack. Stock cryptsetup
 does not directly manage our custom target. The controller tears down our DM
 mappings explicitly; ordinary cryptsetup remains available for unrelated volumes
-and for stock readback after closing ours. No primary or hidden disk format or
-control ABI changed with module separation.
+and for stock readback after closing ours.
 
 dm-piv.c owns the owner target and per-sector AEAD. piv-control.inc owns privileged
 controls, authenticated primary tuple preparation/application and lifetime gates;
@@ -131,11 +123,10 @@ application and journal checkpoints copy existing authenticated tuples without
 new encryption. Fresh preparation spends an encryption invocation even if later
 application fails. The test-only raw controls are not a nonce-policy service.
 
-Hidden unavailability uses positive internal sentinels: PN_UNAVAILABLE, and
-PN_INVALID for an authenticated invalid marker (which also proves the key to
-the setup guard). Linux BLK_STS_MEDIUM maps to negative -ENODATA, a storage
-error that must never be mistaken for hidden unavailability: it is local only
-before mutation and stops the owner once APPLY has begun.
+Hidden unavailability uses the positive internal sentinel PN_UNAVAILABLE. Linux
+BLK_STS_MEDIUM maps to negative -ENODATA, a storage error that must never be
+mistaken for hidden unavailability: it is local only before mutation and stops
+the owner once APPLY has begun.
 
 ## Reproduce
 
@@ -161,13 +152,13 @@ scripts/suite.py builds and shares pivsetup automatically; guest_code installs a
 shared binary as /usr/local/sbin/pivsetup and records its SHA-256.
 
 Create the ordinary control fixture using docs/development.md if absent.
-For the 512-byte profile, use control-512-001/control.img and that fixture's
+For the 512-byte geometry, use an aegis-512 control fixture and that fixture's
 passphrase.key instead; hidden.key is an independently generated 32-byte test key.
 The same guest tests derive their geometry from LUKS and the queried owner. The
 script builds only the matched module inside the VM, records package/config
 provenance, exercises both filesystems and reopens with stock Linux for full
 primary readback. No host module, root privileges or extra host packages are
-needed. Independent host extraction verifies that the kernel wrote the v3 codec.
+needed. Independent host extraction verifies that the kernel wrote the v4 codec.
 See ROADMAP.md for actual tested runs and remaining early-boot/fault coverage.
 
 After that run succeeds, boot its private test initramfs with no OS filesystem:
@@ -226,12 +217,11 @@ python3 scripts/vm.py run --code --script scripts/guest-batch.sh \
 
 The test measures exact primary encryption invocations and elapsed direct
 O_DSYNC write/fsync time, writes nontrivial data, reads it back and restores the
-original bytes. Cases include 4/16/32 KiB, unaligned requests, carrier boundaries
-and incomplete tails. Complete primary/hidden verification, clean reopen, stock
+original bytes. Cases include 4/16/32 KiB, unaligned requests, record boundaries
+and the unused tail. Complete primary/hidden verification, clean reopen, stock
 readback and custom unload follow. batch-results.json stores each sample; single
-QEMU TCG timings are diagnostic, not a stable throughput benchmark. Work scales
-with the carrier groups intersected by each 16 KiB split, rather than just the
-application byte count. No throughput gain is promised for isolated small I/O.
+timings are diagnostic, not a stable throughput benchmark. Format v4 encrypts
+exactly the primary sectors each 16 KiB split touches.
 
 ## Bounded authenticated reads
 

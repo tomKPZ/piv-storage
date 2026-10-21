@@ -1,5 +1,11 @@
 # Matched ordinary-Linux controls
 
+> [!NOTE]
+> 2026-10-21: format v3 and the AES-GCM / ChaCha20-Poly1305 profiles were
+> removed (AEGIS-128 with [format v4](format-v4.md) is the only supported
+> configuration). Results below that mention them are historical evidence for
+> the code at that time; see ROADMAP.md for current runs.
+
 This experiment measures observable differences. It does not certify plausible
 deniability or prove single-snapshot indistinguishability. The implementation
 and on-disk encoding are unchanged.

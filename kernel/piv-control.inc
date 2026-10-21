@@ -390,7 +390,7 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	if (cmd == PIV_NATIVE_SETUP) {
 		setup = memdup_user((void __user *)arg, sizeof(*setup));
 		if (IS_ERR(setup)) return PTR_ERR(setup);
-		if (setup->version != 3 || setup->size != sizeof(*setup)) {
+		if (setup->version != 4 || setup->size != sizeof(*setup)) {
 			ret = -EINVAL; goto out;
 		}
 		/* Early boot: wait for seeded CRNG without holding owner lifecycle lock. */
@@ -424,7 +424,6 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		if (p->native) {
 			status.active = 1; status.views = p->native->views; status.failed = p->native->failed;
 			status.hidden_bytes = p->native->hidden_bytes;
-			status.invalidations = p->native->invalidations;
 		}
 	} else if (cmd == PIV_NATIVE_SETUP)
 		ret = pn_setup(p, file, setup);
@@ -571,15 +570,14 @@ static int piv_register(struct piv_crypt *cc, struct dm_target *ti)
 {
 	struct piv_control *p;
 	int ret;
-	bool aegis = !strcmp(cc->cipher_string, "capi:aegis128-random");
 
-	/* Pin the existing tested crypto profile; this is not a general API. The
-	 * constructor already parsed it; re-check the invariants this code relies on.
+	/* Pin the tested crypto profile (AEGIS-128, format v4); this is not a
+	 * general API. The constructor already parsed it; re-check the invariants
+	 * this code relies on.
 	 */
-	if ((strcmp(cc->cipher_string, "capi:gcm(aes)-random") &&
-	     strcmp(cc->cipher_string, "capi:rfc7539(chacha20,poly1305)-random") && !aegis) ||
-	    cc->key_size != (aegis ? 16 : 32) || (cc->sector_size != 512 && cc->sector_size != 4096) ||
-	    cc->iv_size != (aegis ? 16 : 12) || cc->integrity_iv_size != cc->iv_size ||
+	if (strcmp(cc->cipher_string, "capi:aegis128-random") ||
+	    cc->key_size != 16 || (cc->sector_size != 512 && cc->sector_size != 4096) ||
+	    cc->iv_size != 16 || cc->integrity_iv_size != cc->iv_size ||
 	    cc->integrity_tag_size != 16 || cc->tuple_size != 16 + cc->iv_size ||
 	    cc->iv_offset || cc->start ||
 	    !(dm_table_get_mode(ti->table) & BLK_OPEN_WRITE)) {

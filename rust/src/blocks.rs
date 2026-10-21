@@ -5,9 +5,9 @@ use std::path::Path;
 use crate::bail;
 use crate::cmd::{dm, dm_ok};
 use crate::error::{Error, Result};
-use crate::ioctl::{KernelDevice, SETUP_AB, SETUP_FORMAT_V4, SETUP_INITIALIZE, SETUP_UNINITIALIZED};
-use crate::owner::{mapping_identity, remove_mapping, GuestOwner};
-use crate::profile::{context_v3, context_v4};
+use crate::ioctl::{KernelDevice, SETUP_AB, SETUP_INITIALIZE};
+use crate::owner::{mapping_identity, remove_mapping, Allow, GuestOwner};
+use crate::profile::context_v4;
 use crate::secret::Secret;
 use crate::{hooks, signals};
 
@@ -43,15 +43,14 @@ impl Kdf {
 pub struct OpenOptions<'a> {
     pub name: &'a str,
     pub initialize: bool,
-    pub uninitialized: bool,
-    pub format: Option<u32>,
     pub ab: bool,
-    pub allow_test_stack: bool,
+    pub allow: Allow,
 }
 
 pub struct Views {
     pub decoy: String,
     pub hidden: String,
+    pub decoy_bytes: u64,
     pub hidden_bytes: u64,
 }
 
@@ -63,11 +62,7 @@ pub enum HiddenSecret {
 pub fn base_identity(owner: &GuestOwner) -> Vec<u8> {
     let device = owner.device();
     let primary_bytes = device.sectors * device.sector_size;
-    if device.iv_size == 16 {
-        context_v4(&owner.uuid, primary_bytes, device.sector_size)
-    } else {
-        context_v3(&owner.uuid, primary_bytes, device.sector_size)
-    }
+    context_v4(&owner.uuid, primary_bytes, device.sector_size)
 }
 
 /// KEK for a v4 keyslot from a passphrase. Salts are domain-separated by KDF:
@@ -98,14 +93,11 @@ pub fn passphrase_kek(passphrase: &[u8], base_context: &[u8], kdf: Kdf) -> Resul
     Ok(kek)
 }
 
-fn setup_flags(initialize: bool, uninitialized: bool, format: Option<u32>, ab: bool) -> Result<u32> {
-    if !matches!(format, None | Some(3) | Some(4)) || (ab && !(format == Some(4) && initialize)) {
-        bail!("Unsupported hidden format");
+fn setup_flags(initialize: bool, ab: bool) -> Result<u32> {
+    if ab && !initialize {
+        bail!("--ab applies only with --initialize (the layout is read from the keyslot afterwards)");
     }
-    Ok((if initialize { SETUP_INITIALIZE } else { 0 })
-        | (if uninitialized { SETUP_UNINITIALIZED } else { 0 })
-        | (if format == Some(4) { SETUP_FORMAT_V4 } else { 0 })
-        | (if ab { SETUP_AB } else { 0 }))
+    Ok((if initialize { SETUP_INITIALIZE } else { 0 }) | (if ab { SETUP_AB } else { 0 }))
 }
 
 fn native_setup(device: &KernelDevice, key: &[u8], identity: &[u8], flags: u32) -> Result<()> {
@@ -128,7 +120,7 @@ pub fn open_blocks(source: &Path, key_file: &Path, secret: HiddenSecret, options
             bail!("Hidden key must contain exactly 32 bytes");
         }
     }
-    let mut owner = GuestOwner::open(source, key_file, options.name, options.allow_test_stack)?;
+    let mut owner = GuestOwner::open(source, key_file, options.name, options.allow)?;
     let mut created: Vec<(String, String)> = Vec::new();
     let result = open_inner(&mut owner, secret, options, &mut created);
     match result {
@@ -176,25 +168,11 @@ fn open_inner(owner: &mut GuestOwner, secret: HiddenSecret, options: &OpenOption
             return Err(Error::os(libc::EEXIST, "Public view name is already in use"));
         }
     }
-    let iv_size = owner.device().iv_size;
-    if options.format == Some(4) && iv_size != 16 {
-        bail!("Format v4 requires a 16-byte IV (AEGIS-128) primary profile");
-    }
-    // Initialization defaults to v4 on 16-byte-IV profiles and v3 otherwise.
-    let format = match (options.initialize, options.format) {
-        (true, None) => Some(if iv_size == 16 { 4 } else { 3 }),
-        (_, format) => format,
-    };
-    let flags = setup_flags(options.initialize, options.uninitialized, format, options.ab)?;
+    let flags = setup_flags(options.initialize, options.ab)?;
     let identity = base_identity(owner);
     let key = match secret {
         HiddenSecret::Key(key) => key,
-        HiddenSecret::Passphrase(passphrase, kdf) => {
-            if iv_size != 16 {
-                bail!("Passphrases are supported only for format v4 keyslots");
-            }
-            passphrase_kek(&passphrase, &identity, kdf)?
-        }
+        HiddenSecret::Passphrase(passphrase, kdf) => passphrase_kek(&passphrase, &identity, kdf)?,
     };
     owner.validate()?;
     signals::check()?;
@@ -203,8 +181,8 @@ fn open_inner(owner: &mut GuestOwner, secret: HiddenSecret, options: &OpenOption
     device.begin()?;
     if let Err(mut error) = native_setup(device, &key, &identity, flags) {
         if error.errno == Some(libc::EKEYREJECTED) {
-            error.note("No hidden record authenticated: wrong hidden key, or an uninitialized carrier \
-                        (use --initialize or --uninitialized)");
+            error.note("No keyslot authenticated: wrong hidden key or KDF, or a carrier never \
+                        initialized (use --initialize)");
         }
         return Err(error);
     }
@@ -224,15 +202,16 @@ fn open_inner(owner: &mut GuestOwner, secret: HiddenSecret, options: &OpenOption
     Ok(Views {
         decoy: format!("/dev/mapper/{name}-decoy"),
         hidden: format!("/dev/mapper/{name}-hidden"),
+        decoy_bytes: decoy_sectors * 512,
         hidden_bytes: status.hidden_bytes,
     })
 }
 
-pub fn close_blocks(source: &Path, key_file: &Path, name: &str, allow_test_stack: bool) -> Result<()> {
+pub fn close_blocks(source: &Path, key_file: &Path, name: &str, allow: Allow) -> Result<()> {
     if dm(&["info", name], None, false)?.status != 0 {
         return Err(Error::os(libc::ENOENT, "Native owner is not active"));
     }
-    let mut owner = GuestOwner::open(source, key_file, name, allow_test_stack)?;
+    let mut owner = GuestOwner::open(source, key_file, name, allow)?;
     let result = close_inner(&mut owner, name);
     owner.close();
     result
@@ -268,8 +247,8 @@ fn close_inner(owner: &mut GuestOwner, name: &str) -> Result<()> {
     owner.remove(false)
 }
 
-pub fn keyslot(source: &Path, key_file: &Path, slot: u32, kek: Option<&[u8]>, name: &str, allow_test_stack: bool) -> Result<()> {
-    let mut owner = GuestOwner::open(source, key_file, name, allow_test_stack)?;
+pub fn keyslot(source: &Path, key_file: &Path, slot: u32, kek: Option<&[u8]>, name: &str, allow: Allow) -> Result<()> {
+    let mut owner = GuestOwner::open(source, key_file, name, allow)?;
     let result = (|| {
         if owner.created || !owner.device().status()?.active {
             return Err(Error::os(libc::ENOENT, "Native views must be active to manage keyslots"));
@@ -305,15 +284,11 @@ mod tests {
 
     #[test]
     fn setup_flags_match_kernel_abi() {
-        // tests/test_cleanup.py SetupFlagTests
-        for (init, uninit, format, ab, expected) in [
-            (false, false, None, false, 0), (true, false, None, false, 1), (false, true, None, false, 2),
-            (true, true, None, false, 3), (true, false, Some(4), false, 5), (true, false, Some(4), true, 13),
-            (false, false, Some(4), false, 4)] {
-            assert_eq!(setup_flags(init, uninit, format, ab).unwrap(), expected);
-        }
-        assert!(setup_flags(false, false, None, true).is_err());
-        assert!(setup_flags(true, false, Some(5), false).is_err());
+        // kernel/piv-control.h: INITIALIZE = 1, AB = 8 (SETUP ABI 4).
+        assert_eq!(setup_flags(false, false).unwrap(), 0);
+        assert_eq!(setup_flags(true, false).unwrap(), 1);
+        assert_eq!(setup_flags(true, true).unwrap(), 9);
+        assert!(setup_flags(false, true).is_err());
     }
 
     #[test]

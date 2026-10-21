@@ -8,6 +8,7 @@ mod error;
 mod hooks;
 mod ioctl;
 mod json;
+mod migrate;
 mod owner;
 mod profile;
 mod secret;
@@ -24,17 +25,23 @@ use secret::Secret;
 const USAGE: &str = "\
 usage: pivsetup open-blocks --key-file F (--hidden-key-file F | --hidden-passphrase-file F)
                             [--device /dev/vdb] [--name piv-native] [--initialize]
-                            [--format 3|4] [--ab] [--uninitialized] [--kdf argon2id|scrypt]
+                            [--ab] [--kdf argon2id|scrypt]
        pivsetup close-blocks --key-file F [--device /dev/vdb] [--name piv-native]
        pivsetup keyslot add|remove --key-file F --slot 0-3
                             [--new-key-file F | --new-passphrase-file F [--kdf argon2id|scrypt]]
                             [--device /dev/vdb] [--name piv-native]
+       pivsetup migrate --source-key-file F (--source-hidden-key-file F | --source-hidden-passphrase-file F)
+                        --target D --target-key-file F
+                        (--target-hidden-key-file F | --target-hidden-passphrase-file F)
+                        [--source /dev/vdb] [--source-kdf K] [--target-kdf K] [--ab]
        pivsetup keygen --output F
 
-Initialization defaults to format 4 on 16-byte-IV (AEGIS-128) profiles, else 3.
+LUKS2 AEGIS-128 (aegis128-random, integrity aead) volumes with hidden format v4 only.
 --initialize destroys all existing hidden contents. Keys are read from files only.
 Passphrase KEKs use --kdf (default argon2id: 64 MiB, t=3, p=4); nothing records
-which KDF a keyslot used, so open with the same one.";
+which KDF a keyslot used, so open with the same one. migrate copies both views of
+an opened source into a freshly luksFormatted AEGIS-128 target that it initializes
+(rekey, resize or sector-size change), then re-reads and compares both views.";
 
 const MAX_PASSPHRASE: usize = 4096;
 
@@ -50,8 +57,11 @@ impl Args {
         let action = argv.next().ok_or_else(|| Error::new(USAGE))?;
         let mut args = Args { action, operation: None, values: Vec::new(), flags: Vec::new() };
         let valued = ["--device", "--key-file", "--name", "--hidden-key-file", "--hidden-passphrase-file",
-                      "--format", "--slot", "--new-key-file", "--new-passphrase-file", "--output", "--kdf"];
-        let switches = ["--initialize", "--uninitialized", "--ab", "--allow-test-stack"];
+                      "--slot", "--new-key-file", "--new-passphrase-file", "--output", "--kdf",
+                      "--source", "--source-key-file", "--source-hidden-key-file",
+                      "--source-hidden-passphrase-file", "--source-kdf", "--target", "--target-key-file",
+                      "--target-hidden-key-file", "--target-hidden-passphrase-file", "--target-kdf"];
+        let switches = ["--initialize", "--ab", "--allow-test-stack", "--allow-second-disk"];
         while let Some(word) = argv.next() {
             let (key, inline) = match word.split_once('=') {
                 Some((k, v)) if k.starts_with("--") => (k.to_string(), Some(v.to_string())),
@@ -124,6 +134,25 @@ fn kdf(args: &Args) -> Result<blocks::Kdf> {
     args.value("--kdf").map_or(Ok(blocks::Kdf::Argon2id), blocks::Kdf::parse)
 }
 
+/// Exactly one of `<prefix>-key-file` / `<prefix>-passphrase-file`; `kdf_key`
+/// selects the passphrase KDF and is rejected for key files.
+fn hidden_secret(args: &Args, prefix: &str, kdf_key: &str) -> Result<HiddenSecret> {
+    let (key_opt, pass_opt) = (format!("{prefix}-key-file"), format!("{prefix}-passphrase-file"));
+    match (args.path(&key_opt), args.path(&pass_opt)) {
+        (Some(key), None) => {
+            if args.value(kdf_key).is_some() {
+                return Err(Error::new(format!("{kdf_key} applies only to {pass_opt}")));
+            }
+            Ok(HiddenSecret::Key(read_key(&key)?))
+        }
+        (None, Some(passphrase)) => {
+            let kdf = args.value(kdf_key).map_or(Ok(blocks::Kdf::Argon2id), blocks::Kdf::parse)?;
+            Ok(HiddenSecret::Passphrase(read_passphrase(&passphrase)?, kdf))
+        }
+        _ => Err(Error::new(format!("Give exactly one of {key_opt} or {pass_opt}"))),
+    }
+}
+
 fn json_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
@@ -148,30 +177,17 @@ fn fill_random(buffer: &mut [u8]) -> Result<()> {
 fn run(args: Args) -> Result<()> {
     let device = args.path("--device").unwrap_or_else(|| PathBuf::from("/dev/vdb"));
     let name = args.value("--name").unwrap_or("piv-native").to_string();
-    let test_stack = args.flag("--allow-test-stack");
+    let allow = owner::Allow {
+        test_stack: args.flag("--allow-test-stack"),
+        second_disk: args.flag("--allow-second-disk"),
+    };
     match args.action.as_str() {
         "open-blocks" => {
             args.only(&["--device", "--key-file", "--name", "--hidden-key-file", "--hidden-passphrase-file",
-                        "--initialize", "--uninitialized", "--format", "--ab", "--allow-test-stack", "--kdf"])?;
-            let secret = match (args.path("--hidden-key-file"), args.path("--hidden-passphrase-file")) {
-                (Some(key), None) => {
-                    if args.value("--kdf").is_some() {
-                        return Err(Error::new("--kdf applies only to --hidden-passphrase-file"));
-                    }
-                    HiddenSecret::Key(read_key(&key)?)
-                }
-                (None, Some(passphrase)) => HiddenSecret::Passphrase(read_passphrase(&passphrase)?, kdf(&args)?),
-                _ => return Err(Error::new("Give exactly one of --hidden-key-file or --hidden-passphrase-file")),
-            };
-            let format = match args.value("--format") {
-                None => None,
-                Some("3") => Some(3),
-                Some("4") => Some(4),
-                Some(other) => return Err(Error::new(format!("Unsupported --format {other}"))),
-            };
+                        "--initialize", "--ab", "--allow-test-stack", "--allow-second-disk", "--kdf"])?;
+            let secret = hidden_secret(&args, "--hidden", "--kdf")?;
             let options = OpenOptions {
-                name: &name, initialize: args.flag("--initialize"), uninitialized: args.flag("--uninitialized"),
-                format, ab: args.flag("--ab"), allow_test_stack: test_stack,
+                name: &name, initialize: args.flag("--initialize"), ab: args.flag("--ab"), allow,
             };
             let views = blocks::open_blocks(&device, &args.required("--key-file")?, secret, &options)?;
             println!("{{\n  \"decoy\": {},\n  \"hidden\": {},\n  \"hidden_bytes\": {}\n}}",
@@ -179,12 +195,28 @@ fn run(args: Args) -> Result<()> {
             Ok(())
         }
         "close-blocks" => {
-            args.only(&["--device", "--key-file", "--name", "--allow-test-stack"])?;
-            blocks::close_blocks(&device, &args.required("--key-file")?, &name, test_stack)
+            args.only(&["--device", "--key-file", "--name", "--allow-test-stack", "--allow-second-disk"])?;
+            blocks::close_blocks(&device, &args.required("--key-file")?, &name, allow)
+        }
+        "migrate" => {
+            args.only(&["--source", "--source-key-file", "--source-hidden-key-file",
+                        "--source-hidden-passphrase-file", "--source-kdf", "--target", "--target-key-file",
+                        "--target-hidden-key-file", "--target-hidden-passphrase-file", "--target-kdf", "--ab",
+                        "--allow-test-stack", "--allow-second-disk"])?;
+            let source = args.path("--source").unwrap_or_else(|| PathBuf::from("/dev/vdb"));
+            let source_secret = hidden_secret(&args, "--source-hidden", "--source-kdf")?;
+            let target_secret = hidden_secret(&args, "--target-hidden", "--target-kdf")?;
+            let report = migrate::migrate(&source, &args.required("--source-key-file")?, source_secret,
+                                          &args.required("--target")?, &args.required("--target-key-file")?,
+                                          target_secret, args.flag("--ab"), allow)?;
+            println!("{{\n  \"decoy\": {{\"bytes\": {}, \"target_bytes\": {}}},\n  \
+                      \"hidden\": {{\"bytes\": {}, \"target_bytes\": {}}},\n  \"verified\": true\n}}",
+                     report.decoy_bytes, report.decoy_target_bytes, report.hidden_bytes, report.hidden_target_bytes);
+            Ok(())
         }
         "keyslot" => {
             args.only(&["--device", "--key-file", "--name", "--slot", "--new-key-file", "--new-passphrase-file",
-                        "--allow-test-stack", "--kdf"])?;
+                        "--allow-test-stack", "--allow-second-disk", "--kdf"])?;
             if args.value("--kdf").is_some() && args.path("--new-passphrase-file").is_none() {
                 return Err(Error::new("--kdf applies only to --new-passphrase-file"));
             }
@@ -202,7 +234,7 @@ fn run(args: Args) -> Result<()> {
                 }
                 (Some("add"), None, Some(passphrase)) => {
                     let identity = {
-                        let owner = owner::GuestOwner::open(&device, &key_file, &name, test_stack)?;
+                        let owner = owner::GuestOwner::open(&device, &key_file, &name, allow)?;
                         blocks::base_identity(&owner)
                     };
                     Some(blocks::passphrase_kek(&read_passphrase(&passphrase)?, &identity, kdf(&args)?)?)
@@ -212,7 +244,7 @@ fn run(args: Args) -> Result<()> {
                 }
                 _ => return Err(Error::new(format!("Usage error\n{USAGE}"))),
             };
-            blocks::keyslot(&device, &key_file, slot, kek.as_deref(), &name, test_stack)
+            blocks::keyslot(&device, &key_file, slot, kek.as_deref(), &name, allow)
         }
         "keygen" => {
             args.only(&["--output"])?;

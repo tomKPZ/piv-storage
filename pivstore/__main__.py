@@ -29,8 +29,6 @@ def main():
     extraction.add_argument('image', type=Path)
     extraction.add_argument('--output', type=Path, required=True)
     extraction.add_argument('--hidden-key-file', type=Path, required=True)
-    extraction.add_argument('--format', type=int, choices=(3, 4), default=3,
-                            help='4: the hidden key file is a keyslot KEK')
     args = parser.parse_args()
     try:
         if args.action == 'keygen':
@@ -42,10 +40,10 @@ def main():
             print('Created a private 32-byte key file')
             return 0
         if args.action == 'unpack':
-            from .records import unpack
+            from .records_v4 import unpack
             with args.hidden_key_file.open('rb') as stream:
                 hidden_key = stream.read(33)
-            result = unpack(args.image, args.output, hidden_key, format=args.format)
+            result = unpack(args.image, args.output, hidden_key)
             print(json.dumps(result, indent=2))
             return 0
         with Image(args.image) as image:

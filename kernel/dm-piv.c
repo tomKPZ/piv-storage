@@ -61,8 +61,7 @@ static const struct piv_profile {
 	const char *cipher_string, *algorithm;
 	unsigned int key_size, iv_size;
 } piv_profiles[] = {
-	{ "capi:gcm(aes)-random", "gcm(aes)", 32, 12 },
-	{ "capi:rfc7539(chacha20,poly1305)-random", "rfc7539(chacha20,poly1305)", 32, 12 },
+	/* AEGIS-128 only: format v4 needs 16-byte IVs (AES-GCM/ChaCha removed 2026-10-21). */
 	{ "capi:aegis128-random", "aegis128", 16, 16 },
 };
 

@@ -1,7 +1,7 @@
 """Read-only LUKS2/dm-integrity profile, cross-checked with stock Linux fixtures.
 
 LUKS2 header checksums and redundant-header selection are delegated to cryptsetup.
-Only the no-journal-crypto, fixed-padding, 512/4096-byte AES-GCM, ChaCha20-Poly1305 and original AEGIS-128 profiles are accepted.
+Only the no-journal-crypto, fixed-padding, 512/4096-byte original AEGIS-128 profile is accepted.
 """
 
 from contextlib import AbstractContextManager
@@ -76,7 +76,7 @@ def parse_superblock(header, offset, file_size):
     magic, version, interleave, tuple_size, sections, provided, flags, block = (
         struct.unpack_from('<8sBBHIQIB', header))
     if (magic, version, interleave, flags) != (
-            b'integrt\0', 4, 15, 8) or tuple_size not in (28, 32) or block not in (0, 3):
+            b'integrt\0', 4, 15, 8) or tuple_size != 32 or block not in (0, 3):
         raise UnsupportedImage('Unsupported integrity superblock profile')
     if offset < 32768 or offset % 4096 or offset + 4096 > file_size:
         raise UnsupportedImage('Invalid integrity offset')
@@ -157,8 +157,7 @@ class Image(AbstractContextManager):
                 raise UnsupportedImage('Invalid LUKS2 segment metadata') from exc
             self.encryption = metadata['segments']['0']['encryption']
             self.layout = parse_superblock(self.read(4096, offset), offset, self.size)
-            expected_iv = 16 if self.encryption == 'aegis128-random' else 12
-            if self.layout.iv_bytes != expected_iv:
+            if self.layout.iv_bytes != 16:
                 raise UnsupportedImage('LUKS and integrity IV sizes disagree')
             if self.layout.sector_size != metadata['segments']['0']['sector_size']:
                 raise UnsupportedImage('LUKS and integrity sector sizes disagree')

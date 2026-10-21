@@ -22,29 +22,20 @@ import threading
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
+# AEGIS-128 is the only supported profile (format v4 needs 16-byte IVs).
 CONTROL_SCRIPTS = {
-    'aes-4096': ['scripts/guest-control.sh'],
-    'aes-512': ['scripts/guest-control-512.sh', 'scripts/guest-control.sh'],
-    'chacha-4096': ['scripts/guest-control-chacha.sh', 'scripts/guest-control.sh'],
-    'chacha-512': ['scripts/guest-control-chacha-512.sh', 'scripts/guest-control.sh'],
     'aegis-4096': ['scripts/guest-control-aegis.sh', 'scripts/guest-control.sh'],
     'aegis-512': ['scripts/guest-control-aegis-512.sh', 'scripts/guest-control.sh'],
 }
-SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early', 'power', 'controls', 'sector', 'v4')
+SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early', 'power', 'controls', 'sector', 'v4', 'migrate')
 DEFAULT_SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early')
 lock = threading.Lock()
-
-
-def default_format(control):
-    """Initialization default: v4 on 16-byte-IV (AEGIS-128) profiles, else v3."""
-    segment = json.loads((control / 'share/luks.json').read_text())['segments']['0']
-    return 4 if segment['encryption'] == 'aegis128-random' else 3
 
 
 # Kernel self-reports that fail any run (stock or sanitizer kernel alike).
 KERNEL_REPORT = re.compile(r'BUG: KASAN|UBSAN:|possible circular locking|possible recursive locking|'
                            r'inconsistent lock state|BUG: sleeping function|BUG: unable to handle|'
-                           r'WARNING: CPU|kernel BUG at|Oops|unreferenced object|suspected memory leak|general protection fault')
+                           r'WARNING: CPU|kernel BUG at|Oops|general protection fault')
 
 
 def kernel_reports(run_dir):
@@ -54,7 +45,22 @@ def kernel_reports(run_dir):
             for line in path.read_text(errors='replace').splitlines():
                 if KERNEL_REPORT.search(line):
                     found.append(f'{path.name}: {line.strip()[:200]}')
+    found += kmemleak_objects(run_dir / 'share/kmemleak.txt')
     return found[:20]
+
+
+def kmemleak_objects(path):
+    """Suspected leaks from guest_record's forced kmemleak scan. Boot-time objects
+    (swapper/0 in start_kernel, e.g. 6.12's execmem retpoline thunks) predate our
+    module and are a known kernel-internal false positive (docs/sanitizer.md)."""
+    if not path.exists():
+        return []
+    found = []
+    for block in path.read_text(errors='replace').split('unreferenced object ')[1:]:
+        if 'comm "swapper/0"' in block and ' start_kernel+' in block and 'dm_piv' not in block:
+            continue
+        found.append('kmemleak: ' + ' '.join(block.split())[:200])
+    return found
 
 
 def log(message):
@@ -98,11 +104,8 @@ class Matrix:
         with lock:
             self.results.setdefault(name, {}).update(value)
 
-    def host_check(self, name, image, control, oracle_primary, oracle_hidden, format=None):
-        if format is None:
-            format = default_format(control)
+    def host_check(self, name, image, control, oracle_primary, oracle_hidden):
         command = [sys.executable, str(ROOT / 'scripts/check_stateless.py'), str(image),
-                   *([] if format == 3 else ['--format', str(format)]),
                    '--volume-key-file', str(control / 'share/volume.key'),
                    '--hidden-key-file', str(control / 'hidden.key'),
                    '--expected-primary', str(oracle_primary), '--expected-hidden', str(oracle_hidden)]
@@ -159,6 +162,8 @@ class Matrix:
                       'batch-final.img'),
             'power': (ROOT / 'scripts/guest-stateless-power.sh', control / 'control.img',
                       [ko, ROOT / 'kernel/guest-stateless-power.py', *keys], None),
+            'migrate': (ROOT / 'scripts/guest-migrate.sh', final,
+                        [ko, ROOT / 'kernel/guest-migrate-test.py', *keys, *oracles], None),
             'v4': (ROOT / 'scripts/guest-v4.sh', control / 'control.img',
                    [ko, ROOT / 'kernel/guest-v4-test.py', *keys], 'v4-final.img'),
             'controls': (ROOT / 'scripts/guest-controls.sh', control / 'control.img',
@@ -187,9 +192,6 @@ class Matrix:
             if name == 'sector' and not build:
                 self.record(key, dict(passed=False, note='sector suite needs --scaffold'))
                 return
-            if name == 'v4' and default_format(control) != 4:
-                self.record(key, dict(passed=True, skipped='format v4 needs a 16-byte IV profile'))
-                return
             if name == 'early':
                 run_dir = self.args.prefix / f'{profile}-early'
                 with self.slots:
@@ -213,6 +215,8 @@ class Matrix:
             extra = ['--code']
             if name == 'power':
                 extra += ['--power-cut-script', str(ROOT / 'scripts/guest-stateless-recover.sh')]
+            if name == 'migrate':
+                extra += ['--second-blank-mib', '512']
             if not self.vm(key, script, run_dir, data=data, shares=files, extra=extra):
                 return
             out = run_dir / 'share'
@@ -227,7 +231,7 @@ class Matrix:
                 self.record(key, dict(host_verified=result.returncode == 0))
             elif name == 'v4':
                 self.host_check(key, out / output, control, out / 'expected-primary.sha256',
-                                out / 'expected-hidden-volume', format=4)
+                                out / 'expected-hidden-volume')
             elif output:
                 self.host_check(key, out / output, control, primary, hidden)
 

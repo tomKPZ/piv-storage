@@ -31,12 +31,9 @@ pub const SETUP_SIZE: usize = 192; // '=IIQII32s128s2I'
 pub const STATUS_SIZE: usize = 48; // '=QQQQIIII'
 pub const KEYSLOT_SIZE: usize = 64; // '=IIQII32s2I'
 
+/// SETUP ABI 4 (format v4 only): destructive initialization.
 pub const SETUP_INITIALIZE: u32 = 1;
-/// Accept a carrier with no record authenticating under the hidden key.
-pub const SETUP_UNINITIALIZED: u32 = 2;
-/// Format v4 fragment-local records; 16-byte IV (AEGIS-128) profiles only.
-pub const SETUP_FORMAT_V4: u32 = 4;
-/// v4 A/B record slots.
+/// With SETUP_INITIALIZE: A/B record slots.
 pub const SETUP_AB: u32 = 8;
 pub const KEYSLOT_ADD: u32 = 1;
 pub const KEYSLOT_REMOVE: u32 = 2;
@@ -110,7 +107,7 @@ impl KernelDevice {
         let (version, size) = (u32_at(&q, 0), u32_at(&q, 4));
         let (sector, iv, tag, tuple, flags, reserved) =
             (u32_at(&q, 24), u32_at(&q, 28), u32_at(&q, 32), u32_at(&q, 36), u32_at(&q, 40), u32_at(&q, 44));
-        if (version, size, tag, reserved) != (2, 48, 16, 0) || !(iv == 12 || iv == 16) || tuple != 16 + iv
+        if (version, size, tag, reserved) != (2, 48, 16, 0) || iv != 16 || tuple != 16 + iv
             || !(sector == 512 || sector == 4096) || !(flags == 7 || flags == 15) {
             bail!("Unsupported kernel control/profile");
         }
@@ -177,13 +174,13 @@ impl KernelDevice {
         Ok(status)
     }
 
-    /// ABI 3 SETUP. The request (with the key) is wiped whatever happens.
+    /// ABI 4 SETUP. The request (with the key) is wiped whatever happens.
     pub fn setup(&self, hidden_key: &[u8], identity: &[u8], flags: u32) -> Result<()> {
         if hidden_key.len() != 32 || identity.is_empty() || identity.len() > 120 {
             bail!("Invalid native key/context size");
         }
         let mut data = [0u8; SETUP_SIZE];
-        data[0..4].copy_from_slice(&3u32.to_le_bytes());
+        data[0..4].copy_from_slice(&4u32.to_le_bytes());
         data[4..8].copy_from_slice(&(SETUP_SIZE as u32).to_le_bytes());
         data[8..16].copy_from_slice(&self.generation.to_le_bytes());
         data[16..20].copy_from_slice(&flags.to_le_bytes());

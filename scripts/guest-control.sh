@@ -18,10 +18,9 @@ apt-get -y --no-install-recommends install \
 test "$(uname -r)" = 6.12.113+deb13-amd64
 PIV_SECTOR_SIZE=${PIV_SECTOR_SIZE:-4096}
 case "$PIV_SECTOR_SIZE" in 512|4096) ;; *) exit 1;; esac
-PIV_PRIMARY_CIPHER=${PIV_PRIMARY_CIPHER:-aes-gcm-random}
+# AEGIS-128 is the only supported profile (format v4 needs 16-byte IVs).
+PIV_PRIMARY_CIPHER=${PIV_PRIMARY_CIPHER:-aegis128-random}
 case "$PIV_PRIMARY_CIPHER" in
-    aes-gcm-random) primary_integrity=aead; primary_key_bytes=32 ;;
-    chacha20-random) primary_integrity=poly1305; primary_key_bytes=32 ;;
     aegis128-random) primary_integrity=aead; primary_key_bytes=16 ;;
     *) exit 1 ;;
 esac

@@ -65,7 +65,7 @@ def probe_command(value):
 
 v = open_views()
 owner = GuestOwner('/dev/vdb', KEY)
-unit, group = owner.device.sector_size, 576 // owner.device.iv_size
+unit, group = owner.device.sector_size, 90  # format v4 record size in primary sectors
 generation = owner.device.generation
 owner.close()
 
@@ -128,7 +128,7 @@ results['flag_traces'] = traces
 subprocess.run(['rmmod', 'piv_io_test'], check=True)
 print('Exact bio flags and native flush/completion traces passed', flush=True)
 
-# Distinct logical writers deliberately share primary carrier groups. Each owns
+# Distinct logical writers deliberately share primary records. Each owns
 # its logical region; preservation, rather than a guessed race winner, is tested.
 barrier = threading.Barrier(5)
 progress_lock = threading.Lock()

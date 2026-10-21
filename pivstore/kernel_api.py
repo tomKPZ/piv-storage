@@ -52,8 +52,8 @@ def remove_mapping(name, identity, *, discard=False):
     dm('remove', '--retry', name)
 
 
-def validate_integrity_table(table, sectors, raw_device, offset, sector_size=4096, journal_sectors=1848, tuple_size=28):
-    if tuple_size not in (28, 32):
+def validate_integrity_table(table, sectors, raw_device, offset, sector_size=4096, journal_sectors=1848, tuple_size=32):
+    if tuple_size != 32:
         raise ValueError('Unsupported lower tuple size')
     words = table.split()
     if (len(words) < 8 or words[:3] != ['0', str(sectors * (sector_size // 512)), 'integrity'] or
@@ -62,7 +62,7 @@ def validate_integrity_table(table, sectors, raw_device, offset, sector_size=409
             int(words[7]) != len(words) - 8):
         raise ValueError('Unsupported lower integrity mapping')
     options = words[8:]
-    required = {'interleave_sectors:32768', f'buffer_sectors:{128 if sector_size == 512 or tuple_size == 32 else 32}',
+    required = {'interleave_sectors:32768', 'buffer_sectors:128',
                 'journal_watermark:50', 'commit_time:10000', 'fix_padding'}
     if sector_size == 4096:
         required.add('block_size:4096')
@@ -93,7 +93,7 @@ class KernelDevice:
             data = bytearray(QUERY.size)
             fcntl.ioctl(self.fd, command(0, QUERY.size, 2), data, True)
             v, size, self.generation, self.sectors, sector, iv, tag, tup, flags, reserved = QUERY.unpack(data)
-            if (v, size, tag, reserved) != (2, 48, 16, 0) or iv not in (12, 16) or tup != 16 + iv or sector not in (512, 4096) or flags not in (7, 15):
+            if (v, size, tag, reserved) != (2, 48, 16, 0) or iv != 16 or tup != 16 + iv or sector not in (512, 4096) or flags not in (7, 15):
                 raise ValueError('Unsupported kernel control/profile')
             devices = bytearray(16)
             fcntl.ioctl(self.fd, command(7, 16, 2), devices, True)

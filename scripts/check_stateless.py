@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from pivstore.profile import Image
-from pivstore.records import decode_image
+from pivstore.records_v4 import decode_image
 
 
 def main():
@@ -17,8 +17,8 @@ def main():
     parser.add_argument('--hidden-key-file', type=Path, required=True)
     parser.add_argument('--expected-primary', type=Path, required=True)
     parser.add_argument('--expected-hidden', type=Path, required=True)
-    parser.add_argument('--format', type=int, choices=(3, 4), default=3,
-                        help='4: --hidden-key-file is a keyslot KEK; layout from the keyslot')
+    parser.add_argument('--format', type=int, choices=(4,), default=4,
+                        help='Accepted for compatibility; format v4 is the only format')
     args = parser.parse_args()
     with args.volume_key_file.open('rb') as stream:
         primary_key = stream.read(33)
@@ -27,11 +27,8 @@ def main():
     with Image(args.image) as image:
         primary = image.verify(primary_key)
         assert primary == args.expected_primary.read_text().strip(), 'Primary mismatch'
-        if args.format == 4:
-            from pivstore.records_v4 import decode_image as decode_v4
-            hidden = decode_v4(image, hidden_key)
-        else:
-            hidden = decode_image(image, hidden_key)
+        # --hidden-key-file is a keyslot KEK; the layout comes from the keyslot.
+        hidden = decode_image(image, hidden_key)
         assert hidden == args.expected_hidden.read_bytes(), 'Hidden mismatch'
         ivs = list(image.iv_slots())
         assert len(set(ivs)) == image.layout.sectors, 'Duplicate CURRENT primary IV'

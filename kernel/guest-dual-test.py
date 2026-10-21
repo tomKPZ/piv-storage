@@ -26,32 +26,25 @@ def absent():
     for name in NAMES:
         assert subprocess.run(['dmsetup', 'info', name], capture_output=True).returncode, name
 
-def setup(initialize=False, uninitialized=False, rejected=False):
+def setup(initialize=False, rejected=False):
     args = ['pivsetup', 'open-blocks', '--device', '/dev/vdb',
             '--key-file', str(W / 'passphrase.key'), '--hidden-key-file', str(W / 'hidden.key'),
             ]
     if initialize: args.append('--initialize')
-    if uninitialized: args.append('--uninitialized')
     result = subprocess.run(args, capture_output=True, text=True)
     if rejected:
-        # Wrong-key guard: no record authenticates, so setup must refuse and
+        # Wrong-key guard: no keyslot authenticates, so setup must refuse and
         # remove every mapping it created rather than expose a destructive decoy.
-        assert result.returncode == 1 and 'No hidden record authenticated' in result.stderr, result
+        assert result.returncode == 1 and 'No keyslot authenticated' in result.stderr, result
         absent()
         return None
     assert result.returncode == 0, result.stderr
     value = json.loads(result.stdout)
     primary_bytes = int(subprocess.check_output(['blockdev', '--getsize64', DECOY]))
     segment = json.loads(crypt('luksDump', '--dump-json-metadata', '/dev/vdb').stdout)['segments']['0']
-    sector_size = segment['sector_size']
-    iv_size = 16 if segment['encryption'] == 'aegis128-random' else 12
-    sectors = primary_bytes // sector_size
-    # Initialization defaults to v4 on 16-byte-IV profiles; a stock carrier
-    # opened as uninitialized has no keyslot and is served as v3.
-    if iv_size == 16 and not uninitialized:
-        expected = ((sectors - V4_KEYSLOT_AREA) // V4_GROUP - 2) * 512
-    else:
-        expected = sectors // (576 // iv_size) * 512
+    assert segment['encryption'] == 'aegis128-random'
+    sectors = primary_bytes // segment['sector_size']
+    expected = ((sectors - V4_KEYSLOT_AREA) // V4_GROUP - 2) * 512
     assert value['hidden_bytes'] == expected, (value, expected)
     assert value['decoy'] == DECOY and value['hidden'] == HIDDEN
     return value
@@ -60,29 +53,11 @@ def close():
     subprocess.run(['pivsetup', 'close-blocks', '--device', '/dev/vdb',
                     '--key-file', str(W / 'passphrase.key')], check=True)
 
-# A stock random-IV carrier is not a valid hidden block. Without an explicit
-# fresh-carrier assertion the wrong-key guard refuses it; with one, hidden
-# unavailability must not gate the decoy.
+# A stock random-IV carrier has no keyslot: the wrong-key guard refuses it and
+# removes everything it created (the decoy alone stays usable with stock dm-crypt).
 absent()
 setup(rejected=True)
-setup(uninitialized=True)
-fd = os.open(HIDDEN, os.O_RDONLY)
-try:
-    os.pread(fd, 512, 0)
-except OSError as exc:
-    assert exc.errno == 5
-else:
-    raise AssertionError('Uninitialized hidden block was readable')
-os.close(fd)
-assert subprocess.check_output(['sha256sum', DECOY], text=True).split()[0] == (W / 'primary-before.sha256').read_text().strip()
-fd = os.open(HIDDEN, os.O_RDWR | os.O_DIRECT)
-page = mmap.mmap(-1, 512); page[:] = b'A' * 512
-os.pwritev(fd, [page], 0); os.fsync(fd)
-page[:] = bytes(512)
-assert os.preadv(fd, [page], 0) == 512 and page[:] == b'A' * 512
-os.close(fd); page.close()
-close()
-print('Uninitialized hidden EIO isolation and individual repair passed', flush=True)
+print('Stock carrier refused without --initialize; no mappings left', flush=True)
 print('Creating two native writable DM devices', flush=True)
 geometry = setup(True)
 capacity = geometry['hidden_bytes']
@@ -117,7 +92,8 @@ assert Path(HIDDEN).read_bytes() == before_hidden
 # including the incomplete carrier tail when present. Restore with fresh IVs.
 primary_size = int(subprocess.check_output(['blockdev', '--getsize64', DECOY]))
 sector_size = json.loads(crypt('luksDump', '--dump-json-metadata', '/dev/vdb').stdout)['segments']['0']['sector_size']
-positions = ((576 // iv_size) * sector_size - 512, 32768 * 512 - 512, primary_size - 512)
+# The first record boundary (block 0 -> 1), the 32768-sector interleave and the tail.
+positions = ((V4_BLOCK0 + V4_GROUP) * sector_size - 512, 32768 * 512 - 512, primary_size - 512)
 fd = os.open(DECOY, os.O_RDWR | os.O_DIRECT)
 for position in positions:
     length = min(1024, primary_size - position)
@@ -153,12 +129,10 @@ assert Path(HIDDEN).read_bytes() == before_hidden
 print('Native block RMW, hidden preservation and reopen passed', flush=True)
 # Re-encode one primary sector with a different IV through the authenticated
 # control helper, simulating a legitimate stock write that destroys one record.
-# v3 block 0 starts at primary sector 0; in v4 sector 0 is a keyslot replica,
-# so damage the first sector of hidden block 0's record instead.
+# Sector 0 is a keyslot replica, so damage the first sector of block 0's record.
 close()
 owner = GuestOwner('/dev/vdb', W / 'passphrase.key')
-v4 = owner.device.iv_size == 16
-damaged = V4_BLOCK0 if v4 else 0
+damaged = V4_BLOCK0
 owner.device.suspend(); owner.device.begin()
 old_iv = owner.device.read_iv(damaged, quiesced=True)
 new_iv = os.urandom(owner.device.iv_size)
@@ -179,16 +153,12 @@ fd = os.open(DECOY, os.O_RDWR)
 decoy_offset = damaged * sector_size // 4096 * 4096
 original = os.pread(fd, 4096, decoy_offset)
 os.pwrite(fd, original, decoy_offset); os.fsync(fd); os.close(fd)
-# Decoy write keeps unavailable data unavailable; it must not manufacture zeros.
-# v3 rewrites the group with an encrypted invalid marker; v4 re-randomizes only
-# the written sectors and preserves their (damaged) fragments, so no marker.
+# Decoy write keeps unavailable data unavailable; it must not manufacture zeros:
+# it re-randomizes only the written sectors and preserves their (damaged)
+# fragments.
 subprocess.run(['blockdev', '--flushbufs', HIDDEN], check=True)
 unavailable(0)
 owner = GuestOwner('/dev/vdb', W / 'passphrase.key')
-if v4:
-    assert native_status(owner.device)['invalidations'] == 0
-else:
-    assert native_status(owner.device)['invalidations'] >= 1
 assert not native_status(owner.device)['failed']
 owner.close()
 fd = os.open(HIDDEN, os.O_RDWR | os.O_DIRECT)
@@ -196,9 +166,7 @@ page = mmap.mmap(-1, 512); page[:] = before_hidden[:512]
 os.pwritev(fd, [page], 0); os.fsync(fd); os.close(fd); page.close()
 assert Path(HIDDEN).read_bytes() == before_hidden
 close()
-# A wrong hidden key is rejected before any view exists (the guard), and the
-# primary is unchanged. An explicit fresh-carrier assertion still opens the
-# decoy without hidden data; no writes in this case.
+# A wrong hidden key is rejected before any view exists (the guard).
 import errno
 from pivstore.blocks import open_blocks, close_blocks
 try:
@@ -208,13 +176,9 @@ except OSError as exc:
 else:
     raise AssertionError('Wrong hidden key was accepted')
 absent()
-open_blocks('/dev/vdb', W / 'passphrase.key', bytes(32), uninitialized=True)
-unavailable(0)
-assert subprocess.check_output(['sha256sum', DECOY], text=True).split()[0] == (W / 'primary-before.sha256').read_text().strip()
-close_blocks('/dev/vdb', W / 'passphrase.key')
 setup()
 assert Path(HIDDEN).read_bytes() == before_hidden
-print('Damaged-record isolation, invalid-marker preservation, repair and wrong-key decoy access passed', flush=True)
+print('Damaged-record isolation, damage preservation on decoy writes, repair and wrong-key refusal passed', flush=True)
 # Real filesystems mounted on BOTH native block devices, simultaneously.
 primary = Path('/run/piv-primary'); primary.mkdir(exist_ok=True)
 hidden = Path('/run/piv-hidden-volume'); hidden.mkdir(exist_ok=True)

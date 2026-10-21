@@ -5,7 +5,7 @@ Run from the repository root as an ordinary host user:
 ```sh
 python3 scripts/fetch_sources.py
 python3 scripts/vm.py prepare
-python3 scripts/vm.py run --script scripts/guest-control.sh --run-dir artifacts/control-001
+python3 scripts/vm.py run --script scripts/guest-control-aegis.sh --share-file scripts/guest-control.sh --run-dir artifacts/control-001
 ```
 
 Choose a new run directory each time; the runner refuses to overwrite one.
@@ -35,27 +35,20 @@ Do not silently test a different version. The base image checksum was obtained
 from Debian's HTTPS checksum list; detached-signature verification has not been
 implemented. Package downloads use the guest's normal APT signature verification.
 
-The test formats /dev/vdb as LUKS2 AES-256-GCM/random with 4096-byte encryption
-sectors and AEAD integrity by default. To create the separate stock 512-byte
-fixture, run:
+The test formats /dev/vdb as LUKS2 original AEGIS-128/random (`--cipher
+aegis128-random --integrity aead --key-size 128`), the only supported profile,
+with 4096-byte encryption sectors by default. scripts/guest-control-aegis.sh and
+guest-control-aegis-512.sh select 4096- or 512-byte sectors; share
+scripts/guest-control.sh with them:
 
 ```sh
-python3 scripts/vm.py run --script scripts/guest-control-512.sh \
+python3 scripts/vm.py run --script scripts/guest-control-aegis-512.sh \
   --share-file scripts/guest-control.sh --run-dir artifacts/control-512-next --timeout 1800
 ```
 
-For ChaCha20-Poly1305, use scripts/guest-control-chacha.sh (4096-byte sectors)
-or scripts/guest-control-chacha-512.sh, also sharing scripts/guest-control.sh:
-
-```sh
-python3 scripts/vm.py run --script scripts/guest-control-chacha-512.sh \
-  --share-file scripts/guest-control.sh --run-dir artifacts/chacha-control-512-next --timeout 1800
-```
-
-These use --cipher chacha20-random --integrity poly1305 --key-size 256. Native
-activation and independent diagnostics detect the profile from LUKS metadata.
-The explicit wrappers select only formatting options; all control generation
-and stock readback checks share the same body.
+The AES-GCM and ChaCha20-Poly1305 control wrappers were removed with format v3
+on 2026-10-21. All control generation and stock readback checks share the same
+body.
 
 Each profile writes distinct deterministic synthetic plaintext
 to every primary sector, closes the mapping, reopens it read-only using stock
@@ -86,14 +79,15 @@ live; re-provision deliberately rather than assuming a snapshot pin.
 
 ```sh
 python3 scripts/suite.py --prefix artifacts/suite-next \
-  --profile aes-512 --profile chacha-4096 --control artifacts/control-001 \
+  --profile aegis-4096 --profile aegis-512 \
   --scaffold artifacts/stage-next/scaffold.tar   # or --module experimental-dm-piv.ko
 ```
 
 Per profile it creates a stock fixture (or uses --control), runs the native
 dual-view/early-build test, then runs the selected suites concurrently
 (default faults, profile, cancel, lifecycle, batch, early; optional power,
-controls, sector and v4) and independently verifies every closed output image with
+controls, sector, v4 and migrate; migrate attaches a second 512 MiB blank
+disk, /dev/vdc, via `vm.py --second-blank-mib`). Profiles are aegis-4096 and aegis-512. It independently verifies every closed output image with
 check_stateless.py. `--jobs` bounds concurrent VMs; `--fresh` disables the
 provisioned image; `--accel` defaults to kvm when /dev/kvm is usable (else tcg).
 It also builds the static Rust setup frontend once (scripts/build_pivsetup.py:
@@ -138,8 +132,8 @@ The verification task opens the volume read-only, reads/authenticates every
 primary byte, checks the expected plaintext hash, and verifies that the raw
 image digest did not change. It records package/kernel provenance and a result
 marker. This passed for both a four-sector random-IV experiment and a complete
-hidden-payload pack in earlier revisions. Current stateless v3 records are
-documented in docs/hidden-format.md; use current native tests for that format.
+hidden-payload pack in earlier revisions. Current hidden records are format v4
+(docs/format-v4.md); use the current native tests for that format.
 
 ## Source subset
 

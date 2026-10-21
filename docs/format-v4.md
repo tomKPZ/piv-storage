@@ -1,17 +1,18 @@
 # Hidden format v4 design (fragment-local re-randomization)
 
-Status (2026-10-20): phases 1-3 implemented (fragments, records, keyslots and
+Status (2026-10-21): phases 1-3 implemented (fragments, records, keyslots and
 directory, A/B slots) in the kernel and the independent Python decoder; phase 4
-(`--integrity-no-journal`) is open. v3 (docs/hidden-format.md) stays the
-format for 12-byte-IV profiles. Nothing here is an independent cryptographic
-review; tested behaviour is recorded in ROADMAP.md.
+(`--integrity-no-journal`) is deferred. v4 is the only hidden format: format v3
+and the 12-byte-IV profiles were removed on 2026-10-21 (user decision), so
+AEGIS-128 is the only primary profile. Nothing here is an independent
+cryptographic review; tested behaviour is recorded in ROADMAP.md.
 
 ## Goals
 
 1. A coordinated decoy write changes only the IVs of the primary sectors it
-   writes, as stock random-IV dm-crypt does. v3 re-randomizes the whole 36/48-sector
-   group, which is the 192-vs-7 footprint in docs/detectability.md and the main
-   source of write amplification, nonce-budget use and wear.
+   writes, as stock random-IV dm-crypt does. The removed v3 re-randomized a
+   whole 36/48-sector group, the 192-vs-7 footprint in docs/detectability.md
+   and the main source of write amplification, nonce-budget use and wear.
 2. Whole-block authentication of hidden data, with no silent mixing of old and
    new fragments.
 3. An encrypted header without public magic: fast key check, wrapped master
@@ -35,7 +36,8 @@ times collides with probability about n²/2^(8|r|+1).
 | 12 (AES-GCM/ChaCha) | 4 | 64 | about 2^-17 |
 
 v4 uses 6 payload bytes and 10 random bytes per 16-byte IV. 12-byte profiles
-cannot meet a comparable bound with a useful payload and keep v3. This matches
+cannot meet a comparable bound with a useful payload, which is why they were
+removed together with v3. This matches
 the decision to make AEGIS-128 the recommended profile.
 
 ## Fragment encoding
@@ -90,10 +92,10 @@ and valid records from different times, are still accepted (out of scope).
 
 - **Hidden write:** read and authenticate the record's G primary sectors (to get
   exact old IVs for PREPARE/APPLY), then re-encode every fragment with fresh `r`.
-- **Amplification:** a hidden write re-encrypts G primary sectors, 2.5x v3
+- **Amplification:** a hidden write re-encrypts G primary sectors, 2.5x the removed v3
   AEGIS (90 vs 36). Decoy writes have no hidden amplification at all.
 - **Capacity:** 512/(90·S): 0.139% at 4096-byte sectors, 1.11% at 512-byte
-  sectors. That is about 40% of v3 AEGIS; A/B halves it again.
+  sectors. That is about 40% of the removed v3 on AEGIS; A/B halves it again.
 
 ## Keys, keyslots and directory
 
@@ -170,20 +172,15 @@ Stock-written sectors remain uniform random.
 
 ## Activation and detection
 
-On 16-byte-IV profiles userspace always passes the v4 base context; the
-kernel derives the v3 context by changing the version digit. During the
-mandatory scan it collects the keyslot IVs and probes v3 records. Once the scan
-has passed the 112 keyslot sectors it tries the keyslots; a keyslot that
-authenticates under the given key selects v4 (and the A/B layout from its
-flags) and stops further v3 probing, so a v4 open probes at most the few v3
-records completed before that point. Otherwise a v3 record selects v3;
-otherwise setup fails with EKEYREJECTED. Asking for format 4 at open rejects
-v3. Initialization uses an explicit format or the frontend default (4 on
-16-byte-IV profiles since 2026-10-21, 3 otherwise) and, for v4, creates a
-random master key, keyslot 0 under the KEK and the directory before writing
-zero records. Because the master key is replaced first, an interrupted v4
-re-initialization leaves the not-yet-written blocks unavailable (EIO) rather
-than holding their previous contents.
+Userspace (pivsetup) passes the v4 base context and the keyslot KEK (SETUP ABI
+4: flags INITIALIZE and AB only). During the mandatory scan the kernel collects
+the keyslot IVs and, once the scan has passed the 112 keyslot sectors, tries
+every keyslot replica. A keyslot that authenticates selects the A/B layout from
+its flags; the directory must then authenticate too. Otherwise setup fails with
+EKEYREJECTED. Initialization creates a random master key, keyslot 0 under the
+KEK and the directory before writing zero records. Because the master key is
+replaced first, an interrupted re-initialization leaves the not-yet-written
+blocks unavailable (EIO) rather than holding their previous contents.
 
 ## Implementation phases
 

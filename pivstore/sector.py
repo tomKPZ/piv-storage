@@ -3,25 +3,22 @@
 import struct
 
 from cryptography.exceptions import InvalidTag
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 
 
 class SectorCodec:
-    def __init__(self, key, sector_size=4096, encryption='aes-gcm-random'):
-        self.iv_size = 16 if encryption == 'aegis128-random' else 12
-        key_size = 16 if encryption == 'aegis128-random' else 32
-        if len(key) != key_size:
-            raise ValueError(f'This profile requires a {key_size}-byte primary volume key')
+    """Original AEGIS-128 (the only supported profile) via the pinned reference."""
+
+    def __init__(self, key, sector_size=4096, encryption='aegis128-random'):
+        if encryption != 'aegis128-random':
+            raise ValueError('Unsupported primary cipher')
+        self.iv_size = 16
+        if len(key) != 16:
+            raise ValueError('This profile requires a 16-byte primary volume key')
         if sector_size not in (512, 4096):
             raise ValueError('Unsupported primary sector size')
         self.sector_size = sector_size
-        algorithms = {'aes-gcm-random': AESGCM, 'chacha20-random': ChaCha20Poly1305}
-        if encryption == 'aegis128-random':
-            from .aegis_reference import AEGIS128Reference
-            algorithms[encryption] = AEGIS128Reference
-        if encryption not in algorithms:
-            raise ValueError('Unsupported primary cipher')
-        self.cipher = algorithms[encryption](key)
+        from .aegis_reference import AEGIS128Reference
+        self.cipher = AEGIS128Reference(key)
 
     def decrypt(self, index, ciphertext, metadata):
         if len(ciphertext) != self.sector_size or len(metadata) != 16 + self.iv_size:

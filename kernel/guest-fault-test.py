@@ -22,24 +22,17 @@ PRIMARY = (W / 'expected-primary.sha256').read_text().strip()
 NAMES = ('piv-native-hidden', 'piv-native-decoy', 'piv-native', 'piv-native_dif')
 results = []
 
-# Closed native fixtures are default-initialized: format v4 on 16-byte-IV
-# profiles (112 keyslot sectors, two directory groups, 90-sector records),
-# v3 otherwise (576 // iv_size sectors per record from sector 0).
+# Format v4 geometry (docs/format-v4.md): 112 keyslot sectors, two directory
+# groups, then 90-sector records (AEGIS-128 is the only supported profile).
 def record_span(device, block):
     """First and last primary sector carrying hidden block @block."""
-    if device.iv_size == 16:
-        first = 112 + 90 * (2 + block)
-        return first, first + 89
-    group = 576 // device.iv_size
-    return block * group, block * group + group - 1
+    first = 112 + 90 * (2 + block)
+    return first, first + 89
 
 def blocks_touched(device, first, last):
     """Hidden blocks with a fragment in primary sectors first..last."""
-    if device.iv_size == 16:
-        low, high = (first - 112) // 90 - 2, (last - 112) // 90 - 2
-        return range(max(0, low), high + 1) if last >= 112 + 180 else range(0)
-    group = 576 // device.iv_size
-    return range(first // group, last // group + 1)
+    low, high = (first - 112) // 90 - 2, (last - 112) // 90 - 2
+    return range(max(0, low), high + 1) if last >= 112 + 180 else range(0)
 
 def open_views():
     value = blocks.open_blocks(SOURCE, KEY, HKEY, allow_test_stack=True)
@@ -299,7 +292,7 @@ results.append('late primary corruption rejected during setup, cleanup and reope
 
 # A legitimate fresh-IV primary rewrite destroys one hidden record only.
 handle = owner(); dev = handle.device
-damaged = record_span(dev, 0)[0]  # v3: sector 0; v4: sector 0 is a keyslot replica
+damaged = record_span(dev, 0)[0]  # sector 0 is a keyslot replica
 handle.device.suspend(); dev.begin()
 old = dev.read_iv(damaged, quiesced=True)
 value = dev.prepare(damaged, old, os.urandom(dev.iv_size))
@@ -308,15 +301,15 @@ v = open_views()
 assert rejected(lambda: direct(v['hidden'])).errno == errno.EIO
 assert direct(v['hidden'], offset=512) == EXPECTED[512:1024]
 handle = owner(); assert not blocks.native_status(handle.device)['failed']; handle.close()
-# Rewrite the decoy bytes carrying that sector (v3: refreshes the group with an
-# invalid marker; v4: re-randomizes only that sector, preserving the damage).
+# Rewrite the decoy bytes carrying that sector: re-randomizes only that sector,
+# preserving the damage.
 decoy_offset = damaged * dev.sector_size // 4096 * 4096
 direct(v['decoy'], write=direct(v['decoy'], offset=decoy_offset), offset=decoy_offset)
 assert rejected(lambda: direct(v['hidden'])).errno == errno.EIO
 handle = owner(); assert not blocks.native_status(handle.device)['failed']; handle.close()
 direct(v['hidden'], write=EXPECTED[:512]); assert verify(v) is False
 close_views(); absent()
-results.append('local hidden EIO, invalid marker and direct repair remain isolated')
+results.append('local hidden EIO, preserved damage and direct repair remain isolated')
 
 # Leave a closed image and complete oracles for independent authentication.
 dm('remove', '--retry', 'piv-test-fault')

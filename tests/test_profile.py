@@ -8,8 +8,8 @@ from pivstore.profile import UnsupportedImage, parse_superblock, validate_segmen
 
 
 def header(**changes):
-    values = dict(magic=b'integrt\0', version=4, interleave=15, tuple_size=28,
-                  sections=7, provided=225952, flags=8, block=3)
+    values = dict(magic=b'integrt\0', version=4, interleave=15, tuple_size=32,
+                  sections=7, provided=225728, flags=8, block=3)
     values.update(changes)
     return struct.pack('<8sBBHIQIB', *values.values()).ljust(4096, b'\0')
 
@@ -20,27 +20,27 @@ class LayoutTests(unittest.TestCase):
         data0, tag0 = layout.offsets(0)
         data_before, tag_before = layout.offsets(4095)
         data_after, tag_after = layout.offsets(4096)
-        self.assertEqual(data0, 16777216 + (1856 + 224) * 512)
+        self.assertEqual(data0, 16777216 + (1856 + 256) * 512)
         self.assertEqual(tag0, 16777216 + 1856 * 512)
         self.assertEqual(data_before, data0 + 4095 * 4096)
-        self.assertEqual(data_after - data_before, 4096 + 224 * 512)
-        self.assertEqual(tag_before, tag0 + 4095 * 28)
-        self.assertEqual(tag_after, tag0 + (32768 + 224) * 512)
-        self.assertLessEqual(layout.offsets(28243)[0] + 4096, 134217728)
-        for value in (-1, 28244):
+        self.assertEqual(data_after - data_before, 4096 + 256 * 512)
+        self.assertEqual(tag_before, tag0 + 4095 * 32)
+        self.assertEqual(tag_after, tag0 + (32768 + 256) * 512)
+        self.assertLessEqual(layout.offsets(28215)[0] + 4096, 134217728)
+        for value in (-1, 28216):
             with self.assertRaises(IndexError):
                 layout.offsets(value)
 
     def test_512_interleave_and_journal_geometry(self):
-        layout = parse_superblock(header(block=0, sections=23, provided=214800),
+        layout = parse_superblock(header(block=0, sections=23, provided=213008),
                                   16777216, 134217728)
         self.assertEqual((layout.sector_size, layout.journal_entry_bytes,
                           layout.journal_section_sectors, layout.metadata_run_sectors),
-                         (512, 48, 88, 1792))
+                         (512, 48, 88, 2048))
         data, tag = layout.offsets(0)
-        self.assertEqual(layout.offsets(32767), (data + 32767 * 512, tag + 32767 * 28))
+        self.assertEqual(layout.offsets(32767), (data + 32767 * 512, tag + 32767 * 32))
         self.assertEqual(layout.offsets(32768),
-                         (data + (32768 + 1792) * 512, tag + (32768 + 1792) * 512))
+                         (data + (32768 + 2048) * 512, tag + (32768 + 2048) * 512))
         self.assertLessEqual(layout.offsets(layout.sectors - 1)[0] + 512, 134217728)
 
     def test_aegis32_byte_tuple_geometries(self):
@@ -60,7 +60,7 @@ class LayoutTests(unittest.TestCase):
     def test_large_extent_arithmetic_above_32_bit_byte_offsets(self):
         # Synthetic metadata only: no multi-GiB allocation or actual disk access.
         for block in (0, 3):
-            for tuple_size in (28, 32):
+            for tuple_size in (32,):
                 unit = 512 << block
                 layout = parse_superblock(header(block=block, tuple_size=tuple_size,
                                                   provided=(8 * 1024**3) // 512),
@@ -83,7 +83,7 @@ class LayoutTests(unittest.TestCase):
 
     def test_reject_unsupported_or_invalid_superblocks(self):
         for change in ({'magic': b'badmagic'}, {'version': 6}, {'flags': 10},
-                       {'flags': 9}, {'tuple_size': 30}, {'block': 1},
+                       {'flags': 9}, {'tuple_size': 30}, {'tuple_size': 28}, {'block': 1},
                        {'interleave': 14}, {'sections': 0}, {'sections': 4097},
                        {'provided': 0}, {'provided': 9}, {'provided': 2**63}):
             with self.subTest(change=change), self.assertRaises(UnsupportedImage):
@@ -99,13 +99,12 @@ class SegmentTests(unittest.TestCase):
     def setUp(self):
         self.metadata = {'config': {}, 'segments': {'0': {
             'type': 'crypt', 'offset': '16777216', 'size': 'dynamic',
-            'iv_tweak': '0', 'encryption': 'aes-gcm-random', 'sector_size': 4096,
+            'iv_tweak': '0', 'encryption': 'aegis128-random', 'sector_size': 4096,
             'integrity': {'type': 'aead', 'journal_encryption': 'none',
                           'journal_integrity': 'none'}}}}
 
     def test_supported_segment(self):
-        for cipher, integrity in (('aes-gcm-random', 'aead'), ('chacha20-random', 'poly1305'),
-                                   ('aegis128-random', 'aead')):
+        for cipher, integrity in (('aegis128-random', 'aead'),):
             for size in (512, 4096):
                 segment = self.metadata['segments']['0']
                 segment['encryption'] = cipher
@@ -114,7 +113,8 @@ class SegmentTests(unittest.TestCase):
                 self.assertEqual(validate_segment(self.metadata), 16777216)
 
     def test_reject_mismatched_cipher_and_integrity(self):
-        for cipher, integrity in (('aes-gcm-random', 'poly1305'), ('chacha20-random', 'aead'),
+        for cipher, integrity in (('aegis128-random', 'poly1305'), ('aes-gcm-random', 'aead'),
+                                  ('chacha20-random', 'poly1305'), ('chacha20-random', 'aead'),
                                   ('chacha20-plain64', 'poly1305'),
                                   ('chacha20-poly1305-random', 'aead'), ([], 'aead')):
             metadata = copy.deepcopy(self.metadata)
@@ -140,8 +140,7 @@ class SegmentTests(unittest.TestCase):
 
 class IntegrityTableTests(unittest.TestCase):
     def test_both_stock_geometries_and_reject_mixed_options(self):
-        for size, count, journal, buffer, tuple_size in ((512, 214800, 2024, 128, 28),
-                    (4096, 28244, 1848, 32, 28), (512, 213008, 2024, 128, 32),
+        for size, count, journal, buffer, tuple_size in ((512, 213008, 2024, 128, 32),
                     (4096, 28216, 1848, 128, 32)):
             options = [f'journal_sectors:{journal}', 'interleave_sectors:32768',
                        f'buffer_sectors:{buffer}', 'journal_watermark:50',
@@ -151,6 +150,7 @@ class IntegrityTableTests(unittest.TestCase):
             table = f'0 {count * (size // 512)} integrity 254:16 32768 {tuple_size} J {len(options)} ' + ' '.join(options)
             validate_integrity_table(table, count, os.makedev(254, 16), 16777216, size, journal, tuple_size)
             for changed in (table.replace(f'{tuple_size} J', '30 J'),
+                            table.replace(f'{tuple_size} J', '28 J'),
                             table.replace('fix_padding', 'fix_hmac'),
                             table.replace(f'buffer_sectors:{buffer}', 'buffer_sectors:1'),
                             table.replace(f'journal_sectors:{journal}', 'journal_sectors:1')):

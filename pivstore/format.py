@@ -3,20 +3,15 @@ import struct
 
 
 # LUKS encryption name -> (LUKS integrity type, exact dm-crypt cipher spec).
+# AEGIS-128 only: format v4 needs 16-byte IVs (the 12-byte-IV AES-GCM and
+# ChaCha20-Poly1305 profiles were removed with format v3 on 2026-10-21).
 PRIMARY_PROFILES = {
-    'aes-gcm-random': ('aead', 'capi:gcm(aes)-random'),
     'aegis128-random': ('aead', 'capi:aegis128-random'),
-    'chacha20-random': ('poly1305', 'capi:rfc7539(chacha20,poly1305)-random'),
 }
 
 
-def context(image):
-    return (b'pivstore/volume/v3\0' + image.uuid.encode('ascii') + b'\0' +
-            struct.pack('<QQ', image.layout.primary_bytes, image.layout.sector_size))
-
-
 def context_v4(uuid, primary_bytes, sector_size, ab=False):
-    """Format v4 public context (docs/format-v4.md); stdlib only for setup.
+    """Format v4 public context (docs/format-v4.md); stdlib only.
 
     The A/B layout is part of the context, so every key differs between modes
     and opening a volume in the wrong mode fails the key guard instead of

@@ -65,12 +65,11 @@ def damage(sector):
     owner.device.end(); owner.device.resume(); owner.remove(); owner.close()
 
 
-def write_profile(label, count=48):
+def write_profile(count=48):
     """Direct 4 KiB O_DSYNC decoy writes at pseudo-random aligned offsets:
     elapsed time and exact primary encryptions (TCG timings are diagnostic)."""
     import random, time
-    # Explicit format: initialization defaults to v4 on this 16-byte-IV profile.
-    v = opened(initialize=True, format=3 if label == 'v3' else 4)
+    v = opened(initialize=True)
     st, unit, sectors = status()
     rng = random.Random(4)
     offsets = [rng.randrange(RESERVED * unit // 4096, (sectors * unit) // 4096 - 1) * 4096 for _ in range(count)]
@@ -87,23 +86,19 @@ def write_profile(label, count=48):
         os.close(fd); buf.close()
     spent = status()[0]['encryptions'] - before
     close_blocks('/dev/vdb', KEY)
-    # v4 re-encrypts exactly the written sectors; v3 refreshes >= one 36-sector group.
-    if label == 'v4':
-        assert spent == count * (4096 // unit), (label, spent)
-    else:
-        assert spent >= count * 36, (label, spent)
-    return dict(format=label, writes=count, bytes_each=4096, seconds=round(elapsed, 3),
+    # A decoy write re-encrypts exactly the written sectors.
+    assert spent == count * (4096 // unit), spent
+    return dict(format='v4', writes=count, bytes_each=4096, seconds=round(elapsed, 3),
                 encryptions=spent, encryptions_per_write=spent / count)
 
 
-# A stock carrier has no keyslot (and no v3 record): refused unless initializing.
+# A stock carrier has no keyslot: refused unless initializing.
 assert rejected(lambda: opened()).errno == errno.EKEYREJECTED
-assert rejected(lambda: opened(format=4)).errno == errno.EKEYREJECTED
-results['write_profile'] = [write_profile('v3'), write_profile('v4')]
+results['write_profile'] = [write_profile()]
 
 # A/B slots: half capacity; a damaged newest slot falls back to the previous
 # version, and the next write targets the damaged slot again.
-v = opened(initialize=True, format=4, ab=True)
+v = opened(initialize=True, ab=True)
 st, unit, sectors = status()
 assert v['hidden_bytes'] == ((sectors - RESERVED) // GROUP // 2) * 512
 first, second = bytes([0xa1]) * 512, bytes([0xb2]) * 512
@@ -169,7 +164,7 @@ results['keyslots'] = dict(added=[1, 2, 3], removed=[3, 0, 2], last_slot_protect
                            wrong_kdf_rejected=True, decoy_rewrite_of_keyslot_area_preserved=True)
 results['ab'] = dict(fallback_after_damaged_newest_slot=True, rewrite_encryptions=GROUP)
 
-v = opened(initialize=True, format=4)
+v = opened(initialize=True)
 st, unit, sectors = status()
 records = (sectors - RESERVED) // GROUP
 assert v['hidden_bytes'] == st['hidden_bytes'] == records * 512, (v, records)
@@ -187,7 +182,7 @@ for index, value in pattern.items():
 hidden_before = Path(v['hidden']).read_bytes()
 
 # Decoy writes re-randomize only the written primary sectors: one encryption per
-# sector, independent of carrier groups (v3 refreshed 36/48-sector groups).
+# sector, independent of record groups.
 footprint = []
 for offset in (0, RESERVED * unit, (RESERVED + GROUP // 2) * unit, (RESERVED + GROUP) * unit - 4096,
                (sectors - 1) * unit - 4096 + unit):
