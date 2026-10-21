@@ -95,6 +95,21 @@ them. Known integrity or memory-safety defects still override this order.
 3. **Then the remaining core items** below: no-journal (once the torn-sector
    policy is decided), newer-kernel port, optional v4 default for AEGIS, xts/hmac.
 
+User answers (2026-10-21), binding for autonomous sessions:
+- *Crates:* a small pinned set from crates.io (e.g. libc, zeroize, later
+  argon2); Cargo.lock committed; sources fetched rootlessly into an ignored
+  cache; no clap/serde.
+- *Argon2id:* RFC 9106 second recommendation, m = 64 MiB, t = 3, p = 4, added
+  after parity as an additional passphrase KDF.
+- *Sanitizer guest:* approved, in a disposable guest only, after the Rust port
+  and the W=1/sparse work. No host kernel changes.
+- *No-journal:* deferred; journaled mode only for now.
+- *v4 default:* switch newly initialized 16-byte-IV (AEGIS-128) volumes to
+  format v4 now and update suite expectations. 12-byte-IV profiles stay v3.
+
+Working order: v4 default, Rust port to parity and cutover, Argon2id, C
+W=1/sparse and input review, sanitizer guest, fuzzing, newer-kernel port.
+
 ## Next bounded work: core module changes first
 
 The user's 2026-10-19 priority change puts work requiring production module
