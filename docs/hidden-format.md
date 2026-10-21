@@ -1,5 +1,9 @@
 # Stateless hidden block format v3
 
+Format v3 remains the format for 12-byte-IV profiles and the default at
+initialization. 16-byte-IV (AEGIS-128) volumes can use the fragment-local
+[format v4](format-v4.md), which has encrypted keyslots and optional A/B slots.
+
 One logical 512-byte hidden block uses 576 consecutive carrier bytes, in
 logical primary-sector order. Let group=576/IV_bytes: 48 primary sectors for
 AES-GCM/ChaCha20-Poly1305 (12-byte IV), or 36 for original AEGIS-128 (16-byte IV).

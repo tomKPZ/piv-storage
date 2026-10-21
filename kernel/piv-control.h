@@ -75,7 +75,22 @@ struct piv_native_status {
  * (fresh/uninitialized). Without it or INITIALIZE, setup returns EKEYREJECTED.
  */
 #define PIV_SETUP_UNINITIALIZED 2U
+/* Format v4 fragment-local records (16-byte IV profiles only; docs/format-v4.md). */
+#define PIV_SETUP_FORMAT_V4 4U
+/* v4 A/B record slots: atomic per-block hidden writes at half capacity. */
+#define PIV_SETUP_AB 8U
 #define PIV_NATIVE_SETUP _IOW('P', 12, struct piv_native_setup)
 #define PIV_NATIVE_DETACH _IOW('P', 13, struct piv_read_iv)
 #define PIV_NATIVE_STATUS _IOR('P', 14, struct piv_native_status)
+/* v4 keyslot management on an active owner (version 1, 64 bytes). */
+struct piv_native_keyslot {
+ __u32 version, size;
+ __u64 generation;
+ __u32 slot, op;
+ __u8 kek[32];
+ __u32 reserved[2];
+};
+#define PIV_KEYSLOT_ADD 1U
+#define PIV_KEYSLOT_REMOVE 2U
+#define PIV_NATIVE_KEYSLOT _IOW('P', 15, struct piv_native_keyslot)
 #endif

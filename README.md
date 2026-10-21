@@ -20,8 +20,9 @@ plaintext or carrier IVs are returned.
 The separate `dm-piv.ko` module registers `piv-crypt` and `piv-view`, alongside
 the stock `dm-crypt` module's `crypt` target. Stock encrypted filesystems may
 remain mounted while our module loads, serves its paired devices and unloads.
-It retains a private copy of pinned dm-crypt code; it does not hook or replace
-the stock target. Exact kernel build compatibility is still required.
+It is a standalone implementation of the per-sector AEAD path (no dm-crypt
+fork); it does not hook or replace the stock target. Builds still need the
+matching kernel headers.
 
 README and ROADMAP are provisional research notes. This is not a proven
 indistinguishability construction or reliable production storage. The internal
@@ -50,6 +51,18 @@ blocks. For our 128 MiB disk fixtures:
 | AES-GCM / ChaCha20-Poly1305 | 512 | 109,977,600 | 2,291,200 |
 | AEGIS-128 | 4096 | 115,572,736 | 400,896 |
 | AEGIS-128 | 512 | 109,060,096 | 3,028,992 |
+
+For AEGIS-128 volumes, `--initialize --format 4` creates the
+[fragment-local format v4](docs/format-v4.md): a decoy write re-randomizes only
+the IVs of the sectors it writes (one primary encryption per written sector, as
+stock dm-crypt), at lower hidden capacity: 158,720 bytes (4096-byte sectors) or
+1,209,856 bytes (512-byte sectors) on these fixtures. Adding `--ab` keeps two
+record slots per block so an interrupted hidden write leaves the previous
+version readable, at half that capacity. v4 stores a random master key in up to
+four encrypted keyslots (no public header); the hidden key file is a keyslot
+key, or use `--hidden-passphrase-file` (scrypt). Later opens detect the format
+and layout from the keyslot. `python3 -m pivstore keyslot add|remove --slot N`
+adds or retires keys on active views without rewriting hidden data.
 
 The hidden volume is already encrypted underneath its block interface. Setup
 never creates filesystems. **--initialize destroys all existing hidden contents**

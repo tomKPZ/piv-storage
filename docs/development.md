@@ -92,10 +92,10 @@ python3 scripts/suite.py --prefix artifacts/suite-next \
 
 Per profile it creates a stock fixture (or uses --control), runs the native
 dual-view/early-build test, then runs the selected suites concurrently
-(default faults, profile, cancel, lifecycle, batch, early; optional power and
-controls) and independently verifies every closed output image with
+(default faults, profile, cancel, lifecycle, batch, early; optional power,
+controls, sector, v4 and migrate) and independently verifies every closed output image with
 check_stateless.py. `--jobs` bounds concurrent VMs; `--fresh` disables the
-provisioned image. summary.json records pass/fail, timings and host checks; a
+provisioned image; `--accel` defaults to kvm when /dev/kvm is usable (else tcg). summary.json records pass/fail, timings and host checks; a
 suite that was not run counts as a failure. Original AEGIS-128 host checks need
 PIV_AEGIS_REFERENCE (below).
 

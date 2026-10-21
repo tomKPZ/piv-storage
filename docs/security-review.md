@@ -119,7 +119,9 @@ add a distinguishable on-disk ledger to solve that under the current scope.
 Source paths reviewed: `pivstore/{records,format,sector,profile,blocks,kernel_api,
 kernel_owner}.py`, `kernel/{piv-native.inc,piv-control.inc,dm-crypt-piv.patch}`,
 and the staged pinned dm-crypt AEAD helper in
-`vendor/kernel-build/batch-001/dm-crypt.c`. Source/package hashes and fixture
+`vendor/kernel-build/batch-001/dm-crypt.c` (2026-10-20: the fork was replaced by
+the standalone kernel/dm-piv.c, which reimplements that helper's AEAD layout;
+the review above predates it and was not repeated line by line). Source/package hashes and fixture
 provenance remain in environment/ and the existing development/layout notes.
 
 The primary helper retains Linux sector-address/IV AAD and tag/IV layout.
@@ -156,9 +158,9 @@ paths. Keys also live in crypto transforms and userspace process/subprocess
 memory; Python immutable copies are not reliably wiped. Setup reads a privileged
 key-containing dm table into memory and sends it through stdin, not argv/logs.
 This is not resistance to root, dumps, ptrace or physical memory acquisition.
-The private dm-crypt fork also requires ongoing upstream security maintenance;
-exact source compatibility does not establish that a pinned kernel is free of
-vulnerabilities. Broad deployment is still out of scope.
+The standalone module no longer inherits dm-crypt code or its fixes, but its
+own AEAD/integrity path now needs equivalent review; exact header compatibility
+does not establish that a pinned kernel is free of vulnerabilities. Broad deployment is still out of scope.
 
 ## Journal history and the decoy-key holder
 
@@ -184,6 +186,21 @@ decoy EIO, as for stock users of that option); journal encryption (hides sector
 numbers only from keyless observers, and is unverified for LUKS2 AEAD in
 cryptsetup); and a record format that re-randomizes only touched IVs, reducing
 the group footprint at a capacity cost. These need design review before any claim.
+
+## Format v4 notes (2026-10-20)
+
+Format v4 (format-v4.md) changes the decoy-write footprint: guest tests measured
+exactly one primary encryption per written 4 KiB sector, against 36 for v3 on
+AEGIS-128. Each v4 IV is an LRW-AES output on (10 random bytes || 6 payload
+bytes), so per-sector nonce uniqueness rests on 80 random bits:
+n²/2^81 for n rewrites of one sector. Pseudorandomness without the hidden key
+rests on LRW/AES TPRP security plus the SIV layer; this is a design argument
+that has not had external review. Keyslots give a fast offline key check, so
+a passphrase-derived KEK is exactly as guessable as its scrypt cost allows
+(N = 2^17, r = 8, p = 1). Key files remain the high-entropy option. The keyslot
+directory reveals keyslot outer keys only to holders of the master key. A
+hidden write still re-encrypts 90 sectors with unchanged primary plaintext and
+remains visible to a decoy-key holder with journal history.
 
 ## Disposition and verification
 

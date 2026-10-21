@@ -125,16 +125,20 @@ class CleanupTests(unittest.TestCase):
 class SetupFlagTests(unittest.TestCase):
     def test_setup_flags_match_kernel_abi(self):
         from pivstore.blocks import SETUP, native_setup
-        for initialize, uninitialized, expected in ((False, False, 0), (True, False, 1),
-                                                    (False, True, 2), (True, True, 3)):
-            with self.subTest(initialize=initialize, uninitialized=uninitialized):
+        for initialize, uninitialized, extra, expected in (
+                (False, False, {}, 0), (True, False, {}, 1), (False, True, {}, 2), (True, True, {}, 3),
+                (True, False, {'format': 4}, 5), (True, False, {'format': 4, 'ab': True}, 13),
+                (False, False, {'format': 4}, 4)):
+            with self.subTest(initialize=initialize, uninitialized=uninitialized, extra=extra):
                 seen = []
                 def capture(fd, command, data, mutate):
                     seen.append(SETUP.unpack(bytes(data))[3])
                 with patch('pivstore.blocks.fcntl.ioctl', side_effect=capture):
                     native_setup(Mock(fd=7, generation=1), bytes(32), b'test context',
-                                 initialize=initialize, uninitialized=uninitialized)
+                                 initialize=initialize, uninitialized=uninitialized, **extra)
                 self.assertEqual(seen, [expected])
+        with self.assertRaises(ValueError):
+            native_setup(Mock(fd=7, generation=1), bytes(32), b'test context', ab=True)
 
     def test_rejected_key_unwinds_and_explains(self):
         owner = Mock(created=True, uuid='00000000-0000-0000-0000-000000000000')
@@ -148,7 +152,8 @@ class SetupFlagTests(unittest.TestCase):
             with self.assertRaises(OSError) as raised:
                 open_blocks('/dev/vdb', 'private-key-file', bytes(32))
         self.assertIs(raised.exception, error)
-        self.assertEqual(setup.call_args.kwargs, {'initialize': False, 'uninitialized': False})
+        self.assertEqual(setup.call_args.kwargs, {'initialize': False, 'uninitialized': False, 'format': None,
+                                                  'ab': False})
         self.assertIn('No hidden record authenticated', error.__notes__[0])
         owner.remove.assert_called_once_with(abort=True)
         owner.close.assert_called_once()

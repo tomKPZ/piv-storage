@@ -86,7 +86,10 @@ safety defects take precedence over this ordering whenever discovered.
    Broader resource/lifecycle hardening (allocation failure, queue bounds,
    teardown concurrency) continues evidence-led alongside, without speculative
    machinery or a large debug kernel built only to manufacture a change.
-4. **Standalone target replacing the dm-crypt fork (prioritized by the user).**
+4. **Standalone target replacing the dm-crypt fork — implemented (2026-10-20);
+   newer-kernel port still open.** kernel/dm-piv.c implements the owner target
+   and per-sector AEAD (piv_aead) itself; no dm-crypt source is vendored or
+   patched. See the handoff below for the matrix evidence. Original plan:
    The current patch is small (about 100 dm-crypt.c lines; the native code uses
    only crypt_convert_block_aead_iv, crypt_convert_init, crypt_integrity_io_alloc,
    req_pool and config fields), but vendoring all of dm-crypt.c forces exact
@@ -97,7 +100,12 @@ safety defects take precedence over this ordering whenever discovered.
    guest; stock crypt coexistence retained; cross-checks agree byte-for-byte.
    Then port/test on one newer public distribution kernel series, inside a guest
    only (never the host), to demonstrate build portability.
-5. **Format v4 (design document first, then implementation).** User decisions
+5. **Format v4 — phases 1-3 implemented (2026-10-20); phase 4 (no-journal)
+   open.** Fragments, SIV records, keyslots with directory, passphrase KEKs,
+   keyslot add/remove and A/B slots work in the kernel and the independent
+   Python decoder (docs/format-v4.md). Initialization still defaults to v3.
+   Phase 4 is blocked on a policy decision (docs/journal-atomicity.md).
+   Original plan: User decisions
    (2026-10-20) to design together, because they share the record encoding:
    - *Fragment-local re-randomization (the real footprint fix; implement).* A
      decoy write re-randomizes only the IVs it touches plus required
@@ -117,19 +125,32 @@ safety defects take precedence over this ordering whenever discovered.
    - *Journal mode.* Support stock `--integrity-no-journal` (removes on-disk
      history; likely default). Before fixing the default, run the concrete
      experiment below, since journal-provided group atomicity could change it.
-6. **Journal atomicity experiment (investigate concretely, later).** Determine
+6. **Journal atomicity — answered from source plus prior power-cut evidence
+   (2026-10-20); see docs/journal-atomicity.md.** The journal cannot make a
+   carrier group atomic: multi-section commits and reservation splits. Per-block
+   atomicity comes from A/B slots. Recommendation: keep journaled default;
+   no-journal needs a torn-sector policy decision. Original plan: Determine
    whether a whole carrier group submitted as one bio commits within a single
    dm-integrity journal transaction across power loss. If so, journaled mode
    may give atomic hidden records at no capacity cost, trading against history
    retention. Record evidence before choosing the format v4 journal default.
-7. **AEGIS-128 as the recommended default profile (user decision).** 128-bit
+7. **AEGIS-128 recommended — documentation done; xts/hmac investigated.**
+   README leads with AEGIS-128 and v4 requires it. Pinned cryptsetup emits
+   `capi:authenc(<auth>,<mode>)-<iv>` for non-AEAD integrity (e.g.
+   aes-xts-random + hmac-sha256), and dm-crypt stores random IVs for it, so the
+   profile is stock. Supporting it needs 32-byte tags (the UPDATE ABI and tuple
+   offsets assume 16) plus authenc key encoding: deferred. Fixture defaults stay
+   AES for continuity of existing evidence. Original plan: 128-bit
    IVs make the random-IV birthday term negligible and give more capacity and
    less amplification. Document AES-GCM as the budget-limited option; update
    fixtures/docs/examples to lead with AEGIS-128. Investigate stock
    `aes-xts-random` + `--integrity hmac-sha256` as a further profile (16-byte
    random IVs; IV repetition under XTS reveals equality rather than enabling
    forgery). Unverified; check cryptsetup support and layout first.
-8. **Further core performance work, only when justified.** Current bounded
+8. **Performance — write profiling added (2026-10-20).** guest-v4-test records
+   48 random 4 KiB O_DSYNC decoy writes per format: on AEGIS/4096 v3 spent 36
+   encryptions per write and v4 exactly 1 (TCG: 2.21 s vs 0.39 s). No further
+   write-path change is justified by these numbers yet. Original plan: Current bounded
    authenticated read batching and 16 KiB decoy write batching are complete.
    Add write throughput/latency and wear-amplification profiling (user
    approved) before selecting write-path changes. Concurrency, cross-bio
@@ -138,7 +159,11 @@ safety defects take precedence over this ordering whenever discovered.
 
 ## Work following core implementation
 
-- **Rekey/migration tooling (concrete; promoted).** Offline copy into a freshly
+- **Rekey/migration tooling — implemented (2026-10-20):** `pivstore migrate`
+  (blocks.migrate) with a second pinned guest disk (`vm.py --second-blank-mib`,
+  explicit `/dev/vdc` opt-in) and guest-migrate-test.py: AES v3 to a rekeyed,
+  larger AEGIS v4 volume. Per-cipher budget guidance is still to write. Original
+  plan: Offline copy into a freshly
   formatted volume: format the target (new primary key, chosen cipher, sector
   size and size), activate both paired stacks, copy decoy and hidden contents
   through their views, verify both independently (primary verification and
@@ -148,7 +173,9 @@ safety defects take precedence over this ordering whenever discovered.
   disk; extend fixture guards only explicitly. Hidden-key change becomes a
   header rewrap once format v4 exists. Publish per-cipher lifetime-budget
   guidance; no on-disk ledger or online rekey.
-- **Hidden-key KDF.** Argon2id (or stdlib scrypt meanwhile) from a passphrase in
+- **Hidden-key KDF — implemented for v4 keyslots:** stdlib scrypt (N=2^17,
+  r=8, p=1, salt = base context || "/kek") via `--hidden-passphrase-file`;
+  Argon2id awaits the Rust port. Original plan: Argon2id (or stdlib scrypt meanwhile) from a passphrase in
   userspace setup. Before the header exists, use the LUKS UUID as salt with
   fixed or user-supplied parameters; the header then stores a random salt and
   parameters for wrapped keys.
@@ -1333,3 +1360,94 @@ handoffs from different hardware.
 Next: roadmap item 4 (standalone target replacing the dm-crypt fork). Test
 throughput on this host is TCG-bound; caching a provisioned guest image and
 running independent suites in parallel are candidate harness improvements.
+
+## Session handoff: harness, standalone target, format v4, migration (2026-10-20)
+
+All guest runs used QEMU TCG (no KVM on this host) with the cached provisioned
+image and scripts/suite.py. Fixtures: control-001 (AES-GCM/4096) and
+suite-generated AES/512, AEGIS/4096, AEGIS/512 and ChaCha/4096 controls.
+
+Changes:
+- **Harness** (commit 4ca9321): vm.py provision/--provisioned, offline
+  guest_packages, virtio-rng, scripts/suite.py, guest-build.sh. suite-001: 29 VMs
+  passed with host verification in about 20 minutes.
+- **Standalone target (item 4):** kernel/dm-piv.c replaces the vendored dm-crypt
+  fork and kernel/dm-crypt-piv.patch. It accepts only the pinned profiles' stock
+  table syntax plus piv_control; hex keys only, wiped after setkey; status never
+  prints the key; it supports "key wipe" while suspended. The owner serves
+  bounded authenticated reads before native ownership and never accepts
+  ordinary writes. Staging copies five source files; no kernel source archive
+  is needed.
+- **Format v4 phases 1-3 (item 5):** fragments, SIV records, keyslots, directory,
+  passphrase KEKs (scrypt), the keyslot add/remove ioctl and A/B slots. 16-byte-IV
+  profiles detect the format at open; initialization defaults to v3.
+  pn_write is noinline for the kprobe-based tests.
+- **Migration:** `pivstore migrate` plus `vm.py --second-blank-mib` and an
+  explicit /dev/vdc opt-in in the guest guard.
+- **Docs:** format-v4.md, journal-atomicity.md (item 6 answered), README,
+  native-blocks, security-review, kernel/README, AGENTS.md rules.
+
+Evidence:
+- suite-006 (module from artifacts/v4ks-input-002, all five profiles): native,
+  faults, batch, early, power, controls, sector and v4 passed (40 VMs) with
+  independent host verification of every closed image. The 20 failures were
+  profile, cancel and lifecycle (kprobes could not find the inlined pn_write)
+  and migrate (the test wrongly required a bit-identical source raw image).
+- suite-007 (noinline fix, artifacts/v4ks-input-003, experimental-dm-piv.ko
+  SHA-256 b09eafb8a5f76aaf793abc4699e04ee0bb6c662db0c18f192dfc7d2e20d68423, built
+  in-guest without warnings): profile, cancel and lifecycle passed on all five
+  profiles; migrate passed for AES/4096, AEGIS/4096 and ChaCha/4096. On 512-byte
+  sources it correctly refused a 4096-byte AEGIS v4 target whose hidden view
+  would be smaller; the test now keeps the source sector size (rerun:
+  suite-008).
+- v4 results (guest-v4-test.py, independently decoded on the host via keyslot
+  unlock): 1 primary encryption per 4 KiB decoy write versus 36 for v3; hidden
+  writes 90; A/B falls back after the newest slot is damaged. Keyslot add/remove,
+  passphrase slots, the last-keyslot protection and keyslot preservation across
+  a decoy rewrite of the keyslot area all passed. Capacity on 128 MiB AEGIS:
+  158,720 bytes (4096-byte sectors).
+- Host: 61 unit tests, including the v4 codec, keyslots and directory, pass with
+  the fixture and the AEGIS reference.
+
+Remaining:
+- No-journal (phase 4) needs your decision on the torn-sector policy.
+- Porting to a newer public kernel series is not done.
+- The xts/hmac profile needs 32-byte tag ABI work.
+- Rust setup port.
+- Per-cipher lifetime-budget guidance.
+- External cryptographic review of v4.
+- Initialization defaults to v3. Switching AEGIS to v4 by default would require
+  updating dual/fault/other suite expectations.
+
+## Session handoff: v4 landed and full KVM matrix (2026-10-21)
+
+The previous session was interrupted before committing; its work was applied
+from a saved diff (one malformed suite.py hunk line fixed) on top of
+726a35a/feb6d6f. Also removed: kernel/dm-crypt-piv.patch and
+environment/kernel-sources.json, both obsolete with the standalone dm-piv.c
+(fetch_kernel.py no longer downloads Debian source archives). The suite-008
+migrate rerun noted above was never recorded; suite-004 below supersedes it.
+
+Harness (726a35a): suite.py/early_vm.py take `--accel`, defaulting to KVM when
+/dev/kvm is usable; host checks no longer pass `--format` for v3 images (that
+bug made every host verification fail).
+
+Evidence (this host has KVM; all runs `accel=kvm`, cached provisioned image):
+- suite-003 (pre-v4 tree with the fork patch): 66 VMs, six profiles, all suites
+  except v4/migrate passed; 36/36 closed images host-verified.
+- suite-004 (this tree, artifacts/v4-input-001 scaffold): 78/78 VMs passed in
+  about 23 minutes for all six profiles (AES/ChaCha/AEGIS at 512/4096) and the
+  suites faults, profile, cancel, lifecycle, batch, early, power, controls,
+  sector, v4 and migrate. 44 host checks (including v4 decoding via keyslot
+  unlock) verified; no failures. v4 ran on both AEGIS profiles and correctly
+  skipped on 12-byte-IV profiles. Migrate passed from every source profile
+  into a rekeyed, larger AEGIS v4 target with the source's sector size.
+  experimental-dm-piv.ko SHA-256 (AEGIS/4096 native run)
+  b09eafb8a5f76aaf793abc4699e04ee0bb6c662db0c18f192dfc7d2e20d68423, identical
+  to suite-007's; no compiler warnings, BUG or Oops (only unsigned-module taint).
+- AEGIS/4096 v4 write profile under KVM: 48 random 4 KiB O_DSYNC decoy writes,
+  v3 36 encryptions/write (0.749 s) vs v4 exactly 1 (0.448 s); A/B fallback and
+  keyslot add/remove/last-slot protection passed.
+- Host: 61 unit tests pass against fresh fixtures with the AEGIS reference.
+
+Remaining items are unchanged from the previous handoff.

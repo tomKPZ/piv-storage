@@ -49,26 +49,27 @@ resolved from context/evidence, not for routine implementation decisions.
   LUKS/dm-integrity structures and encrypted records inside IVs. No separate
   partition, root-ext4 file or hidden-volume metadata dependency. /run ownership
   locks are volatile. Early activation must be possible from an initramfs.
-- User-approved planned changes (2026-10-20; see ROADMAP.md items 3-8). Until
-  each lands with tests, the current rules below remain in force:
-  - A standalone AEAD-sector target replaces the vendored dm-crypt fork.
-  - Format v4: fragment-local re-randomization of touched IVs; an encrypted
-    in-IV hidden header (indistinguishable, no public magic; fast key check,
-    key wrapping, version/flags) without any persistent encryption counter;
-    optional A/B record slots; support for stock `--integrity-no-journal`
-    (default decided after the journal-atomicity experiment).
-  - AEGIS-128 becomes the recommended default profile.
-  - Setup userspace may later be ported to Rust; Python diagnostics remain.
+- Format v4 (docs/format-v4.md, user-approved 2026-10-20) is implemented for
+  16-byte-IV (AEGIS-128) profiles: LRW-randomized fragments (10 random + 6
+  payload bytes per IV), 90-fragment SIV records, encrypted keyslots (no
+  public magic) with a directory, scrypt passphrase KEKs and optional A/B
+  slots. Never add a persistent encryption counter. v3 remains for 12-byte
+  IVs and is still the initialization default. Still planned: stock
+  `--integrity-no-journal` support (needs a torn-sector policy decision, see
+  docs/journal-atomicity.md) and a Rust setup port (Python diagnostics remain).
+  AEGIS-128 is the recommended profile.
   Multi-snapshot observers, rollback resistance and alternative hidden openings
   under coercion are out of scope. Never put host-specific (e.g. corporate
   kernel) identifiers in the repository.
 - One authenticated record covers exactly one hidden 512-byte logical block in
-  48 primary IVs for AES/ChaCha or 36 for original AEGIS-128. Full-block authentication prevents old/new fragment mixing;
+  48 primary IVs for AES/ChaCha or 36 for original AEGIS-128 (v3), or 90 IVs
+  (v4, A/B: two records per block). Full-block authentication prevents old/new fragment mixing;
   cross-block transactions, hidden crash recovery and rollback resistance are
   NOT goals. Interrupted updates may leave hidden blocks returning EIO.
-- Decoy access must not depend on hidden-record authentication. A decoy write
+- Decoy access must not depend on hidden-record authentication. A v3 decoy write
   refreshes valid hidden records, or writes a fresh encrypted invalid marker for
-  absent/damaged/wrong-key records. Never turn corruption into authenticated
+  absent/damaged/wrong-key records. A v4 decoy write re-randomizes only the
+  written sectors' IVs and preserves their fragments (damage stays damage). Never turn corruption into authenticated
   zeros. Full hidden writes may repair a block after primary authentication.
 - Fresh seeded CRNG entropy is mandatory. Local proposed/replaced IV collision
   rejection is only a small check, not lifetime nonce history. The 2^32 per-owner
@@ -81,9 +82,10 @@ resolved from context/evidence, not for routine implementation decisions.
   before the first APPLY (reads, authentication, allocation, preparation) fail
   only that bio; APPLY-time and flush errors stop the shared owner. Local hidden
   unavailability must not stop the decoy.
-- Wrong-key guard: setup without initialize requires one record (data or invalid
-  marker) to authenticate, using carriers from the mandatory scan, unless the
-  explicit uninitialized-carrier flag is given. Never add extra I/O for it.
+- Wrong-key guard: setup without initialize requires a v4 keyslot, or one v3
+  record (data or invalid marker), to authenticate, using IVs from the
+  mandatory scan, unless the explicit uninitialized-carrier flag is given.
+  Never add extra I/O for it. v4 also refuses without its keyslot directory.
 - Decoy bios are bounded to 16 KiB at power-of-two DM split boundaries, hidden
   bios to 512 bytes. Retain the two-carrier-group/96-tuple preparation bound,
   ordered work and lower preflush/completion-flush semantics. Batching is within
@@ -103,14 +105,14 @@ resolved from context/evidence, not for routine implementation decisions.
   reads. Authenticate every sector with unchanged Linux AAD/tag offsets before
   publishing any range bytes or IVs. Keep per-sector crypto counts and late-sector
   corruption/no-output regressions; fewer submissions must never skip checks.
-- Build dm-piv.ko as a separate module registering piv-crypt/piv-view. Keep
-  stock dm-crypt/crypt loaded and independent; never unload it to activate ours.
-  Keep private sysfs workqueue names distinct (kpiv_io/kpiv_crypt): independent
-  stock/fork ID allocators can collide during a suspended table reload.
-  Build/load experimental kernel code only in disposable guests with exact
-  source/config/symbol matches. Never install host modules or touch real disks.
-  scripts/fetch_kernel.py stages the COMPLETE module including dm-audit.h;
-  kernel/prepare.py alone stages only the patch and is insufficient for a build.
+- Build dm-piv.ko as a standalone module (dm-piv.c, no dm-crypt fork)
+  registering piv-crypt/piv-view. Keep stock dm-crypt/crypt loaded and
+  independent; never unload it to activate ours. Keep workqueue names distinct
+  from stock kcryptd names (piv-native/kpiv_io). The owner never accepts
+  ordinary writes and never prints its key. Build/load experimental kernel code
+  only in disposable guests with exact header/config/symbol matches. Never
+  install host modules or touch real disks. scripts/fetch_kernel.py (or
+  kernel/prepare.py) stages the complete module source.
 - Supported profiles: LUKS2 AES-GCM/random (integrity aead) or ChaCha20-Poly1305
   via chacha20-random (integrity poly1305), or original aegis128-random
   (integrity aead). All support 512/4096-byte sectors and 16-byte tags; AES/ChaCha

@@ -66,12 +66,16 @@ def decode_image(image, key):
                     for i in range(records.count))
 
 
-def unpack(source, output, hidden_key):
+def unpack(source, output, hidden_key, format=3):
     output = Path(output)
     if output.exists() or output.is_symlink():
         raise FileExistsError('Output must not exist')
     with Image(source) as image:
-        payload = decode_image(image, hidden_key)
+        if format == 4:
+            from .records_v4 import decode_image as decode_v4
+            payload = decode_v4(image, hidden_key)
+        else:
+            payload = decode_image(image, hidden_key)
         image.check_unchanged()
         fd, name = tempfile.mkstemp(prefix='.pivstore-', suffix='.partial', dir=output.parent)
         temporary = Path(name)

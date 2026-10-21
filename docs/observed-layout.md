@@ -134,8 +134,8 @@ or hidden-record encoding change is needed.
 The mappings and tuple sizing were checked against the pinned cryptsetup
 cipher_dm2c and INTEGRITY_tag_size implementations. Linux's rfc7539 template
 uses a 12-byte IV and a 16-byte authentication tag; it is distinct from the
-8-byte-IV rfc7539esp template, which this prototype does not accept. Both native
-primary crypto paths reuse pinned dm-crypt; userspace verification selects the
+8-byte-IV rfc7539esp template, which this prototype does not accept. The native
+primary crypto path (dm-piv.c piv_aead) reproduces pinned dm-crypt's layout; userspace verification selects the
 maintained AESGCM or ChaCha20Poly1305 primitive only after validating the exact
 LUKS cipher/integrity combination. Active owner tables are checked against that
 selection on setup and reuse. Neither profile changes the hidden nonce policy

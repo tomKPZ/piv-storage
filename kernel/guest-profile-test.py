@@ -118,7 +118,7 @@ def symbol(stem):
     assert len(matches) == 1, (stem, matches)
     return 'dm_piv:' + matches[0]
 probes = {event: symbol(function) for event, function in dict(
-    load='piv_load', range='piv_read_range', crypto='crypt_convert_block_aead_iv',
+    load='piv_load', range='piv_read_range', crypto='piv_aead',
     record='pn_record', write='pn_write', checkpoint='piv_checkpoint').items()}
 
 

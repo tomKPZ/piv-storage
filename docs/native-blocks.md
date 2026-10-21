@@ -1,11 +1,13 @@
 # Paired native block devices
 
-The separate dm-piv.ko module contains a private fork of pinned dm-crypt to reuse
-its exact primary AEAD/AAD handling and stock dm-integrity journal. It registers
-piv-crypt and paired piv-view targets. Stock dm-crypt keeps its crypt target and
-can remain loaded with unrelated encrypted filesystems mounted throughout setup,
-I/O and removal of our module. No stock symbols are hooked or replaced. The fork
-still needs upstream fixes and exact matching kernel headers/config/symbols.
+The separate standalone dm-piv.ko module implements the primary per-sector
+AEAD path itself (the Linux LUKS2 AAD/IV/tag layout) over the stock dm-integrity
+journal; it no longer contains a dm-crypt fork. It registers piv-crypt and
+paired piv-view targets. Stock dm-crypt keeps its crypt target and can remain
+loaded with unrelated encrypted filesystems mounted throughout setup, I/O and
+removal of our module. No stock symbols are hooked or replaced. Builds still
+need the matching kernel headers/config/symbols, but only ordinary exported
+block, device-mapper and crypto APIs are used.
 
 Both public views reference one private piv-crypt owner, lower dm-integrity
 device, serialization lock and record cipher. They expose plaintext logical I/O;
@@ -75,8 +77,13 @@ that block without stopping the owner.
 
 ABI 3 SETUP is 192 bytes: version/size, generation, flags/context_length, hidden
 key32, context128, reserved2. Flag 1 destructively initializes all hidden blocks;
-flag 2 accepts a carrier where no record authenticates (fresh/uninitialized).
-Other flag bits are rejected.
+flag 2 accepts a carrier where no record authenticates (fresh/uninitialized);
+flag 4 selects (with flag 1) or requires format v4; flag 8 selects A/B slots
+when initializing v4. Other flag bits are rejected. On 16-byte-IV profiles the
+key is a v4 keyslot KEK and the format is detected (docs/format-v4.md).
+KEYSLOT (ioctl 15, version 1, 64 bytes: version/size, generation, slot, op,
+kek32, reserved2) adds (op 1) or removes (op 2) a v4 keyslot on an active owner;
+the last keyslot cannot be removed, and failures after a lower write fail-stop.
 STATUS is 48 bytes: generation, hidden_bytes, encryptions, invalidations (u64),
 active/views/failed/version (u32). Counters are volatile; invalidations count group writes in successfully
 completed invalid-marker requests, not durable lifetime history.
@@ -84,7 +91,7 @@ No user paths or file descriptors enter the native persistence path.
 
 The primary cipher whitelist includes capi:gcm(aes)-random and
 capi:rfc7539(chacha20,poly1305)-random (32-byte keys, 12-byte stored IVs),
-and capi:aegis128-random (16-byte key, 16-byte IV). All use 16-byte tags. The pinned dm-crypt AEAD helper handles either transform with
+and capi:aegis128-random (16-byte key, 16-byte IV). All use 16-byte tags. dm-piv.c's piv_aead reproduces dm-crypt's AEAD layout:
 AAD LE64(address_in_512_byte_units) || IV. Setup checks the actual owner table
 against the validated LUKS cipher on creation and reuse. The independent verifier
 selects AESGCM, ChaCha20Poly1305 or the pinned diagnostic AEGIS-128 reference from the same validated public metadata; setup
@@ -113,7 +120,7 @@ mappings explicitly; ordinary cryptsetup remains available for unrelated volumes
 and for stock readback after closing ours. No primary or hidden disk format or
 control ABI changed with module separation.
 
-The integration patch is kernel/dm-crypt-piv.patch. piv-control.inc owns privileged
+dm-piv.c owns the owner target and per-sector AEAD. piv-control.inc owns privileged
 controls, authenticated primary tuple preparation/application and lifetime gates;
 piv-native.inc owns hidden crypto, both views and the ordered workqueue. The
 independent Python codec remains a cross-check for kernel output. Exact-current

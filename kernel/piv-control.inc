@@ -31,7 +31,7 @@ struct piv_control {
 	bool failed;
 	u64 encryptions;
 	struct file *controller;
-	struct crypt_config *cc;
+	struct piv_crypt *cc;
 	struct piv_query profile;
 	struct piv_devices devices;
 	char name[40];
@@ -65,13 +65,13 @@ static int piv_release(struct inode *inode, struct file *file)
 }
 
 struct piv_sector {
-	struct dm_crypt_io io;
+	struct piv_io io;
 	struct page *page;
 	struct bio *bio;
 	u8 original[PIV_TUPLE_BYTES];
 };
 
-static void piv_sector_free(struct crypt_config *cc, struct piv_sector *s)
+static void piv_sector_free(struct piv_crypt *cc, struct piv_sector *s)
 {
 	if (!s)
 		return;
@@ -85,7 +85,7 @@ static void piv_sector_free(struct crypt_config *cc, struct piv_sector *s)
 	kfree_sensitive(s);
 }
 
-static int piv_bio(struct crypt_config *cc, struct piv_sector *s, blk_opf_t op)
+static int piv_bio(struct piv_crypt *cc, struct piv_sector *s, blk_opf_t op)
 {
 	if (s->bio)
 		bio_put(s->bio);
@@ -95,27 +95,19 @@ static int piv_bio(struct crypt_config *cc, struct piv_sector *s, blk_opf_t op)
 	s->bio->bi_iter.bi_sector = cc->start + s->io.sector;
 	if (bio_add_page(s->bio, s->page, cc->sector_size, 0) != cc->sector_size)
 		return -ENOMEM;
-	return dm_crypt_integrity_io_alloc(&s->io, s->bio);
+	return piv_integrity_alloc(&s->io, s->bio);
 }
 
-static int piv_crypto(struct crypt_config *cc, struct piv_sector *s,
+/* Write bios encrypt with the requested IV; read bios authenticate/decrypt. */
+static int piv_crypto(struct piv_crypt *cc, struct piv_sector *s,
 		      const u8 *iv)
 {
-	struct aead_request *req;
-	DECLARE_CRYPTO_WAIT(wait);
-	int ret;
-
-	crypt_convert_init(cc, &s->io.ctx, s->bio, s->bio, s->io.sector);
-	req = mempool_alloc(&cc->req_pool, GFP_NOIO);
-	aead_request_set_tfm(req, any_tfm_aead(cc));
-	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG, crypto_req_done, &wait);
-	ret = crypto_wait_req(crypt_convert_block_aead_iv(cc, &s->io.ctx, req, 0, iv), &wait);
-	mempool_free(req, &cc->req_pool);
-	return ret;
+	return piv_aead(cc, s->io.sector, s->page, 0, s->io.integrity_metadata, iv,
+			op_is_write(bio_op(s->bio)));
 }
 
 /* Caller holds lifecycle lock. Plaintext lives only in a private wiped page. */
-static int piv_load(struct crypt_config *cc, u64 index, struct piv_sector **out)
+static int piv_load(struct piv_crypt *cc, u64 index, struct piv_sector **out)
 {
 	struct piv_sector *s;
 	struct bvec_iter saved;
@@ -155,18 +147,15 @@ bad:
  */
 #define PIV_READ_BYTES 16384
 struct piv_range_io {
- struct dm_crypt_io io;
+ struct piv_io io;
  struct bio *bio;
  struct page *pages[PIV_READ_BYTES / PAGE_SIZE];
 };
 static int piv_read_range(struct piv_control *p, u64 index, u32 count,
                           u8 *data, u8 *ivs)
 {
- struct crypt_config *cc = p->cc;
+ struct piv_crypt *cc = p->cc;
  struct piv_range_io *r;
- struct aead_request *req = NULL;
- struct bvec_iter saved;
- DECLARE_CRYPTO_WAIT(wait);
  u32 i, bytes, pages;
  int ret = -ENOMEM;
  if (!count || count > PIV_READ_BYTES / cc->sector_size ||
@@ -184,25 +173,20 @@ static int piv_read_range(struct piv_control *p, u64 index, u32 count,
   r->pages[i] = alloc_page(GFP_NOIO | __GFP_ZERO);
   if (!r->pages[i] || bio_add_page(r->bio, r->pages[i], length, 0) != length) goto done;
  }
- ret = dm_crypt_integrity_io_alloc(&r->io, r->bio); if (ret) goto done;
- saved = r->bio->bi_iter;
+ ret = piv_integrity_alloc(&r->io, r->bio); if (ret) goto done;
  ret = submit_bio_wait(r->bio); if (ret) goto done;
- r->bio->bi_iter = saved;
- crypt_convert_init(cc, &r->io.ctx, r->bio, r->bio, r->io.sector);
- req = mempool_alloc(&cc->req_pool, GFP_NOIO);
- aead_request_set_tfm(req, any_tfm_aead(cc));
- aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG, crypto_req_done, &wait);
+ /* Authenticate every sector with its own address/IV AAD before publishing. */
  for (i = 0; i < count; i++) {
-  ret = crypto_wait_req(crypt_convert_block_aead_iv(cc, &r->io.ctx, req, i, NULL), &wait);
+  u32 at = i * cc->sector_size;
+  ret = piv_aead(cc, r->io.sector + ((u64)i << cc->sector_shift), r->pages[at >> PAGE_SHIFT],
+                 at & ~PAGE_MASK, r->io.integrity_metadata + i * cc->tuple_size, NULL, false);
   if (ret) goto done;
-  r->io.ctx.cc_sector += 1U << cc->sector_shift;
  }
  for (i = 0; data && i < pages; i++)
   memcpy(data + i * PAGE_SIZE, page_address(r->pages[i]), min_t(u32, PAGE_SIZE, bytes - i * PAGE_SIZE));
  for (i = 0; ivs && i < count; i++)
   memcpy(ivs + i * cc->iv_size, r->io.integrity_metadata + i * cc->tuple_size + 16, cc->iv_size);
 done:
- if (req) mempool_free(req, &cc->req_pool);
  if (r->bio) bio_put(r->bio);
  for (i = 0; i < pages; i++) if (r->pages[i]) {
   memzero_explicit(page_address(r->pages[i]), PAGE_SIZE); __free_page(r->pages[i]);
@@ -220,7 +204,7 @@ static int piv_identity(struct piv_control *p, u32 version, u32 size,
 		return -ESTALE;
 	if (sector >= p->profile.sectors)
 		return -ERANGE;
-	if (!p->activated || !test_bit(DM_CRYPT_KEY_VALID, &p->cc->flags))
+	if (!p->activated || !test_bit(PIV_KEY_VALID, &p->cc->flags))
 		return -EBUSY;
 	return 0;
 }
@@ -228,7 +212,7 @@ static int piv_identity(struct piv_control *p, u32 version, u32 size,
 static bool piv_quiesced(struct piv_control *p)
 {
 	return p->blocked && !p->resuming &&
-		test_bit(DM_CRYPT_SUSPENDED, &p->cc->flags);
+		test_bit(PIV_SUSPENDED, &p->cc->flags);
 }
 
 static int piv_read_iv(struct piv_control *p, struct piv_read_iv *out, bool quiesced)
@@ -255,7 +239,7 @@ static int piv_read_iv(struct piv_control *p, struct piv_read_iv *out, bool quie
 static int piv_update(struct piv_control *p, struct file *file,
 		      struct piv_update *u, bool prepare, bool primary, bool internal)
 {
-	struct crypt_config *cc = p->cc;
+	struct piv_crypt *cc = p->cc;
 	struct piv_sector *old = NULL, *candidate = NULL;
 	int ret;
 
@@ -359,7 +343,7 @@ done:
  * not encryption, consumes no nonce, and needs no external recovery plan because
  * every byte is identical. Native journaling still protects its sector atomicity.
  */
-static int piv_checkpoint(struct crypt_config *cc)
+static int piv_checkpoint(struct piv_crypt *cc)
 {
 	struct piv_sector *s = NULL;
 	int ret;
@@ -387,6 +371,7 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	struct piv_query profile;
 	struct piv_native_status status = {};
 	struct piv_native_setup *setup = NULL;
+	struct piv_native_keyslot *keyslot = NULL;
 	struct piv_update *update = NULL;
 	bool preparing = cmd == PIV_PREPARE || cmd == PIV_PREPARE_PRIMARY;
 	bool primary = cmd == PIV_PREPARE_PRIMARY || cmd == PIV_APPLY_PRIMARY;
@@ -399,7 +384,8 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return -EPERM;
 	if (cmd != PIV_QUERY && cmd != PIV_DEVICES && cmd != PIV_READ_IV && cmd != PIV_READ_QUIESCED &&
 	    cmd != PIV_BEGIN && cmd != PIV_END && cmd != PIV_SYNC &&
-	    cmd != PIV_NATIVE_SETUP && cmd != PIV_NATIVE_DETACH && cmd != PIV_NATIVE_STATUS && !data_request)
+	    cmd != PIV_NATIVE_SETUP && cmd != PIV_NATIVE_DETACH && cmd != PIV_NATIVE_STATUS &&
+	    cmd != PIV_NATIVE_KEYSLOT && !data_request)
 		return -ENOTTY;
 	if (cmd == PIV_NATIVE_SETUP) {
 		setup = memdup_user((void __user *)arg, sizeof(*setup));
@@ -408,6 +394,11 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			ret = -EINVAL; goto out;
 		}
 		/* Early boot: wait for seeded CRNG without holding owner lifecycle lock. */
+		ret = wait_for_random_bytes();
+		if (ret) goto out;
+	} else if (cmd == PIV_NATIVE_KEYSLOT) {
+		keyslot = memdup_user((void __user *)arg, sizeof(*keyslot));
+		if (IS_ERR(keyslot)) return PTR_ERR(keyslot);
 		ret = wait_for_random_bytes();
 		if (ret) goto out;
 	} else if (data_request) {
@@ -437,6 +428,8 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		}
 	} else if (cmd == PIV_NATIVE_SETUP)
 		ret = pn_setup(p, file, setup);
+	else if (cmd == PIV_NATIVE_KEYSLOT)
+		ret = pn_keyslot(p, keyslot);
 	else if (cmd == PIV_NATIVE_DETACH) {
 		ret = piv_identity(p, read.version, read.size, read.generation, read.sector, sizeof(read));
 		if (!ret && (read.sector || memchr_inv(read.iv, 0, sizeof(read.iv)) || memchr_inv(read.reserved, 0, sizeof(read.reserved)))) ret = -EINVAL;
@@ -517,19 +510,20 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 out:
 	kfree_sensitive(update);
 	kfree_sensitive(setup);
+	kfree_sensitive(keyslot);
 	return ret;
 }
 
 static int piv_preresume(struct dm_target *ti)
 {
-	struct crypt_config *cc = ti->private;
+	struct piv_crypt *cc = ti->private;
 	struct piv_control *p = cc->piv_control;
 	int ret = 0;
 	if (!p)
 		return 0;
 	mutex_lock(&p->lock);
 	if (p->failed || p->transaction ||
-	    !test_bit(DM_CRYPT_KEY_VALID, &cc->flags))
+	    !test_bit(PIV_KEY_VALID, &cc->flags))
 		ret = -EBUSY;
 	else
 		p->resuming = true;
@@ -540,7 +534,7 @@ static int piv_preresume(struct dm_target *ti)
 /* presuspend runs before upper I/O drains or lower tables are suspended. */
 static void piv_presuspend(struct dm_target *ti)
 {
-	struct crypt_config *cc = ti->private;
+	struct piv_crypt *cc = ti->private;
 	struct piv_control *p = cc->piv_control;
 	if (!p)
 		return;
@@ -552,7 +546,7 @@ static void piv_presuspend(struct dm_target *ti)
 
 static void piv_unblock(struct dm_target *ti)
 {
-	struct crypt_config *cc = ti->private;
+	struct piv_crypt *cc = ti->private;
 	struct piv_control *p = cc->piv_control;
 	if (!p)
 		return;
@@ -573,23 +567,21 @@ static const struct file_operations piv_fops = {
 #endif
 };
 
-static int piv_register(struct crypt_config *cc, struct dm_target *ti)
+static int piv_register(struct piv_crypt *cc, struct dm_target *ti)
 {
 	struct piv_control *p;
 	int ret;
 	bool aegis = !strcmp(cc->cipher_string, "capi:aegis128-random");
 
-	if (!cc->piv_enabled)
-		return 0;
-	/* Pin the existing tested crypto profile; this is not a general API. */
-	if (!crypt_integrity_aead(cc) || cc->iv_gen_ops != &crypt_iv_random_ops ||
-	    (strcmp(cc->cipher_string, "capi:gcm(aes)-random") &&
+	/* Pin the existing tested crypto profile; this is not a general API. The
+	 * constructor already parsed it; re-check the invariants this code relies on.
+	 */
+	if ((strcmp(cc->cipher_string, "capi:gcm(aes)-random") &&
 	     strcmp(cc->cipher_string, "capi:rfc7539(chacha20,poly1305)-random") && !aegis) ||
 	    cc->key_size != (aegis ? 16 : 32) || (cc->sector_size != 512 && cc->sector_size != 4096) ||
 	    cc->iv_size != (aegis ? 16 : 12) || cc->integrity_iv_size != cc->iv_size ||
 	    cc->integrity_tag_size != 16 || cc->tuple_size != 16 + cc->iv_size ||
 	    cc->iv_offset || cc->start ||
-	    test_bit(CRYPT_IV_LARGE_SECTORS, &cc->cipher_flags) ||
 	    !(dm_table_get_mode(ti->table) & BLK_OPEN_WRITE)) {
 		ti->error = "piv_control requires the tested writable-owner AEAD profile";
 		return -EINVAL;
@@ -632,7 +624,7 @@ static int piv_register(struct crypt_config *cc, struct dm_target *ti)
 	return 0;
 }
 
-static void piv_unregister(struct crypt_config *cc)
+static void piv_unregister(struct piv_crypt *cc)
 {
 	struct piv_control *p = cc->piv_control;
 	if (!p)
