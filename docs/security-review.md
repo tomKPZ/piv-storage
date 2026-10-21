@@ -92,33 +92,45 @@ key commitment nor producing convincing alternative valid hidden openings under
 other keys is an implemented property. A wrong key looks unavailable to this
 interface; it can still destroy correct-key records on a later decoy write.
 
-## Nonce and data budgets
+## Nonce and data budgets (AEGIS-128 lifetime guidance)
 
 Primary nonce uniqueness is global per primary key across addresses, devices,
-clones, stock writes and time. Adding address AAD does not permit nonce reuse.
-Assuming pseudorandom IVs, the approximate collision term is q(q-1)/2^97 for
-96 bits and q(q-1)/2^129 for 128 bits. At q=2^32 these are about 2^-33 and 2^-65.
-They are not complete confidentiality or forgery bounds.
+clones, stock writes and time. Adding address AAD does not permit nonce reuse;
+under original AEGIS-128 a repeated (key, nonce) pair leaks plaintext
+relations and enables state recovery/forgery, so treat it as a key compromise.
 
-For random-IV AES-GCM, [NIST SP 800-38D section 8.3](https://tsapps.nist.gov/publication/get_pdf.cfm?pub_id=51288)
-limits authenticated-encryption invocations to 2^32 across all instances with
-the given key. Sections 8 and Appendix B also discuss IV failure probability,
-aggregate data and verification attempts. The prototype's counter is per owner,
-starts after earlier stock encryptions, and resets on recreation. It therefore
-**does not enforce the GCM key-lifetime requirement**. It is not a safe remaining
-write allowance. Failed preparations/retries that reach encryption consume
-budget even if no ciphertext is finally installed; applying an exact prepared
-tuple or flushing it does not perform another encryption.
+**What consumes nonces.** Every primary encryption draws one 16-byte IV:
+stock dm-crypt writes (one per written sector), native decoy writes (exactly
+one per written primary sector), hidden writes (90 per 512-byte hidden block,
+one record; A/B writes one slot), keyslot/directory updates and initialization
+(28 + 90 + 90 × records). Failed preparations that reached encryption count;
+exact replays do not.
 
-A single flat invocation counter is not a full security policy for any supported
-cipher. The 2^32 diagnostic cap also applied to ChaCha and original AEGIS-128 is
-not a derived cipher-specific bound or approval for that many writes. The
-128-bit AEGIS IV lowers the collision term but does not establish stronger
-end-to-end security; original AEGIS-128 is not AEGIS-128L, and bounds for the latter
-must not be transplanted. Rekey tooling and a reviewed, per-cipher aggregate
-policy are still absent. Without trusted external lifetime knowledge, this
-stateless image cannot certify that its key is safe to continue using. Do not
-add a distinguishable on-disk ledger to solve that under the current scope.
+**Two collision terms.**
+
+| Term | Model | Example values |
+| --- | --- | --- |
+| Whole key, IVs at different sectors | about q²/2^129 (uniform 128-bit IVs) | q = 2^32: 2^-65; 2^40: 2^-49; 2^48: 2^-33 |
+| One sector rewritten n times (v4 fragments carry 80 random bits) | about n²/2^81 | n = 2^20: 2^-41; 2^24: 2^-33; 2^32: 2^-17 |
+
+The per-sector term dominates for hot sectors. Sectors outside records (tail) and stock
+writes use fully random 128-bit IVs and follow the first row only.
+
+**Guidance (not a proven bound).** Choose a per-key budget for the deployment,
+for example at most 2^40 total primary encryptions and at most 2^24 rewrites of
+any one sector (both around 2^-33 to 2^-49 collision probability), and rekey
+before either is reached by recreating the volume with `pivsetup migrate`
+(new LUKS volume key, fresh hidden master key). These numbers come only from
+the collision terms above; they are not a reviewed AEGIS-128 security bound
+(original AEGIS-128 is not AEGIS-128L, whose analyses must not be transplanted)
+and cover neither multi-key nor RNG-failure scenarios. RNG snapshots, cloned
+images and VM restores can repeat randomness and void the birthday model.
+
+**Not enforced.** The per-owner 2^32 encryption counter starts after earlier
+stock encryptions and resets on recreation; it is a diagnostic cap, not a
+remaining allowance. A stateless image cannot know its own lifetime usage, so
+the budget must be tracked outside the volume (e.g. by write volume estimates
+from the host), and no on-disk ledger is added under the current scope.
 
 ## Integrity, journal and implementation boundaries
 

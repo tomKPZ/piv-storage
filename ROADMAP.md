@@ -1785,6 +1785,12 @@ suite-048), and suite-047/049 on 6.12 after the change. KUNIT is disabled in
 both Debian configs, so kunit helper tests would require a custom kernel; not
 pursued (the Python cross-checks cover the helpers end to end).
 
-Remaining roadmap items need user input or are documentation: no-journal
-(torn-sector policy decision), AEGIS-128 lifetime-budget guidance, optional
-sanitizer build of 7.2, external crypto review.
+AEGIS-128 lifetime-budget guidance is now in docs/security-review.md ("Nonce
+and data budgets"): both collision terms (whole key q²/2^129, per hot sector
+n²/2^81 from the 80 random fragment bits), what consumes nonces, a suggested
+external budget (2^40 total, 2^24 per sector) with rekey via `pivsetup migrate`,
+explicitly not a reviewed AEGIS-128 bound and not enforced on disk.
+
+Remaining roadmap items need user input or outside help: no-journal
+(torn-sector policy decision), optional sanitizer build of 7.2, external crypto
+review.
