@@ -1704,6 +1704,16 @@ fixture) and 12 cargo tests pass. suite-021-sanitizer (pre-option-A code,
 after the kmemleak triage (docs/sanitizer.md: the 6 boot-time execmem objects
 are ignored, no dm_piv frames).
 
-Open: option-A sanitizer matrix (suite-026-sanitizer, running at handoff time);
-kunit tests for the pure helpers; ioctl fuzzing; newer-kernel port; no-journal
+Sanitizer (option A code, scaffold optA-input-001): suite-026-sanitizer passed
+20/22 with no kernel reports (both profiles × native, faults, profile, cancel,
+lifecycle, batch, early, power, controls, v4); both migrate runs failed because
+the localmodconfig debug kernel lacked AF_ALG, so in-guest `cryptsetup
+luksFormat --cipher aegis128-random` called the cipher unavailable (an image
+gap, not a dm-piv defect). scripts/guest-debug-kernel.sh now keeps
+af_alg/algif_*; on the rebuilt image downloads/debug-kernel-f30764a4de26f21a
+suite-028-sanitizer migrate passed 4/4 with no kernel reports. The recurring
+"Buffer I/O error on dev dm-N, logical block 0" console lines also appear on
+the stock kernel (udev probes of private mappings) and are not new.
+
+Open: kunit tests for the pure helpers; ioctl fuzzing; newer-kernel port; no-journal
 (awaiting the torn-sector policy); lifetime-budget guidance for AEGIS-128.

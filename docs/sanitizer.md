@@ -11,7 +11,11 @@ python3 scripts/build_debug_kernel.py --prefix artifacts/debug-image-next
 
 1. **build** (scripts/guest-debug-kernel.sh, 32 vCPU / 32 GiB guest, tmpfs):
    Debian `linux-source-6.12` 6.12.113-1, the pinned guest's boot config,
-   `localmodconfig` from the modules the suites load, then KASAN (generic,
+   `localmodconfig` from the modules the suites load (including the AF_ALG
+   modules af_alg/algif_aead/algif_skcipher/algif_hash: without them
+   in-guest `cryptsetup luksFormat --cipher aegis128-random` reports the cipher
+   unavailable, which first broke the migrate suite; image
+   debug-kernel-f30764a4de26f21a and later), then KASAN (generic,
    inline, stack, vmalloc), UBSAN (bounds strict, shift, bool, enum),
    PROVE_LOCKING, DEBUG_ATOMIC_SLEEP, DEBUG_LIST, DEBUG_SG and kmemleak; no
    debug info. `make bindeb-pkg` with `LOCALVERSION=+deb13-amd64-pivdbg`.

@@ -17,7 +17,7 @@ cp /boot/config-"$(uname -r)" .config
 # Restrict modules to what the guest suites load (plus their dependencies).
 for module in virtio_blk virtio_net virtio_rng 9p 9pnet_virtio dm_mod dm_crypt dm_integrity \
     dm_flakey dm_delay loop ext4 aegis128 gcm ghash_generic ctr chacha_generic poly1305_generic \
-    chacha20poly1305 hmac sha256_generic aesni_intel; do
+    chacha20poly1305 hmac sha256_generic aesni_intel af_alg algif_aead algif_skcipher algif_hash; do
     modprobe "$module" || true
 done
 lsmod > /root/kbuild/lsmod.txt
