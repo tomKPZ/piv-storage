@@ -27,7 +27,7 @@ CONTROL_SCRIPTS = {
     'aegis-4096': ['scripts/guest-control-aegis.sh', 'scripts/guest-control.sh'],
     'aegis-512': ['scripts/guest-control-aegis-512.sh', 'scripts/guest-control.sh'],
 }
-SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early', 'power', 'controls', 'sector', 'v4', 'migrate')
+SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early', 'power', 'controls', 'sector', 'v4', 'migrate', 'fuzz')
 DEFAULT_SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early')
 lock = threading.Lock()
 
@@ -164,6 +164,8 @@ class Matrix:
                       [ko, ROOT / 'kernel/guest-stateless-power.py', *keys], None),
             'migrate': (ROOT / 'scripts/guest-migrate.sh', final,
                         [ko, ROOT / 'kernel/guest-migrate-test.py', *keys, *oracles], None),
+            'fuzz': (ROOT / 'scripts/guest-fuzz.sh', final,
+                     [ko, ROOT / 'kernel/guest-ioctl-fuzz.py', *keys, *oracles], None),
             'v4': (ROOT / 'scripts/guest-v4.sh', control / 'control.img',
                    [ko, ROOT / 'kernel/guest-v4-test.py', *keys], 'v4-final.img'),
             'controls': (ROOT / 'scripts/guest-controls.sh', control / 'control.img',

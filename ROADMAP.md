@@ -95,7 +95,8 @@ them. Known integrity or memory-safety defects still override this order.
      cross-checked against the Python decoder;
    - a disposable KASAN/UBSAN/lockdep debug guest kernel running the existing
      suites (a scoped kernel build; confirm with the user first);
-   - in-guest syzkaller-style fuzzing of the control ioctls.
+   - in-guest syzkaller-style fuzzing of the control ioctls — first pass done
+     (2026-10-21, kernel/guest-ioctl-fuzz.py, suite `fuzz`; see the handoff).
 3. **Then the remaining core items** below: no-journal (once the torn-sector
    policy is decided) and the newer-kernel port. (The v4 default is done; v3,
    AES-GCM/ChaCha20-Poly1305 and therefore the xts/hmac idea were removed by
@@ -1717,3 +1718,37 @@ the stock kernel (udev probes of private mappings) and are not new.
 
 Open: kunit tests for the pure helpers; ioctl fuzzing; newer-kernel port; no-journal
 (awaiting the torn-sector policy); lifetime-budget guidance for AEGIS-128.
+
+## Session handoff: control-ioctl fuzzing (2026-10-21)
+
+New guest-only suite `fuzz` (kernel/guest-ioctl-fuzz.py, scripts/guest-fuzz.sh;
+no kernel changes). A seeded Python/ctypes fuzzer drives the owner's control
+device in three phases: an idle private owner; the owner suspended inside a
+control transaction (PREPARE/APPLY/SETUP reachable; template PREPAREs use real
+current IVs, so they succeed and encrypt without writing); and active paired
+views with a concurrent reader thread. Each step picks every defined command
+with the right or a wrong size/direction, or a random number, and passes a
+template-valid or mutated structure, a buffer ending in a PROT_NONE page, or a
+raw invalid/kernel pointer. Excluded because they succeed destructively by
+design: SETUP with INITIALIZE, keyslot ops on slot 0, replaying a PREPARE into
+APPLY. A deterministic APPLY-gate check flips single bits of genuine hidden and
+primary PREPARE results (ciphertext, tag, IV, padding) at four sectors: all 256
+or 224 attempts per profile were rejected (EBADMSG; EINVAL for 512-byte padding)
+and the IVs stayed unchanged. Afterwards the owner must not be failed, both views
+reopen with the original key unchanged, and stock dm-crypt reproduces the
+primary hash.
+
+Evidence: suite-033-fuzz (stock KVM) and suite-034-fuzz-sanitizer (KASAN/UBSAN/
+lockdep image debug-kernel-f30764a4de26f21a), 100,000 ioctls per phase per
+profile (seeds in each fuzz-results.json): 4/4 VMs each, no kernel reports.
+Coverage includes successful QUERY/STATUS/DEVICES/READ_IV/READ_PRIMARY,
+transaction BEGIN/END/SYNC, PREPARE and keyslot add, and SETUP reaching keyslot
+rejection (EKEYREJECTED). Limits: random structure fuzzing without coverage
+feedback, single-threaded ioctls (a reader thread only), and the dm table
+message/constructor surface is not fuzzed. Also fixed the stale "IV[12|16]"
+comment in piv-control.h (comment only; the tested scaffold predates it).
+
+Next: kunit-style helper tests need CONFIG_KUNIT, which the localmodconfig
+sanitizer kernel lacks (unchecked on the stock config); the Python cross-checks
+already cover the helpers end to end. Remaining: dm constructor/table fuzzing,
+newer-kernel port, no-journal (policy), AEGIS-128 lifetime-budget guidance.

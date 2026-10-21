@@ -86,8 +86,10 @@ python3 scripts/suite.py --prefix artifacts/suite-next \
 Per profile it creates a stock fixture (or uses --control), runs the native
 dual-view/early-build test, then runs the selected suites concurrently
 (default faults, profile, cancel, lifecycle, batch, early; optional power,
-controls, sector, v4 and migrate; migrate attaches a second 512 MiB blank
-disk, /dev/vdc, via `vm.py --second-blank-mib`). Profiles are aegis-4096 and aegis-512. It independently verifies every closed output image with
+controls, sector, v4, migrate and fuzz; migrate attaches a second 512 MiB blank
+disk, /dev/vdc, via `vm.py --second-blank-mib`; fuzz runs
+kernel/guest-ioctl-fuzz.py, seeded control-ioctl fuzzing with
+`PIV_FUZZ_STEPS`/`PIV_FUZZ_SEED` overrides, best on the sanitizer image). Profiles are aegis-4096 and aegis-512. It independently verifies every closed output image with
 check_stateless.py. `--jobs` bounds concurrent VMs; `--fresh` disables the
 provisioned image; `--accel` defaults to kvm when /dev/kvm is usable (else tcg).
 It also builds the static Rust setup frontend once (scripts/build_pivsetup.py:

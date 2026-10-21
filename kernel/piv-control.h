@@ -39,7 +39,7 @@ struct piv_update {
 	__u64 sector;
 	__u8 expected_iv[16];
 	__u32 flags;
-	__u8 tuple[PIV_TUPLE_BYTES]; /* sector ciphertext, zero-pad to4096 || tag16 || IV[12|16], zero-pad to16 (RAM ABI only) */
+	__u8 tuple[PIV_TUPLE_BYTES]; /* sector ciphertext, zero-pad to 4096 || tag16 || IV16 (RAM ABI only) */
 	__u32 reserved;
 };
 #define PIV_READ_QUIESCED _IOWR('P', 2, struct piv_read_iv)
