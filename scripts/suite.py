@@ -165,7 +165,7 @@ class Matrix:
             'migrate': (ROOT / 'scripts/guest-migrate.sh', final,
                         [ko, ROOT / 'kernel/guest-migrate-test.py', *keys, *oracles], None),
             'fuzz': (ROOT / 'scripts/guest-fuzz.sh', final,
-                     [ko, ROOT / 'kernel/guest-ioctl-fuzz.py', *keys, *oracles], None),
+                     [ko, ROOT / 'kernel/guest-table-fuzz.py', ROOT / 'kernel/guest-ioctl-fuzz.py', *keys, *oracles], None),
             'v4': (ROOT / 'scripts/guest-v4.sh', control / 'control.img',
                    [ko, ROOT / 'kernel/guest-v4-test.py', *keys], 'v4-final.img'),
             'controls': (ROOT / 'scripts/guest-controls.sh', control / 'control.img',

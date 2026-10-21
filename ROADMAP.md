@@ -1744,11 +1744,22 @@ profile (seeds in each fuzz-results.json): 4/4 VMs each, no kernel reports.
 Coverage includes successful QUERY/STATUS/DEVICES/READ_IV/READ_PRIMARY,
 transaction BEGIN/END/SYNC, PREPARE and keyslot add, and SETUP reaching keyslot
 rejection (EKEYREJECTED). Limits: random structure fuzzing without coverage
-feedback, single-threaded ioctls (a reader thread only), and the dm table
-message/constructor surface is not fuzzed. Also fixed the stale "IV[12|16]"
+feedback, single-threaded ioctls (a reader thread only), and table
+constructors and messages are fuzzed separately (below). Also fixed the stale "IV[12|16]"
 comment in piv-control.h (comment only; the tested scaffold predates it).
+
+Table/constructor fuzzing (kernel/guest-table-fuzz.py, run first in the same
+`fuzz` suite): ~1,500 token-level mutations of a piv-crypt table per sector size
+over a scratch lower device (the _dif layer of a stock LUKS2 AEGIS-128 loop file;
+integritysetup cannot make an external-tag device), including read-only tables,
+plus target messages; about 7% of mutations still construct (e.g. same-value
+swaps) and are removed again, churning ctr/dtr/control registration. piv-view
+tables are mutated against the live owner: with both views present all 750
+creates per profile failed; with the hidden view removed only semantically
+exact tables (leading zeros, path vs major:minor, empty tokens) succeeded. Fixture
+contents and stock readback stay unchanged. Evidence: suite-041-fuzz (stock)
+and suite-042-fuzz-sanitizer, 4/4 each, no kernel reports.
 
 Next: kunit-style helper tests need CONFIG_KUNIT, which the localmodconfig
 sanitizer kernel lacks (unchecked on the stock config); the Python cross-checks
-already cover the helpers end to end. Remaining: dm constructor/table fuzzing,
-newer-kernel port, no-journal (policy), AEGIS-128 lifetime-budget guidance.
+already cover the helpers end to end. Remaining: newer-kernel port, no-journal (policy), AEGIS-128 lifetime-budget guidance.

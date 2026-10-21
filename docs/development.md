@@ -88,6 +88,7 @@ dual-view/early-build test, then runs the selected suites concurrently
 (default faults, profile, cancel, lifecycle, batch, early; optional power,
 controls, sector, v4, migrate and fuzz; migrate attaches a second 512 MiB blank
 disk, /dev/vdc, via `vm.py --second-blank-mib`; fuzz runs
+kernel/guest-table-fuzz.py (table/constructor fuzzing) and
 kernel/guest-ioctl-fuzz.py, seeded control-ioctl fuzzing with
 `PIV_FUZZ_STEPS`/`PIV_FUZZ_SEED` overrides, best on the sanitizer image). Profiles are aegis-4096 and aegis-512. It independently verifies every closed output image with
 check_stateless.py. `--jobs` bounds concurrent VMs; `--fresh` disables the
