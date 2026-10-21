@@ -1,6 +1,6 @@
 #!/bin/bash
 source /mnt/piv-work/guest-common.sh
-guest_packages
+guest_packages python3-cryptography python3-argon2
 guest_code
 guest_load_module /mnt/piv-work/experimental-dm-piv.ko
 python3 /mnt/piv-work/guest-v4-test.py

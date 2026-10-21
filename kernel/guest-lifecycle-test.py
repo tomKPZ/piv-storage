@@ -176,7 +176,9 @@ assert before == {n: mapping_identity(n) for n in before}
 # A real close attempt while both descriptors are held must report busy and
 # preserve mappings; close retries are bounded by the frontend's dm retry policy.
 try: close_blocks('/dev/vdb', KEY)
-except subprocess.CalledProcessError: pass
+except ValueError as exc:
+    # pivsetup reports the failed dmsetup remove, with its stderr as a note.
+    assert 'resource busy' in ' '.join(getattr(exc, '__notes__', [])), exc
 else: raise AssertionError('Busy close unexpectedly succeeded')
 assert before == {n: mapping_identity(n) for n in before}
 for fd in held: os.close(fd)

@@ -7,12 +7,13 @@ the native state ready. Waiting for the setup lifecycle mutex is interruptible.
 The ioctl returns EINTR when cancellation wins at one of these boundaries.
 No new ABI, flag, on-disk marker, resume file or record encoding is introduced.
 
-For the existing Python frontend, use Ctrl-C/SIGINT with its default handler.
-That handler raises KeyboardInterrupt, allowing open_blocks to unwind and remove
-its own mappings. The ioctl key buffer is wiped in a finally block. Library users
-must likewise use a handler that unwinds the operation: Python's fcntl.ioctl can
-automatically retry EINTR if a handler simply returns. There is no separate abort
-ioctl or process-wide signal-handler installation in the library.
+The setup frontend is the Rust `pivsetup` binary. It installs SIGINT and
+SIGTERM handlers without SA_RESTART that only set a flag, so the interruptible
+SETUP ioctl returns EINTR; pivsetup then removes the mappings its own attempt
+created and exits with status 130. The ioctl request (with the key) is wiped
+after the call either way. There is no separate abort ioctl. (The former
+Python frontend handled only SIGINT, via KeyboardInterrupt; a default SIGTERM
+terminated it without cleanup.)
 
 ## Guarantees and limits
 
@@ -48,10 +49,11 @@ Closing a raw control descriptor can also wait for another operation's mutex,
 even after its own SETUP ioctl was interrupted while waiting for that mutex.
 Other control commands are not made universally interruptible by this change.
 
-SIGKILL, a default terminating SIGTERM, process death and repeated interruption
-of cleanup do not run Python exception cleanup. Private mappings may need manual
-administrative cleanup in those cases, especially if a probe is blocked on a
-suspended device. SIGINT is the verified cooperative frontend path. Activation
+SIGKILL, process death and repeated interruption of cleanup do not run the
+frontend's cleanup. Private mappings may need manual administrative cleanup in
+those cases, especially if a probe is blocked on a suspended device. SIGINT is
+the verified cooperative frontend path; SIGTERM uses the same handler but has
+no dedicated regression yet. Activation
 steps before the native ioctl, including cryptsetup journal replay, are not made
 transactional or mutation-free by cancellation. These limits also apply to early
 boot integration; graceful service shutdown needs an appropriate caller handler.
@@ -76,8 +78,9 @@ that never completes an outstanding request.
 ## Regression method
 
 scripts/guest-cancel.sh uses the existing shared pinned-guest scaffold. The
-Python harness runs child setup clients with the default SIGINT handler. A
-handshake occurs before the native ioctl, then module-qualified kprobes witness
+harness runs pivsetup itself as the child setup client. Its explicit test hook
+(PIVSETUP_TEST_GATE) provides a handshake before the native ioctl and reports
+the kernel status after it; module-qualified kprobes witness
 actual primary range reads or initialization writes in that child's context.
 /proc/PID/syscall must identify the native SETUP ioctl before a signal is sent.
 It does not count a signal delivered before entering the kernel as a pass.

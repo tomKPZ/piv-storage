@@ -27,7 +27,7 @@ def absent():
         assert subprocess.run(['dmsetup', 'info', name], capture_output=True).returncode, name
 
 def setup(initialize=False, uninitialized=False, rejected=False):
-    args = ['python3', '-m', 'pivstore', 'open-blocks', '--device', '/dev/vdb',
+    args = ['pivsetup', 'open-blocks', '--device', '/dev/vdb',
             '--key-file', str(W / 'passphrase.key'), '--hidden-key-file', str(W / 'hidden.key'),
             ]
     if initialize: args.append('--initialize')
@@ -57,7 +57,7 @@ def setup(initialize=False, uninitialized=False, rejected=False):
     return value
 
 def close():
-    subprocess.run(['python3', '-m', 'pivstore', 'close-blocks', '--device', '/dev/vdb',
+    subprocess.run(['pivsetup', 'close-blocks', '--device', '/dev/vdb',
                     '--key-file', str(W / 'passphrase.key')], check=True)
 
 # A stock random-IV carrier is not a valid hidden block. Without an explicit

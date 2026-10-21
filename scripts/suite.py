@@ -11,6 +11,7 @@ and hidden decoding). Original AEGIS-128 images need PIV_AEGIS_REFERENCE.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -57,7 +58,7 @@ class Matrix:
             command.append('--provisioned')
         if data:
             command += ['--data-image', str(data)]
-        for path in shares:
+        for path in (*shares, self.args.pivsetup):
             command += ['--share-file', str(path)]
         with self.slots:
             log(f'start {name}: {run_dir}')
@@ -109,7 +110,7 @@ class Matrix:
         build = [Path(self.args.scaffold)] if self.args.scaffold else []
         script = ROOT / ('scripts/guest-stateless-prebuilt.sh' if module else 'scripts/guest-stateless.sh')
         shares = [*build, *module, ROOT / 'scripts/guest-dual.sh', ROOT / 'scripts/guest-early-build.sh',
-                  ROOT / 'kernel/guest-early-test.py', ROOT / 'kernel/guest-dual-test.py',
+                  ROOT / 'kernel/guest-early-test.sh', ROOT / 'kernel/guest-dual-test.py',
                   ROOT / 'kernel/check-config.py', *keys]
         if not self.vm(f'{profile}/native', script, native, data=control / 'control.img',
                        shares=shares, extra=['--code']):
@@ -239,11 +240,18 @@ def main():
     if args.provisioned:
         subprocess.run([sys.executable, str(ROOT / 'scripts/vm.py'), 'provision', '--accel', args.accel],
                        cwd=ROOT, check=True)
+    # Static Rust setup frontend shared into every guest (scripts/build_pivsetup.py).
+    sys.path.insert(0, str(ROOT / 'scripts'))
+    from build_pivsetup import build
+    args.pivsetup = build(quiet=True)
+    pivsetup_sha256 = hashlib.sha256(args.pivsetup.read_bytes()).hexdigest()
+    log(f'pivsetup {pivsetup_sha256}')
     matrix = Matrix(args)
     work = [(p, None) for p in args.profile] + [(c.name, c.resolve()) for c in args.control]
     with ThreadPoolExecutor(max_workers=len(work)) as pool:
         list(pool.map(lambda item: matrix.profile(*item), work))
-    summary = dict(provisioned=args.provisioned, accel=args.accel, suites=args.suites, results=matrix.results)
+    summary = dict(provisioned=args.provisioned, accel=args.accel, pivsetup_sha256=pivsetup_sha256,
+                   suites=args.suites, results=matrix.results)
     (args.prefix / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     failed = [k for k, v in matrix.results.items() if not v.get('passed') or v.get('host_verified') is False]
     expected = len(work) * (1 + len(args.suites)) + len(args.profile)

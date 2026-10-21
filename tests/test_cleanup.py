@@ -1,9 +1,18 @@
-"""Failure cleanup keeps ownership boundaries and the original error."""
+"""Cleanup boundaries of the test instrumentation and the pivsetup client.
+
+Setup unwinding itself now lives in the Rust pivsetup binary (rust/src/blocks.rs);
+it is exercised end to end by the guest fault/cancel suites through explicit
+PIVSETUP_TEST_FAIL / PIVSETUP_TEST_GATE hooks.
+"""
 import errno
+import os
+from pathlib import Path
+import stat
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from pivstore.blocks import open_blocks
+from pivstore import blocks
 from pivstore.kernel_api import remove_mapping
 
 
@@ -43,117 +52,49 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual([call.kwargs for call in remove.call_args_list],
                          [{'discard': True}, {'discard': False}])
 
-    def test_setup_unwinds_partial_view_creation(self):
-        for fail_at in ('setup', 'first-view', 'second-view'):
-            for created_owner in (True, False):
-                with self.subTest(fail_at=fail_at, created_owner=created_owner):
-                    owner = Mock(created=created_owner, uuid='00000000-0000-0000-0000-000000000000')
-                    owner.device.sectors = 96
-                    owner.device.sector_size = 4096
-                    owner.device.generation = 1
-                    mappings = {}
-                    error = OSError(errno.EIO, 'injected setup failure')
-                    calls = []
-                    def dm(*args, **kw):
-                        calls.append(args)
-                        if args[0] == 'create':
-                            mappings[args[1]] = ('253', str(len(mappings)), args[3])
-                            if fail_at == ('first-view' if args[1].endswith('decoy') else 'second-view'):
-                                raise error  # kernel creation succeeded; subsequent step failed
-                    def remove(name, identity):
-                        self.assertEqual(mappings[name], identity)
-                        del mappings[name]
-                    with patch('pivstore.blocks.GuestOwner', return_value=owner), \
-                         patch('pivstore.blocks.native_status', return_value={'active': False, 'hidden_bytes': 1024}), \
-                         patch('pivstore.blocks.native_setup', side_effect=error if fail_at == 'setup' else None), \
-                         patch('pivstore.blocks.mapping_identity', side_effect=lambda name: mappings.get(name)), \
-                         patch('pivstore.blocks.remove_mapping', side_effect=remove), \
-                         patch('pivstore.blocks.dm', side_effect=dm):
-                        if created_owner:
-                            with self.assertRaises(OSError) as raised:
-                                open_blocks('/dev/vdb', 'private-key-file', bytes(32))
-                            self.assertIs(raised.exception, error)
-                            owner.remove.assert_called_once()
-                        else:
-                            with self.assertRaises(FileExistsError):
-                                open_blocks('/dev/vdb', 'private-key-file', bytes(32))
-                            owner.remove.assert_not_called()
-                            owner.device.suspend.assert_not_called()
-                    self.assertFalse(mappings)
-                    owner.close.assert_called_once()
 
-    def test_keyboard_interrupt_unwinds_created_owner(self):
-        owner = Mock(created=True, uuid='00000000-0000-0000-0000-000000000000')
-        owner.device.sectors = 96
-        owner.device.sector_size = 4096
-        error = KeyboardInterrupt()
-        with patch('pivstore.blocks.GuestOwner', return_value=owner), \
-             patch('pivstore.blocks.native_status', return_value={'active': False}), \
-             patch('pivstore.blocks.mapping_identity', return_value=None), \
-             patch('pivstore.blocks.native_setup', side_effect=error):
-            with self.assertRaises(KeyboardInterrupt) as raised:
-                open_blocks('/dev/vdb', 'private-key-file', bytes(32))
-        self.assertIs(raised.exception, error)
-        owner.remove.assert_called_once_with(abort=True)
-        owner.close.assert_called_once()
-
-    def test_cancelled_setup_wipes_ioctl_key_buffer(self):
-        from pivstore.blocks import native_setup
-        seen = []
-        def interrupt(fd, command, data, mutate):
-            seen.append(data)
-            raise KeyboardInterrupt
-        with patch('pivstore.blocks.fcntl.ioctl', side_effect=interrupt):
-            with self.assertRaises(KeyboardInterrupt):
-                native_setup(Mock(fd=7, generation=1), bytes(range(32)), b'test context')
-        self.assertEqual(len(seen), 1)
-        self.assertEqual(seen[0], bytes(len(seen[0])))
-
-    def test_cleanup_failure_does_not_mask_storage_error(self):
-        owner = Mock(created=True)
-        error = OSError(errno.EIO, 'primary failure')
-        owner.remove.side_effect = OSError(errno.EBUSY, 'still in use')
-        with patch('pivstore.blocks.GuestOwner', return_value=owner), \
-             patch('pivstore.blocks.native_status', side_effect=error):
-            with self.assertRaises(OSError) as raised:
-                open_blocks('/dev/vdb', 'private-key-file', bytes(32))
-        self.assertIs(raised.exception, error)
-        self.assertIn('cleanup incomplete', error.__notes__[0])
-        owner.close.assert_called_once()
-
-
-class SetupFlagTests(unittest.TestCase):
-    def test_setup_flags_match_kernel_abi(self):
-        from pivstore.blocks import SETUP, native_setup
-        for initialize, uninitialized, extra, expected in (
-                (False, False, {}, 0), (True, False, {}, 1), (False, True, {}, 2), (True, True, {}, 3),
-                (True, False, {'format': 4}, 5), (True, False, {'format': 4, 'ab': True}, 13),
-                (False, False, {'format': 4}, 4)):
-            with self.subTest(initialize=initialize, uninitialized=uninitialized, extra=extra):
-                seen = []
-                def capture(fd, command, data, mutate):
-                    seen.append(SETUP.unpack(bytes(data))[3])
-                with patch('pivstore.blocks.fcntl.ioctl', side_effect=capture):
-                    native_setup(Mock(fd=7, generation=1), bytes(32), b'test context',
-                                 initialize=initialize, uninitialized=uninitialized, **extra)
-                self.assertEqual(seen, [expected])
-        with self.assertRaises(ValueError):
-            native_setup(Mock(fd=7, generation=1), bytes(32), b'test context', ab=True)
-
-    def test_rejected_key_unwinds_and_explains(self):
-        owner = Mock(created=True, uuid='00000000-0000-0000-0000-000000000000')
-        owner.device.sectors = 96
-        owner.device.sector_size = 4096
-        error = OSError(errno.EKEYREJECTED, 'Key was rejected by service')
-        with patch('pivstore.blocks.GuestOwner', return_value=owner), \
-             patch('pivstore.blocks.native_status', return_value={'active': False}), \
-             patch('pivstore.blocks.mapping_identity', return_value=None), \
-             patch('pivstore.blocks.native_setup', side_effect=error) as setup:
-            with self.assertRaises(OSError) as raised:
-                open_blocks('/dev/vdb', 'private-key-file', bytes(32))
-        self.assertIs(raised.exception, error)
-        self.assertEqual(setup.call_args.kwargs, {'initialize': False, 'uninitialized': False, 'format': None,
-                                                  'ab': False})
+class ClientTests(unittest.TestCase):
+    def test_errors_map_back_to_python_exceptions(self):
+        error = blocks.error_from(1, 'pivsetup: [Errno 129] Key was rejected by service\n'
+                                     'pivsetup: No hidden record authenticated: wrong hidden key\n')
+        self.assertIsInstance(error, OSError)
+        self.assertEqual(error.errno, errno.EKEYREJECTED)
         self.assertIn('No hidden record authenticated', error.__notes__[0])
-        owner.remove.assert_called_once_with(abort=True)
-        owner.close.assert_called_once()
+        self.assertIsInstance(blocks.error_from(1, 'pivsetup: [Errno 17] Public view name is already in use'),
+                              FileExistsError)
+        value = blocks.error_from(1, 'pivsetup: Refusing to remove unrelated view piv-native-hidden')
+        self.assertIsInstance(value, ValueError)
+        self.assertIn('unrelated view', str(value))
+        self.assertIsInstance(blocks.error_from(130, 'pivsetup: [Errno 4] Interrupted'), KeyboardInterrupt)
+        self.assertIsInstance(blocks.error_from(1, 'thread panicked'), ValueError)
+
+    def test_open_arguments_never_contain_key_material(self):
+        args = blocks.open_args('/dev/vdb', '/w/passphrase.key', '/run/secret', initialize=True, format=4,
+                                ab=True, allow_test_stack=True)
+        self.assertEqual(args, ['open-blocks', '--device', '/dev/vdb', '--key-file', '/w/passphrase.key',
+                                '--name', 'piv-native', '--hidden-key-file', '/run/secret', '--initialize',
+                                '--format', '4', '--ab', '--allow-test-stack'])
+        self.assertIn('--hidden-passphrase-file', blocks.open_args('/dev/vdb', 'k', 's', passphrase=True))
+
+    def test_secret_file_is_private_and_removed(self):
+        real = tempfile.mkstemp
+        with tempfile.TemporaryDirectory() as directory, \
+             patch('pivstore.blocks.tempfile.mkstemp', side_effect=lambda **kw: real(prefix='s', dir=directory)):
+            with blocks.secret_file(b'synthetic') as path:
+                self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+                self.assertEqual(Path(path).read_bytes(), b'synthetic')
+            self.assertFalse(Path(path).exists())
+
+    def test_passphrase_kek_cross_check_vectors(self):
+        # Same vectors as rust/tests/*.hex (Rust/Python KDF parity).
+        vectors = Path(__file__).resolve().parents[1] / 'rust/tests'
+        self.assertEqual(blocks.passphrase_kek(b'pw', b'ctx', 'scrypt').hex(),
+                         (vectors / 'scrypt-pw-ctx.hex').read_text().strip())
+        self.assertEqual(blocks.passphrase_kek(b'pw', b'ctx').hex(),
+                         (vectors / 'argon2id-pw-ctx.hex').read_text().strip())
+        with self.assertRaises(ValueError):
+            blocks.passphrase_kek(b'pw', b'ctx', 'pbkdf2')
+
+
+if __name__ == '__main__':
+    unittest.main()

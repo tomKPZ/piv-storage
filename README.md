@@ -31,10 +31,13 @@ boundaries and open assumptions; independent cryptographic review remains open.
 
 ## Use
 
-Follow [build and test instructions](docs/native-blocks.md). Inside the guest:
+Setup is the static Rust `pivsetup` binary (rust/), built rootlessly on the
+host with `python3 scripts/build_pivsetup.py` and shared into the guest; the
+Python package keeps only independent read-only diagnostics. Follow
+[build and test instructions](docs/native-blocks.md). Inside the guest:
 
 ```sh
-python3 -m pivstore open-blocks --device /dev/vdb \
+pivsetup open-blocks --device /dev/vdb \
   --key-file /mnt/piv-work/passphrase.key \
   --hidden-key-file /mnt/piv-work/hidden.key --initialize
 ```
@@ -60,8 +63,9 @@ v3 (`--format 3`: 400,896 or 3,028,992 bytes on these fixtures). Adding `--ab`
 keeps two record slots per block so an interrupted hidden write leaves the
 previous version readable, at half the v4 capacity. v4 stores a random master
 key in up to four encrypted keyslots (no public header); the hidden key file is
-a keyslot key, or use `--hidden-passphrase-file` (scrypt). Later opens detect
-the format and layout from the keyslot. `python3 -m pivstore keyslot add|remove
+a keyslot key, or use `--hidden-passphrase-file` (Argon2id by default,
+`--kdf scrypt` as the alternative; use the same KDF on every open). Later opens detect
+the format and layout from the keyslot. `pivsetup keyslot add|remove
 --slot N` adds or retires keys on active views without rewriting hidden data.
 
 The hidden volume is already encrypted underneath its block interface. Setup
@@ -72,7 +76,7 @@ already initialized records remain zeroed, and lower I/O can delay interruption.
 Unmount both filesystems before:
 
 ```sh
-python3 -m pivstore close-blocks --device /dev/vdb \
+pivsetup close-blocks --device /dev/vdb \
   --key-file /mnt/piv-work/passphrase.key
 ```
 

@@ -1035,6 +1035,7 @@ static int pn_keyslot(struct piv_control *p, struct piv_native_keyslot *ks)
   if (present == 1) return -EBUSY;
   n->ks_present[ks->slot] = false;
   memzero_explicit(n->ks_outer[ks->slot], 64);
+  memzero_explicit(&n->ks_lrw[ks->slot], sizeof(n->ks_lrw[ks->slot]));
   r = pn_dir_write(p, &mutated);
   if (!r) r = pn_ks_write(p, ks->slot, NULL, NULL, &mutated);
  }

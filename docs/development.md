@@ -95,7 +95,11 @@ dual-view/early-build test, then runs the selected suites concurrently
 (default faults, profile, cancel, lifecycle, batch, early; optional power,
 controls, sector and v4) and independently verifies every closed output image with
 check_stateless.py. `--jobs` bounds concurrent VMs; `--fresh` disables the
-provisioned image; `--accel` defaults to kvm when /dev/kvm is usable (else tcg). summary.json records pass/fail, timings and host checks; a
+provisioned image; `--accel` defaults to kvm when /dev/kvm is usable (else tcg).
+It also builds the static Rust setup frontend once (scripts/build_pivsetup.py:
+system rustc/cargo, CARGO_HOME under ignored downloads/cargo, committed
+Cargo.lock, static glibc) and shares it into every VM; summary.json records its
+SHA-256. summary.json records pass/fail, timings and host checks; a
 suite that was not run counts as a failure. Original AEGIS-128 host checks need
 PIV_AEGIS_REFERENCE (below).
 

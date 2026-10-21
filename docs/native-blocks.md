@@ -31,7 +31,10 @@ teardown. Do not manipulate the same stack concurrently with external dmsetup
 commands; these checks do not protect against a racing privileged administrator.
 
 Setup remains privileged and intentionally restricted to QEMU, the pinned
-6.12.113+deb13-amd64 guest and disposable 128 or 512 MiB /dev/vdb. It invokes cryptsetup
+6.12.113+deb13-amd64 guest and disposable 128 or 512 MiB /dev/vdb. The setup
+frontend is the static Rust `pivsetup` binary (rust/, built rootlessly on the host
+by scripts/build_pivsetup.py with a committed Cargo.lock and static glibc; keys
+stay in mlocked, zeroized buffers and never reach argv). It invokes cryptsetup
 for ordinary LUKS opening and journal replay, suspends the new crypt mapping,
 reloads its private table as piv-crypt with piv_control, resumes it, then suspends
 and begins coordinated ownership, authenticates every primary sector,
@@ -95,7 +98,7 @@ and capi:aegis128-random (16-byte key, 16-byte IV). All use 16-byte tags. dm-piv
 AAD LE64(address_in_512_byte_units) || IV. Setup checks the actual owner table
 against the validated LUKS cipher on creation and reuse. The independent verifier
 selects AESGCM, ChaCha20Poly1305 or the pinned diagnostic AEGIS-128 reference from the same validated public metadata; setup
-continues to require only the Python standard library. The v3 hidden encoding is unchanged; AEGIS groups contain 36 primary sectors
+continues to need no userspace crypto beyond pivsetup's scrypt for v4 passphrase KEKs. The v3 hidden encoding is unchanged; AEGIS groups contain 36 primary sectors
 instead of 48. No persistent format is added outside the IVs.
 
 QUERY reports the primary sector size and encryption-sector count. Primary
@@ -139,6 +142,7 @@ before mutation and stops the owner once APPLY has begun.
 Use a fresh destination for every source stage and run:
 
 ```sh
+python3 scripts/build_pivsetup.py   # prints the static binary path and SHA-256
 python3 scripts/fetch_kernel.py vendor/kernel-build/stateless-next
 mkdir -p artifacts/stateless-input-next
 tar -cf artifacts/stateless-input-next/scaffold.tar -C vendor/kernel-build/stateless-next .
@@ -146,11 +150,15 @@ python3 scripts/vm.py run --code --script scripts/guest-stateless.sh \
   --run-dir artifacts/stateless-next --data-image artifacts/control-003/control.img \
   --share-file artifacts/stateless-input-next/scaffold.tar \
   --share-file scripts/guest-dual.sh --share-file scripts/guest-early-build.sh \
-  --share-file kernel/guest-early-test.py \
+  --share-file kernel/guest-early-test.sh \
   --share-file kernel/guest-dual-test.py --share-file kernel/check-config.py \
   --share-file artifacts/control-003/share/passphrase.key \
-  --share-file artifacts/control-003/hidden.key --timeout 3600
+  --share-file artifacts/control-003/hidden.key \
+  --share-file rust/target/x86_64-unknown-linux-gnu/release/pivsetup --timeout 3600
 ```
+
+scripts/suite.py builds and shares pivsetup automatically; guest_code installs a
+shared binary as /usr/local/sbin/pivsetup and records its SHA-256.
 
 Create the ordinary control fixture using docs/development.md if absent.
 For the 512-byte profile, use control-512-001/control.img and that fixture's
@@ -173,10 +181,9 @@ python3 scripts/early_vm.py \
 ```
 
 The initramfs includes synthetic test credentials and must stay private/ignored.
-It supplies Python's standard library, cryptsetup/dmsetup, decompression libraries
-for kmod and all required crypto modules, including aegis128. It mounts only RAM/pseudo filesystems.
-Activation runs with Python -S; Python cryptography is needed only for independent
-offline diagnostics. early_vm.py copies the data image and attaches a blank disk
+It supplies the static pivsetup binary, cryptsetup/dmsetup, a few coreutils for the
+shell test, decompression libraries for kmod and all required crypto modules,
+including aegis128. It contains no Python. It mounts only RAM/pseudo filesystems. early_vm.py copies the data image and attaches a blank disk
 solely to preserve the /dev/vdb test guard. It never attaches an OS/root disk.
 The builder-only guest-early-only.sh can reuse an already built exact-kernel
 module and closed fixture; it is a test optimization, not an installer.

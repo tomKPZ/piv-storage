@@ -77,23 +77,23 @@ for repeat in range(3):
         measure_reads('/dev/mapper/piv-stock-profile', primary, 'stock-decoy', logical)
     crypt('close', 'piv-stock-profile')
 
-original_setup = blocks.native_setup
-setup_seconds = []
+# pivsetup's explicit test hook reports the SETUP ioctl time (PREFIX-setup.json).
+# A pre-created gate means it never waits; timings stay uninstrumented.
+GATE = '/run/piv-profile'
+Path(GATE + '-gate').touch()
 
 
-def timed_setup(*args, **kwargs):
-    start = time.monotonic()
-    value = original_setup(*args, **kwargs)
-    setup_seconds.append(time.monotonic() - start)
-    return value
+def hooked_open():
+    Path(GATE + '-setup.json').unlink(missing_ok=True)
+    views = blocks.open_blocks('/dev/vdb', KEY, HKEY, env=dict(PIVSETUP_TEST_GATE=GATE))
+    return views, json.loads(Path(GATE + '-setup.json').read_text())
 
 
-blocks.native_setup = timed_setup
 for repeat in range(3):
     start = time.monotonic()
-    views = blocks.open_blocks('/dev/vdb', KEY, HKEY)
+    views, report = hooked_open()
     results['activation'].append(dict(kind='native', repeat=repeat,
-        seconds=time.monotonic() - start, setup_ioctl_seconds=setup_seconds[-1]))
+        seconds=time.monotonic() - start, setup_ioctl_seconds=report['seconds']))
     subprocess.run(['udevadm', 'settle'], check=True)
     if repeat == 0:
         owner = GuestOwner('/dev/vdb', KEY)
@@ -106,7 +106,6 @@ for repeat in range(3):
         assert not blocks.native_status(owner.device)['failed']
         owner.close()
     blocks.close_blocks('/dev/vdb', KEY)
-blocks.native_setup = original_setup
 
 # Timings above are uninstrumented. Probe entry counts below have no payload/key
 # fields and use tracing_on=0: no ring-buffer events need to be retained.
@@ -175,11 +174,30 @@ try:
         # Wrong-key guard: the first v3 record proves the key.
         setup_expected = dict(load=1, range=(sectors + per_range - 1) // per_range,
                               crypto=sectors + 1, record=1, write=0, checkpoint=1)
-    def counted_setup(*args, **kwargs):
-        counted('setup-ioctl', lambda: original_setup(*args, **kwargs), setup_expected)
-    blocks.native_setup = counted_setup
-    views = blocks.open_blocks('/dev/vdb', KEY, HKEY)
-    blocks.native_setup = original_setup
+    # Bracket exactly the SETUP ioctl with pivsetup's gate (before) and hold
+    # (after) hooks; the binary waits at each point for our marker file.
+    counted_gate = '/run/piv-profile-counted'
+    def counted_open():
+        before = counters()
+        with blocks.spawn_open('/dev/vdb', KEY, HKEY, env=dict(PIVSETUP_TEST_GATE=counted_gate,
+                                                              PIVSETUP_TEST_HOLD='1')) as process:
+            while not Path(counted_gate + '-ready.json').exists():
+                assert process.poll() is None, process.communicate()
+                time.sleep(0.005)
+            before = counters()
+            Path(counted_gate + '-gate').touch()
+            while not Path(counted_gate + '-setup.json').exists():
+                assert process.poll() is None, process.communicate()
+                time.sleep(0.005)
+            after = counters()
+            Path(counted_gate + '-continue').touch()
+            out, err = process.communicate(timeout=120)
+            assert process.returncode == 0, err
+        delta = {key: after[key] - before[key] for key in probes}
+        assert delta == setup_expected, ('setup-ioctl', delta, setup_expected)
+        results['counts'].append(dict(case='setup-ioctl', **delta))
+        return json.loads(out)
+    views = counted_open()
     subprocess.run(['udevadm', 'settle'], check=True)
     if v4:
         # v4 hidden reads authenticate each block's 90 sectors (no v3 record path).

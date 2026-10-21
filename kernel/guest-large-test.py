@@ -42,7 +42,10 @@ def direct(path, offset, count=512, write=None):
 
 
 def open_views(source='/dev/vdb', initialize=False):
-    value = open_blocks(source, KEY, HKEY, initialize=initialize, allow_test_stack=source == SOURCE)
+    # This suite's geometry assertions are v3 (576 // iv sectors per record);
+    # pin v3 now that AEGIS-128 initialization defaults to v4.
+    value = open_blocks(source, KEY, HKEY, initialize=initialize, format=3 if initialize else None,
+                        allow_test_stack=source == SOURCE)
     subprocess.run(['udevadm', 'settle'], check=True)
     return value
 

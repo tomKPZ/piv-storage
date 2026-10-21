@@ -29,6 +29,11 @@ guest_code() {
     mkdir -p /opt/piv-code/pivstore
     mount -t 9p -o trans=virtio,version=9p2000.L,ro pivcode /opt/piv-code/pivstore
     export PYTHONPATH=/opt/piv-code
+    # The Rust setup frontend (scripts/build_pivsetup.py), shared per run.
+    if test -e /mnt/piv-work/pivsetup; then
+        install -m 0755 /mnt/piv-work/pivsetup /usr/local/sbin/pivsetup
+        sha256sum /usr/local/sbin/pivsetup > /mnt/piv-work/pivsetup.sha256
+    fi
 }
 
 guest_build_module() {

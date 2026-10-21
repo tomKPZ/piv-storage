@@ -57,26 +57,7 @@ def child(phase):
         write_json('waiter-interrupted.json', dict(interrupted=True))
         os.close(fd)
         return
-    original = blocks.native_setup
-    def setup(device, key, identity, **kwargs):
-        write_json(phase + '-ready.json', dict(control=device.control_path,
-                   generation=device.generation, context=identity.hex()))
-        wait_until(lambda: (W / (phase + '-gate')).exists())
-        try:
-            return original(device, key, identity, **kwargs)
-        except KeyboardInterrupt:
-            write_json(phase + '-kernel-status.json', blocks.native_status(device))
-            raise
-    blocks.native_setup = setup
-    try:
-        blocks.open_blocks(SOURCE, KEY, HKEY, initialize=phase == 'initialize', allow_test_stack=True)
-    except KeyboardInterrupt as error:
-        notes = getattr(error, '__notes__', [])
-        write_json(phase + '-finished.json', dict(interrupted=True, cleanup_returned=True, notes=notes))
-        assert not notes, notes
-    else:
-        raise AssertionError('Setup completed instead of cancelling')
-
+    raise AssertionError('Only the raw waiter runs as a Python child')
 
 if len(sys.argv) == 3 and sys.argv[1] == '--child':
     child(sys.argv[2])
@@ -138,13 +119,26 @@ def in_setup(process):
 
 
 def spawn(phase):
-    return subprocess.Popen([sys.executable, __file__, '--child', phase],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if phase == 'waiter':
+        # Second raw SETUP caller (Python ioctl instrumentation) on the same control.
+        return subprocess.Popen([sys.executable, __file__, '--child', phase],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # The real setup client: pivsetup with its explicit gate hook, default SIGINT
+    # handling (cooperative cancellation), cleanup and exit status 130.
+    args = blocks.open_args(SOURCE, KEY, W / 'hidden.key', initialize=phase == 'initialize',
+                            allow_test_stack=True)
+    return subprocess.Popen([blocks.binary(), *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, env={**os.environ, 'PIVSETUP_TEST_GATE': str(W / phase)})
 
 
-def finished(process):
+def finished(process, interrupted=False):
     out, err = process.communicate(timeout=20)
-    assert process.returncode == 0, (process.returncode, out, err)
+    if interrupted:
+        # Cancelled: exit 130 and no "cleanup incomplete" notes after unwinding.
+        assert process.returncode == 130, (process.returncode, out, err)
+        assert 'cleanup incomplete' not in err, err
+    else:
+        assert process.returncode == 0, (process.returncode, out, err)
 
 
 def open_views(initialize=False):
@@ -217,7 +211,7 @@ try:
             results.append(dict(phase='contended-setup-lock', interrupted_seconds=time.monotonic() - start))
         start = time.monotonic()
         process.send_signal(signal.SIGINT)
-        finished(process)
+        finished(process, interrupted=True)
         elapsed = time.monotonic() - start
         if waiter is not None: finished(waiter)
         (T / 'tracing_on').write_text('0')
@@ -226,10 +220,11 @@ try:
         (W / (phase + '.trace')).write_text(text)
         stats = '\n'.join(path.read_text() for path in (T / 'per_cpu').glob('cpu*/stats'))
         assert not re.search(r'(?:overrun|dropped events):\s*[1-9]', stats), stats
-        status = json.loads((W / (phase + '-kernel-status.json')).read_text())
+        report = json.loads((W / (phase + '-setup.json')).read_text())
+        assert report['interrupted'] and report['errno'] == errno.EINTR, report
+        status = report['status']
         assert not status['active'] and not status['views'] and not status['failed']
         assert status['hidden_bytes'] == 0
-        assert json.loads((W / (phase + '-finished.json')).read_text())['cleanup_returned']
         reload()
         absent()
         assert mapping_identity('piv-test-delay') == wrapper

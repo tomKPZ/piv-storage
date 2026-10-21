@@ -52,12 +52,13 @@ resolved from context/evidence, not for routine implementation decisions.
 - Format v4 (docs/format-v4.md, user-approved 2026-10-20) is implemented for
   16-byte-IV (AEGIS-128) profiles: LRW-randomized fragments (10 random + 6
   payload bytes per IV), 90-fragment SIV records, encrypted keyslots (no
-  public magic) with a directory, scrypt passphrase KEKs and optional A/B
+  public magic) with a directory, Argon2id (default) or scrypt passphrase
+  KEKs and optional A/B
   slots. Never add a persistent encryption counter. v3 remains for 12-byte
   IVs; initialization defaults to v4 on 16-byte-IV profiles (user decision
   2026-10-21) and v3 otherwise. Still planned: stock
-  `--integrity-no-journal` support (needs a torn-sector policy decision, see
-  docs/journal-atomicity.md) and a Rust setup port (Python diagnostics remain).
+  `--integrity-no-journal` support (deferred by the user 2026-10-21; needs a
+  torn-sector policy decision, see docs/journal-atomicity.md).
   AEGIS-128 is the recommended profile.
   Multi-snapshot observers, rollback resistance and alternative hidden openings
   under coercion are out of scope. Never put host-specific (e.g. corporate
@@ -121,7 +122,13 @@ resolved from context/evidence, not for routine implementation decisions.
   Integrity v4 fixed padding and the ordinary journal are required. Validate geometry,
   AAD, extents and arithmetic. Offline diagnostics reject dirty journals; native
   setup delegates replay to Linux before authenticated access.
-- Use maintained crypto primitives. Setup uses Python standard library/cryptsetup; diagnostics use cryptography plus the optional pinned
+- Use maintained crypto primitives. Setup is the static Rust `pivsetup` binary
+  (rust/; crates libc, zeroize, RustCrypto scrypt and argon2, pinned by Cargo.lock; no
+  clap/serde) plus cryptsetup, built rootlessly by scripts/build_pivsetup.py.
+  Keys stay in mlocked, zeroized buffers and never reach argv. Python keeps only
+  diagnostics and guest test instrumentation; pivstore.blocks is a thin client
+  of the binary. Test hooks are explicit PIVSETUP_TEST_* variables, never
+  monkeypatching. Diagnostics use cryptography plus the optional pinned
   SUPERCOP AES-NI reference for original AEGIS-128 (not 128L);
   actual crypto/I/O runs in the experimental kernel module. Retain the independent
   codec and complete primary verifier as cross-checks. Only synthetic test keys.

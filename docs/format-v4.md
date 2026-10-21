@@ -123,9 +123,13 @@ keys. Its data lists, for each keyslot in use, that keyslot's outer keys OK_k
   IVs and receive fresh random IVs.
 - **What leaks:** OK_k reveals only the outer randomization of keyslot k, not
   its MK wrapping (IK_k).
-- **KEK:** derived in userspace. Either a 32-byte random key file, or
-  scrypt(passphrase, salt = base context || "/kek", N = 2^17, r = 8, p = 1).
-  The parameters are fixed because nothing is stored in clear. All keyslot
+- **KEK:** derived in userspace (pivsetup). Either a 32-byte random key file,
+  or a passphrase KDF: Argon2id (default since 2026-10-21; RFC 9106 second
+  recommendation: m = 64 MiB, t = 3, p = 4; salt = base context ||
+  "/kek/argon2id") or scrypt (`--kdf scrypt`; N = 2^17, r = 8, p = 1; salt =
+  base context || "/kek"). Parameters and the KDF choice are fixed per keyslot
+  but not recorded, because nothing is stored in clear: opening with the wrong
+  KDF simply fails the key check. All keyslot
   keys use HKDF with the base context (without "/ab") as salt.
 - **Fast key check:** setup collects the keyslot fragments during the mandatory
   scan and authenticates them. A wrong KEK fails immediately (EKEYREJECTED)

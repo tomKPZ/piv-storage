@@ -126,37 +126,34 @@ for foreign in ('piv-native', 'piv-native_dif', 'piv-native-decoy', 'piv-native-
     absent()
 results.append('foreign setup names preserved')
 
-# Inject failure immediately after cryptsetup created both mappings.
-real_crypt = owners.crypt
-def crypt_after(*args):
-    result = real_crypt(*args)
-    if args[0] == 'open': raise OSError(errno.EIO, 'after cryptsetup creation')
-    return result
-with patch.object(owners, 'crypt', side_effect=crypt_after):
-    rejected(open_views)
-absent()
-results.append('post-cryptsetup failure cleanup')
-
-real_setup, real_dm = blocks.native_setup, blocks.dm
-for phase in ('before-setup', 'kernel-auth', 'after-setup', 'first-view', 'second-view'):
-    def setup(*args, **kw):
-        if phase == 'before-setup': raise OSError(errno.EIO, 'before native setup')
-        if phase == 'kernel-auth':
-            fault('reads')
-            try: return real_setup(*args, **kw)
-            finally: fault()
-        result = real_setup(*args, **kw)
-        if phase == 'after-setup': raise OSError(errno.EIO, 'after native setup')
-        return result
-    def create(*args, **kw):
-        result = real_dm(*args, **kw)
-        if args[0] == 'create' and phase == ('first-view' if args[1].endswith('decoy') else 'second-view'):
-            raise OSError(errno.EIO, 'after view creation')
-        return result
-    with patch.object(blocks, 'native_setup', side_effect=setup), patch.object(blocks, 'dm', side_effect=create):
-        rejected(open_views)
+# Inject failures at each setup phase through pivsetup's explicit test hook
+# (PIVSETUP_TEST_FAIL); every attempt must remove exactly what it created.
+for phase in ('after-cryptsetup-open', 'before-setup', 'after-setup', 'first-view', 'second-view'):
+    rejected(lambda: blocks.open_blocks(SOURCE, KEY, HKEY, allow_test_stack=True,
+                                        env=dict(PIVSETUP_TEST_FAIL=phase)))
     absent()
     results.append(phase + ' cleanup')
+
+# Lower read failure during the kernel authentication scan: hold pivsetup at its
+# gate, inject the fault for exactly the SETUP ioctl, then let it unwind.
+gate = '/run/piv-fault-kernel-auth'
+with blocks.spawn_open(SOURCE, KEY, HKEY, allow_test_stack=True,
+                       env=dict(PIVSETUP_TEST_GATE=gate, PIVSETUP_TEST_HOLD='1')) as process:
+    while not Path(gate + '-ready.json').exists():
+        assert process.poll() is None, process.communicate()
+    fault('reads')
+    try:
+        Path(gate + '-gate').touch()
+        while not Path(gate + '-setup.json').exists():
+            assert process.poll() is None, process.communicate()
+    finally:
+        fault()
+    Path(gate + '-continue').touch()
+    out, err = process.communicate(timeout=120)
+    assert process.returncode == 1 and '[Errno 5]' in err, (process.returncode, err)
+assert json.loads(Path(gate + '-setup.json').read_text())['errno'] == errno.EIO
+absent()
+results.append('kernel-auth cleanup')
 print('Setup phase failures and unrelated-name protection passed', flush=True)
 
 # Existing bare owners are not silently adopted or destroyed by a failed open.

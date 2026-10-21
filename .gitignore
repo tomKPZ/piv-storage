@@ -19,6 +19,7 @@
 /build/
 /dist/
 /target/
+/rust/target/
 *.egg-info/
 __pycache__/
 *.py[cod]

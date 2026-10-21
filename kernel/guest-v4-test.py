@@ -69,7 +69,8 @@ def write_profile(label, count=48):
     """Direct 4 KiB O_DSYNC decoy writes at pseudo-random aligned offsets:
     elapsed time and exact primary encryptions (TCG timings are diagnostic)."""
     import random, time
-    v = opened(**({'initialize': True} if label == 'v3' else {'initialize': True, 'format': 4}))
+    # Explicit format: initialization defaults to v4 on this 16-byte-IV profile.
+    v = opened(initialize=True, format=3 if label == 'v3' else 4)
     st, unit, sectors = status()
     rng = random.Random(4)
     offsets = [rng.randrange(RESERVED * unit // 4096, (sectors * unit) // 4096 - 1) * 4096 for _ in range(count)]
@@ -86,6 +87,11 @@ def write_profile(label, count=48):
         os.close(fd); buf.close()
     spent = status()[0]['encryptions'] - before
     close_blocks('/dev/vdb', KEY)
+    # v4 re-encrypts exactly the written sectors; v3 refreshes >= one 36-sector group.
+    if label == 'v4':
+        assert spent == count * (4096 // unit), (label, spent)
+    else:
+        assert spent >= count * 36, (label, spent)
     return dict(format=label, writes=count, bytes_each=4096, seconds=round(elapsed, 3),
                 encryptions=spent, encryptions_per_write=spent / count)
 
@@ -121,20 +127,33 @@ assert direct(v['hidden'], 512, 512) == bytes(512)
 # rewrite the whole keyslot/directory area through the decoy (fragment refresh
 # must preserve every listed keyslot), then retire the original key.
 second_key, passphrase = os.urandom(32), b'synthetic test passphrase'
+scrypt_passphrase = b'synthetic scrypt passphrase'
 keyslot('/dev/vdb', KEY, 1, second_key)
+keyslot('/dev/vdb', KEY, 2, passphrase=passphrase)   # pivsetup derives the KEK (default Argon2id)
+keyslot('/dev/vdb', KEY, 3, passphrase=scrypt_passphrase, kdf='scrypt')
+# Independent Python KEKs (cryptography Argon2id, hashlib scrypt) must open the
+# same slots: Rust/Python KDF parity on the real volume context.
 from pivstore.blocks import base_identity, passphrase_kek
 from pivstore.kernel_owner import GuestOwner as _Owner
 owner = _Owner('/dev/vdb', KEY)
-pass_kek = passphrase_kek(passphrase, base_identity(owner))
+identity = base_identity(owner)
 owner.close()
-keyslot('/dev/vdb', KEY, 2, pass_kek)
+pass_kek = passphrase_kek(passphrase, identity)
+scrypt_kek = passphrase_kek(scrypt_passphrase, identity, 'scrypt')
 area = direct(v['decoy'], 0, RESERVED * unit)
 direct(v['decoy'], 0, RESERVED * unit, area)
 close_blocks('/dev/vdb', KEY)
-for kw in (dict(), dict(key=second_key), dict(key=None, hidden_passphrase=passphrase)):
+for kw in (dict(), dict(key=second_key), dict(key=None, hidden_passphrase=passphrase), dict(key=pass_kek),
+           dict(key=None, hidden_passphrase=scrypt_passphrase, kdf='scrypt'), dict(key=scrypt_kek)):
     v = opened(**kw)
     assert direct(v['hidden'], 0, 512) == second
     close_blocks('/dev/vdb', KEY)
+# Nothing records the KDF: the wrong one derives an unrelated KEK.
+assert rejected(lambda: opened(key=None, hidden_passphrase=scrypt_passphrase)).errno == errno.EKEYREJECTED
+v = opened(key=second_key)
+keyslot('/dev/vdb', KEY, 3)
+close_blocks('/dev/vdb', KEY)
+assert rejected(lambda: opened(key=None, hidden_passphrase=scrypt_passphrase, kdf='scrypt')).errno == errno.EKEYREJECTED
 v = opened(key=second_key)
 keyslot('/dev/vdb', KEY, 0)            # remove the original key file's slot
 assert rejected(lambda: keyslot('/dev/vdb', KEY, 0)).errno == errno.ENOENT
@@ -145,8 +164,9 @@ keyslot('/dev/vdb', KEY, 2)
 assert rejected(lambda: keyslot('/dev/vdb', KEY, 1)).errno == errno.EBUSY   # last keyslot stays
 close_blocks('/dev/vdb', KEY)
 assert rejected(lambda: opened(key=None, hidden_passphrase=passphrase)).errno == errno.EKEYREJECTED
-results['keyslots'] = dict(added=[1, 2], removed=[0, 2], last_slot_protected=True,
-                           decoy_rewrite_of_keyslot_area_preserved=True)
+results['keyslots'] = dict(added=[1, 2, 3], removed=[3, 0, 2], last_slot_protected=True,
+                           kdfs=dict(slot2='argon2id', slot3='scrypt'), python_kdf_cross_check=True,
+                           wrong_kdf_rejected=True, decoy_rewrite_of_keyslot_area_preserved=True)
 results['ab'] = dict(fallback_after_damaged_newest_slot=True, rewrite_encryptions=GROUP)
 
 v = opened(initialize=True, format=4)

@@ -51,7 +51,8 @@ policy decision), deferred (xts/hmac needs a 32-byte tag ABI) or optional (v4
 as the AEGIS default). The user therefore moved the Rust setup port ahead of
 them. Known integrity or memory-safety defects still override this order.
 
-1. **Rust userspace setup port (next).** Port only the setup path: blocks.py,
+1. **Rust userspace setup port — done (2026-10-21), including cutover and
+   Argon2id; see the handoff below.** Port only the setup path: blocks.py,
    kernel_owner.py, kernel_api.py, format.py, the LUKS/integrity validation
    in profile.py and the open-blocks/close-blocks/keyslot CLI (about 800
    Python lines). The independent decoders (records, records_v4, sector, Image),
@@ -85,8 +86,9 @@ them. Known integrity or memory-safety defects still override this order.
    only if a target distro kernel enables Rust and upstream gains those
    abstractions. Instead, in order:
    - in-guest `W=1` and sparse (`C=1`) builds (smatch if available); fix
-     findings;
-   - review the ioctl decoders and setup inputs for bounds/arithmetic issues;
+     findings — done (scripts/guest-hardening.sh, zero findings);
+   - review the ioctl decoders and setup inputs for bounds/arithmetic issues —
+     first pass done (one key-hygiene fix); kunit tests still open;
      consider kunit tests for the pure helpers (fragment/LRW, SIV, geometry)
      cross-checked against the Python decoder;
    - a disposable KASAN/UBSAN/lockdep debug guest kernel running the existing
@@ -107,8 +109,9 @@ User answers (2026-10-21), binding for autonomous sessions:
 - *v4 default:* switch newly initialized 16-byte-IV (AEGIS-128) volumes to
   format v4 now and update suite expectations. 12-byte-IV profiles stay v3.
 
-Working order: v4 default, Rust port to parity and cutover, Argon2id, C
-W=1/sparse and input review, sanitizer guest, fuzzing, newer-kernel port.
+Working order: v4 default (done), Rust port to parity and cutover (done),
+Argon2id (done), C W=1/sparse (done) and input review (first pass done),
+sanitizer guest, fuzzing, newer-kernel port.
 
 ## Next bounded work: core module changes first
 
@@ -1551,3 +1554,62 @@ O_DIRECT (buffered page reads include unavailable neighbours). v4 setup probe
 count: record=3 on both AEGIS geometries. Power on AEGIS/4096 observed 32/90
 changed carrier IVs and recovered to local EIO. 61 host tests pass.
 Not rerun: ChaCha profiles and AES/4096 (test-only changes on v3 paths).
+
+## Session handoff: Rust setup cutover, Argon2id, hardening (2026-10-21)
+
+**Rust setup frontend (current priority 1) is complete and the Python setup
+path is gone.** `pivsetup` (rust/, ~1,700 lines) ports pivstore/blocks.py and
+kernel_owner.py setup behaviour: guest guard, strict LUKS/integrity validation
+(own minimal JSON reader; no serde/clap), /run lock, cryptsetup open + reload as
+piv-crypt via stdin, ABI 3 SETUP/STATUS/KEYSLOT, wrong-key note, identity-checked
+failed-attempt cleanup and two-view close validation. Keys live in mlocked,
+zeroized buffers; the process is non-dumpable; SIGINT and SIGTERM are
+cooperative (EINTR from SETUP, cleanup, exit 130); errors print `[Errno N]`.
+Built rootlessly and statically by scripts/build_pivsetup.py (system rustc 1.93.1,
+CARGO_HOME under downloads/cargo, committed Cargo.lock, static glibc); suite.py
+builds and shares it into every VM and records its SHA-256.
+- Python: `python3 -m pivstore` keeps only diagnostics. pivstore/blocks.py is a
+  thin client of the binary (keys via private /run files, errors mapped back to
+  OSError/ValueError/KeyboardInterrupt) plus test instrumentation
+  (native_status, raw structs) and independent KDF cross-checks. kernel_owner.py
+  and kernel_api.py remain only as guest test instrumentation (raw controls).
+- Tests: Python monkeypatching of setup internals is replaced by explicit hooks:
+  PIVSETUP_TEST_FAIL (five failure points, faults suite), PIVSETUP_TEST_GATE /
+  HOLD (handshake around the SETUP ioctl: cancel, profile kprobe counts, the
+  kernel-auth fault). tests/test_cleanup.py now tests the client mapping;
+  setup unwinding is covered end to end by the guest fault/cancel suites, not by
+  host unit tests.
+- Early boot: the test initramfs contains no Python. guest-early-test.sh (POSIX
+  sh) activates both views with the static binary on a RAM root.
+- Argon2id: `--kdf argon2id|scrypt` for passphrase keyslots, default Argon2id
+  (m = 64 MiB, t = 3, p = 4, salt context || "/kek/argon2id"); scrypt unchanged.
+  The KDF is not recorded; the wrong one fails the key check (tested).
+  Cross-checks: Rust unit vectors equal Python cryptography (host) and the
+  guest's argon2-cffi reference C implementation (Debian 13's cryptography
+  lacks Argon2).
+- Found and fixed on the way: guest-v4-test's "v3" write profile silently
+  measured v4 after the default change (now explicit, and asserted: v3 36/write,
+  v4 1/write at 4096 bytes, 8 at 512).
+
+Hardening (current priority 2):
+- scripts/guest-hardening.sh: in-guest W=1 (flags verified in the V=1 log) and
+  sparse 0.6.4-5 with default flags (C=2): zero findings in our sources
+  (artifacts/hardening-002).
+- Manual ioctl/input review: commands match exact encoded sizes, fixed-size
+  memdup_user, version/size/generation/reserved checks on SETUP and KEYSLOT,
+  carrier buffers sized for A/B (PN_MAX_CARRIER = 2880). One fix: removing a v4
+  keyslot now also wipes its expanded LRW key schedule (was kept until owner
+  free).
+
+Evidence (KVM, fresh fixtures for all six profiles): suite-016, 72/72 VMs
+(native, faults, profile, cancel, lifecycle, batch, early, power, controls,
+sector, v4) with 44/44 host checks; pivsetup SHA-256
+c9be401724a716547df0bd34bcbf1e66b6f58c314b8f3753defa450b206e1d34,
+experimental-dm-piv.ko baa900ed1709e808154a925e81cc26fb7f0cab31a61f41be44242773a2dc7e48.
+suite-014 (pre-Argon2 binary 4171adb7...) also passed 72/72. Host: 59 Python
+tests, 12 Rust tests. Not covered: large-volume suite (now pins v3), SIGTERM
+cancellation (same handler as SIGINT, no dedicated test).
+
+Next: sanitizer (KASAN/UBSAN/lockdep) guest kernel (approved; needs vm.py
+CPU/RAM/disk options, a debug kernel package and an explicit guard opt-in for
+its release string), then kunit/fuzzing, then the newer-kernel port.

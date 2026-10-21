@@ -196,8 +196,10 @@ bytes), so per-sector nonce uniqueness rests on 80 random bits:
 n²/2^81 for n rewrites of one sector. Pseudorandomness without the hidden key
 rests on LRW/AES TPRP security plus the SIV layer; this is a design argument
 that has not had external review. Keyslots give a fast offline key check, so
-a passphrase-derived KEK is exactly as guessable as its scrypt cost allows
-(N = 2^17, r = 8, p = 1). Key files remain the high-entropy option. The keyslot
+a passphrase-derived KEK is exactly as guessable as its KDF cost allows:
+Argon2id by default (m = 64 MiB, t = 3, p = 4, memory-hard against GPU/ASIC
+guessing) or scrypt (N = 2^17, r = 8, p = 1). The KDF is not recorded, which
+adds no secrecy (an attacker tries both). Key files remain the high-entropy option. The keyslot
 directory reveals keyslot outer keys only to holders of the master key. A
 hidden write still re-encrypts 90 sectors with unchanged primary plaintext and
 remains visible to a decoy-key holder with journal history.
