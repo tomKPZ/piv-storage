@@ -46,7 +46,7 @@ class Matrix:
 
     def vm(self, name, script, run_dir, *, data=None, shares=(), timeout=3600, extra=()):
         command = [sys.executable, str(ROOT / 'scripts/vm.py'), 'run', '--script', str(script),
-                   '--run-dir', str(run_dir), '--timeout', str(timeout), *extra]
+                   '--run-dir', str(run_dir), '--timeout', str(timeout), '--accel', self.args.accel, *extra]
         if self.args.provisioned:
             command.append('--provisioned')
         if data:
@@ -69,7 +69,8 @@ class Matrix:
             self.results.setdefault(name, {}).update(value)
 
     def host_check(self, name, image, control, oracle_primary, oracle_hidden, format=3):
-        command = [sys.executable, str(ROOT / 'scripts/check_stateless.py'), str(image), '--format', str(format),
+        command = [sys.executable, str(ROOT / 'scripts/check_stateless.py'), str(image),
+                   *([] if format == 3 else ['--format', str(format)]),
                    '--volume-key-file', str(control / 'share/volume.key'),
                    '--hidden-key-file', str(control / 'hidden.key'),
                    '--expected-primary', str(oracle_primary), '--expected-hidden', str(oracle_hidden)]
@@ -167,7 +168,8 @@ class Matrix:
                         code = subprocess.run([sys.executable, str(ROOT / 'scripts/early_vm.py'),
                                                '--kernel', str(share / 'early-test.vmlinuz'),
                                                '--initrd', str(share / 'early-test.initrd'),
-                                               '--data-image', str(final), '--run-dir', str(run_dir)],
+                                               '--data-image', str(final), '--run-dir', str(run_dir),
+                                               '--accel', self.args.accel],
                                               cwd=ROOT, stdout=output, stderr=subprocess.STDOUT).returncode
                 log(f'{"PASS" if code == 0 else "FAIL"} {key}')
                 self.record(key, dict(run_dir=str(run_dir), passed=code == 0,
@@ -216,6 +218,9 @@ def main():
                         help='Maximum concurrent VMs')
     parser.add_argument('--fresh', dest='provisioned', action='store_false',
                         help='Use per-run first boot and apt instead of the provisioned image')
+    kvm = os.access('/dev/kvm', os.R_OK | os.W_OK)
+    parser.add_argument('--accel', choices=('tcg', 'kvm'), default='kvm' if kvm else 'tcg',
+                        help='QEMU accelerator for every VM (default: kvm when /dev/kvm is usable)')
     args = parser.parse_args()
     args.suites = [s for s in args.suites.split(',') if s]
     if not set(args.suites) <= set(SUITES):
@@ -225,12 +230,13 @@ def main():
     args.prefix = args.prefix.resolve()
     args.prefix.mkdir(parents=True, exist_ok=False)
     if args.provisioned:
-        subprocess.run([sys.executable, str(ROOT / 'scripts/vm.py'), 'provision'], cwd=ROOT, check=True)
+        subprocess.run([sys.executable, str(ROOT / 'scripts/vm.py'), 'provision', '--accel', args.accel],
+                       cwd=ROOT, check=True)
     matrix = Matrix(args)
     work = [(p, None) for p in args.profile] + [(c.name, c.resolve()) for c in args.control]
     with ThreadPoolExecutor(max_workers=len(work)) as pool:
         list(pool.map(lambda item: matrix.profile(*item), work))
-    summary = dict(provisioned=args.provisioned, suites=args.suites, results=matrix.results)
+    summary = dict(provisioned=args.provisioned, accel=args.accel, suites=args.suites, results=matrix.results)
     (args.prefix / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     failed = [k for k, v in matrix.results.items() if not v.get('passed') or v.get('host_verified') is False]
     expected = len(work) * (1 + len(args.suites)) + len(args.profile)

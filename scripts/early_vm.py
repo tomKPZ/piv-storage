@@ -13,6 +13,7 @@ def main():
     parser.add_argument('--initrd', type=Path, required=True)
     parser.add_argument('--data-image', type=Path, required=True)
     parser.add_argument('--run-dir', type=Path, required=True)
+    parser.add_argument('--accel', choices=('tcg', 'kvm'), default='tcg')
     args = parser.parse_args()
     run = args.run_dir.resolve()
     run.mkdir(mode=0o700, parents=True, exist_ok=False)
@@ -22,7 +23,7 @@ def main():
     dummy = run / 'empty-boot-disk.img'
     with dummy.open('wb') as stream:
         stream.truncate(1024 * 1024)
-    command = ['qemu-system-x86_64', '-machine', 'q35,accel=tcg', '-cpu', 'max',
+    command = ['qemu-system-x86_64', '-machine', 'q35,accel=' + args.accel, '-cpu', 'max',
                '-m', '1024', '-smp', '2', '-nographic', '-no-reboot',
                '-kernel', str(args.kernel.resolve()), '-initrd', str(args.initrd.resolve()),
                '-append', 'console=ttyS0 panic=1 rdinit=/init',
