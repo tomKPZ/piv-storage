@@ -44,6 +44,57 @@ Exit criteria (all passed):
    primary remains valid and hidden either authenticates a complete old/new
    block or returns EIO. No recovery-file dependency or silent fragment mixing.
 
+## Current priorities (user decision, 2026-10-21)
+
+The remaining core-module items are blocked (no-journal awaits a torn-sector
+policy decision), deferred (xts/hmac needs a 32-byte tag ABI) or optional (v4
+as the AEGIS default). The user therefore moved the Rust setup port ahead of
+them. Known integrity or memory-safety defects still override this order.
+
+1. **Rust userspace setup port (next).** Port only the setup path: blocks.py,
+   kernel_owner.py, kernel_api.py, format.py, the LUKS/integrity validation
+   in profile.py and the open-blocks/close-blocks/keyslot CLI (about 800
+   Python lines). The independent decoders (records, records_v4, sector, Image),
+   check_stateless.py and the VM harness stay in Python as cross-checks.
+   - *Build:* a static binary built rootlessly on the host with the existing
+     toolchain (rustc/cargo 1.93.1 in /usr/bin; static glibc via
+     `-C target-feature=+crt-static`), shared into guests like the module.
+     No root installs; rustup in the user's home only if a musl target becomes
+     necessary. Keep build outputs (target/) ignored; vendor or pin crate
+     dependencies reproducibly and keep them minimal.
+   - *Scope:* identical kernel ABI and behaviour (setup flags, wrong-key guard,
+     cancellation polling, failed-attempt cleanup, close validation, guest
+     guard) plus zeroizing/mlocked key buffers. Keys never in argv or logs.
+     Argon2id comes after parity, as a new passphrase KDF alongside the
+     current scrypt one, not a silent replacement.
+   - *Tests:* about ten guest tests import pivstore and some replace internals
+     (blocks.native_setup in profile/cancel, kernel_owner in faults). Move them
+     to driving the binary. Replace the substituted functions with explicit,
+     test-only hooks (e.g. setup timing/crypto counters, an injected
+     cancellation point) rather than Python patching.
+   - *Cutover (user decision):* keep the Python setup until the Rust binary
+     passes the full suite matrix (all six profiles, every suite) with host
+     verification, then delete the Python setup path and update AGENTS.md's
+     Python-standard-library setup rule.
+2. **C module hardening (instead of a Rust kernel port).** A Rust kernel module
+   was assessed and rejected for now: the pinned Debian 6.12.113 kernel has
+   CONFIG_RUST unset (CONFIG_RUSTC_VERSION=0) and MODVERSIONS enabled, and Linux
+   6.12 has no Rust abstractions for device-mapper targets, bio integrity or
+   the AEAD/skcipher APIs the module uses. A port would mean a custom kernel,
+   mostly `unsafe` FFI and losing the stock-kernel evidence baseline. Revisit
+   only if a target distro kernel enables Rust and upstream gains those
+   abstractions. Instead, in order:
+   - in-guest `W=1` and sparse (`C=1`) builds (smatch if available); fix
+     findings;
+   - review the ioctl decoders and setup inputs for bounds/arithmetic issues;
+     consider kunit tests for the pure helpers (fragment/LRW, SIV, geometry)
+     cross-checked against the Python decoder;
+   - a disposable KASAN/UBSAN/lockdep debug guest kernel running the existing
+     suites (a scoped kernel build; confirm with the user first);
+   - in-guest syzkaller-style fuzzing of the control ioctls.
+3. **Then the remaining core items** below: no-journal (once the torn-sector
+   policy is decided), newer-kernel port, optional v4 default for AEGIS, xts/hmac.
+
 ## Next bounded work: core module changes first
 
 The user's 2026-10-19 priority change puts work requiring production module
@@ -171,9 +222,10 @@ safety defects take precedence over this ordering whenever discovered.
   userspace setup. Before the header exists, use the LUKS UUID as salt with
   fixed or user-supplied parameters; the header then stores a random salt and
   parameters for wrapped keys.
-- **Userspace setup port to Rust.** Zeroizing/mlocked key buffers, Argon2id and
-  a static initramfs binary. Changes the current Python-standard-library setup
-  rule; retain the independent Python diagnostics as a cross-check.
+- **Userspace setup port to Rust — promoted to current priority 1 (2026-10-21).**
+  Zeroizing/mlocked key buffers, Argon2id and a static initramfs binary. Changes
+  the current Python-standard-library setup rule; retain the independent Python
+  diagnostics as a cross-check.
 - Security/test expansion: active on-disk metadata/journal negative fixtures,
   broader interruption and scheduling/storage coverage, and a refreshed full
   profile matrix. Targeted versions move forward whenever a core change needs them.
