@@ -28,7 +28,7 @@ CONTROL_SCRIPTS = {
     'aegis-4096': ['scripts/guest-control-aegis.sh', 'scripts/guest-control.sh'],
     'aegis-512': ['scripts/guest-control-aegis-512.sh', 'scripts/guest-control.sh'],
 }
-SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early', 'power', 'controls', 'sector', 'v4', 'migrate')
+SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early', 'power', 'controls', 'sector', 'v4')
 DEFAULT_SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early')
 lock = threading.Lock()
 
@@ -127,8 +127,6 @@ class Matrix:
                       'batch-final.img'),
             'power': (ROOT / 'scripts/guest-stateless-power.sh', control / 'control.img',
                       [ko, ROOT / 'kernel/guest-stateless-power.py', *keys], None),
-            'migrate': (ROOT / 'scripts/guest-migrate.sh', final,
-                        [ko, ROOT / 'kernel/guest-migrate-test.py', *keys, *oracles], None),
             'v4': (ROOT / 'scripts/guest-v4.sh', control / 'control.img',
                    [ko, ROOT / 'kernel/guest-v4-test.py', *keys], 'v4-final.img'),
             'controls': (ROOT / 'scripts/guest-controls.sh', control / 'control.img',
@@ -182,8 +180,6 @@ class Matrix:
             extra = ['--code']
             if name == 'power':
                 extra += ['--power-cut-script', str(ROOT / 'scripts/guest-stateless-recover.sh')]
-            if name == 'migrate':
-                extra += ['--second-blank-mib', '512']
             if not self.vm(key, script, run_dir, data=data, shares=files, extra=extra):
                 return
             out = run_dir / 'share'

@@ -159,20 +159,12 @@ safety defects take precedence over this ordering whenever discovered.
 
 ## Work following core implementation
 
-- **Rekey/migration tooling — implemented (2026-10-20):** `pivstore migrate`
-  (blocks.migrate) with a second pinned guest disk (`vm.py --second-blank-mib`,
-  explicit `/dev/vdc` opt-in) and guest-migrate-test.py: AES v3 to a rekeyed,
-  larger AEGIS v4 volume. Per-cipher budget guidance is still to write. Original
-  plan: Offline copy into a freshly
-  formatted volume: format the target (new primary key, chosen cipher, sector
-  size and size), activate both paired stacks, copy decoy and hidden contents
-  through their views, verify both independently (primary verification and
-  hidden unpack hashes), then let the user retire the source. This one workflow
-  provides primary rekey, cipher change and **offline resize** (hidden AAD binds
-  geometry, so live resize stays unsupported). Tests need a second pinned guest
-  disk; extend fixture guards only explicitly. Hidden-key change becomes a
-  header rewrap once format v4 exists. Publish per-cipher lifetime-budget
-  guidance; no on-disk ledger or online rekey.
+- **Rekey/migration tooling — removed (user decision, 2026-10-21).** This is a
+  research prototype with no deployed volumes, so `pivstore migrate`, its guest
+  test and the second-disk (`/dev/vdc`) harness/guard opt-in were deleted to
+  reduce maintenance (they passed in suite-004 before removal). Recreate
+  volumes instead; v4 hidden-key changes use keyslot add/remove. Per-cipher
+  lifetime-budget guidance is still to write; no on-disk ledger or online rekey.
 - **Hidden-key KDF — implemented for v4 keyslots:** stdlib scrypt (N=2^17,
   r=8, p=1, salt = base context || "/kek") via `--hidden-passphrase-file`;
   Argon2id awaits the Rust port. Original plan: Argon2id (or stdlib scrypt meanwhile) from a passphrase in
@@ -1451,3 +1443,10 @@ Evidence (this host has KVM; all runs `accel=kvm`, cached provisioned image):
 - Host: 61 unit tests pass against fresh fixtures with the AEGIS reference.
 
 Remaining items are unchanged from the previous handoff.
+
+Follow-up (2026-10-21): migration tooling removed by user decision (see "Work
+following core implementation"); the suite no longer has a migrate entry and
+vm.py no longer attaches a second disk.
+Verified by artifacts/suite-005 (KVM, reusing suite-004 AEGIS/4096 and AES/512
+fixtures): native, faults, profile, cancel, lifecycle, batch, early, power and
+v4 passed (18/18 VMs, all host checks verified); 61 host unit tests pass.

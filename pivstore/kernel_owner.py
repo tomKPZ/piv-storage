@@ -14,16 +14,13 @@ from .kernel_api import KernelDevice, dm, mapping_identity, remove_mapping, vali
 from .profile import parse_superblock, validate_segment
 
 
-def guest_guard(source, allow_test_stack=False, allow_second_disk=False):
+def guest_guard(source, allow_test_stack=False):
     if (os.geteuid() != 0 or os.uname().release != '6.12.113+deb13-amd64' or
             Path('/sys/class/dmi/id/sys_vendor').read_text().strip() != 'QEMU'):
         raise ValueError('Kernel setup is restricted to the pinned disposable QEMU guest')
     allowed = ['/dev/vdb']
     if allow_test_stack:
         allowed += ['/dev/mapper/piv-test-delay', '/dev/mapper/piv-test-fault']
-    if allow_second_disk:
-        # Explicit opt-in for migration tests: the pinned guest's second disposable disk.
-        allowed += ['/dev/vdc']
     if str(source) not in allowed or not stat.S_ISBLK(Path(source).stat().st_mode):
         raise ValueError('Unsupported disposable test device')
     size = subprocess.check_output(['blockdev', '--getsize64', str(source)], text=True)
@@ -39,8 +36,7 @@ def crypt(*args):
 
 
 class GuestOwner:
-    def __init__(self, source, passphrase_file, name='piv-native', *, allow_test_stack=False,
-                 allow_second_disk=False):
+    def __init__(self, source, passphrase_file, name='piv-native', *, allow_test_stack=False):
         self.lock_fd = None
         self.device = None
         self.created = False
@@ -50,7 +46,7 @@ class GuestOwner:
         self.source = Path(source)
         if not re.fullmatch(r'piv-[a-zA-Z0-9_-]{1,40}', name):
             raise ValueError('Invalid experimental mapping name')
-        self.raw_bytes = guest_guard(self.source, allow_test_stack, allow_second_disk)
+        self.raw_bytes = guest_guard(self.source, allow_test_stack)
         metadata = json.loads(crypt('luksDump', '--dump-json-metadata', self.source).stdout)
         self.offset = validate_segment(metadata)
         self.encryption = metadata['segments']['0']['encryption']

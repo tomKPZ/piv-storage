@@ -100,7 +100,7 @@ def native_detach(device):
 
 def open_blocks(source, key_file, hidden_key, *, name='piv-native', initialize=False,
                 uninitialized=False, format=None, ab=False, allow_test_stack=False,
-                hidden_passphrase=None, allow_second_disk=False):
+                hidden_passphrase=None):
     """Open paired views. On 16-byte-IV profiles the hidden key is a format v4
     keyslot KEK (or derived from @hidden_passphrase) and the format is detected:
     a v4 keyslot, else a v3 record. format=4 requires v4; initialization uses
@@ -108,8 +108,7 @@ def open_blocks(source, key_file, hidden_key, *, name='piv-native', initialize=F
     """
     if hidden_passphrase is None and len(hidden_key) != 32:
         raise ValueError('Hidden key must contain exactly 32 bytes')
-    owner = GuestOwner(source, key_file, name, allow_test_stack=allow_test_stack,
-                       allow_second_disk=allow_second_disk)
+    owner = GuestOwner(source, key_file, name, allow_test_stack=allow_test_stack)
     created = []
     try:
         if native_status(owner.device)['active']:
@@ -162,11 +161,10 @@ def open_blocks(source, key_file, hidden_key, *, name='piv-native', initialize=F
         owner.close()
 
 
-def close_blocks(source, key_file, *, name='piv-native', allow_test_stack=False, allow_second_disk=False):
+def close_blocks(source, key_file, *, name='piv-native', allow_test_stack=False):
     if dm('info', name, check=False).returncode:
         raise FileNotFoundError('Native owner is not active')
-    owner = GuestOwner(source, key_file, name, allow_test_stack=allow_test_stack,
-                       allow_second_disk=allow_second_disk)
+    owner = GuestOwner(source, key_file, name, allow_test_stack=allow_test_stack)
     try:
         status = native_status(owner.device)
         views = []
@@ -194,72 +192,3 @@ def close_blocks(source, key_file, *, name='piv-native', allow_test_stack=False,
         owner.remove()
     finally:
         owner.close()
-
-
-def _copy(source, target, length, chunk=1 << 20):
-    import hashlib
-    digest = hashlib.sha256()
-    with open(source, 'rb', buffering=0) as src, open(target, 'r+b', buffering=0) as dst:
-        done = 0
-        while done < length:
-            data = src.read(min(chunk, length - done))
-            if not data:
-                raise OSError('Short read during migration')
-            dst.write(data)
-            digest.update(data)
-            done += len(data)
-        os.fsync(dst.fileno())
-    return digest.hexdigest()
-
-
-def _digest(path, length, chunk=1 << 20):
-    import hashlib
-    digest = hashlib.sha256()
-    with open(path, 'rb', buffering=0) as src:
-        done = 0
-        while done < length:
-            data = src.read(min(chunk, length - done))
-            if not data:
-                raise OSError('Short read during verification')
-            digest.update(data)
-            done += len(data)
-    return digest.hexdigest()
-
-
-def migrate(source, source_key_file, source_hidden_key, target, target_key_file, target_hidden_key, *,
-            target_format=None, target_ab=False, allow_second_disk=False):
-    """Copy decoy and hidden contents into a freshly formatted, initialized target.
-
-    This one offline workflow provides primary rekey (a new LUKS volume key),
-    cipher/sector-size change and offline resize. The target hidden volume is
-    destructively initialized first; both views of both volumes are compared by
-    SHA-256 after copying. Source contents are only read (activation still writes
-    ordinary journal metadata); retire the source yourself.
-    """
-    src = open_blocks(source, source_key_file, source_hidden_key, name='piv-src',
-                      allow_second_disk=allow_second_disk)
-    try:
-        dst = open_blocks(target, target_key_file, target_hidden_key, name='piv-dst', initialize=True,
-                          format=target_format, ab=target_ab, allow_second_disk=allow_second_disk)
-        try:
-            sizes = {role: int(command_output(['blockdev', '--getsize64', src[role]])) for role in ('decoy', 'hidden')}
-            room = {role: int(command_output(['blockdev', '--getsize64', dst[role]])) for role in ('decoy', 'hidden')}
-            for role in ('decoy', 'hidden'):
-                if room[role] < sizes[role]:
-                    raise ValueError(f'Target {role} view is smaller than the source')
-            result = {}
-            for role in ('decoy', 'hidden'):
-                copied = _copy(src[role], dst[role], sizes[role])
-                if _digest(src[role], sizes[role]) != copied or _digest(dst[role], sizes[role]) != copied:
-                    raise OSError(f'{role} verification failed after migration')
-                result[role] = dict(bytes=sizes[role], target_bytes=room[role], sha256=copied)
-            return result
-        finally:
-            close_blocks(target, target_key_file, name='piv-dst', allow_second_disk=allow_second_disk)
-    finally:
-        close_blocks(source, source_key_file, name='piv-src', allow_second_disk=allow_second_disk)
-
-
-def command_output(args):
-    import subprocess
-    return subprocess.check_output(args, text=True)

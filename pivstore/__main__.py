@@ -51,17 +51,6 @@ def main():
                 block.add_argument('--uninitialized', action='store_true',
                                    help='Accept a carrier with no authenticating hidden record; '
                                         'decoy writes then cannot preserve hidden data under a wrong key')
-    move = sub.add_parser('migrate', help='Copy both views into a freshly formatted target (rekey/resize)')
-    move.add_argument('--source', type=Path, default=Path('/dev/vdb'))
-    move.add_argument('--source-key-file', type=Path, required=True)
-    move.add_argument('--source-hidden-key-file', type=Path, required=True)
-    move.add_argument('--target', type=Path, required=True)
-    move.add_argument('--target-key-file', type=Path, required=True)
-    move.add_argument('--target-hidden-key-file', type=Path, required=True)
-    move.add_argument('--target-format', type=int, choices=(3, 4))
-    move.add_argument('--target-ab', action='store_true')
-    move.add_argument('--allow-second-disk', action='store_true',
-                      help='Test-guest opt-in permitting /dev/vdc')
     slots = sub.add_parser('keyslot', help='Add or remove a format v4 keyslot on active views')
     slots.add_argument('operation', choices=('add', 'remove'))
     slots.add_argument('--device', type=Path, default=Path('/dev/vdb'))
@@ -73,17 +62,6 @@ def main():
     new.add_argument('--new-passphrase-file', type=Path)
     args = parser.parse_args()
     try:
-        if args.action == 'migrate':
-            from .blocks import migrate
-            keys = []
-            for path in (args.source_hidden_key_file, args.target_hidden_key_file):
-                with path.open('rb') as stream:
-                    keys.append(stream.read(33))
-            result = migrate(args.source, args.source_key_file, keys[0], args.target, args.target_key_file,
-                             keys[1], target_format=args.target_format, target_ab=args.target_ab,
-                             allow_second_disk=args.allow_second_disk)
-            print(json.dumps(result, indent=2))
-            return 0
         if args.action == 'keyslot':
             from .blocks import keyslot, base_identity, passphrase_kek
             kek = None
