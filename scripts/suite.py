@@ -5,7 +5,11 @@ Phases per profile (profiles run concurrently):
   0. control: create a stock fixture with vm.py (unless --control supplies one)
   1. native:  build (or reuse) dm-piv.ko and run the dual-view/early-build test
   2. suites:  run the selected suites concurrently against the closed native image
-Each VM uses its own fresh run directory; nothing is reused or overwritten.
+Each VM uses its own fresh run directory; nothing is overwritten. With
+--reuse-native, phase 1 is skipped and the suites start from a previous
+matrix's passed, host-verified native run (same module input and base image).
+Suite sets: --suites routine (the default), all, or an explicit list;
+--suites-for narrows the list per profile (e.g. on the sanitizer image).
 Host checks use scripts/check_stateless.py (independent primary authentication
 and hidden decoding). Original AEGIS-128 images need PIV_AEGIS_REFERENCE.
 """
@@ -28,7 +32,12 @@ CONTROL_SCRIPTS = {
     'aegis-512': ['scripts/guest-control-aegis-512.sh', 'scripts/guest-control.sh'],
 }
 SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early', 'power', 'controls', 'sector', 'v4', 'migrate', 'fuzz')
-DEFAULT_SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early')
+# Routine tier: run after kernel or pivsetup changes. The opt-in remainder is for
+# changes in its own area: controls (descriptive write-pattern statistics),
+# sector (legacy fixture-decoding regression), migrate (pivsetup migrate) and
+# fuzz (control ioctls and table constructors; most useful on the sanitizer).
+DEFAULT_SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early', 'power', 'v4')
+SUITE_SETS = {'routine': DEFAULT_SUITES, 'all': SUITES}
 lock = threading.Lock()
 
 
@@ -131,6 +140,7 @@ class Matrix:
             if control is None:
                 return
         keys = [control / 'share/passphrase.key', control / 'hidden.key']
+        suites = self.suites_for(profile)
         native = self.args.prefix / f'{profile}-native'
         module = [Path(self.args.module)] if self.args.module else []
         build = [Path(self.args.scaffold)] if self.args.scaffold else []
@@ -138,13 +148,18 @@ class Matrix:
         shares = [*build, *module, ROOT / 'scripts/guest-dual.sh', ROOT / 'scripts/guest-early-build.sh',
                   ROOT / 'kernel/guest-early-test.sh', ROOT / 'kernel/guest-dual-test.py',
                   ROOT / 'kernel/check-config.py', *keys]
-        if not self.vm(f'{profile}/native', script, native, data=control / 'control.img',
-                       shares=shares, extra=['--code']):
+        if self.args.reuse_native:
+            native = self.reused_native(profile)
+            if native is None:
+                return
+        elif not self.vm(f'{profile}/native', script, native, data=control / 'control.img',
+                         shares=shares, extra=['--code']):
             return
         share = native / 'share'
         ko, final = share / 'experimental-dm-piv.ko', share / 'dual-final.img'
         primary, hidden = share / 'expected-primary.sha256', share / 'expected-hidden-volume'
-        self.host_check(f'{profile}/native', final, control, primary, hidden)
+        if not self.args.reuse_native:
+            self.host_check(f'{profile}/native', final, control, primary, hidden)
         oracles = [hidden, primary]
         plans = {
             'faults': (ROOT / 'scripts/guest-faults.sh', final,
@@ -173,7 +188,7 @@ class Matrix:
                          None),
         }
 
-        if 'sector' in self.args.suites:
+        if 'sector' in suites:
             # Focused sector-control regression on the stock fixture; builds the
             # module itself, so it needs the staged scaffold.
             layout = self.args.prefix / f'{profile}-input' / 'read-layout.json'
@@ -237,8 +252,36 @@ class Matrix:
             elif output:
                 self.host_check(key, out / output, control, primary, hidden)
 
-        with ThreadPoolExecutor(max_workers=len(self.args.suites)) as pool:
-            list(pool.map(suite, self.args.suites))
+        if suites:
+            with ThreadPoolExecutor(max_workers=len(suites)) as pool:
+                list(pool.map(suite, suites))
+
+    def suites_for(self, profile):
+        for prefix, names in self.args.suites_for:
+            if profile.startswith(prefix):
+                return [s for s in self.args.suites if s in names]
+        return list(self.args.suites)
+
+    def reused_native(self, profile):
+        """A previous passed, host-verified native run built from the same module
+        input on the same base image; recorded as reused, never re-verified."""
+        key = f'{profile}/native'
+        old = self.args.reuse_native_summary
+        result = old['results'].get(key, {})
+        reasons = []
+        if old.get('module_input_sha256') != self.args.module_input_sha256:
+            reasons.append('different (or unrecorded) module input')
+        if old.get('base_image') != (str(self.args.base_image) if self.args.base_image else None):
+            reasons.append('different base image')
+        if not (result.get('passed') and result.get('host_verified')):
+            reasons.append('native run did not pass host verification')
+        if reasons:
+            self.record(key, dict(passed=False, note='cannot reuse native: ' + '; '.join(reasons)))
+            log(f'FAIL {key}: cannot reuse native ({"; ".join(reasons)})')
+            return None
+        self.record(key, dict(passed=True, host_verified=True, reused=result['run_dir']))
+        log(f'REUSE {key}: {result["run_dir"]}')
+        return Path(result['run_dir'])
 
 
 def main():
@@ -251,8 +294,15 @@ def main():
     build = parser.add_mutually_exclusive_group(required=True)
     build.add_argument('--scaffold', type=Path, help='Staged module scaffold.tar to build in each native run')
     build.add_argument('--module', type=Path, help='Prebuilt matched experimental-dm-piv.ko')
-    parser.add_argument('--suites', default=','.join(DEFAULT_SUITES),
-                        help=f'Comma-separated subset of {",".join(SUITES)}')
+    parser.add_argument('--suites', default='routine',
+                        help=f'routine ({",".join(DEFAULT_SUITES)}), all, or a comma-separated '
+                             f'subset of {",".join(SUITES)}')
+    parser.add_argument('--suites-for', action='append', default=[], metavar='PROFILE=LIST',
+                        help='Restrict profiles whose name starts with PROFILE to LIST (comma-separated, '
+                             'may be empty); e.g. aegis-512=faults on the sanitizer image')
+    parser.add_argument('--reuse-native', type=Path, metavar='PREFIX',
+                        help='Skip native runs: reuse PREFIX/summary.json native results built from the '
+                             'same --scaffold/--module and base image')
     parser.add_argument('--jobs', type=int, default=max(1, min(16, (os.cpu_count() or 2) // 4)),
                         help='Maximum concurrent VMs')
     parser.add_argument('--fresh', dest='provisioned', action='store_false',
@@ -264,9 +314,22 @@ def main():
     parser.add_argument('--accel', choices=('tcg', 'kvm'), default='kvm' if kvm else 'tcg',
                         help='QEMU accelerator for every VM (default: kvm when /dev/kvm is usable)')
     args = parser.parse_args()
-    args.suites = [s for s in args.suites.split(',') if s]
+    args.suites = list(SUITE_SETS.get(args.suites, [s for s in args.suites.split(',') if s]))
     if not set(args.suites) <= set(SUITES):
         parser.error('Unknown suite')
+    limits = []
+    for item in args.suites_for:
+        prefix, sep, names = item.partition('=')
+        names = [n for n in names.split(',') if n]
+        if not sep or not prefix or not set(names) <= set(SUITES):
+            parser.error(f'Invalid --suites-for {item}')
+        limits.append((prefix, names))
+    args.suites_for = limits
+    module_input = args.scaffold or args.module
+    args.module_input_sha256 = hashlib.sha256(module_input.read_bytes()).hexdigest()
+    args.reuse_native_summary = None
+    if args.reuse_native:
+        args.reuse_native_summary = json.loads((args.reuse_native / 'summary.json').read_text())
     if not args.profile and not args.control:
         parser.error('Give --profile and/or --control')
     args.prefix = args.prefix.resolve()
@@ -285,11 +348,13 @@ def main():
     with ThreadPoolExecutor(max_workers=len(work)) as pool:
         list(pool.map(lambda item: matrix.profile(*item), work))
     summary = dict(provisioned=args.provisioned, accel=args.accel, pivsetup_sha256=pivsetup_sha256,
+                   module_input_sha256=args.module_input_sha256,
+                   reuse_native=str(args.reuse_native.resolve()) if args.reuse_native else None,
                    base_image=str(args.base_image) if args.base_image else None,
                    suites=args.suites, results=matrix.results)
     (args.prefix / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     failed = [k for k, v in matrix.results.items() if not v.get('passed') or v.get('host_verified') is False]
-    expected = len(work) * (1 + len(args.suites)) + len(args.profile)
+    expected = sum(1 + len(matrix.suites_for(name)) for name, _ in work) + len(args.profile)
     missing = expected - len(matrix.results)
     log(f'{len(matrix.results) - len(failed)} passed, {len(failed)} failed, {missing} not run; '
         f'summary: {args.prefix / "summary.json"}')

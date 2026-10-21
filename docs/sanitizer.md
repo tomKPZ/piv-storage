@@ -40,10 +40,13 @@ initramfs copies the marker.
 ```sh
 python3 scripts/suite.py --prefix artifacts/sanitizer-next \
   --base-image downloads/debug-kernel-<hash>.qcow2 --memory-mib 2048 \
-  --control ... --scaffold ... --suites faults,profile,cancel,lifecycle,batch,early,power,controls,v4
+  --control ... --scaffold ... --suites routine --suites-for aegis-512=faults
 ```
 
-The sector suite asserts the stock release and is not run here. suite.py fails
+The 512-byte profile dominates sanitizer time (native ~12 min, v4 ~19 min) but
+shares every kernel code path with 4096, so routine sanitizer runs keep only its
+native and faults runs; run it fully at milestones. Add `fuzz` when the ioctl or
+table code changes. The sector suite asserts the stock release and is not run here. suite.py fails
 any run (stock or debug) whose console or dmesg contains a kernel self-report:
 KASAN/UBSAN, lockdep, sleeping-in-atomic, BUG/Oops/GPF, WARNING or kmemleak.
 guest_record forces a final kmemleak scan and saves the report. vm.py now keeps
