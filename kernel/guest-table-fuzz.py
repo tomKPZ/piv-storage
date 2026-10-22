@@ -139,7 +139,7 @@ def canonical(tokens):
     out = []
     for index, word in enumerate(words):
         if index in (0, 1, 4) and word.isdigit():
-            word = str(int(word))
+            word = word.lstrip('0') or '0'  # no int(): mutated tokens can be huge
         elif index == 3 and word.startswith('/') and os.path.exists(word):
             rdev = os.stat(word).st_rdev
             word = f'{os.major(rdev)}:{os.minor(rdev)}'

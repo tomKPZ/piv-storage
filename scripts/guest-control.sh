@@ -40,7 +40,13 @@ cryptsetup luksFormat --batch-mode --type luks2 --cipher "$PIV_PRIMARY_CIPHER" \
     --key-size "$((primary_key_bytes * 8))" --sector-size "$PIV_SECTOR_SIZE" --integrity "$primary_integrity" \
     --pbkdf pbkdf2 --pbkdf-force-iterations 1000 \
     --volume-key-file volume.key --key-file passphrase.key "$device"
-cryptsetup open --key-file passphrase.key "$device" piv-control
+# PIV_NO_JOURNAL=1: persist stock --integrity-no-journal in the LUKS2 header
+# (config flag "no-journal"); every later open then uses a direct-mode table.
+if test "${PIV_NO_JOURNAL:-0}" = 1; then
+    cryptsetup open --integrity-no-journal --persistent --key-file passphrase.key "$device" piv-control
+else
+    cryptsetup open --key-file passphrase.key "$device" piv-control
+fi
 size=$(blockdev --getsize64 /dev/mapper/piv-control)
 python3 - "$size" "$PIV_SECTOR_SIZE" <<'PY'
 import hashlib

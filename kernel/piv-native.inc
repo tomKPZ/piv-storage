@@ -37,6 +37,7 @@
 struct pn_entry {
  __le64 sector;
  __le32 primary;
+ u8 replace; /* full-sector decoy write over a sector failing authentication */
  u8 old[16], tuple[PIV_TUPLE_BYTES];
 } __packed;
 #if PIV_AES_KEY_API
@@ -400,7 +401,8 @@ static int pn_v4_read(struct piv_control *p, u64 index, u8 *carrier, u8 *data, i
   u64 group = pn_v4_group(n, index, i);
   r = pn_carrier_at(p, pn_v4_group_first(group), PN_V4_GROUP, carrier + i * PN_V4_CARRIER);
   if (!r) r = pn_v4_unpack(n, group, carrier + i * PN_V4_CARRIER, candidate, &found);
-  if (r == PN_UNAVAILABLE) continue;
+  /* A primary sector failing authentication makes only this slot unavailable. */
+  if (r == PN_UNAVAILABLE || r == -EBADMSG) continue;
   if (r) goto out;
   if (chosen < 0 || found > best) { chosen = i; best = found; memcpy(data, candidate, PN_DATA); }
  }
@@ -445,12 +447,15 @@ static int pn_commit(struct piv_control *p, bool hidden, u64 offset, const u8 *d
   if (primary) {
    struct piv_sector *s = NULL;
    u64 lo = max(start, offset), hi = min(start + unit, offset + bytes);
-   r = piv_load(p->cc, sector, &s); if (r) goto done;
-   memcpy(u->tuple, page_address(s->page), unit); piv_sector_free(p->cc, s);
+   /* A replaced sector is fully covered by the request; nothing to merge. */
+   if (!entries[i].replace) {
+    r = piv_load(p->cc, sector, &s); if (r) goto done;
+    memcpy(u->tuple, page_address(s->page), unit); piv_sector_free(p->cc, s);
+   }
    memcpy(u->tuple + lo - start, data + lo - offset, hi - lo);
    entries[i].primary = cpu_to_le32(1);
   }
-  r = piv_update(p, NULL, u, true, primary, true); if (r) goto done;
+  r = piv_update(p, NULL, u, true, primary, true, entries[i].replace); if (r) goto done;
   memcpy(entries[i].tuple, u->tuple, PIV_TUPLE_BYTES);
  }
  u->flags = PIV_APPLY_DEFER_FLUSH;
@@ -459,7 +464,8 @@ static int pn_commit(struct piv_control *p, bool hidden, u64 offset, const u8 *d
  for (i = 0; i < count; i++) {
   u->sector = le64_to_cpu(entries[i].sector);
   memcpy(u->expected_iv, entries[i].old, iv); memcpy(u->tuple, entries[i].tuple, PIV_TUPLE_BYTES);
-  r = piv_update(p, NULL, u, false, le32_to_cpu(entries[i].primary), true); if (r) goto done;
+  r = piv_update(p, NULL, u, false, le32_to_cpu(entries[i].primary), true, entries[i].replace);
+  if (r) goto done;
   if ((i + 1) % 32 == 0) { r = blkdev_issue_flush(p->cc->dev->bdev); if (r) goto done; }
  }
  r = blkdev_issue_flush(p->cc->dev->bdev);
@@ -585,9 +591,16 @@ static int pn_write_v4(struct piv_control *p, bool hidden, u64 offset, const u8 
  if (!entries || !ivs) goto done;
  for (index = offset / unit; index <= (offset + bytes - 1) / unit; index++) {
   struct piv_sector *s = NULL;
+  /* A sector failing authentication (e.g. torn without the journal) may be
+   * replaced only by a write covering all of it. Its raw stored fragment is
+   * refreshed like any other: the record's SIV tag decides whether it is
+   * still valid, so damage stays damage and is never made authentic.
+   */
+  bool full = index * unit >= offset && (index + 1) * unit <= offset + bytes;
   if (count == PN_MAX_ENTRIES) { r = -E2BIG; goto done; }
-  r = piv_load(p->cc, index, &s); if (r) goto done;
+  r = piv_load_mode(p->cc, index, &s, full); if (r) goto done;
   entries[count].sector = cpu_to_le64(index);
+  entries[count].replace = s->bad;
   memcpy(entries[count++].old, s->original + 4112, 16); piv_sector_free(p->cc, s);
  }
  if (!count || count > (1ULL << 32) - p->encryptions) { r = -EDQUOT; goto done; }
@@ -687,7 +700,7 @@ static int pn_dir_load(struct piv_control *p)
  for (slot = 0; slot < 2; slot++) {
   r = pn_carrier_at(p, pn_v4_group_first(slot), PN_V4_GROUP, carrier);
   if (!r) r = pn_v4_unpack(n, slot, carrier, carrier + PN_V4_CARRIER, &generation);
-  if (r == PN_UNAVAILABLE) continue;
+  if (r == PN_UNAVAILABLE || r == -EBADMSG) continue;
   if (r) goto out;
   if (n->dir_slot < 0 || generation > n->dir_generation) {
    r = pn_dir_parse(n, carrier + PN_V4_CARRIER);
@@ -722,11 +735,13 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
  u64 i;
  u32 j;
  bool initialize = s->flags & PIV_SETUP_INITIALIZE, ab = s->flags & PIV_SETUP_AB, mutated, ks_done = false;
+ bool verify = s->flags & PIV_SETUP_VERIFY;
+ u64 scan_end;
  int r;
  if (s->version != 4 || s->size != sizeof(*s) || s->generation != p->profile.generation ||
      s->context_length > 120 || s->context_length <= 19 ||
      memcmp(s->context, "pivstore/volume/v4", 19) ||
-     (s->flags & ~(PIV_SETUP_INITIALIZE | PIV_SETUP_AB)) ||
+     (s->flags & ~(PIV_SETUP_INITIALIZE | PIV_SETUP_AB | PIV_SETUP_VERIFY)) ||
      memchr_inv(s->reserved, 0, sizeof(s->reserved))) return -EINVAL;
  /* Format v4 needs 16-byte IVs (AEGIS-128). A/B is chosen at initialization
   * and afterwards read from the keyslot.
@@ -749,16 +764,32 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
  if (IS_ERR(n->hmac) || IS_ERR(n->chacha)) { r = -ENOENT; goto bad; }
  p->native = n;
  /* Key guard: a keyslot must authenticate under the given KEK; its IVs come
-  * from the mandatory authenticating scan. A decoy write under an unproven key
-  * would destroy hidden data.
+  * from the keyslot-area scan. A decoy write under an unproven key would
+  * destroy hidden data. By default (user decision 2026-10-21) setup scans only
+  * the keyslot area: every later request authenticates exactly the sectors it
+  * touches, so a full scan adds no protection, only O(volume) setup time.
+  * PIV_SETUP_VERIFY restores the strict full audit (any failing sector
+  * refuses). Without it, keyslot sectors failing authentication contribute
+  * their raw stored IVs: replicas exist for this, and the keyslot SIV tag
+  * rejects any damaged fragment, so nothing unauthenticated is accepted.
   */
+ scan_end = verify ? p->profile.sectors : PN_V4_KEYSLOT_AREA;
  ivs = kmalloc(PIV_READ_BYTES / 512 * 16, GFP_NOIO);
  if (!initialize) ks_ivs = kzalloc(PN_V4_KEYSLOT_AREA * 16, GFP_NOIO);
  if (!ivs || (!initialize && !ks_ivs)) { r = -ENOMEM; goto bad; }
- for (i = 0; i < p->profile.sectors;) {
-  u32 count = min_t(u64, p->profile.sectors - i, PIV_READ_BYTES / p->profile.sector_size);
+ for (i = 0; i < scan_end;) {
+  u32 count = min_t(u64, scan_end - i, PIV_READ_BYTES / p->profile.sector_size);
   r = pn_setup_poll(); if (r) goto bad;
-  r = piv_read_range(p, i, count, NULL, ivs); if (r) goto bad;
+  r = piv_read_range(p, i, count, NULL, ivs);
+  if (r == -EBADMSG && !verify) {
+   for (j = 0; j < count; j++) {
+    struct piv_sector *sector = NULL;
+    r = piv_load_mode(p->cc, i + j, &sector, true); if (r) goto bad;
+    memcpy(ivs + j * 16, sector->original + 4112, 16);
+    piv_sector_free(p->cc, sector);
+   }
+  }
+  if (r) goto bad;
   for (j = 0; ks_ivs && j < count && i + j < PN_V4_KEYSLOT_AREA; j++)
    memcpy(ks_ivs + (i + j) * 16, ivs + j * 16, 16);
   i += count;

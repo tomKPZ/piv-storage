@@ -160,7 +160,7 @@ Primary AEAD checks do not authenticate all superblock, LUKS configuration or
 journal metadata, nor guarantee valid replay ordering. Replaying a valid sector
 at its original address can pass primary authentication. Hidden authentication
 rejects torn fragments, but an old whole block or different-time valid blocks
-can pass. Lower replay can mutate storage before native setup's full scan;
+can pass. Lower replay can mutate storage before native setup's scan;
 activation is not a promise to reject hostile storage before any modification.
 
 The journal can retain older carrier fragments; enough correctly associated
@@ -198,9 +198,10 @@ short write history even though multi-snapshot observers are out of scope.
 Every coordinated decoy write also refreshes its full group, so this pattern
 indicates use of the prototype rather than proving hidden data exists. In many
 coercion settings that distinction offers little protection. Candidate
-mitigations, none implemented or tested: formatting with stock
-`--integrity-no-journal` (removes on-disk history; torn writes then return
-decoy EIO, as for stock users of that option); journal encryption (hides sector
+mitigations: stock `--integrity-no-journal`, now supported as an opt-in
+(removes on-disk history; a crash then tears decoy sectors not only where the
+user wrote but also in the carrier of an interrupted hidden write, see
+docs/journal-atomicity.md); untested: journal encryption (hides sector
 numbers only from keyless observers, and is unverified for LUKS2 AEAD in
 cryptsetup); and a record format that re-randomizes only touched IVs, reducing
 the group footprint at a capacity cost. These need design review before any claim.

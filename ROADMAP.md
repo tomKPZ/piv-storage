@@ -1791,6 +1791,33 @@ n²/2^81 from the 80 random fragment bits), what consumes nonces, a suggested
 external budget (2^40 total, 2^24 per sector) with rekey via `pivsetup migrate`,
 explicitly not a reviewed AEGIS-128 bound and not enforced on disk.
 
-Remaining roadmap items need user input or outside help: no-journal
-(torn-sector policy decision), optional sanitizer build of 7.2, external crypto
-review.
+Remaining roadmap items need user input or outside help: optional sanitizer
+build of 7.2, external crypto review. (No-journal: done as an opt-in, below.)
+
+## Session handoff: keyslot-area setup scan and no-journal opt-in (2026-10-21)
+
+User decision: setup no longer authenticates the whole primary. The kernel
+scans the 112 keyslot sectors (SETUP flag VERIFY = 16, pivsetup `--verify`, keeps
+the full audit). Keyslot sectors failing authentication contribute raw IVs that
+only the keyslot SIV tag can accept; directory/A-B slots whose carrier fails
+authentication count as unavailable; a decoy write covering an entire failing
+sector replaces it (piv_load_mode allow_bad, piv_update replace, internal only),
+refreshing its raw fragment so the record's SIV still decides hidden validity.
+Setup time is now constant in volume size. Tests: profile counts updated,
+cancel's scan phase uses --verify, faults gained default-vs-verify corruption,
+keyslot-sector corruption, partial-write rejection and full-sector replacement
+cases. Evidence: suite-050 (+ suite-051 fuzz) stock 22/22, suite-052-sanitizer
+13/13 (512 trimmed), suite-053-port 7.2.9 18/18, no kernel reports.
+
+No-journal (format v4 phase 4): accepted with explicit `--allow-no-journal`
+(LUKS2 flag "no-journal" exactly; D-mode table validated in Rust and Python).
+Measured hazard: a power cut during a hidden write tore primary sector 303 of
+the interrupted record's carrier on both sector sizes (decoy plaintext lost
+without a copy); see docs/journal-atomicity.md. New nojournal suite profiles;
+faults and power tests verify that torn sectors stay within the request/carrier
+and repair by full-sector replacement. Evidence: suite-056-nojournal 22/22, 14/14
+host checks. The journal stays the default.
+
+Open: sanitizer run on no-journal profiles (optional), large-volume suite
+(guest-large-test asserts an owner fail-stop on a hidden-read corruption, which
+predates scoped isolation; recheck before relying on it), external review.

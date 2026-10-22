@@ -34,8 +34,35 @@ def blocks_touched(device, first, last):
     low, high = (first - 112) // 90 - 2, (last - 112) // 90 - 2
     return range(max(0, low), high + 1) if last >= 112 + 180 else range(0)
 
-def open_views():
-    value = blocks.open_blocks(SOURCE, KEY, HKEY, allow_test_stack=True)
+# Fixture persists stock --integrity-no-journal (guest_code sets this).
+NO_JOURNAL = os.environ.get('PIV_ALLOW_NO_JOURNAL') == '1'
+
+
+def unreadable(path, unit, sectors, chunk=65536):
+    """Primary sectors whose decoy reads fail (O_DIRECT, per-sector on error)."""
+    bad, fd = [], os.open(path, os.O_RDONLY | os.O_DIRECT)
+    try:
+        with mmap.mmap(-1, chunk) as buf, mmap.mmap(-1, unit) as one:
+            for start in range(0, sectors * unit, chunk):
+                length = min(chunk, sectors * unit - start)
+                try:
+                    os.preadv(fd, [memoryview(buf)[:length]], start)
+                    continue
+                except OSError:
+                    pass
+                for sector in range(start // unit, (start + length) // unit):
+                    try:
+                        os.preadv(fd, [one], sector * unit)
+                    except OSError as exc:
+                        assert exc.errno == errno.EIO
+                        bad.append(sector)
+    finally:
+        os.close(fd)
+    return bad
+
+
+def open_views(**options):
+    value = blocks.open_blocks(SOURCE, KEY, HKEY, allow_test_stack=True, **options)
     subprocess.run(['udevadm', 'settle'], check=True)
     return value
 
@@ -147,6 +174,13 @@ with blocks.spawn_open(SOURCE, KEY, HKEY, allow_test_stack=True,
 assert json.loads(Path(gate + '-setup.json').read_text())['errno'] == errno.EIO
 absent()
 results.append('kernel-auth cleanup')
+if NO_JOURNAL:
+    # The no-journal hazard needs pivsetup's explicit opt-in; refusal cleans up.
+    refusal = rejected(lambda: blocks.open_blocks(SOURCE, KEY, HKEY, allow_test_stack=True,
+                                                  allow_no_journal=False), ValueError)
+    assert 'allow-no-journal' in str(refusal), refusal
+    absent()
+    results.append('no-journal volume refused without --allow-no-journal')
 print('Setup phase failures and unrelated-name protection passed', flush=True)
 
 # Existing bare owners are not silently adopted or destroyed by a failed open.
@@ -182,6 +216,12 @@ for role in ('decoy', 'hidden'):
         affected = (range(10, 11) if role == 'hidden' else
                     blocks_touched(handle.device, offset // unit, (offset + size - 1) // unit))
         old = direct(v[role], offset=offset, size=size)
+        # Primary sectors this request may rewrite: the decoy range, or the
+        # hidden record's whole carrier (hidden-only tuples).
+        span = (range(offset // unit, (offset + size - 1) // unit + 1) if role == 'decoy'
+                else range(record_span(handle.device, 10)[0], record_span(handle.device, 10)[1] + 1))
+        saved = {sector: direct(v['decoy'], offset=sector * unit, size=unit) for sector in span}
+        sectors = handle.device.sectors
         before_count = blocks.native_status(handle.device)['encryptions']
         print(f'Injecting lower {mode} through {role}, {size} bytes at offset {offset}', flush=True)
         fault(mode)
@@ -205,6 +245,17 @@ for role in ('decoy', 'hidden'):
             handle = owner()
             assert handle.device.generation != generation and not blocks.native_status(handle.device)['failed']
             handle.close()
+            torn = []
+            if NO_JOURNAL:
+                # Without the journal a failed lower write may leave sectors
+                # torn (EIO). They must lie within the request's primary
+                # sectors, and full-sector decoy writes of the saved plaintext
+                # replace them (the failing-sector replacement path).
+                torn = unreadable(v['decoy'], unit, sectors)
+                assert set(torn) <= set(span), (torn, span)
+                for sector in torn:
+                    direct(v['decoy'], write=saved[sector], offset=sector * unit)
+                assert not unreadable(v['decoy'], unit, sectors)
             repaired = verify(v, unavailable=affected)
         else:
             # Nothing was mutated: only the request fails. A write needing the
@@ -227,6 +278,7 @@ for role in ('decoy', 'hidden'):
         results.append(dict(view=role, fault=mode, bytes=size, offset=offset,
                             failed_both_views=mode == 'writes', recreated=mode == 'writes',
                             same_owner_continued=mode == 'reads', repaired=repaired,
+                            torn_primary_sectors=torn if mode == 'writes' else [],
                             prepared_encryptions=spent))
         print(f'{role} lower {mode}: ' + ('fail-stop, teardown, replay and recreation passed' if mode == 'writes'
               else 'local EIO, no encryption, same-owner continuation passed'), flush=True)
@@ -239,11 +291,13 @@ for role in ('decoy', 'hidden'):
     handle = owner()
     generation = handle.device.generation
     unit = handle.device.sector_size
+    layout = handle.layout
     size = 16384 if role == 'decoy' else 512
     first10, last10 = record_span(handle.device, 10)
     offset = ((first10 * unit + size - 1) // size) * size if role == 'decoy' else 10 * 512
     last = ((offset + size - 1) // unit if role == 'decoy' else last10)
     physical = handle.layout.offsets(last)[0]
+    plaintext = direct(v[role], offset=offset, size=size)  # authenticated, before the fault
     original = direct('/dev/vdb', offset=physical, size=512)
     replacement = original[0] ^ 1
     corrupt_read(physical // 512, replacement)
@@ -261,11 +315,23 @@ for role in ('decoy', 'hidden'):
     status = blocks.native_status(handle.device)
     assert not status['failed']
     before_count = status['encryptions']
-    # A write overlapping the corrupt carrier authenticates first and must fail
-    # before encrypting or changing anything.
-    assert rejected(lambda: direct(v[role], write=b'\x5a' * size, offset=offset, size=size)).errno == errno.EIO
-    status = blocks.native_status(handle.device)
-    assert not status['failed'] and status['encryptions'] == before_count
+    if role == 'hidden' or unit > 512:
+        # A write that does not cover the failing sector entirely (any hidden
+        # write, or a 512-byte decoy write into a 4096-byte sector) needs its
+        # authenticated old data and must fail before encrypting or changing
+        # anything.
+        partial = (offset if role == 'hidden' else last * unit)
+        assert rejected(lambda: direct(v[role], write=b'\x5a' * 512, offset=partial, size=512)).errno == errno.EIO
+        status = blocks.native_status(handle.device)
+        assert not status['failed'] and status['encryptions'] == before_count
+    if role == 'decoy':
+        # A decoy write covering the failing sector entirely replaces it
+        # (user decision 2026-10-21): fresh IV, refreshed raw fragment. Writing
+        # the same plaintext keeps the primary oracle; record 10's fragment
+        # survives because the fault corrupts data, not the stored IV.
+        direct(v[role], write=plaintext, offset=offset)
+        status = blocks.native_status(handle.device)
+        assert not status['failed'] and status['encryptions'] == before_count + size // unit, status
     # Unrelated requests on both views continue during the fault.
     assert direct(v['hidden'], offset=0) == EXPECTED[:512]
     direct(v['decoy'], offset=0)
@@ -279,16 +345,39 @@ for role in ('decoy', 'hidden'):
                         same_owner_continued=True))
     print(f'{role} late primary corruption: no output, local EIO, unchanged storage and continuation passed', flush=True)
 
-# The full setup scan must also reject a later corrupt sector, before views exist.
+# --verify (full audit) rejects a later corrupt sector before views exist; the
+# default setup scans only the keyslot area and opens, leaving that sector to
+# fail authentication when accessed.
 corrupt_read(physical // 512, replacement)
 try:
-    rejected(open_views)
+    rejected(lambda: open_views(verify=True))
     absent()
+    v = open_views()
+    assert rejected(lambda: direct(v['hidden'], offset=10 * 512)).errno == errno.EIO
+    assert direct(v['hidden'], offset=0) == EXPECTED[:512]
+    handle = owner(); assert not blocks.native_status(handle.device)['failed']; handle.close()
+    close_views(); absent()
 finally:
     fault()
-v = open_views(); assert verify(v) is False
+v = open_views(verify=True); assert verify(v) is False
 close_views(); absent()
-results.append('late primary corruption rejected during setup, cleanup and reopen passed')
+results.append('late corruption: --verify refuses, default setup opens with local EIO, reopen passed')
+
+# A keyslot sector failing authentication does not block the default setup:
+# its raw stored IV is used and the keyslot SIV tag (or the other replica)
+# decides; --verify still refuses.
+ks_physical = layout.offsets(1)[0]
+ks_byte = direct('/dev/vdb', offset=ks_physical, size=512)[0] ^ 1
+corrupt_read(ks_physical // 512, ks_byte)
+try:
+    rejected(lambda: open_views(verify=True))
+    absent()
+    v = open_views()
+    assert direct(v['hidden'], offset=0) == EXPECTED[:512]
+    close_views(); absent()
+finally:
+    fault()
+results.append('keyslot sector failing authentication: default setup unlocks, --verify refuses')
 
 # A legitimate fresh-IV primary rewrite destroys one hidden record only.
 handle = owner(); dev = handle.device

@@ -30,6 +30,9 @@ ROOT = Path(__file__).resolve().parents[1]
 CONTROL_SCRIPTS = {
     'aegis-4096': ['scripts/guest-control-aegis.sh', 'scripts/guest-control.sh'],
     'aegis-512': ['scripts/guest-control-aegis-512.sh', 'scripts/guest-control.sh'],
+    # Stock --integrity-no-journal persisted in the LUKS2 header (direct-mode lower table).
+    'aegis-4096-nojournal': ['scripts/guest-control-aegis-nojournal.sh', 'scripts/guest-control.sh'],
+    'aegis-512-nojournal': ['scripts/guest-control-aegis-512-nojournal.sh', 'scripts/guest-control.sh'],
 }
 SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early', 'power', 'controls', 'sector', 'v4', 'migrate', 'fuzz')
 # Routine tier: run after kernel or pivsetup changes. The opt-in remainder is for

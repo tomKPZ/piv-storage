@@ -78,6 +78,11 @@ struct piv_native_status {
 #define PIV_SETUP_INITIALIZE 1U
 /* With INITIALIZE: A/B record slots (atomic per-block hidden writes, half capacity). */
 #define PIV_SETUP_AB 8U
+/* Full audit: authenticate every primary sector and refuse on any failure.
+ * Without it setup scans only the keyslot area (constant time); requests
+ * still authenticate every sector they touch.
+ */
+#define PIV_SETUP_VERIFY 16U
 #define PIV_NATIVE_SETUP _IOW('P', 12, struct piv_native_setup)
 #define PIV_NATIVE_DETACH _IOW('P', 13, struct piv_read_iv)
 #define PIV_NATIVE_STATUS _IOR('P', 14, struct piv_native_status)

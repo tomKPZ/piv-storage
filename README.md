@@ -96,8 +96,19 @@ Cleanup releases resources; it does not roll back a partial initialization.
 Opening without `--initialize` requires a keyslot to authenticate under the
 hidden key (or passphrase KDF) and the keyslot directory to be readable;
 otherwise setup fails (EKEYREJECTED for a wrong key) and removes its mappings.
-This **wrong-key guard** uses keyslot IVs collected during the mandatory primary
-scan, adding no I/O. A stock carrier has no keyslot: initialize it, or use stock
+This **wrong-key guard** uses keyslot IVs collected by setup's scan of the
+112-sector keyslot area. Setup does not read the rest of the volume (constant
+time on any size); every later request authenticates exactly the sectors it
+touches, so a damaged sector returns EIO when accessed, as in stock dm-crypt.
+`--verify` instead authenticates every primary sector first and refuses the
+volume on any failure (an O(volume) audit). A decoy write covering a whole
+damaged sector replaces it (fresh IV; its hidden fragment is kept only if the
+record still authenticates).
+
+Stock `--integrity-no-journal` volumes (LUKS2 persistent flag) open only with
+`--allow-no-journal`: they keep no journal history on disk, but a crash during a
+hidden write can destroy decoy sectors of that record, not just sectors being
+written (docs/journal-atomicity.md). The journal remains the default. A stock carrier has no keyslot: initialize it, or use stock
 cryptsetup for decoy-only access. A damaged hidden record returns EIO locally;
 decoy writes preserve its (damaged) fragments, so corruption never becomes valid
 zeros. Repair an unavailable block with a complete 512-byte direct-I/O write: a

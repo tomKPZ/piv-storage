@@ -16,8 +16,11 @@ done < /proc/mounts
 case "$root_type" in rootfs|tmpfs|ramfs) ;; *) fail "unexpected root filesystem $root_type" ;; esac
 if command -v python3 >/dev/null 2>&1; then fail 'python3 present in the test initramfs'; fi
 
+# A fixture persisting stock --integrity-no-journal needs the explicit opt-in.
+nojournal=
+if cryptsetup luksDump --dump-json-metadata /dev/vdb | grep -q '"no-journal"'; then nojournal=--allow-no-journal; fi
 pivsetup open-blocks --device /dev/vdb --key-file /piv/passphrase.key \
-    --hidden-key-file /piv/hidden.key > /run/open.json
+    --hidden-key-file /piv/hidden.key $nojournal > /run/open.json
 set -- $(dmsetup table piv-native)
 test "$3" = piv-crypt || fail "owner target is $3"
 grep -q "\"hidden_bytes\": $(stat -c %s /piv/expected-hidden-volume)\$" /run/open.json || fail 'hidden size'

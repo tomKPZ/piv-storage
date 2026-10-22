@@ -129,6 +129,8 @@ pub struct GuestOwner {
     pub uuid: String,
     pub layout: Layout,
     offset: u64,
+    /// The volume persists stock "no-journal": lower table in direct mode.
+    pub no_journal: bool,
     mapping_cipher: &'static str,
     raw_major: u32,
     raw_minor: u32,
@@ -145,6 +147,7 @@ impl GuestOwner {
         let metadata = json::parse(&crypt(&["luksDump", "--dump-json-metadata", source_text])?)
             .map_err(|e| Error::new(format!("Invalid LUKS2 metadata: {e}")))?;
         let offset = profile::validate_segment(&metadata)?;
+        let no_journal = profile::no_journal(&metadata)?;
         let segment = metadata.get("segments").and_then(|s| s.get("0")).expect("validated segment");
         let encryption = segment.get("encryption").and_then(json::Value::as_str).expect("validated").to_string();
         let luks_sector = segment.get("sector_size").and_then(json::Value::as_u64).expect("validated");
@@ -157,7 +160,7 @@ impl GuestOwner {
             layout: Layout { integrity_offset: 0, primary_bytes: 0, journal_sections: 0, journal_section_sectors: 0,
                              initial_sectors: 0, metadata_run_sectors: 0, interleave_sectors: 0, sector_size: 512,
                              tag_bytes: 16, iv_bytes: 12 },
-            offset, mapping_cipher, raw_major: libc::major(rdev), raw_minor: libc::minor(rdev),
+            offset, no_journal, mapping_cipher, raw_major: libc::major(rdev), raw_minor: libc::minor(rdev),
             lower_table: String::new(),
         };
         match owner.establish(&encryption, luks_sector, raw_bytes, passphrase_file) {
@@ -320,7 +323,7 @@ impl GuestOwner {
         profile::validate_integrity_table(table, sectors, self.raw_major, self.raw_minor, self.offset,
                                           self.layout.sector_size,
                                           self.layout.journal_sections * self.layout.journal_section_sectors,
-                                          self.layout.tuple_bytes())
+                                          self.layout.tuple_bytes(), self.no_journal)
     }
 
     pub fn device(&self) -> &KernelDevice {

@@ -14,6 +14,29 @@ w = Path('/mnt/piv-work')
 v = open_blocks('/dev/vdb', w / 'passphrase.key', (w / 'hidden.key').read_bytes())
 old = (w / 'power-old-hidden').read_bytes()
 new = (w / 'power-new-block').read_bytes()
+torn = []
+if os.environ.get('PIV_ALLOW_NO_JOURNAL') == '1':
+    # No integrity journal: the cut may have torn primary sectors that the
+    # interrupted hidden write was rewriting. Only that record's carrier may be
+    # affected; restore those sectors from the pre-cut copy by full-sector
+    # decoy writes (the failing-sector replacement path).
+    info = json.loads((w / 'power-carrier.json').read_text())
+    unit, saved = info['unit'], (w / 'power-carrier-plaintext').read_bytes()
+    carrier = range(info['first'], info['first'] + info['group'])
+    dfd = os.open(v['decoy'], os.O_RDWR | os.O_DIRECT)
+    one = mmap.mmap(-1, unit)
+    for sector in range(info['sectors']):
+        try:
+            os.preadv(dfd, [one], sector * unit)
+        except OSError as exc:
+            assert exc.errno == errno.EIO
+            torn.append(sector)
+    assert set(torn) <= set(carrier), (torn, carrier)
+    for sector in torn:
+        at = (sector - info['first']) * unit
+        one[:] = saved[at:at + unit]
+        assert os.pwritev(dfd, [one], sector * unit) == unit
+    os.fsync(dfd); os.close(dfd); one.close()
 fd = os.open(v['hidden'], os.O_RDWR | os.O_DIRECT)
 buf = mmap.mmap(-1, 512)
 try:
@@ -42,7 +65,7 @@ buf[:] = old[:512]
 os.pwritev(fd, [buf], 0); os.fsync(fd); os.close(fd); buf.close()
 assert Path(v['hidden']).read_bytes() == old
 close_blocks('/dev/vdb', w / 'passphrase.key')
-(w / 'power-results.json').write_text(json.dumps(dict(affected_block=outcome,
+(w / 'power-results.json').write_text(json.dumps(dict(affected_block=outcome, torn_primary_sectors=torn,
     other_hidden_blocks_unchanged=True, primary_unchanged=True, repair_passed=True)) + '\n')
 PY
 rmmod dm_piv

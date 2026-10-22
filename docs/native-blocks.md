@@ -37,12 +37,13 @@ by scripts/build_pivsetup.py with a committed Cargo.lock and static glibc; keys
 stay in mlocked, zeroized buffers and never reach argv). It invokes cryptsetup
 for ordinary LUKS opening and journal replay, suspends the new crypt mapping,
 reloads its private table as piv-crypt with piv_control, resumes it, then suspends
-and begins coordinated ownership, authenticates every primary sector,
+and begins coordinated ownership, authenticates the keyslot area (every primary
+sector with `--verify`),
 and loads the keyslot KEK and v4 base context through SETUP ABI 4.
 Optional destructive initialization writes a new master key, keyslot 0, the
 directory and zero hidden blocks before exposing devices. Without
 initialization, a keyslot must authenticate under the key, using keyslot IVs
-collected by the primary scan, and the directory must authenticate; otherwise
+collected by that scan, and the directory must authenticate; otherwise
 setup fails (EKEYREJECTED for a wrong key). There is no uninitialized-carrier
 mode. Hidden availability of individual records never gates the decoy. CRNG
 readiness is awaited before setup takes the owner lock. Runtime ownership locks

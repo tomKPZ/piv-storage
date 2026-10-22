@@ -52,18 +52,32 @@ def remove_mapping(name, identity, *, discard=False):
     dm('remove', '--retry', name)
 
 
-def validate_integrity_table(table, sectors, raw_device, offset, sector_size=4096, journal_sectors=1848, tuple_size=32):
+def no_journal(metadata):
+    """LUKS2 persistent flags: none, or exactly "no-journal" (stock
+    `cryptsetup open --integrity-no-journal --persistent`); others are refused."""
+    flags = metadata.get('config', {}).get('flags', [])
+    if flags == []:
+        return False
+    if flags == ['no-journal']:
+        return True
+    raise ValueError('Unsupported LUKS2 activation flags')
+
+
+def validate_integrity_table(table, sectors, raw_device, offset, sector_size=4096, journal_sectors=1848, tuple_size=32,
+                             no_journal=False):
+    """The stock lower table: journaled ("J"), or direct ("D") for no-journal."""
     if tuple_size != 32:
         raise ValueError('Unsupported lower tuple size')
     words = table.split()
     if (len(words) < 8 or words[:3] != ['0', str(sectors * (sector_size // 512)), 'integrity'] or
             words[3:7] != [f'{os.major(raw_device)}:{os.minor(raw_device)}',
-                           str(offset // 512), str(tuple_size), 'J'] or
+                           str(offset // 512), str(tuple_size), 'D' if no_journal else 'J'] or
             int(words[7]) != len(words) - 8):
         raise ValueError('Unsupported lower integrity mapping')
     options = words[8:]
-    required = {'interleave_sectors:32768', 'buffer_sectors:128',
-                'journal_watermark:50', 'commit_time:10000', 'fix_padding'}
+    required = {'interleave_sectors:32768', 'buffer_sectors:128', 'fix_padding'}
+    if not no_journal:
+        required |= {'journal_watermark:50', 'commit_time:10000'}
     if sector_size == 4096:
         required.add('block_size:4096')
     elif sector_size != 512:

@@ -20,7 +20,7 @@ Commands (inside the pinned disposable guest only, like the Python setup was):
 ```
 pivsetup open-blocks --key-file F (--hidden-key-file F | --hidden-passphrase-file F)
                      [--device /dev/vdb] [--name piv-native] [--initialize]
-                     [--ab] [--kdf argon2id|scrypt]
+                     [--ab] [--verify] [--kdf argon2id|scrypt]
 pivsetup close-blocks --key-file F [--device /dev/vdb] [--name piv-native]
 pivsetup keyslot add|remove --key-file F --slot 0-3 [--new-key-file F | --new-passphrase-file F [--kdf K]]
 pivsetup migrate --source-key-file F (--source-hidden-key-file F | --source-hidden-passphrase-file F)

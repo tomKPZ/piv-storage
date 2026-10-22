@@ -18,8 +18,11 @@ terminated it without cleanup.)
 ## Guarantees and limits
 
 Cancelling the authentication scan leaves no ready native state or public views.
+(Since 2026-10-21 the default scan covers only the keyslot area; the scan
+cancellation evidence below uses `--verify`, the full audit.)
 Healthy scan cancellation performs no primary encryption. Successful reopening
-still authenticates the entire primary; it does not adopt an incomplete scan.
+repeats the setup scan (the whole primary with `--verify`); it does not adopt an
+incomplete scan.
 
 Cancellation during --initialize waits for the current pn_write call to finish,
 then stops before another record starts. Under healthy I/O, completed leading

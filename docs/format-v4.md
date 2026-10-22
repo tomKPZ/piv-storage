@@ -2,7 +2,8 @@
 
 Status (2026-10-21): phases 1-3 implemented (fragments, records, keyslots and
 directory, A/B slots) in the kernel and the independent Python decoder; phase 4
-(`--integrity-no-journal`) is deferred. v4 is the only hidden format: format v3
+(`--integrity-no-journal`) is supported as an explicit opt-in since 2026-10-21
+(docs/journal-atomicity.md). v4 is the only hidden format: format v3
 and the 12-byte-IV profiles were removed on 2026-10-21 (user decision), so
 AEGIS-128 is the only primary profile. Nothing here is an independent
 cryptographic review; tested behaviour is recorded in ROADMAP.md.
@@ -133,8 +134,8 @@ keys. Its data lists, for each keyslot in use, that keyslot's outer keys OK_k
   but not recorded, because nothing is stored in clear: opening with the wrong
   KDF simply fails the key check. All keyslot
   keys use HKDF with the base context (without "/ab") as salt.
-- **Fast key check:** setup collects the keyslot fragments during the mandatory
-  scan and authenticates them. A wrong KEK fails immediately (EKEYREJECTED)
+- **Fast key check:** setup collects the keyslot fragments by scanning the
+  keyslot area and authenticates them. A wrong KEK fails immediately (EKEYREJECTED)
   without any record decryption.
 - **Corruption:** replicas defend a keyslot. A lost directory still allows
   unlocking, but decoy writes would then destroy the other keyslots. Setup
@@ -168,13 +169,16 @@ Stock-written sectors remain uniform random.
 - A hidden write still re-encrypts G sectors with unchanged primary plaintext.
   A decoy-key holder who sees journal history or two snapshots can detect it.
   Decoy writes no longer have this signature.
-- Format with `--integrity-no-journal` to avoid retaining history on disk.
+- Use stock `--integrity-no-journal` (pivsetup `--allow-no-journal`) to avoid
+  retaining history on disk, accepting the torn-decoy-sector hazard documented
+  in docs/journal-atomicity.md.
 
 ## Activation and detection
 
 Userspace (pivsetup) passes the v4 base context and the keyslot KEK (SETUP ABI
-4: flags INITIALIZE and AB only). During the mandatory scan the kernel collects
-the keyslot IVs and, once the scan has passed the 112 keyslot sectors, tries
+4: flags INITIALIZE, AB and VERIFY). Setup scans the 112 keyslot sectors (all
+sectors with VERIFY), collects their IVs (raw stored IVs for sectors failing
+authentication, which only the keyslot SIV tag can accept) and tries
 every keyslot replica. A keyslot that authenticates selects the A/B layout from
 its flags; the directory must then authenticate too. Otherwise setup fails with
 EKEYREJECTED. Initialization creates a random master key, keyslot 0 under the
@@ -190,5 +194,5 @@ blocks unavailable (EIO) rather than holding their previous contents.
 2. **Keyslots and directory:** KDF in userspace, fast key check replacing the
    record-probe guard for v4, passphrase add/change ioctl.
 3. **A/B slots** as an initialization option, plus interrupted-write tests.
-4. **`--integrity-no-journal` support**, with the default decided by the journal
-   atomicity experiment (roadmap item 6).
+4. **`--integrity-no-journal` support** — done as an opt-in; the journal stays
+   the default (docs/journal-atomicity.md).

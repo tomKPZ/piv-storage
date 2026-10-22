@@ -158,5 +158,24 @@ class IntegrityTableTests(unittest.TestCase):
                     validate_integrity_table(changed, count, os.makedev(254, 16), 16777216, size, journal, tuple_size)
 
 
+class NoJournalTests(unittest.TestCase):
+    def test_direct_mode_table_and_flags(self):
+        from pivstore.kernel_api import no_journal
+        direct = ('0 225728 integrity 254:16 32768 32 D 5 block_size:4096 journal_sectors:1848 '
+                  'interleave_sectors:32768 buffer_sectors:128 fix_padding')
+        validate_integrity_table(direct, 28216, os.makedev(254, 16), 16777216, 4096, 1848, 32, True)
+        with self.assertRaises(ValueError):
+            validate_integrity_table(direct, 28216, os.makedev(254, 16), 16777216, 4096, 1848, 32, False)
+        with self.assertRaises(ValueError):
+            validate_integrity_table(direct + ' journal_watermark:50', 28216, os.makedev(254, 16), 16777216,
+                                     4096, 1848, 32, True)
+        self.assertFalse(no_journal({'config': {}}))
+        self.assertFalse(no_journal({'config': {'flags': []}}))
+        self.assertTrue(no_journal({'config': {'flags': ['no-journal']}}))
+        for flags in (['allow-discards'], ['no-journal', 'allow-discards']):
+            with self.assertRaises(ValueError):
+                no_journal({'config': {'flags': flags}})
+
+
 if __name__ == '__main__':
     unittest.main()

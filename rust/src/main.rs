@@ -25,7 +25,7 @@ use secret::Secret;
 const USAGE: &str = "\
 usage: pivsetup open-blocks --key-file F (--hidden-key-file F | --hidden-passphrase-file F)
                             [--device /dev/vdb] [--name piv-native] [--initialize]
-                            [--ab] [--kdf argon2id|scrypt]
+                            [--ab] [--verify] [--allow-no-journal] [--kdf argon2id|scrypt]
        pivsetup close-blocks --key-file F [--device /dev/vdb] [--name piv-native]
        pivsetup keyslot add|remove --key-file F --slot 0-3
                             [--new-key-file F | --new-passphrase-file F [--kdf argon2id|scrypt]]
@@ -38,6 +38,10 @@ usage: pivsetup open-blocks --key-file F (--hidden-key-file F | --hidden-passphr
 
 LUKS2 AEGIS-128 (aegis128-random, integrity aead) volumes with hidden format v4 only.
 --initialize destroys all existing hidden contents. Keys are read from files only.
+Setup authenticates only the keyslot area; --verify first authenticates every
+primary sector and refuses on any failure (a full audit, O(volume) time).
+Volumes persisting stock --integrity-no-journal need --allow-no-journal: a crash
+during a hidden write can then destroy decoy sectors of that record.
 Passphrase KEKs use --kdf (default argon2id: 64 MiB, t=3, p=4); nothing records
 which KDF a keyslot used, so open with the same one. migrate copies both views of
 an opened source into a freshly luksFormatted AEGIS-128 target that it initializes
@@ -61,7 +65,8 @@ impl Args {
                       "--source", "--source-key-file", "--source-hidden-key-file",
                       "--source-hidden-passphrase-file", "--source-kdf", "--target", "--target-key-file",
                       "--target-hidden-key-file", "--target-hidden-passphrase-file", "--target-kdf"];
-        let switches = ["--initialize", "--ab", "--allow-test-stack", "--allow-second-disk"];
+        let switches = ["--initialize", "--ab", "--verify", "--allow-no-journal", "--allow-test-stack",
+                        "--allow-second-disk"];
         while let Some(word) = argv.next() {
             let (key, inline) = match word.split_once('=') {
                 Some((k, v)) if k.starts_with("--") => (k.to_string(), Some(v.to_string())),
@@ -184,10 +189,12 @@ fn run(args: Args) -> Result<()> {
     match args.action.as_str() {
         "open-blocks" => {
             args.only(&["--device", "--key-file", "--name", "--hidden-key-file", "--hidden-passphrase-file",
-                        "--initialize", "--ab", "--allow-test-stack", "--allow-second-disk", "--kdf"])?;
+                        "--initialize", "--ab", "--verify", "--allow-no-journal", "--allow-test-stack",
+                        "--allow-second-disk", "--kdf"])?;
             let secret = hidden_secret(&args, "--hidden", "--kdf")?;
             let options = OpenOptions {
-                name: &name, initialize: args.flag("--initialize"), ab: args.flag("--ab"), allow,
+                name: &name, initialize: args.flag("--initialize"), ab: args.flag("--ab"),
+                verify: args.flag("--verify"), allow_no_journal: args.flag("--allow-no-journal"), allow,
             };
             let views = blocks::open_blocks(&device, &args.required("--key-file")?, secret, &options)?;
             println!("{{\n  \"decoy\": {},\n  \"hidden\": {},\n  \"hidden_bytes\": {}\n}}",
@@ -202,13 +209,13 @@ fn run(args: Args) -> Result<()> {
             args.only(&["--source", "--source-key-file", "--source-hidden-key-file",
                         "--source-hidden-passphrase-file", "--source-kdf", "--target", "--target-key-file",
                         "--target-hidden-key-file", "--target-hidden-passphrase-file", "--target-kdf", "--ab",
-                        "--allow-test-stack", "--allow-second-disk"])?;
+                        "--allow-no-journal", "--allow-test-stack", "--allow-second-disk"])?;
             let source = args.path("--source").unwrap_or_else(|| PathBuf::from("/dev/vdb"));
             let source_secret = hidden_secret(&args, "--source-hidden", "--source-kdf")?;
             let target_secret = hidden_secret(&args, "--target-hidden", "--target-kdf")?;
             let report = migrate::migrate(&source, &args.required("--source-key-file")?, source_secret,
                                           &args.required("--target")?, &args.required("--target-key-file")?,
-                                          target_secret, args.flag("--ab"), allow)?;
+                                          target_secret, args.flag("--ab"), args.flag("--allow-no-journal"), allow)?;
             println!("{{\n  \"decoy\": {{\"bytes\": {}, \"target_bytes\": {}}},\n  \
                       \"hidden\": {{\"bytes\": {}, \"target_bytes\": {}}},\n  \"verified\": true\n}}",
                      report.decoy_bytes, report.decoy_target_bytes, report.hidden_bytes, report.hidden_target_bytes);

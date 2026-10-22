@@ -69,6 +69,7 @@ struct piv_sector {
 	struct page *page;
 	struct bio *bio;
 	u8 original[PIV_TUPLE_BYTES];
+	bool bad;	/* piv_load_mode(allow_bad): stored tuple failed authentication */
 };
 
 static void piv_sector_free(struct piv_crypt *cc, struct piv_sector *s)
@@ -106,8 +107,14 @@ static int piv_crypto(struct piv_crypt *cc, struct piv_sector *s,
 			op_is_write(bio_op(s->bio)));
 }
 
-/* Caller holds lifecycle lock. Plaintext lives only in a private wiped page. */
-static int piv_load(struct piv_crypt *cc, u64 index, struct piv_sector **out)
+/* Caller holds lifecycle lock. Plaintext lives only in a private wiped page.
+ * With @allow_bad, a sector whose stored tuple fails authentication (-EBADMSG,
+ * e.g. torn by a crash without the integrity journal) is returned with ->bad set
+ * and its raw stored ciphertext/tuple in ->original; its page is not plaintext.
+ * Only internal full-sector replacement and SIV-protected fragment collection
+ * may use that; nothing unauthenticated is ever published.
+ */
+static noinline int piv_load_mode(struct piv_crypt *cc, u64 index, struct piv_sector **out, bool allow_bad)
 {
 	struct piv_sector *s;
 	struct bvec_iter saved;
@@ -133,6 +140,10 @@ static int piv_load(struct piv_crypt *cc, u64 index, struct piv_sector **out)
 	memcpy(s->original, page_address(s->page), cc->sector_size);
 	memcpy(s->original + 4096, s->io.integrity_metadata, cc->tuple_size);
 	ret = piv_crypto(cc, s, NULL);
+	if (ret == -EBADMSG && allow_bad) {
+		s->bad = true;
+		ret = 0;
+	}
 	if (ret)
 		goto bad;
 	*out = s;
@@ -140,6 +151,11 @@ static int piv_load(struct piv_crypt *cc, u64 index, struct piv_sector **out)
 bad:
 	piv_sector_free(cc, s);
 	return ret;
+}
+
+static int piv_load(struct piv_crypt *cc, u64 index, struct piv_sector **out)
+{
+	return piv_load_mode(cc, index, out, false);
 }
 
 /* Bounded lower reads; outputs are published only after every sector verifies.
@@ -236,8 +252,12 @@ static int piv_read_iv(struct piv_control *p, struct piv_read_iv *out, bool quie
 	return ret;
 }
 
+/* @replace (internal primary updates only): the old sector may fail
+ * authentication; its full plaintext is replaced, so nothing of it is kept
+ * except the raw stored IV used as expected_iv and for fragment refresh.
+ */
 static int piv_update(struct piv_control *p, struct file *file,
-		      struct piv_update *u, bool prepare, bool primary, bool internal)
+		      struct piv_update *u, bool prepare, bool primary, bool internal, bool replace)
 {
 	struct piv_crypt *cc = p->cc;
 	struct piv_sector *old = NULL, *candidate = NULL;
@@ -260,7 +280,9 @@ static int piv_update(struct piv_control *p, struct file *file,
 		return -EIO;
 	if (prepare && memchr_inv(u->tuple + (primary ? 4096 : 0), 0, primary ? 16 : 4112))
 		return -EINVAL;
-	ret = piv_load(cc, u->sector, &old);
+	if (replace && (!internal || !primary))
+		return -EINVAL;
+	ret = piv_load_mode(cc, u->sector, &old, replace);
 	if (ret)
 		goto done;
 	/* Exact replay performs no new encryption or changed data write. */
@@ -441,7 +463,7 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	} else if (p->native && cmd != PIV_QUERY && cmd != PIV_DEVICES)
 		ret = -EBUSY;
 	else if (updating)
-		ret = piv_update(p, file, update, preparing, primary, false);
+		ret = piv_update(p, file, update, preparing, primary, false, false);
 	else if (cmd == PIV_READ_PRIMARY) {
 		struct piv_sector *sector = NULL;
 		ret = piv_identity(p, update->version, update->size, update->generation,

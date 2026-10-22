@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::bail;
 use crate::cmd::{dm, dm_ok};
 use crate::error::{Error, Result};
-use crate::ioctl::{KernelDevice, SETUP_AB, SETUP_INITIALIZE};
+use crate::ioctl::{KernelDevice, SETUP_AB, SETUP_INITIALIZE, SETUP_VERIFY};
 use crate::owner::{mapping_identity, remove_mapping, Allow, GuestOwner};
 use crate::profile::context_v4;
 use crate::secret::Secret;
@@ -44,6 +44,9 @@ pub struct OpenOptions<'a> {
     pub name: &'a str,
     pub initialize: bool,
     pub ab: bool,
+    pub verify: bool,
+    /// Accept a volume that persists stock "no-journal" (see docs/journal-atomicity.md).
+    pub allow_no_journal: bool,
     pub allow: Allow,
 }
 
@@ -93,11 +96,12 @@ pub fn passphrase_kek(passphrase: &[u8], base_context: &[u8], kdf: Kdf) -> Resul
     Ok(kek)
 }
 
-fn setup_flags(initialize: bool, ab: bool) -> Result<u32> {
+fn setup_flags(initialize: bool, ab: bool, verify: bool) -> Result<u32> {
     if ab && !initialize {
         bail!("--ab applies only with --initialize (the layout is read from the keyslot afterwards)");
     }
-    Ok((if initialize { SETUP_INITIALIZE } else { 0 }) | (if ab { SETUP_AB } else { 0 }))
+    Ok((if initialize { SETUP_INITIALIZE } else { 0 }) | (if ab { SETUP_AB } else { 0 })
+        | (if verify { SETUP_VERIFY } else { 0 }))
 }
 
 fn native_setup(device: &KernelDevice, key: &[u8], identity: &[u8], flags: u32) -> Result<()> {
@@ -168,7 +172,13 @@ fn open_inner(owner: &mut GuestOwner, secret: HiddenSecret, options: &OpenOption
             return Err(Error::os(libc::EEXIST, "Public view name is already in use"));
         }
     }
-    let flags = setup_flags(options.initialize, options.ab)?;
+    if owner.no_journal && !options.allow_no_journal {
+        let mut error = Error::new("Volume uses stock --integrity-no-journal; pass --allow-no-journal to accept");
+        error.note("Without the journal, a crash during a hidden write can destroy decoy sectors of that record \
+                    (they return EIO), not only sectors being written; see docs/journal-atomicity.md");
+        return Err(error);
+    }
+    let flags = setup_flags(options.initialize, options.ab, options.verify)?;
     let identity = base_identity(owner);
     let key = match secret {
         HiddenSecret::Key(key) => key,
@@ -284,11 +294,12 @@ mod tests {
 
     #[test]
     fn setup_flags_match_kernel_abi() {
-        // kernel/piv-control.h: INITIALIZE = 1, AB = 8 (SETUP ABI 4).
-        assert_eq!(setup_flags(false, false).unwrap(), 0);
-        assert_eq!(setup_flags(true, false).unwrap(), 1);
-        assert_eq!(setup_flags(true, true).unwrap(), 9);
-        assert!(setup_flags(false, true).is_err());
+        // kernel/piv-control.h: INITIALIZE = 1, AB = 8, VERIFY = 16 (SETUP ABI 4).
+        assert_eq!(setup_flags(false, false, false).unwrap(), 0);
+        assert_eq!(setup_flags(true, false, false).unwrap(), 1);
+        assert_eq!(setup_flags(true, true, false).unwrap(), 9);
+        assert_eq!(setup_flags(false, false, true).unwrap(), 16);
+        assert!(setup_flags(false, true, false).is_err());
     }
 
     #[test]

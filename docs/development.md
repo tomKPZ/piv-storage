@@ -91,7 +91,10 @@ and fuzz, meant for changes in their own areas; migrate attaches a second 512 Mi
 disk, /dev/vdc, via `vm.py --second-blank-mib`; fuzz runs
 kernel/guest-table-fuzz.py (table/constructor fuzzing) and
 kernel/guest-ioctl-fuzz.py, seeded control-ioctl fuzzing with
-`PIV_FUZZ_STEPS`/`PIV_FUZZ_SEED` overrides, best on the sanitizer image). Profiles are aegis-4096 and aegis-512. `--suites-for PROFILE=LIST` narrows the suites of matching profiles.
+`PIV_FUZZ_STEPS`/`PIV_FUZZ_SEED` overrides, best on the sanitizer image). Profiles are aegis-4096 and aegis-512, plus aegis-4096-nojournal and
+aegis-512-nojournal (fixtures persisting stock --integrity-no-journal; guest_code
+then exports PIV_ALLOW_NO_JOURNAL=1 so the test client passes --allow-no-journal;
+the sector suite is journaled-only). `--suites-for PROFILE=LIST` narrows the suites of matching profiles.
 `--reuse-native PREFIX` skips the native step and starts the suites from a
 previous matrix's passed, host-verified native run when the module input
 (scaffold or module SHA-256, recorded in summary.json) and base image match;

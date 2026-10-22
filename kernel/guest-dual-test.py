@@ -31,6 +31,7 @@ def setup(initialize=False, rejected=False):
             '--key-file', str(W / 'passphrase.key'), '--hidden-key-file', str(W / 'hidden.key'),
             ]
     if initialize: args.append('--initialize')
+    if os.environ.get('PIV_ALLOW_NO_JOURNAL') == '1': args.append('--allow-no-journal')
     result = subprocess.run(args, capture_output=True, text=True)
     if rejected:
         # Wrong-key guard: no keyslot authenticates, so setup must refuse and

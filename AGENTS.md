@@ -55,9 +55,11 @@ resolved from context/evidence, not for routine implementation decisions.
   directory, Argon2id (default) or scrypt passphrase KEKs and optional A/B
   slots. Never add a persistent encryption counter. Format v3, its invalid
   markers and the 12-byte-IV AES-GCM/ChaCha20-Poly1305 profiles were removed
-  by user decision (2026-10-21, "option A"); do not reintroduce them. Still
-  planned: stock `--integrity-no-journal` support (deferred by the user
-  2026-10-21; needs a torn-sector policy decision, see docs/journal-atomicity.md).
+  by user decision (2026-10-21, "option A"); do not reintroduce them. Stock
+  `--integrity-no-journal` (persisted LUKS2 flag "no-journal", direct-mode
+  lower table) is accepted only with pivsetup's explicit --allow-no-journal,
+  because a crash during a hidden write can tear decoy sectors of that record
+  (docs/journal-atomicity.md); the journal stays the default.
   Multi-snapshot observers, rollback resistance and alternative hidden openings
   under coercion are out of scope. Never put host-specific (e.g. corporate
   kernel) identifiers in the repository.
@@ -80,7 +82,7 @@ resolved from context/evidence, not for routine implementation decisions.
   only that bio; APPLY-time and flush errors stop the shared owner. Local hidden
   unavailability must not stop the decoy.
 - Wrong-key guard: setup without initialize requires a keyslot to
-  authenticate, using IVs from the mandatory scan, and refuses without the
+  authenticate, using IVs from the keyslot-area scan, and refuses without the
   keyslot directory. Never add extra I/O for it. There is no
   uninitialized-carrier mode (removed with v3); stock carriers must be
   initialized.
@@ -90,7 +92,7 @@ resolved from context/evidence, not for routine implementation decisions.
   one bio, not cross-bio writeback. Tail primary sectors have no hidden record.
 - Setup polls pending signals and yields between authenticated ranges and
   complete initialization records. Keep cancellation outside pn_write: completed
-  records stay committed, full scan is mandatory on retry, and cancellation is
+  records stay committed, the keyslot-area scan repeats on retry, and cancellation is
   not rollback. Failed-attempt cleanup may errorize only its newly created,
   identity-checked private owner to drain probes; never force public views or
   existing/foreign mappings. Normal close retains busy-device protection.
@@ -113,7 +115,8 @@ resolved from context/evidence, not for routine implementation decisions.
   kernel/prepare.py) stages the complete module source.
 - Supported profile: LUKS2 original aegis128-random (integrity aead; not
   AEGIS-128L), 512/4096-byte sectors, 16-byte keys, IVs and tags.
-  Integrity v4 fixed padding and the ordinary journal are required. Validate geometry,
+  Integrity v4 fixed padding and the ordinary journal are required (or the
+  opted-in stock no-journal direct mode). Validate geometry,
   AAD, extents and arithmetic. Offline diagnostics reject dirty journals; native
   setup delegates replay to Linux before authenticated access.
 - Use maintained crypto primitives. Setup is the static Rust `pivsetup` binary
@@ -132,7 +135,14 @@ resolved from context/evidence, not for routine implementation decisions.
 - All primary plaintext remains byte-for-byte identical after a hidden update,
   and unmodified Linux verifies every supported primary sector.
 - Authenticate the original primary data before modifying it. A replacement IV
-  requires recomputed primary ciphertext and tag with exact Linux AAD.
+  requires recomputed primary ciphertext and tag with exact Linux AAD. Sole
+  exception (user decision 2026-10-21): a decoy write covering an entire primary
+  sector that fails authentication replaces it, refreshing its raw stored
+  fragment; the record's SIV tag still decides hidden validity.
+- Setup scans only the 112-sector keyslot area by default (user decision
+  2026-10-21); every request authenticates what it touches. `--verify`
+  (PIV_SETUP_VERIFY) is the strict full audit. Never publish unauthenticated
+  bytes or IVs; raw IVs of failing sectors may feed only SIV-checked decoding.
 - Primary AEAD nonce uniqueness is per key across sectors and time. Different
   addresses/AAD do not permit reuse. Repeated hidden data must be freshly
   randomized on rewrite. Specify retries, rollback, clones and lifetime budgets.

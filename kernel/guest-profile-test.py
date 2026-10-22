@@ -117,7 +117,7 @@ def symbol(stem):
     assert len(matches) == 1, (stem, matches)
     return 'dm_piv:' + matches[0]
 probes = {event: symbol(function) for event, function in dict(
-    load='piv_load', range='piv_read_range', crypto='piv_aead',
+    load='piv_load_mode', range='piv_read_range', crypto='piv_aead',
     write='pn_write', checkpoint='piv_checkpoint').items()}
 
 
@@ -160,10 +160,11 @@ try:
     (T / 'events/piv_profile/enable').write_text('1')
     per_range = 16384 // unit
     v4_ranges = (90 + per_range - 1) // per_range  # one 90-sector record
-    # The keyslot check runs once the scan passes the 112 keyslot sectors (no
-    # extra I/O); the directory (groups 0 and 1) is then read and authenticated.
-    setup_expected = dict(load=1, range=(sectors + per_range - 1) // per_range + 2 * v4_ranges,
-                          crypto=sectors + 1 + 2 * 90, write=0, checkpoint=1)
+    # Default setup scans only the 112 keyslot sectors (the keyslot check runs
+    # on their IVs); the directory (groups 0 and 1) is then read and
+    # authenticated. --verify would scan every sector instead.
+    setup_expected = dict(load=1, range=(112 + per_range - 1) // per_range + 2 * v4_ranges,
+                          crypto=112 + 1 + 2 * 90, write=0, checkpoint=1)
     # Bracket exactly the SETUP ioctl with pivsetup's gate (before) and hold
     # (after) hooks; the binary waits at each point for our marker file.
     counted_gate = '/run/piv-profile-counted'

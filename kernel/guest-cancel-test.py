@@ -125,8 +125,10 @@ def spawn(phase):
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     # The real setup client: pivsetup with its explicit gate hook, default SIGINT
     # handling (cooperative cancellation), cleanup and exit status 130.
+    # The scan phase cancels a --verify full audit: the default setup scans only
+    # the keyslot area, too briefly to witness cancellation reliably.
     args = blocks.open_args(SOURCE, KEY, W / 'hidden.key', initialize=phase == 'initialize',
-                            allow_test_stack=True)
+                            verify=phase == 'scan', allow_test_stack=True)
     return subprocess.Popen([blocks.binary(), *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, env={**os.environ, 'PIVSETUP_TEST_GATE': str(W / phase)})
 

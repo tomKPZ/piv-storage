@@ -35,6 +35,8 @@ pub const KEYSLOT_SIZE: usize = 64; // '=IIQII32s2I'
 pub const SETUP_INITIALIZE: u32 = 1;
 /// With SETUP_INITIALIZE: A/B record slots.
 pub const SETUP_AB: u32 = 8;
+/// Full audit: authenticate every primary sector at setup (else keyslot area only).
+pub const SETUP_VERIFY: u32 = 16;
 pub const KEYSLOT_ADD: u32 = 1;
 pub const KEYSLOT_REMOVE: u32 = 2;
 

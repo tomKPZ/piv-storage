@@ -165,16 +165,16 @@ fn copy_both(src: &Views, dst: &Views) -> Result<Report> {
 #[allow(clippy::too_many_arguments)]
 pub fn migrate(source: &Path, source_key_file: &Path, source_secret: HiddenSecret,
                target: &Path, target_key_file: &Path, target_secret: HiddenSecret,
-               ab: bool, allow: Allow) -> Result<Report> {
+               ab: bool, allow_no_journal: bool, allow: Allow) -> Result<Report> {
     let canonical = |p: &Path| std::fs::canonicalize(p).map_err(Error::from);
     if canonical(source)? == canonical(target)? || path_str(source)? == path_str(target)? {
         bail!("Source and target must be different devices");
     }
     let src = open_blocks(source, source_key_file, source_secret,
-                          &OpenOptions { name: SOURCE_NAME, initialize: false, ab: false, allow })?;
+                          &OpenOptions { name: SOURCE_NAME, initialize: false, ab: false, verify: false, allow_no_journal, allow })?;
     let result = (|| {
         let dst = open_blocks(target, target_key_file, target_secret,
-                              &OpenOptions { name: TARGET_NAME, initialize: true, ab, allow })?;
+                              &OpenOptions { name: TARGET_NAME, initialize: true, ab, verify: false, allow_no_journal, allow })?;
         let copied = copy_both(&src, &dst);
         let closed = close_blocks(target, target_key_file, TARGET_NAME, allow);
         match (copied, closed) {
