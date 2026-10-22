@@ -36,7 +36,6 @@ only with a concrete need; each needs a disposable-guest test first):
 - Boot-time `ask` prompts (initramfs askpass), a root filesystem on a view,
   Secure Boot enrollment/enforcement of the DKMS-signed module, dracut and
   non-Debian distributions (packaging/README.md lists what was verified).
-- External cryptographic review of the format and profiles (not an agent task).
 
 ## Standing decisions (binding for autonomous sessions)
 
