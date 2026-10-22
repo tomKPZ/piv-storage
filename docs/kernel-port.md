@@ -18,8 +18,7 @@ Python, Rust) accept `7.2.9+deb13-amd64` only with that marker; module builds
 on it use the normal boot/header config comparison (check-config.py now takes
 the release for the `CONFIG_BUILD_SALT` packaging entry).
 
-Run suites with `suite.py --base-image downloads/port-kernel-<hash>.qcow2`. The
-sector suite asserts the stock 6.12 release by design and fails there.
+Run suites with `suite.py --base-image downloads/port-kernel-<hash>.qcow2`.
 
 ## API differences handled (kernel/dm-piv.c)
 

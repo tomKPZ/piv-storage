@@ -61,6 +61,21 @@ def unreadable(path, unit, sectors, chunk=65536):
     return bad
 
 
+def stock_rewrite(source, key, sector, unit):
+    """One uncoordinated stock dm-crypt rewrite of primary @sector with its own
+    plaintext: stock writes pick a fresh random IV, destroying that fragment."""
+    subprocess.run(['cryptsetup', 'open', '--key-file', str(key), str(source), 'piv-stock-rw'], check=True)
+    try:
+        fd = os.open('/dev/mapper/piv-stock-rw', os.O_RDWR | os.O_DIRECT)
+        with mmap.mmap(-1, unit) as buf:
+            assert os.preadv(fd, [buf], sector * unit) == unit
+            assert os.pwritev(fd, [buf], sector * unit) == unit
+            os.fsync(fd)
+        os.close(fd)
+    finally:
+        subprocess.run(['cryptsetup', 'close', 'piv-stock-rw'], check=True)
+
+
 def open_views(**options):
     value = blocks.open_blocks(SOURCE, KEY, HKEY, allow_test_stack=True, **options)
     subprocess.run(['udevadm', 'settle'], check=True)
@@ -410,20 +425,16 @@ finally:
     fault()
 results.append('keyslot sector failing authentication: default setup unlocks, --verify refuses')
 
-# A legitimate fresh-IV primary rewrite destroys one hidden record only.
-handle = owner(); dev = handle.device
-damaged = record_span(dev, 0)[0]  # sector 0 is a keyslot replica
-handle.device.suspend(); dev.begin()
-old = dev.read_iv(damaged, quiesced=True)
-value = dev.prepare(damaged, old, os.urandom(dev.iv_size))
-dev.apply(damaged, old, value); dev.end(); dev.resume(); handle.remove(); handle.close()
+# An uncoordinated stock rewrite (same plaintext, fresh IV) destroys one hidden record only.
+damaged = record_span(None, 0)[0]  # sector 0 is a keyslot replica
+stock_rewrite(SOURCE, KEY, damaged, unit)
 v = open_views()
 assert rejected(lambda: direct(v['hidden'])).errno == errno.EIO
 assert direct(v['hidden'], offset=512) == EXPECTED[512:1024]
 handle = owner(); assert not blocks.native_status(handle.device)['failed']; handle.close()
 # Rewrite the decoy bytes carrying that sector: re-randomizes only that sector,
 # preserving the damage.
-decoy_offset = damaged * dev.sector_size // 4096 * 4096
+decoy_offset = damaged * unit // 4096 * 4096
 direct(v['decoy'], write=direct(v['decoy'], offset=decoy_offset), offset=decoy_offset)
 assert rejected(lambda: direct(v['hidden'])).errno == errno.EIO
 handle = owner(); assert not blocks.native_status(handle.device)['failed']; handle.close()

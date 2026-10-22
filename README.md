@@ -153,7 +153,7 @@ encryption cap is only a diagnostic guard: reopening resets it. All writes,
 retries, failed preparations and clones count toward the real per-key budget.
 A 512-byte hidden write reencrypts 90 primary sectors (360 KiB at 4096-byte
 sectors, 45 KiB at 512), before ordinary journal overhead; decoy writes have no
-hidden amplification. Measured write costs are in ROADMAP.md (guest-v4-test).
+hidden amplification. guest-v4-test measures write costs (write_profile).
 
 Never rely on snapshot-restored RNG state or replay cached encryption plans. A
 repeated primary IV under one key is AEAD nonce reuse. VM snapshot restores,
@@ -210,5 +210,5 @@ hidden write's 90 sectors reencrypted with unchanged plaintext (see the
 [Matched ordinary-Linux controls](docs/detectability.md) show that a v4 decoy
 write changes exactly the IVs an ordinary write changes. These results provide
 no multi-snapshot/workload-observing deniability guarantee. See
-[roadmap](ROADMAP.md) for results and next work, and
+[roadmap](ROADMAP.md) for remaining work, commit messages for executed runs, and
 [observed layout](docs/observed-layout.md) for source evidence.

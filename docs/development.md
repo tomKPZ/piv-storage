@@ -80,7 +80,7 @@ live; re-provision deliberately rather than assuming a snapshot pin.
 ```sh
 python3 scripts/suite.py --prefix artifacts/suite-next \
   --profile aegis-4096 --profile aegis-512 \
-  --scaffold artifacts/stage-next/scaffold.tar   # or --module experimental-dm-piv.ko
+  --scaffold artifacts/stage-next/scaffold.tar
 ```
 
 Per profile it creates a stock fixture (or uses --control), runs the native
@@ -93,8 +93,7 @@ kernel/guest-table-fuzz.py (table/constructor fuzzing) and
 kernel/guest-ioctl-fuzz.py, seeded control-ioctl fuzzing with
 `PIV_FUZZ_STEPS`/`PIV_FUZZ_SEED` overrides, best on the sanitizer image). Profiles are aegis-4096 and aegis-512, plus aegis-4096-nojournal and
 aegis-512-nojournal (fixtures persisting stock --integrity-no-journal; guest_code
-then exports PIV_ALLOW_NO_JOURNAL=1 so the test client passes --allow-no-journal;
-the sector suite is journaled-only). `--suites-for PROFILE=LIST` narrows the suites of matching profiles.
+then exports PIV_ALLOW_NO_JOURNAL=1 so the test client passes --allow-no-journal). `--suites-for PROFILE=LIST` narrows the suites of matching profiles.
 `--reuse-native PREFIX` skips the native step and starts the suites from a
 previous matrix's passed, host-verified native run when the module input
 (scaffold or module SHA-256, recorded in summary.json) and base image match;
@@ -134,22 +133,12 @@ times out, preserve its transcript for diagnosis and discard that run as a
 source of trusted fixtures. These VM checks establish primary compatibility for
 the attached image, not hardware crash durability or plausible deniability.
 
-## Verify an output image with stock Linux
+## Verify an output image
 
-The runner copies the supplied image into a new private run before attachment.
-It never attaches the supplied image directly. Use the original control volume's
-synthetic passphrase and expected primary digest:
-
-```sh
-python3 scripts/vm.py run --script scripts/guest-verify.sh --data-image artifacts/native-closed.img --share-file artifacts/control-003/share/passphrase.key --share-file artifacts/control-003/share/expected.sha256 --run-dir artifacts/verify-native-next
-```
-
-The verification task opens the volume read-only, reads/authenticates every
-primary byte, checks the expected plaintext hash, and verifies that the raw
-image digest did not change. It records package/kernel provenance and a result
-marker. This passed for both a four-sector random-IV experiment and a complete
-hidden-payload pack in earlier revisions. Current hidden records are format v4
-(docs/format-v4.md); use the current native tests for that format.
+Every suite verifies its closed output images on the host with
+`scripts/check_stateless.py` (independent primary authentication and hidden
+decoding) and inside the guest with stock dm-crypt readback; there is no
+separate verification VM task.
 
 ## Source subset
 

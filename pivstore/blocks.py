@@ -26,7 +26,7 @@ SETUP = struct.Struct('=IIQII32s128s2I')
 # SETUP ABI 4 (format v4 only): flags INITIALIZE and AB.
 SETUP_VERSION = 4
 SETUP_INITIALIZE, SETUP_AB, SETUP_VERIFY = 1, 8, 16
-STATUS = struct.Struct('=QQQQIIII')
+STATUS = struct.Struct('=QQQIIII')  # STATUS version 4
 KEYSLOT = struct.Struct('=IIQII32s2I')
 # Passphrase KEK parameters; must equal rust/src/blocks.rs. Argon2id (default):
 # RFC 9106 second recommendation; scrypt kept as an explicit alternative.
@@ -165,11 +165,11 @@ def native_status(device):
     """Test instrumentation: volatile kernel status of a bound control."""
     data = bytearray(STATUS.size)
     fcntl.ioctl(device.fd, command(14, STATUS.size, 2), data, True)
-    generation, hidden, encryptions, invalidations, active, views, failed, version = STATUS.unpack(data)
-    if generation != device.generation or version != 3:
+    generation, hidden, encryptions, active, views, failed, version = STATUS.unpack(data)
+    if generation != device.generation or version != 4:
         raise ValueError('Unsupported native status ABI')
     return dict(active=bool(active), views=views, failed=bool(failed),
-                hidden_bytes=hidden, encryptions=encryptions, invalidations=invalidations)
+                hidden_bytes=hidden, encryptions=encryptions)
 
 
 def base_identity(owner):

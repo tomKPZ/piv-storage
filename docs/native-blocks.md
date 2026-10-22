@@ -160,7 +160,7 @@ script builds only the matched module inside the VM, records package/config
 provenance, exercises both filesystems and reopens with stock Linux for full
 primary readback. No host module, root privileges or extra host packages are
 needed. Independent host extraction verifies that the kernel wrote the v4 codec.
-See ROADMAP.md for actual tested runs and remaining early-boot/fault coverage.
+Tested runs are recorded in commit messages; remaining work is in ROADMAP.md.
 
 After that run succeeds, boot its private test initramfs with no OS filesystem:
 
@@ -177,13 +177,10 @@ It supplies the static pivsetup binary, cryptsetup/dmsetup, a few coreutils for 
 shell test, decompression libraries for kmod and all required crypto modules,
 including aegis128. It contains no Python. It mounts only RAM/pseudo filesystems. early_vm.py copies the data image and attaches a blank disk
 solely to preserve the /dev/vdb test guard. It never attaches an OS/root disk.
-The builder-only guest-early-only.sh can reuse an already built exact-kernel
-module and closed fixture; it is a test optimization, not an installer.
 
 vm.py automatically freezes guest-common.sh for setup guards, package installation,
 module build/load and provenance recording. Tests keep their scenario logic in
-separate scripts. guest-stateless-prebuilt.sh reuses the same guest-dual.sh test
-body with PIV_PREBUILT=1; share guest-dual.sh and guest-early-build.sh when using it.
+separate scripts.
 
 The shared guest loader creates a separate disposable stock-encrypted ext4
 filesystem on a guest-root-backed loop image before loading dm-piv. It remains

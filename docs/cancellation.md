@@ -136,5 +136,5 @@ build archive. Full initialization is interrupted, not repeated to completion
 on the large fixture. Verify cancel-final.img with scripts/check_stateless.py,
 using expected-cancel-hidden from the cancellation run and the original primary
 key/hash. Original-AEGIS verification needs the optional diagnostic reference
-library; native activation does not. See ROADMAP.md for executed results and
-failed experiments; a trace or interrupted process alone is not a successful run.
+library; native activation does not. Executed results are recorded in commit
+messages; a trace or interrupted process alone is not a successful run.

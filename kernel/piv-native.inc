@@ -482,7 +482,7 @@ static int pn_commit(struct piv_control *p, bool hidden, u64 offset, const u8 *d
    memcpy(u->tuple + lo - start, data + lo - offset, hi - lo);
    entries[i].primary = cpu_to_le32(1);
   }
-  r = piv_update(p, NULL, u, true, primary, true, entries[i].replace); if (r) goto done;
+  r = piv_update(p, u, true, primary, entries[i].replace); if (r) goto done;
   memcpy(entries[i].tuple, u->tuple, PIV_TUPLE_BYTES);
  }
  u->flags = PIV_APPLY_DEFER_FLUSH;
@@ -491,7 +491,7 @@ static int pn_commit(struct piv_control *p, bool hidden, u64 offset, const u8 *d
  for (i = 0; i < count; i++) {
   u->sector = le64_to_cpu(entries[i].sector);
   memcpy(u->expected_iv, entries[i].old, iv); memcpy(u->tuple, entries[i].tuple, PIV_TUPLE_BYTES);
-  r = piv_update(p, NULL, u, false, le32_to_cpu(entries[i].primary), true, entries[i].replace);
+  r = piv_update(p, u, false, le32_to_cpu(entries[i].primary), entries[i].replace);
   if (r) goto done;
   if ((i + 1) % 32 == 0) { r = blkdev_issue_flush(p->cc->dev->bdev); if (r) goto done; }
  }

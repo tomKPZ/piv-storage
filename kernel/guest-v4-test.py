@@ -56,13 +56,25 @@ def opened(**kw):
 
 
 def damage(sector):
-    """One legitimate fresh-IV primary rewrite, as an uncoordinated stock write would."""
-    owner = GuestOwner('/dev/vdb', KEY)
-    owner.device.suspend(); owner.device.begin()
-    old_iv = owner.device.read_iv(sector, quiesced=True)
-    prepared = owner.device.prepare(sector, old_iv, os.urandom(owner.device.iv_size))
-    owner.device.apply(sector, old_iv, prepared)
-    owner.device.end(); owner.device.resume(); owner.remove(); owner.close()
+    """One uncoordinated stock dm-crypt rewrite of @sector (same plaintext, fresh IV)."""
+    unit = json.loads(subprocess.check_output(['cryptsetup', 'luksDump', '--dump-json-metadata', '/dev/vdb'],
+                                              text=True))['segments']['0']['sector_size']
+    stock_rewrite('/dev/vdb', KEY, sector, unit)
+
+def stock_rewrite(source, key, sector, unit):
+    """One uncoordinated stock dm-crypt rewrite of primary @sector with its own
+    plaintext: stock writes pick a fresh random IV, destroying that fragment."""
+    subprocess.run(['cryptsetup', 'open', '--key-file', str(key), str(source), 'piv-stock-rw'], check=True)
+    try:
+        fd = os.open('/dev/mapper/piv-stock-rw', os.O_RDWR | os.O_DIRECT)
+        with mmap.mmap(-1, unit) as buf:
+            assert os.preadv(fd, [buf], sector * unit) == unit
+            assert os.pwritev(fd, [buf], sector * unit) == unit
+            os.fsync(fd)
+        os.close(fd)
+    finally:
+        subprocess.run(['cryptsetup', 'close', 'piv-stock-rw'], check=True)
+
 
 
 def write_profile(count=48):
@@ -223,7 +235,7 @@ assert direct(v['hidden'], 512, 512) == pattern[1]
 block = direct(v['decoy'], target * unit, unit)
 direct(v['decoy'], target * unit, unit, block)
 assert rejected(lambda: direct(v['hidden'], 0, 512)).errno == errno.EIO
-assert not status()[0]['failed'] and status()[0]['invalidations'] == 0
+assert not status()[0]['failed']
 direct(v['hidden'], 0, 512, pattern[0])
 assert Path(v['hidden']).read_bytes() == hidden_before
 assert subprocess.check_output(['sha256sum', v['decoy']], text=True).split()[0] == primary_after

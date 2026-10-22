@@ -4,7 +4,7 @@
 > 2026-10-21: format v3 and the AES-GCM / ChaCha20-Poly1305 profiles were
 > removed (AEGIS-128 with [format v4](format-v4.md) is the only supported
 > configuration). Results below that mention them are historical evidence for
-> the code at that time; see ROADMAP.md for current runs.
+> the code at that time; current runs are recorded in commit messages.
 
 The external recovery/history protocol and its root-ext4 ENOSPC/compaction tests
 were removed with the stateless architecture. Historical results in Git do not
@@ -38,7 +38,7 @@ restore availability.
 Fault tests use only disposable synthetic guest disks. VM SIGKILL preserves the
 host page cache and is not hardware power-loss evidence. Never infer hidden
 filesystem consistency or rollback resistance from primary sector authentication.
-See ROADMAP.md for current executed tests and artifacts.
+Executed tests and artifacts are recorded in commit messages.
 
 ## Reproduce the partial-record interruption
 
@@ -163,7 +163,7 @@ This is a public-view lifecycle contract. Direct administrative suspension or
 replacement of the PRIVATE owner/lower mappings while views are active remains
 outside the supported workflow. Successful kernel flush return/order is not
 proof that physical hardware honored persistence, hidden-record atomicity, or a
-debug-kernel/lockdep audit. See ROADMAP.md for executed results.
+debug-kernel/lockdep audit (see docs/sanitizer.md for the later sanitizer runs).
 
 Example using a CLOSED native fixture and a matched module (fresh run directory):
 
@@ -201,4 +201,4 @@ the complete primary/hidden oracles with no repair. A separate setup attempt wit
 fail, remove its own mappings and permit a healthy full reopen after restoration.
 These synthetic faults test authenticated-read withholding and scoped failure,
 not adversarial journal replay, physical corruption durability or atomicity of
-application requests spanning multiple public bios. Results are in ROADMAP.md.
+application requests spanning multiple public bios.

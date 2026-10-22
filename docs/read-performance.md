@@ -4,7 +4,7 @@
 > 2026-10-21: format v3 and the AES-GCM / ChaCha20-Poly1305 profiles were
 > removed (AEGIS-128 with [format v4](format-v4.md) is the only supported
 > configuration). Results below that mention them are historical evidence for
-> the code at that time; see ROADMAP.md for current runs.
+> the code at that time; current runs are recorded in commit messages.
 
 The bounded profile separates uninstrumented elapsed time from kernel call counts.
 Baseline profiling did not change the runtime. The subsequent bounded read
@@ -176,7 +176,7 @@ Setup includes one scalar checkpoint read; other reads use bounded ranges.
 The setup and timed-read counters still show no new primary encryptions.
 Both profiles passed complete plaintext oracles, stock authentication, unload
 and independent host verification of all sectors and hidden bytes. Broader
-regression results and the next task are recorded in ROADMAP.md. Full primary
+regression results are recorded in commit messages. Full primary
 authentication is retained; no new crash, durability or deniability claim follows.
 
 ## Reproduce

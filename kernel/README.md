@@ -10,8 +10,7 @@ The hidden views share one owner, hidden-record crypto and stateless authenticat
 Primary encryption is original AEGIS-128 with stored 16-byte random IVs (format v4 only; AES-GCM/ChaCha20-Poly1305 and v3 were removed 2026-10-21).
 See [native interface and end-to-end tests](../docs/native-blocks.md).
 The userspace FUSE/NBD adapters have been removed; their historical test results
-remain in ROADMAP.md and Git history. Authenticated sector controls remain for
-focused kernel regression tests. Both 512- and 4096-byte primary encryption
+remain in Git history. Both 512- and 4096-byte primary encryption
 sectors are supported; the tests derive sector and interleave boundaries from
 the selected stock fixture.
 
@@ -33,27 +32,20 @@ in environment/sources.json only as the layout reference.
 
 ## Reproduce
 
-Create the ordinary fixture using docs/development.md, then follow the full
-paired-device build/run command in docs/native-blocks.md. For focused native
-sector/control checks, stage the same module and create corruption offsets:
+Create the ordinary fixture using docs/development.md, then run the suites with
+`scripts/suite.py --scaffold` (docs/development.md); it stages nothing itself:
 
 ```sh
 python3 scripts/fetch_kernel.py vendor/kernel-build/native-next
 mkdir -p artifacts/native-input
 tar -cf artifacts/native-input/scaffold.tar -C vendor/kernel-build/native-next .
-python3 kernel/read-fixture.py artifacts/control-003/control.img > artifacts/read-layout.json
-python3 scripts/vm.py run --script scripts/guest-kernel.sh \
-  --run-dir artifacts/native-sector-next --data-image artifacts/control-003/control.img --code \
-  --share-file artifacts/native-input/scaffold.tar --share-file kernel/guest-test.py \
-  --share-file kernel/check-config.py --share-file artifacts/read-layout.json \
-  --share-file artifacts/control-003/share/passphrase.key \
-  --share-file artifacts/control-003/share/volume.key \
-  --share-file artifacts/control-003/share/expected.sha256 --timeout 1200
 ```
 
-For original AEGIS-128, additionally share the pinned diagnostic library described
-in docs/development.md as libaegis128-reference.so. Native paired-device and
-early-boot tests do not require this reference.
+The control device exposes only QUERY, DEVICES, BEGIN/END, SETUP, DETACH,
+STATUS and KEYSLOT. The former userspace IV-read and prepare/apply controls
+(and the sector suite that exercised them) were removed on 2026-10-22; the
+owner's internal prepare/apply path is unchanged and every kernel-written image
+is still decoded and authenticated independently on the host.
 
 Use fresh staging/run names. vm.py freezes sources for each run, including reboot.
 Never force module loading. Independent host parsing/authentication and hidden

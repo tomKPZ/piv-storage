@@ -64,6 +64,20 @@ static int piv_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
+/* Internal prepare/apply tuple (no longer a userspace ABI since 2026-10-22). */
+#define PIV_TUPLE_BYTES 4128
+#define PIV_APPLY_DEFER_FLUSH 1
+struct piv_update {
+	u32 version;
+	u32 size;
+	u64 generation;
+	u64 sector;
+	u8 expected_iv[16];
+	u32 flags;
+	u8 tuple[PIV_TUPLE_BYTES]; /* sector ciphertext, zero-pad to 4096 || tag16 || IV16 */
+	u32 reserved;
+};
+
 struct piv_sector {
 	struct piv_io io;
 	struct page *page;
@@ -231,33 +245,11 @@ static bool piv_quiesced(struct piv_control *p)
 		test_bit(PIV_SUSPENDED, &p->cc->flags);
 }
 
-static int piv_read_iv(struct piv_control *p, struct piv_read_iv *out, bool quiesced)
-{
-	struct piv_sector *s = NULL;
-	int ret;
-
-	ret = piv_identity(p, out->version, out->size, out->generation,
-			   out->sector, sizeof(*out));
-	if (ret)
-		return ret;
-	if (memchr_inv(out->iv, 0, sizeof(out->iv)) ||
-	    memchr_inv(out->reserved, 0, sizeof(out->reserved)))
-		return -EINVAL;
-	if (quiesced ? !piv_quiesced(p) : p->blocked)
-		return -EBUSY;
-	ret = piv_load(p->cc, out->sector, &s);
-	if (!ret)
-		memcpy(out->iv, s->original + 4112, p->profile.iv_size);
-	piv_sector_free(p->cc, s);
-	return ret;
-}
-
 /* @replace (internal primary updates only): the old sector may fail
  * authentication; its full plaintext is replaced, so nothing of it is kept
  * except the raw stored IV used as expected_iv and for fragment refresh.
  */
-static int piv_update(struct piv_control *p, struct file *file,
-		      struct piv_update *u, bool prepare, bool primary, bool internal, bool replace)
+static int piv_update(struct piv_control *p, struct piv_update *u, bool prepare, bool primary, bool replace)
 {
 	struct piv_crypt *cc = p->cc;
 	struct piv_sector *old = NULL, *candidate = NULL;
@@ -274,13 +266,11 @@ static int piv_update(struct piv_control *p, struct file *file,
 		return -EINVAL;
 	if (u->reserved || (u->flags && (prepare || u->flags != PIV_APPLY_DEFER_FLUSH)))
 		return -EINVAL;
-	if (!internal && (!piv_quiesced(p) || !p->transaction || p->controller != file))
-		return -EBUSY;
 	if (p->failed)
 		return -EIO;
 	if (prepare && memchr_inv(u->tuple + (primary ? 4096 : 0), 0, primary ? 16 : 4112))
 		return -EINVAL;
-	if (replace && (!internal || !primary))
+	if (replace && !primary)
 		return -EINVAL;
 	ret = piv_load_mode(cc, u->sector, &old, replace);
 	if (ret)
@@ -394,20 +384,14 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	struct piv_native_status status = {};
 	struct piv_native_setup *setup = NULL;
 	struct piv_native_keyslot *keyslot = NULL;
-	struct piv_update *update = NULL;
-	bool preparing = cmd == PIV_PREPARE || cmd == PIV_PREPARE_PRIMARY;
-	bool primary = cmd == PIV_PREPARE_PRIMARY || cmd == PIV_APPLY_PRIMARY;
-	bool updating = preparing || cmd == PIV_APPLY || cmd == PIV_APPLY_PRIMARY;
-	bool data_request = updating || cmd == PIV_READ_PRIMARY;
 	unsigned int noio;
 	long ret = 0;
 
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
-	if (cmd != PIV_QUERY && cmd != PIV_DEVICES && cmd != PIV_READ_IV && cmd != PIV_READ_QUIESCED &&
-	    cmd != PIV_BEGIN && cmd != PIV_END && cmd != PIV_SYNC &&
+	if (cmd != PIV_QUERY && cmd != PIV_DEVICES && cmd != PIV_BEGIN && cmd != PIV_END &&
 	    cmd != PIV_NATIVE_SETUP && cmd != PIV_NATIVE_DETACH && cmd != PIV_NATIVE_STATUS &&
-	    cmd != PIV_NATIVE_KEYSLOT && !data_request)
+	    cmd != PIV_NATIVE_KEYSLOT)
 		return -ENOTTY;
 	if (cmd == PIV_NATIVE_SETUP) {
 		setup = memdup_user((void __user *)arg, sizeof(*setup));
@@ -423,10 +407,6 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		if (IS_ERR(keyslot)) return PTR_ERR(keyslot);
 		ret = wait_for_random_bytes();
 		if (ret) goto out;
-	} else if (data_request) {
-		update = memdup_user((void __user *)arg, sizeof(*update));
-		if (IS_ERR(update))
-			return PTR_ERR(update);
 	} else if (cmd != PIV_QUERY && cmd != PIV_DEVICES && cmd != PIV_NATIVE_STATUS &&
 		   copy_from_user(&read, (void __user *)arg, sizeof(read))) {
 		return -EFAULT;
@@ -441,7 +421,7 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	if (!p->live)
 		ret = -ENODEV;
 	else if (cmd == PIV_NATIVE_STATUS) {
-		status.generation = p->profile.generation; status.version = 3;
+		status.generation = p->profile.generation; status.version = 4;
 		status.encryptions = p->encryptions;
 		if (p->native) {
 			status.active = 1; status.views = p->native->views; status.failed = p->native->failed;
@@ -460,32 +440,12 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			if (ret) { p->failed = true; p->native->failed = true; }
 		}
 		if (!ret) { pn_free(p->native); p->native = NULL; }
-	} else if (p->native && cmd != PIV_QUERY && cmd != PIV_DEVICES)
-		ret = -EBUSY;
-	else if (updating)
-		ret = piv_update(p, file, update, preparing, primary, false, false);
-	else if (cmd == PIV_READ_PRIMARY) {
-		struct piv_sector *sector = NULL;
-		ret = piv_identity(p, update->version, update->size, update->generation,
-				   update->sector, sizeof(*update));
-		if (!ret && (update->flags || update->reserved ||
-		    memchr_inv(update->expected_iv, 0, sizeof(update->expected_iv)) ||
-		    memchr_inv(update->tuple, 0, PIV_TUPLE_BYTES)))
-			ret = -EINVAL;
-		if (!ret && (p->blocked || p->failed))
-			ret = -EBUSY;
-		if (!ret)
-			ret = piv_load(p->cc, update->sector, &sector);
-		if (!ret) {
-			memcpy(update->tuple, page_address(sector->page), p->profile.sector_size);
-			memcpy(update->tuple + 4112, sector->original + 4112, p->profile.iv_size);
-		}
-		piv_sector_free(p->cc, sector);
-	} else if (cmd == PIV_READ_IV || cmd == PIV_READ_QUIESCED)
-		ret = piv_read_iv(p, &read, cmd == PIV_READ_QUIESCED);
-	else if (cmd == PIV_QUERY || cmd == PIV_DEVICES)
+	} else if (cmd == PIV_QUERY || cmd == PIV_DEVICES)
 		profile = p->profile;
+	else if (p->native)
+		ret = -EBUSY;
 	else {
+		/* BEGIN/END bracket native SETUP on a quiesced owner. */
 		ret = piv_identity(p, read.version, read.size, read.generation,
 				   read.sector, sizeof(read));
 		if (!ret && (read.sector || memchr_inv(read.iv, 0, sizeof(read.iv)) ||
@@ -504,12 +464,11 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			if (!p->transaction || p->controller != file)
 				ret = -EPERM;
 			else {
-				ret = cmd == PIV_END ? piv_checkpoint(p->cc) :
-					blkdev_issue_flush(p->cc->dev->bdev);
-				if (!ret && cmd == PIV_END) {
+				ret = piv_checkpoint(p->cc);
+				if (!ret) {
 					p->transaction = false;
 					p->controller = NULL;
-				} else if (ret)
+				} else
 					p->failed = true;
 			}
 		}
@@ -523,13 +482,8 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			ret = copy_to_user((void __user *)arg, &p->devices, sizeof(p->devices)) ? -EFAULT : 0;
 		else if (cmd == PIV_QUERY)
 			ret = copy_to_user((void __user *)arg, &profile, sizeof(profile)) ? -EFAULT : 0;
-		else if (cmd == PIV_READ_IV || cmd == PIV_READ_QUIESCED)
-			ret = copy_to_user((void __user *)arg, &read, sizeof(read)) ? -EFAULT : 0;
-		else if (preparing || cmd == PIV_READ_PRIMARY)
-			ret = copy_to_user((void __user *)arg, update, sizeof(*update)) ? -EFAULT : 0;
 	}
 out:
-	kfree_sensitive(update);
 	kfree_sensitive(setup);
 	kfree_sensitive(keyslot);
 	return ret;
@@ -620,7 +574,6 @@ static int piv_register(struct piv_crypt *cc, struct dm_target *ti)
 		.sectors = ti->len >> cc->sector_shift,
 		.sector_size = cc->sector_size, .iv_size = cc->iv_size,
 		.tag_size = cc->integrity_tag_size, .tuple_size = cc->tuple_size,
-		.flags = PIV_QUERY_LOWER_WRITE | PIV_QUERY_PRIMARY_FILTER | PIV_QUERY_MUTATION | PIV_QUERY_PRIMARY_CONTROL,
 	};
 	p->devices = (struct piv_devices) {
 		.owner_major = MAJOR(disk_devt(dm_disk(dm_table_get_md(ti->table)))),

@@ -20,15 +20,16 @@ security specification. Respect tool/sandbox approval requirements.
 
 1. Read README.md, ROADMAP.md, applicable nested instructions, and existing design
    notes (especially docs/development.md, docs/observed-layout.md and
-   docs/hidden-format.md, docs/native-blocks.md, docs/native-faults.md and
+   docs/format-v4.md, docs/native-blocks.md, docs/native-faults.md and
    docs/security-review.md, docs/read-performance.md and docs/large-volumes.md and docs/cancellation.md). Inspect
    git status and relevant code before changing anything.
 2. Determine what is actually implemented and tested. Recheck environmental
    assumptions as needed; the initial host is WSL2 without visible DM/KVM nodes.
 3. Select a bounded task with observable exit criteria. Continue through its
    implementation and appropriate verification without routine design questions.
-4. Update roadmap status and handoff notes with results, remaining uncertainties,
-   blockers and next steps. Report what changed and what was actually tested.
+4. Keep ROADMAP.md to what remains (no session history: git keeps it); record
+   executed runs and evidence in commit messages and the relevant docs. Report
+   what changed and what was actually tested.
 
 Do not overwrite unrelated changes or claim tests passed when they were skipped.
 If dependencies or privileges are missing, perform useful independent work and
@@ -39,7 +40,7 @@ resolved from context/evidence, not for routine implementation decisions.
 ## Implementation priorities
 
 - The user prioritizes remaining work that requires core module changes. Follow
-  ROADMAP.md's core-first order; include necessary tests/docs with each change.
+  ROADMAP.md's order; include necessary tests/docs with each change.
   Do not fabricate kernel features to defer useful validation. Concrete security
   defects override feature ordering; standalone tooling/assessment comes later.
 - Maintain the paired native writable decoy/hidden block devices, one coordinated

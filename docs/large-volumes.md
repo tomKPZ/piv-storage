@@ -4,7 +4,7 @@
 > 2026-10-21: format v3 and the AES-GCM / ChaCha20-Poly1305 profiles were
 > removed (AEGIS-128 with [format v4](format-v4.md) is the only supported
 > configuration). Results below that mention them are historical evidence for
-> the code at that time; see ROADMAP.md for current runs.
+> the code at that time; current runs are recorded in commit messages.
 >
 > Rerun 2026-10-21 after the keyslot-area setup scan (large-4096-004,
 > large-512-004, 512 MiB, both passed): reopen took 0.34 s and 0.22 s under KVM

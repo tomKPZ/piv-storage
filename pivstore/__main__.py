@@ -1,5 +1,5 @@
 """Independent read-only image diagnostics. Setup (open-blocks, close-blocks,
-keyslot) is the Rust pivsetup binary; see rust/ and docs/native-blocks.md."""
+keyslot, keygen) is the Rust pivsetup binary; see rust/ and docs/native-blocks.md."""
 
 import argparse
 import json
@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 import sys
 import subprocess
-import secrets
 
 from .profile import Image, UnsupportedImage
 
@@ -15,8 +14,6 @@ from .profile import Image, UnsupportedImage
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='action', required=True)
-    keygen = sub.add_parser('keygen')
-    keygen.add_argument('--output', type=Path, required=True)
     inspect = sub.add_parser('inspect')
     inspect.add_argument('image', type=Path)
     verify = sub.add_parser('verify')
@@ -31,14 +28,6 @@ def main():
     extraction.add_argument('--hidden-key-file', type=Path, required=True)
     args = parser.parse_args()
     try:
-        if args.action == 'keygen':
-            fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, 'wb') as stream:
-                stream.write(secrets.token_bytes(32))
-                stream.flush()
-                os.fsync(stream.fileno())
-            print('Created a private 32-byte key file')
-            return 0
         if args.action == 'unpack':
             from .records_v4 import unpack
             with args.hidden_key_file.open('rb') as stream:

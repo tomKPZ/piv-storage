@@ -1,15 +1,8 @@
 #!/bin/bash
 source /mnt/piv-work/guest-common.sh
-if test "${PIV_PREBUILT:-0}" = 1; then
-    guest_packages python3-cryptography e2fsprogs
-    mkdir -p /root/piv-module
-    cp experimental-dm-piv.ko /root/piv-module/dm-piv.ko
-    sha256sum experimental-dm-piv.ko > module.sha256
-else
-    guest_packages python3-cryptography e2fsprogs \
-        linux-headers-6.12.113+deb13-amd64=6.12.113-1 gcc-14 make patch
-    guest_build_module
-fi
+guest_packages python3-cryptography e2fsprogs \
+    linux-headers-6.12.113+deb13-amd64=6.12.113-1 gcc-14 make patch
+guest_build_module
 guest_code
 mkdir -p /run/piv-init
 modprobe dm_integrity

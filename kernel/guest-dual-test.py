@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Both writable block devices outlive the setup process; no NBD/FUSE service."""
+import errno
+import fcntl
 import hashlib
 import json
 import mmap
@@ -68,13 +70,15 @@ owner = GuestOwner('/dev/vdb', W / 'passphrase.key')
 iv_size = owner.device.iv_size
 status = native_status(owner.device)
 assert status['active'] and status['views'] == 3 and not status['failed']
-# Legacy controls cannot bypass the shared native owner.
-try:
-    owner.device.read_primary_sector(0)
-except OSError:
-    pass
-else:
-    raise AssertionError('Legacy primary control escaped native ownership')
+# The former userspace IV/tuple controls are gone (ENOTTY), not merely refused.
+for number, size, direction in ((1, 48, 3), (2, 48, 3), (3, 4176, 3), (4, 4176, 1), (8, 48, 1),
+                                (9, 4176, 3), (10, 4176, 3), (11, 4176, 1)):
+    try:
+        fcntl.ioctl(owner.device.fd, direction << 30 | size << 16 | ord('P') << 8 | number, bytearray(size), True)
+    except OSError as exc:
+        assert exc.errno == errno.ENOTTY, (number, exc)
+    else:
+        raise AssertionError(f'Removed control {number} still accepted')
 owner.close()
 # Native hidden decryption returns a fixed zero-filled raw block volume.
 assert Path(HIDDEN).read_bytes() == bytes(capacity)
@@ -128,18 +132,22 @@ os.fsync(fd); os.close(fd); page.close()
 close(); setup()
 assert Path(HIDDEN).read_bytes() == before_hidden
 print('Native block RMW, hidden preservation and reopen passed', flush=True)
-# Re-encode one primary sector with a different IV through the authenticated
-# control helper, simulating a legitimate stock write that destroys one record.
-# Sector 0 is a keyslot replica, so damage the first sector of block 0's record.
+# An uncoordinated stock dm-crypt rewrite of one primary sector (same plaintext,
+# fresh random IV) destroys one record. Sector 0 is a keyslot replica, so damage
+# the first sector of block 0's record.
 close()
-owner = GuestOwner('/dev/vdb', W / 'passphrase.key')
 damaged = V4_BLOCK0
-owner.device.suspend(); owner.device.begin()
-old_iv = owner.device.read_iv(damaged, quiesced=True)
-new_iv = os.urandom(owner.device.iv_size)
-prepared = owner.device.prepare(damaged, old_iv, new_iv)
-owner.device.apply(damaged, old_iv, prepared)
-owner.device.end(); owner.device.resume(); owner.remove(); owner.close()
+unit = json.loads(crypt('luksDump', '--dump-json-metadata', '/dev/vdb').stdout)['segments']['0']['sector_size']
+subprocess.run(['cryptsetup', 'open', '--key-file', str(W / 'passphrase.key'), '/dev/vdb', 'piv-stock-rw'], check=True)
+try:
+    fd = os.open('/dev/mapper/piv-stock-rw', os.O_RDWR | os.O_DIRECT)
+    with mmap.mmap(-1, unit) as buf:
+        assert os.preadv(fd, [buf], damaged * unit) == unit
+        assert os.pwritev(fd, [buf], damaged * unit) == unit
+        os.fsync(fd)
+    os.close(fd)
+finally:
+    subprocess.run(['cryptsetup', 'close', 'piv-stock-rw'], check=True)
 setup()
 def unavailable(index):
     fd = os.open(HIDDEN, os.O_RDONLY)

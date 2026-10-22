@@ -9,7 +9,6 @@ import struct
 import subprocess
 
 READ = struct.Struct('=IIQQ16sII')
-UPDATE = struct.Struct('=IIQQ16sI4128sI')
 QUERY = struct.Struct('=IIQQIIIIII')
 
 
@@ -107,7 +106,7 @@ class KernelDevice:
             data = bytearray(QUERY.size)
             fcntl.ioctl(self.fd, command(0, QUERY.size, 2), data, True)
             v, size, self.generation, self.sectors, sector, iv, tag, tup, flags, reserved = QUERY.unpack(data)
-            if (v, size, tag, reserved) != (2, 48, 16, 0) or iv != 16 or tup != 16 + iv or sector not in (512, 4096) or flags not in (7, 15):
+            if (v, size, tag, reserved) != (2, 48, 16, 0) or iv != 16 or tup != 16 + iv or sector not in (512, 4096) or flags != 0:
                 raise ValueError('Unsupported kernel control/profile')
             devices = bytearray(16)
             fcntl.ioctl(self.fd, command(7, 16, 2), devices, True)
@@ -141,61 +140,11 @@ class KernelDevice:
     def request(self, index=0):
         return bytearray(READ.pack(2, READ.size, self.generation, index, bytes(16), 0, 0))
 
-    def read_iv(self, index, *, quiesced=False):
-        data = self.request(index)
-        fcntl.ioctl(self.fd, command(2 if quiesced else 1, READ.size), data, True)
-        return READ.unpack(data)[4][:self.iv_size]
-
     def begin(self):
         fcntl.ioctl(self.fd, command(5, READ.size, 1), self.request(), True)
 
     def end(self):
         fcntl.ioctl(self.fd, command(6, READ.size, 1), self.request(), True)
-
-    def sync(self):
-        fcntl.ioctl(self.fd, command(8, READ.size, 1), self.request(), True)
-
-    def prepare(self, index, old_iv, new_iv):
-        if len(old_iv) != self.iv_size or len(new_iv) != self.iv_size:
-            raise ValueError('Invalid IV size')
-        data = bytearray(UPDATE.pack(2, UPDATE.size, self.generation, index,
-                                    old_iv, 0, bytes(4112) + new_iv.ljust(16, b'\0'), 0))
-        fcntl.ioctl(self.fd, command(3, UPDATE.size), data, True)
-        result = UPDATE.unpack(data)
-        if result[:6] != (2, UPDATE.size, self.generation, index, old_iv.ljust(16, b'\0'), 0) or result[7] or result[6][4112:4112 + self.iv_size] != new_iv:
-            raise OSError(errno.EIO, 'Invalid prepare response')
-        return result[6]
-
-    def apply(self, index, old_iv, prepared, *, defer_flush=False):
-        if len(old_iv) != self.iv_size or len(prepared) != 4128:
-            raise ValueError('Invalid tuple size')
-        data = bytearray(UPDATE.pack(2, UPDATE.size, self.generation, index,
-                                    old_iv, int(defer_flush), prepared, 0))
-        fcntl.ioctl(self.fd, command(4, UPDATE.size, 1), data, True)
-
-    def read_primary_sector(self, index):
-        data = bytearray(UPDATE.pack(2, UPDATE.size, self.generation, index,
-                                    bytes(16), 0, bytes(4128), 0))
-        fcntl.ioctl(self.fd, command(9, UPDATE.size), data, True)
-        return UPDATE.unpack(data)[6][:self.sector_size]
-
-    def prepare_primary(self, index, old_iv, new_iv, plaintext):
-        if len(plaintext) != self.sector_size or len(old_iv) != self.iv_size or len(new_iv) != self.iv_size:
-            raise ValueError('Invalid primary preparation')
-        data = bytearray(UPDATE.pack(2, UPDATE.size, self.generation, index,
-                                    old_iv, 0, plaintext.ljust(4096, b'\0') + bytes(16) + new_iv.ljust(16, b'\0'), 0))
-        fcntl.ioctl(self.fd, command(10, UPDATE.size), data, True)
-        value = UPDATE.unpack(data)[6]
-        if value[4112:4112 + self.iv_size] != new_iv:
-            raise OSError(errno.EIO, 'Invalid primary prepare response')
-        return value
-
-    def apply_primary(self, index, old_iv, prepared, *, defer_flush=False):
-        if len(old_iv) != self.iv_size or len(prepared) != 4128:
-            raise ValueError('Invalid primary tuple')
-        data = bytearray(UPDATE.pack(2, UPDATE.size, self.generation, index,
-                                    old_iv, int(defer_flush), prepared, 0))
-        fcntl.ioctl(self.fd, command(11, UPDATE.size, 1), data, True)
 
     def suspend(self):
         dm('suspend', self.name)

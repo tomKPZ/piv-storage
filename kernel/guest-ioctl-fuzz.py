@@ -3,11 +3,8 @@
 
 Three phases on the disposable /dev/vdb fixture: an idle private owner without
 native state; the same owner suspended inside a control transaction (where
-PREPARE/APPLY/SETUP are reachable, and template PREPAREs use the sectors' real
-current IVs so they succeed); then active paired views with concurrent view
-reads. The transaction phase also checks the APPLY authentication gate
-deterministically: every tried single-byte mutation of a genuine PREPARE
-result (ciphertext, tag, IV or padding) must be rejected. Each step
+SETUP and END are reachable); then active paired views with concurrent view
+reads. Each step
 sends a seeded random command (every defined number, correct or wrong size and
 direction, or a random number) with a template-valid or mutated structure, a
 short/page-crossing buffer that ends in a PROT_NONE page, or a raw invalid
@@ -15,8 +12,9 @@ pointer. Any errno is acceptable. Failures are: an owner that reports
 failed, a crash or hang, a kernel self-report (the suite scans the console and
 dmesg), or any change to primary or hidden contents. Deliberately excluded,
 because they succeed legitimately and are destructive by design: SETUP with
-INITIALIZE, keyslot operations on slot 0, and replaying a PREPARE result into
-APPLY. Keyslot add/remove on slots 1-3 may succeed (random KEKs) and are
+INITIALIZE and keyslot operations on slot 0. The former userspace IV and
+prepare/apply controls (numbers 1-4, 8-11) were removed on 2026-10-22; they are
+still sent and must return ENOTTY. Keyslot add/remove on slots 1-3 may succeed (random KEKs) and are
 left in place; the final reopen with the original key must still work.
 """
 import ctypes
@@ -49,7 +47,8 @@ libc.ioctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_void_p]
 # number: (size, direction) from kernel/piv-control.h (1 = write, 2 = read).
 COMMANDS = {0: (48, 2), 1: (48, 3), 2: (48, 3), 3: (4176, 3), 4: (4176, 1), 5: (48, 1), 6: (48, 1),
             7: (16, 2), 8: (48, 1), 9: (4176, 3), 10: (4176, 3), 11: (4176, 1), 12: (192, 1),
-            13: (48, 1), 14: (48, 2), 15: (64, 1)}
+            13: (48, 1), 14: (40, 2), 15: (64, 1)}
+REMOVED = {1, 2, 3, 4, 8, 9, 10, 11}  # former userspace IV/tuple controls: ENOTTY
 SETUP_SCANS = 16  # template-valid SETUPs scan the whole primary; keep them rare
 
 
@@ -76,18 +75,9 @@ class Arena:
 ARENA = Arena(8192)
 
 
-def template(number, size, device, sectors, context, known):
+def template(number, size, device, sectors, context):
     sector = rng.choice([0, 1, sectors - 1, sectors, sectors + 1, 2**63, 2**64 - 1,
                          rng.randrange(sectors)])
-    if size == 4176 and known and number in (3, 10) and rng.random() < 0.5:
-        # A PREPARE that should succeed: real current IV, fresh new IV, zero tag
-        # area (and for primary, new plaintext). It encrypts but never writes.
-        sector, iv = rng.choice(list(known.items()))
-        new_iv = rng.randbytes(16)
-        data = rng.randbytes(device.sector_size) if number == 10 else bytes(device.sector_size)
-        body = struct.pack('=IIQQ16sI4128sI', 2, size, device.generation, sector, iv, 0,
-                           data.ljust(4112, b'\0') + new_iv, 0)
-        return body if rng.random() < 0.8 else mutate(bytearray(body))
     generation = device.generation if rng.random() < 0.9 else rng.getrandbits(64)
     version = {12: 4, 15: 1}.get(number, 2) if rng.random() < 0.9 else rng.getrandbits(32)
     length = size if rng.random() < 0.9 else rng.choice([0, size - 1, size + 1, rng.getrandbits(32)])
@@ -117,7 +107,7 @@ def mutate(body):
     return bytes(body)
 
 
-def step(fd, device, sectors, context, stats, scans, known):
+def step(fd, device, sectors, context, stats, scans):
     roll = rng.random()
     if roll < 0.85:
         number = rng.choice(list(COMMANDS))
@@ -132,7 +122,7 @@ def step(fd, device, sectors, context, stats, scans, known):
             size, direction = COMMANDS[14]
         else:
             scans[0] += 1
-    data = template(number, max(size, 1), device, sectors, context, known)
+    data = template(number, max(size, 1), device, sectors, context)
     mode = rng.random()
     if mode < 0.75:
         pointer = ARENA.place(data, 0) if len(data) <= 4096 else None
@@ -149,17 +139,19 @@ def step(fd, device, sectors, context, stats, scans, known):
     outcome = 'ok' if result == 0 else errno.errorcode.get(ctypes.get_errno(), str(ctypes.get_errno()))
     stats.setdefault(key, {}).setdefault(outcome, 0)
     stats[key][outcome] += 1
+    if number in REMOVED:
+        assert result != 0 and ctypes.get_errno() == errno.ENOTTY, (number, size, direction, outcome)
     if number == 15 and result == 0:
         stats.setdefault('keyslot_changes', 0)
         stats['keyslot_changes'] += 1
 
 
-def fuzz(owner, label, known=None):
+def fuzz(owner, label):
     device, sectors = owner.device, owner.device.sectors
     context = base_identity(owner)
     stats, scans, started = {}, [0], time.monotonic()
     for _ in range(STEPS):
-        step(device.fd, device, sectors, context, stats, scans, known)
+        step(device.fd, device, sectors, context, stats, scans)
     status = native_status(device)
     assert not status['failed'], (label, status)
     print(f'{label}: {STEPS} ioctls in {time.monotonic() - started:.1f}s, status {status}', flush=True)
@@ -185,37 +177,7 @@ device = owner.device
 try:
     device.suspend()
     device.begin()
-    sectors = device.sectors
-    sample = sorted({0, 1, 111, 112, 292, sectors // 2, sectors - 2, sectors - 1})
-    known = {i: device.read_iv(i, quiesced=True).ljust(16, b'\0') for i in sample}
-    gate = {}
-    for index in sample[:4]:
-        iv = known[index]
-        new_iv = os.urandom(16)
-        for kind, prepared in (('hidden', device.prepare(index, iv, new_iv)),
-                               ('primary', device.prepare_primary(index, iv, new_iv,
-                                                                  os.urandom(device.sector_size)))):
-            positions = ([rng.randrange(device.sector_size) for _ in range(24)] +
-                         list(range(4096, 4096 + 32)) +
-                         [rng.randrange(device.sector_size, 4096) for _ in range(8)
-                          if device.sector_size < 4096])
-            for position in positions:
-                tampered = bytearray(prepared)
-                tampered[position] ^= 1 << rng.randrange(8)
-                try:
-                    (device.apply if kind == 'hidden' else device.apply_primary)(index, iv, bytes(tampered))
-                except OSError as error:
-                    name = errno.errorcode.get(error.errno, str(error.errno))
-                    gate.setdefault(kind, {}).setdefault(name, 0)
-                    gate[kind][name] += 1
-                else:
-                    raise AssertionError(f'APPLY accepted a mutated tuple ({kind}, byte {position})')
-        assert device.read_iv(index, quiesced=True).ljust(16, b'\0') == iv
-    print(f'apply gate: {gate}', flush=True)
-    results['apply_gate'] = gate
-    results['transaction'] = fuzz(owner, 'transaction', known)
-    for index, iv in known.items():
-        assert device.read_iv(index, quiesced=True).ljust(16, b'\0') == iv, index
+    results['transaction'] = fuzz(owner, 'transaction')
     try:
         device.end()
     except OSError:

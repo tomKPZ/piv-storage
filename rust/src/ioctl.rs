@@ -28,7 +28,7 @@ pub fn command(number: u64, size: u64, direction: u64) -> u64 {
 pub const QUERY_SIZE: usize = 48; // '=IIQQIIIIII'
 pub const READ_SIZE: usize = 48; // '=IIQQ16sII'
 pub const SETUP_SIZE: usize = 192; // '=IIQII32s128s2I'
-pub const STATUS_SIZE: usize = 48; // '=QQQQIIII'
+pub const STATUS_SIZE: usize = 40; // '=QQQIIII' (STATUS version 4)
 pub const KEYSLOT_SIZE: usize = 64; // '=IIQII32s2I'
 
 /// SETUP ABI 4 (format v4 only): destructive initialization.
@@ -59,7 +59,6 @@ pub struct Status {
     pub generation: u64,
     pub hidden_bytes: u64,
     pub encryptions: u64,
-    pub invalidations: u64,
     pub active: bool,
     pub views: u32,
     pub failed: bool,
@@ -110,7 +109,7 @@ impl KernelDevice {
         let (sector, iv, tag, tuple, flags, reserved) =
             (u32_at(&q, 24), u32_at(&q, 28), u32_at(&q, 32), u32_at(&q, 36), u32_at(&q, 40), u32_at(&q, 44));
         if (version, size, tag, reserved) != (2, 48, 16, 0) || iv != 16 || tuple != 16 + iv
-            || !(sector == 512 || sector == 4096) || !(flags == 7 || flags == 15) {
+            || !(sector == 512 || sector == 4096) || flags != 0 {
             bail!("Unsupported kernel control/profile");
         }
         let mut devices = [0u8; 16];
@@ -167,10 +166,9 @@ impl KernelDevice {
         ioctl(self.fd, command(14, STATUS_SIZE as u64, DIR_READ), &mut data)?;
         let status = Status {
             generation: u64_at(&data, 0), hidden_bytes: u64_at(&data, 8), encryptions: u64_at(&data, 16),
-            invalidations: u64_at(&data, 24), active: u32_at(&data, 32) != 0, views: u32_at(&data, 36),
-            failed: u32_at(&data, 40) != 0,
+            active: u32_at(&data, 24) != 0, views: u32_at(&data, 28), failed: u32_at(&data, 32) != 0,
         };
-        if status.generation != self.generation || u32_at(&data, 44) != 3 {
+        if status.generation != self.generation || u32_at(&data, 36) != 4 {
             bail!("Unsupported native status ABI");
         }
         Ok(status)

@@ -1,4 +1,4 @@
-# Journal atomicity and the no-journal option (roadmap item 6)
+# Journal atomicity and the no-journal option
 
 Question: can the stock dm-integrity journal make one hidden record (a carrier
 group of 36/48/90 primary sectors) atomic across power loss? If it could,

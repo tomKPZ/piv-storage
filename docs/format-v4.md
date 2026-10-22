@@ -6,7 +6,7 @@ directory, A/B slots) in the kernel and the independent Python decoder; phase 4
 (docs/journal-atomicity.md). v4 is the only hidden format: format v3
 and the 12-byte-IV profiles were removed on 2026-10-21 (user decision), so
 AEGIS-128 is the only primary profile. Nothing here is an independent
-cryptographic review; tested behaviour is recorded in ROADMAP.md.
+cryptographic review; tested behaviour is recorded in commit messages.
 
 ## Goals
 

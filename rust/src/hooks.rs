@@ -78,8 +78,8 @@ pub fn after_setup(device: &KernelDevice, elapsed: Duration, result: &Result<()>
     };
     let status = match device.status() {
         Ok(s) => format!(
-            "{{\"active\": {}, \"views\": {}, \"failed\": {}, \"hidden_bytes\": {}, \"encryptions\": {}, \"invalidations\": {}}}",
-            s.active, s.views, s.failed, s.hidden_bytes, s.encryptions, s.invalidations),
+            "{{\"active\": {}, \"views\": {}, \"failed\": {}, \"hidden_bytes\": {}, \"encryptions\": {}}}",
+            s.active, s.views, s.failed, s.hidden_bytes, s.encryptions),
         Err(_) => "null".to_string(),
     };
     let _ = write_json(&format!("{prefix}-setup.json"), &format!(

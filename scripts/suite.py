@@ -34,10 +34,10 @@ CONTROL_SCRIPTS = {
     'aegis-4096-nojournal': ['scripts/guest-control-aegis-nojournal.sh', 'scripts/guest-control.sh'],
     'aegis-512-nojournal': ['scripts/guest-control-aegis-512-nojournal.sh', 'scripts/guest-control.sh'],
 }
-SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early', 'power', 'controls', 'sector', 'v4', 'migrate', 'fuzz')
+SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early', 'power', 'controls', 'v4', 'migrate', 'fuzz')
 # Routine tier: run after kernel or pivsetup changes. The opt-in remainder is for
 # changes in its own area: controls (descriptive write-pattern statistics),
-# sector (legacy fixture-decoding regression), migrate (pivsetup migrate) and
+# migrate (pivsetup migrate) and
 # fuzz (control ioctls and table constructors; most useful on the sanitizer).
 DEFAULT_SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early', 'power', 'v4')
 SUITE_SETS = {'routine': DEFAULT_SUITES, 'all': SUITES}
@@ -133,7 +133,7 @@ class Matrix:
         if not self.vm(f'{profile}/control', scripts[0], run_dir, shares=scripts[1:], timeout=1800,
                        extra=['--blank-mib', '128']):
             return None
-        subprocess.run([sys.executable, '-m', 'pivstore', 'keygen', '--output', str(run_dir / 'hidden.key')],
+        subprocess.run([str(self.args.pivsetup), 'keygen', '--output', str(run_dir / 'hidden.key')],
                        cwd=ROOT, check=True, capture_output=True)
         return run_dir
 
@@ -145,10 +145,8 @@ class Matrix:
         keys = [control / 'share/passphrase.key', control / 'hidden.key']
         suites = self.suites_for(profile)
         native = self.args.prefix / f'{profile}-native'
-        module = [Path(self.args.module)] if self.args.module else []
-        build = [Path(self.args.scaffold)] if self.args.scaffold else []
-        script = ROOT / ('scripts/guest-stateless-prebuilt.sh' if module else 'scripts/guest-stateless.sh')
-        shares = [*build, *module, ROOT / 'scripts/guest-dual.sh', ROOT / 'scripts/guest-early-build.sh',
+        script = ROOT / 'scripts/guest-stateless.sh'
+        shares = [Path(self.args.scaffold), ROOT / 'scripts/guest-dual.sh', ROOT / 'scripts/guest-early-build.sh',
                   ROOT / 'kernel/guest-early-test.sh', ROOT / 'kernel/guest-dual-test.py',
                   ROOT / 'kernel/check-config.py', *keys]
         if self.args.reuse_native:
@@ -191,27 +189,8 @@ class Matrix:
                          None),
         }
 
-        if 'sector' in suites:
-            # Focused sector-control regression on the stock fixture; builds the
-            # module itself, so it needs the staged scaffold.
-            layout = self.args.prefix / f'{profile}-input' / 'read-layout.json'
-            layout.parent.mkdir()
-            layout.write_text(subprocess.run([sys.executable, str(ROOT / 'kernel/read-fixture.py'),
-                                              str(control / 'control.img')], cwd=ROOT, check=True,
-                                             capture_output=True, text=True).stdout)
-            sector_shares = [*build, ROOT / 'kernel/guest-test.py', ROOT / 'kernel/check-config.py', layout,
-                             control / 'share/passphrase.key', control / 'share/volume.key',
-                             control / 'share/expected.sha256']
-            reference = os.environ.get('PIV_AEGIS_REFERENCE')
-            if reference:
-                sector_shares.append(Path(reference))
-            plans['sector'] = (ROOT / 'scripts/guest-kernel.sh', control / 'control.img', sector_shares, None)
-
         def suite(name):
             key = f'{profile}/{name}'
-            if name == 'sector' and not build:
-                self.record(key, dict(passed=False, note='sector suite needs --scaffold'))
-                return
             if name == 'early':
                 run_dir = self.args.prefix / f'{profile}-early'
                 with self.slots:
@@ -294,9 +273,8 @@ def main():
                         help='Create a fresh stock fixture for this profile (repeatable)')
     parser.add_argument('--control', action='append', default=[], type=Path,
                         help='Existing control run directory (with share/ and hidden.key); repeatable')
-    build = parser.add_mutually_exclusive_group(required=True)
-    build.add_argument('--scaffold', type=Path, help='Staged module scaffold.tar to build in each native run')
-    build.add_argument('--module', type=Path, help='Prebuilt matched experimental-dm-piv.ko')
+    parser.add_argument('--scaffold', type=Path, required=True,
+                        help='Staged module scaffold.tar (scripts/fetch_kernel.py) to build in each native run')
     parser.add_argument('--suites', default='routine',
                         help=f'routine ({",".join(DEFAULT_SUITES)}), all, or a comma-separated '
                              f'subset of {",".join(SUITES)}')
@@ -305,7 +283,7 @@ def main():
                              'may be empty); e.g. aegis-512=faults on the sanitizer image')
     parser.add_argument('--reuse-native', type=Path, metavar='PREFIX',
                         help='Skip native runs: reuse PREFIX/summary.json native results built from the '
-                             'same --scaffold/--module and base image')
+                             'same --scaffold and base image')
     parser.add_argument('--jobs', type=int, default=max(1, min(16, (os.cpu_count() or 2) // 4)),
                         help='Maximum concurrent VMs')
     parser.add_argument('--fresh', dest='provisioned', action='store_false',
@@ -328,8 +306,7 @@ def main():
             parser.error(f'Invalid --suites-for {item}')
         limits.append((prefix, names))
     args.suites_for = limits
-    module_input = args.scaffold or args.module
-    args.module_input_sha256 = hashlib.sha256(module_input.read_bytes()).hexdigest()
+    args.module_input_sha256 = hashlib.sha256(args.scaffold.read_bytes()).hexdigest()
     args.reuse_native_summary = None
     if args.reuse_native:
         args.reuse_native_summary = json.loads((args.reuse_native / 'summary.json').read_text())

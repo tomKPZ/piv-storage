@@ -4,7 +4,7 @@
 > 2026-10-21: format v3 and the AES-GCM / ChaCha20-Poly1305 profiles were
 > removed (AEGIS-128 with [format v4](format-v4.md) is the only supported
 > configuration). Results below that mention them are historical evidence for
-> the code at that time; see ROADMAP.md for current runs.
+> the code at that time; current runs are recorded in commit messages.
 
 Internal source-led review, 2026-10-19, of runtime/format revision 1f4c94f.
 This is a bounded engineering assessment, not an independent cryptographic audit
@@ -47,50 +47,48 @@ resistance and coercion-resistant alternative hidden openings. The latter would
 only move coercion from one hidden key to the next. Retained single-image
 journal history remains in scope (see below).
 
-## Encoding review
+## Encoding review (format v4)
 
-The exact bytes are specified in [hidden-format.md](hidden-format.md).
-`pn_derive` implements HKDF extract with HMAC-SHA256 keyed by the public salt and
-input hidden key, then its single expand block over AAD followed by byte 1.
-That matches [RFC 5869 sections 2–3](https://www.rfc-editor.org/rfc/rfc5869.html#section-2).
-The Python reference delegates this operation to cryptography's HKDF.
+The exact bytes are specified in [format-v4.md](format-v4.md). Record, keyslot
+and directory keys come from HKDF-SHA256 ([RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html))
+over the master key (or a keyslot KEK) with the public v4 context as salt and a
+`"pivstore/v4/" || label` info string (`pn_hkdf`, cross-checked against the
+Python decoder's cryptography HKDF). A keyslot KEK is a 32-byte key file or a
+passphrase through Argon2id (default; m = 64 MiB, t = 3, p = 4) or scrypt
+(N = 2^17, r = 8, p = 1); the KDF is not recorded, which adds no secrecy.
 
-Each encoding uses a fresh 256-bit salt and a derived ChaCha20-Poly1305 key,
-with a fixed zero nonce. Uniqueness is needed for each *key/nonce pair*, not
-across different keys. [RFC 8439 section 4](https://www.rfc-editor.org/rfc/rfc8439.html#section-4)
-explains the damage from repeated nonces under one key. Here a repeated salt at
-the same context/address repeats the derived key: different plaintexts then
-reuse a stream and a Poly1305 one-time key. For r independent salts at one
-context/address, salt-collision probability is approximately r(r-1)/2^257;
-this is only one failure term, excluding KDF/AEAD advantages and derived-key
-collisions. RNG snapshots/clones can make the birthday model inapplicable.
-No salt history or deterministic uniqueness enforcement exists.
+Each hidden block is a deterministic SIV record: a 16-byte HMAC-SHA256 tag over
+context, group, generation and data, and ChaCha20 under `tag[0:12]`. Identical
+data at the same address therefore gives an identical record payload; freshness
+of the stored bytes comes from the outer encoding, where every 16-byte IV is an
+LRW-AES output on (10 fresh random bytes || 6 payload bytes) tweaked by the
+primary sector. Per-sector nonce uniqueness rests on those 80 random bits
+(n²/2^81 for n rewrites of one sector; see the budget section below).
 
-The intended concealment argument requires the *joint distribution* of salt,
-ciphertext and tag to be pseudorandom for repeated/chosen plaintexts, valid and
-invalid records and exposed AAD, under many keys derived from one root key.
-Ordinary AEAD confidentiality/authenticity alone does not establish that property.
-The encrypted magic, state and fixed invalid-marker zeros introduce no public
-marker, but are known plaintext for a key guess. Primary IVs come from slices of
-this entire encoding; their pseudorandomness is an additional assumption relative
-to ordinary independent random IV generation. Local duplicate rejection slightly
-conditions the distribution and is not an exact match to the stock sampler.
-Statistical summaries in [detectability.md](detectability.md) cannot prove this
-composition secure. No primitive or format change is justified by these tests.
+The concealment argument requires the joint distribution of every stored IV,
+for chosen and repeated hidden data, valid and damaged records and the public
+context, to be indistinguishable from stock random IVs without the hidden key.
+It rests on LRW/AES tweakable-PRP security plus the SIV layer; local collision
+rejection slightly conditions the distribution. This is a design argument
+without external review. Statistical summaries in [detectability.md](detectability.md)
+cannot prove it.
 
-AAD binds canonical UUID, primary capacity/sector size and hidden block address.
-It does not bind a timestamp, generation, primary key, primary cipher, primary
-plaintext or physical disk identity. Correctly transporting an entire record
-with the same context/address to a clone remains valid. Cipher conversion with
-identical UUID/geometry is not a separate hidden cryptographic domain. Use
-independent hidden keys for unrelated volumes; the context is not an anti-cloning
-mechanism. Changing UUID/geometry makes existing hidden records unavailable.
+The context binds the canonical UUID, primary capacity, sector size, the A/B
+layout and the record group. It does not bind a timestamp, the primary key or
+the physical disk: a whole record copied to a clone with the same context stays
+valid, and whole-record rollback is accepted (out of scope). Fragments from
+different versions fail the tag except with probability 2^-128. Raw stored IVs
+of sectors that fail primary authentication feed only this SIV-checked decoding
+(keyslots, the directory and hidden reads), never published output.
 
-Any candidate hidden key can be checked offline using one record's tag and
-known plaintext structure. HKDF is not a password-hardening function. Neither
-key commitment nor producing convincing alternative valid hidden openings under
-other keys is an implemented property. A wrong key looks unavailable to this
-interface; it can still destroy correct-key records on a later decoy write.
+Keyslots give a fast offline key check: a passphrase KEK is exactly as guessable
+as its KDF cost allows, so key files remain the high-entropy option. Neither key
+commitment nor convincing alternative openings under other keys is provided. A
+wrong key is refused by the wrong-key guard instead of being allowed to destroy
+records on a later decoy write. The keyslot directory reveals keyslot outer keys
+only to holders of the master key. A hidden write re-encrypts its 90 primary
+sectors with unchanged plaintext and remains visible to a decoy-key holder with
+journal history.
 
 ## Nonce and data budgets (AEGIS-128 lifetime guidance)
 
@@ -134,13 +132,13 @@ from the host), and no on-disk ledger is added under the current scope.
 
 ## Integrity, journal and implementation boundaries
 
-Source paths reviewed: `pivstore/{records,format,sector,profile,blocks,kernel_api,
-kernel_owner}.py`, `kernel/{piv-native.inc,piv-control.inc,dm-crypt-piv.patch}`,
-and the staged pinned dm-crypt AEAD helper in
-`vendor/kernel-build/batch-001/dm-crypt.c` (2026-10-20: the fork was replaced by
-the standalone kernel/dm-piv.c, which reimplements that helper's AEAD layout;
-the review above predates it and was not repeated line by line). Source/package hashes and fixture
-provenance remain in environment/ and the existing development/layout notes.
+Source paths reviewed: `kernel/{dm-piv.c,piv-control.inc,piv-native.inc}` (the
+standalone target; it reimplements the stock dm-crypt AEAD layout, cross-checked
+by host decoding of every kernel-written image), `rust/src/` (pivsetup) and the
+independent decoders `pivstore/{records_v4,format,sector,profile}.py`. Parts of
+this internal review predate later changes and were not repeated line by line.
+Source/package hashes and fixture provenance remain in environment/ and the
+development/layout notes.
 
 The primary helper retains Linux sector-address/IV AAD and tag/IV layout.
 `piv_load` authenticates before primary modification. PREPARE consumes encryption
@@ -205,23 +203,6 @@ docs/journal-atomicity.md); untested: journal encryption (hides sector
 numbers only from keyless observers, and is unverified for LUKS2 AEAD in
 cryptsetup); and a record format that re-randomizes only touched IVs, reducing
 the group footprint at a capacity cost. These need design review before any claim.
-
-## Format v4 notes (2026-10-20)
-
-Format v4 (format-v4.md) changes the decoy-write footprint: guest tests measured
-exactly one primary encryption per written 4 KiB sector, against 36 for v3 on
-AEGIS-128. Each v4 IV is an LRW-AES output on (10 random bytes || 6 payload
-bytes), so per-sector nonce uniqueness rests on 80 random bits:
-n²/2^81 for n rewrites of one sector. Pseudorandomness without the hidden key
-rests on LRW/AES TPRP security plus the SIV layer; this is a design argument
-that has not had external review. Keyslots give a fast offline key check, so
-a passphrase-derived KEK is exactly as guessable as its KDF cost allows:
-Argon2id by default (m = 64 MiB, t = 3, p = 4, memory-hard against GPU/ASIC
-guessing) or scrypt (N = 2^17, r = 8, p = 1). The KDF is not recorded, which
-adds no secrecy (an attacker tries both). Key files remain the high-entropy option. The keyslot
-directory reveals keyslot outer keys only to holders of the master key. A
-hidden write still re-encrypts 90 sectors with unchanged primary plaintext and
-remains visible to a decoy-key holder with journal history.
 
 ## Disposition and verification
 
