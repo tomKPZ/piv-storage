@@ -1826,6 +1826,9 @@ journaled routine 18/18.
 suite-058-nojournal-sanitizer (KASAN/UBSAN/lockdep image, no-journal fixtures;
 4096 routine, 512 faults and power): 12/12, no kernel reports.
 
+User decision (2026-10-22): the no-journal hazard is accepted; keep no-journal
+support behind the explicit --allow-no-journal opt-in, journaled by default.
+
 Possible improvement (not done): hidden reads could use raw IVs of carrier
 sectors that fail primary authentication (SIV-checked, like keyslots), so a
 torn primary sector whose IV survived would not make its hidden block EIO.
