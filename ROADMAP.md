@@ -26,11 +26,10 @@ and limits are in README.md and docs/.
    `piv_update`, which per sector reads and authenticates three times (range
    read, prepare, apply), self-decrypts, submits one synchronous write and
    flushes every 32 sectors: about 2,000 serial round trips per 687-sector v5
-   record (initialization rewrites every carrier sector, so a 1 TiB
-   `--initialize` still extrapolates to most of a day at 4096-byte sectors and
-   days at 512; docs/configuration.md has the measured rates). A hidden write
-   also allocates one prepared tuple per carrier sector (about 3 MiB per
-   record). Reuse the range read's authenticated plaintext
+   record (5–8 hidden 4 KiB blocks/s; initialization at 4,600–5,500 primary
+   sectors/s extrapolates to 16 h for 1 TiB at 4096-byte sectors and 4–5 days
+   at 512; suite-077). A hidden write also allocates one prepared tuple per
+   carrier sector (about 3 MiB per record). Reuse the range read's authenticated plaintext
    (drop the prepare/apply re-reads; a per-record lock replaces the old
    userspace-era ESTALE recheck), submit each record as a few multi-sector bios
    with integrity metadata and wait once, flush once per record (initialization:
@@ -40,9 +39,9 @@ and limits are in README.md and docs/.
    writes; faults, power, cancel, batch and lifecycle suites updated and
    passing on the stock and sanitizer images; docs updated.
 2. **Concurrent bios and larger reads** (core module). The single ordered
-   `piv-native` worker handles one bio at a time, so decoy writes run 12–50×
-   slower than stock dm-crypt and sequential reads 2.5–4.5× slower
-   (docs/configuration.md, suite-072). Process independent bios and
+   `piv-native` worker handles one bio at a time, so decoy writes run 12–45×
+   slower than stock dm-crypt and sequential reads 3–5× slower
+   (docs/configuration.md, suite-077). Process independent bios and
    initialization records concurrently and/or batch across bios while
    serializing updates that touch the same hidden record, keeping stock
    PREFLUSH/FUA/flush semantics, per-sector authentication before publishing

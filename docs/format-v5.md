@@ -189,12 +189,12 @@ output) over the passphrase, computed by pivsetup:
 salt = base ‖ "/kek/argon2id/" ‖ ASCII tier digit
 ```
 
-| Tier (`--kdf-cost`) | Memory | Passes | Intended use | Measured open (bench host) |
+| Tier (`--kdf-cost`) | Memory | Passes | Intended use | Added open time (suite-077 guests) |
 | ---: | ---: | ---: | --- | ---: |
-| 1 | 64 MiB | 3 | low-memory systems (v4's cost) | see [configuration.md](configuration.md) |
-| 2 | 256 MiB | 3 | small systems | |
-| 3 (default) | 1 GiB | 3 | cryptsetup's LUKS2 default memory cap and lanes | |
-| 4 | 2 GiB | 6 | high-value passphrases on large-memory hosts | |
+| 1 | 64 MiB | 3 | low-memory systems (v4's cost) | 0.13–0.19 s |
+| 2 | 256 MiB | 3 | small systems | 0.52–0.56 s |
+| 3 (default) | 1 GiB | 3 | cryptsetup's LUKS2 default memory cap and lanes | 2.1–2.5 s |
+| 4 | 2 GiB | 6 | high-value passphrases on large-memory hosts | 7.9–9.2 s |
 
 The default matches cryptsetup's LUKS2 Argon2id defaults (user decision
 2026-10-22): 1 GiB of memory and 4 lanes. cryptsetup also calibrates passes to
@@ -202,8 +202,10 @@ about 2 seconds and records them in its header; v5 records nothing, so passes
 are fixed per tier. Tier 3 was measured with pivsetup's Argon2id (RustCrypto
 `argon2`, release build, lanes computed sequentially) on the bench host before
 fixing its passes: 1.95 s at 3 passes and 2.61 s at 4 passes, so tier 3 uses 3
-passes (2026-10-22; tiers 1, 2 and 4 took 0.12, 0.50 and 7.7 s). The other
-tiers' passes are the design targets.
+passes (2026-10-22; tiers 1, 2 and 4 took 0.12, 0.50 and 7.7 s). In the
+suite-077 bench guests tier 3 added 2.1–2.5 s to an open (open time minus a
+key-file open, all four profiles; see [configuration.md](configuration.md)).
+The other tiers' passes are the design targets.
 
 The tier is deliberately not recorded anywhere: nothing can be decrypted before
 the KEK exists, and a clear-text parameter would be public magic. The user
