@@ -89,6 +89,12 @@ no-journal, setup's keyslot-area scan, the failing-sector replacement and A/B
 records (recommended) keep the volume usable after a crash: torn sectors return
 EIO until a full-sector decoy write replaces them.
 
+Hidden reads (since 2026-10-22, user decision) take the raw stored IV of a
+carrier sector that fails primary authentication, so a decoy-write tear (both
+IVs carry the same fragment) or data-area damage leaves the hidden block
+readable; an interrupted hidden write still mixes old and new fragments and
+fails its SIV tag (A/B keeps the previous version).
+
 Evidence: suite-054/056 (`aegis-4096-nojournal`, `aegis-512-nojournal` fixtures
 created with PIV_NO_JOURNAL=1): native, faults (including the opt-in refusal
 and confinement of torn sectors after injected lower write failures), profile,

@@ -93,10 +93,11 @@ def fault(mode='linear'):
     dm('reload', 'piv-test-fault', input=table(mode))
     dm('resume', 'piv-test-fault')
 
-def corrupt_read(sector512, value):
-    # One raw data sector only; unchanged backing bytes and normal writes.
+def corrupt_read(sector512, value, nth=1):
+    # One raw 512-byte sector only (its @nth byte on reads); unchanged backing
+    # bytes and normal writes.
     lines = (f'0 {sector512} linear /dev/vdb 0\n'
-             f'{sector512} 1 flakey /dev/vdb {sector512} 0 3600 5 corrupt_bio_byte 1 r {value} 0\n'
+             f'{sector512} 1 flakey /dev/vdb {sector512} 0 3600 5 corrupt_bio_byte {nth} r {value} 0\n'
              f'{sector512 + 1} {262144 - sector512 - 1} linear /dev/vdb {sector512 + 1}\n')
     dm('suspend', '--noflush', 'piv-test-fault')
     dm('reload', 'piv-test-fault', input=lines)
@@ -308,8 +309,15 @@ for role in ('decoy', 'hidden'):
         buf[:] = sentinel
         fd = os.open(v[role], os.O_RDONLY | os.O_DIRECT)
         try:
-            assert rejected(lambda: os.preadv(fd, [buf], offset)).errno == errno.EIO
-            assert buf[:] == sentinel, 'Failed authenticated work item exposed bytes'
+            if role == 'decoy':
+                assert rejected(lambda: os.preadv(fd, [buf], offset)).errno == errno.EIO
+                assert buf[:] == sentinel, 'Failed authenticated work item exposed bytes'
+            else:
+                # Hidden reads use the raw stored IV of a carrier sector that
+                # fails primary authentication; the fault hit only its data, so
+                # the record's SIV tag still authenticates the intact fragment.
+                assert os.preadv(fd, [buf], offset) == size
+                assert buf[:] == EXPECTED[offset:offset + size]
         finally:
             os.close(fd)
     status = blocks.native_status(handle.device)
@@ -353,7 +361,10 @@ try:
     rejected(lambda: open_views(verify=True))
     absent()
     v = open_views()
-    assert rejected(lambda: direct(v['hidden'], offset=10 * 512)).errno == errno.EIO
+    # Data-area damage: the decoy sector fails, its hidden block still reads.
+    assert rejected(lambda: direct(v['decoy'], offset=last10 * unit,
+                                   size=unit)).errno == errno.EIO
+    assert direct(v['hidden'], offset=10 * 512) == EXPECTED[10 * 512:11 * 512]
     assert direct(v['hidden'], offset=0) == EXPECTED[:512]
     handle = owner(); assert not blocks.native_status(handle.device)['failed']; handle.close()
     close_views(); absent()
@@ -362,6 +373,26 @@ finally:
 v = open_views(verify=True); assert verify(v) is False
 close_views(); absent()
 results.append('late corruption: --verify refuses, default setup opens with local EIO, reopen passed')
+
+# IV damage: corrupt the first IV byte of a record-10 carrier sector whose tuple
+# starts a 512-byte metadata sector (tuple = tag16 || IV16). The primary sector
+# fails and its raw fragment is wrong, so the record's SIV tag rejects block 10.
+# Applied before opening so no cached metadata masks it.
+iv_sector = next(sector for sector in range(record_span(None, 10)[0], record_span(None, 10)[1] + 1)
+                 if layout.offsets(sector)[1] % 512 == 0)
+tag_physical = layout.offsets(iv_sector)[1]
+iv_byte = direct('/dev/vdb', offset=tag_physical, size=512)[16] ^ 1
+corrupt_read(tag_physical // 512, iv_byte, nth=17)
+try:
+    v = open_views()
+    assert rejected(lambda: direct(v['hidden'], offset=10 * 512)).errno == errno.EIO
+    assert rejected(lambda: direct(v['decoy'], offset=iv_sector * unit, size=unit)).errno == errno.EIO
+    assert direct(v['hidden'], offset=11 * 512) == EXPECTED[11 * 512:12 * 512]
+    handle = owner(); assert not blocks.native_status(handle.device)['failed']; handle.close()
+    close_views(); absent()
+finally:
+    fault()
+results.append('IV damage: hidden block EIO (SIV), decoy sector EIO, neighbours intact')
 
 # A keyslot sector failing authentication does not block the default setup:
 # its raw stored IV is used and the keyslot SIV tag (or the other replica)

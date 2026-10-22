@@ -373,17 +373,43 @@ static void pn_v4_decoy_iv(struct piv_native *n, u64 sector, const u8 old[16], u
 	do get_random_bytes(iv, 16); while (!memcmp(iv, old, 16));
 }
 
-/* Authenticate primary data before accepting its carrier, even for replacement. */
-static int pn_carrier_at(struct piv_control *p, u64 first, u32 group, u8 *carrier)
+/* IVs of @count sectors from @index (one bounded range). With @tolerant, a
+ * range failing primary authentication falls back to per-sector loads and
+ * takes the raw stored IV of each failing sector. Only SIV-checked decoding
+ * (keyslots, the directory, hidden reads) may use that: its tag rejects any
+ * damaged, missing or mixed fragment, so nothing unauthenticated is accepted.
+ */
+static int pn_range_ivs(struct piv_control *p, u64 index, u32 count, u8 *ivs, bool tolerant)
+{
+ u32 j, iv = p->profile.iv_size;
+ int r = piv_read_range(p, index, count, NULL, ivs);
+ if (r != -EBADMSG || !tolerant) return r;
+ for (j = 0; j < count; j++) {
+  struct piv_sector *s = NULL;
+  r = piv_load_mode(p->cc, index + j, &s, true); if (r) return r;
+  memcpy(ivs + j * iv, s->original + 4112, iv);
+  piv_sector_free(p->cc, s);
+ }
+ return 0;
+}
+
+/* Authenticate primary data before accepting its carrier, even for replacement
+ * (strict: writes need the authenticated old sectors). Reads pass @tolerant.
+ */
+static int pn_carrier_mode(struct piv_control *p, u64 first, u32 group, u8 *carrier, bool tolerant)
 {
  u32 j = 0, iv = p->profile.iv_size;
  while (j < group) {
   u32 count = min_t(u32, group - j, PIV_READ_BYTES / p->profile.sector_size);
-  int r = piv_read_range(p, first + j, count, NULL, carrier + j * iv);
+  int r = pn_range_ivs(p, first + j, count, carrier + j * iv, tolerant);
   if (r) return r;
   j += count;
  }
  return 0;
+}
+static int pn_carrier_at(struct piv_control *p, u64 first, u32 group, u8 *carrier)
+{
+ return pn_carrier_mode(p, first, group, carrier, false);
 }
 /* Read block i's record(s). With A/B, *slot returns the newest valid slot (or
  * -1 if none) and *generation its generation; @carrier needs 2 * 1440 bytes.
@@ -399,7 +425,8 @@ static int pn_v4_read(struct piv_control *p, u64 index, u8 *carrier, u8 *data, i
  if (!candidate) return -ENOMEM;
  for (i = 0; i < slots; i++) {
   u64 group = pn_v4_group(n, index, i);
-  r = pn_carrier_at(p, pn_v4_group_first(group), PN_V4_GROUP, carrier + i * PN_V4_CARRIER);
+  /* Hidden decoding only needs the IVs; the record's SIV tag decides. */
+  r = pn_carrier_mode(p, pn_v4_group_first(group), PN_V4_GROUP, carrier + i * PN_V4_CARRIER, true);
   if (!r) r = pn_v4_unpack(n, group, carrier + i * PN_V4_CARRIER, candidate, &found);
   /* A primary sector failing authentication makes only this slot unavailable. */
   if (r == PN_UNAVAILABLE || r == -EBADMSG) continue;
@@ -698,7 +725,7 @@ static int pn_dir_load(struct piv_control *p)
  n->dir_slot = -1;
  if (!carrier) return -ENOMEM;
  for (slot = 0; slot < 2; slot++) {
-  r = pn_carrier_at(p, pn_v4_group_first(slot), PN_V4_GROUP, carrier);
+  r = pn_carrier_mode(p, pn_v4_group_first(slot), PN_V4_GROUP, carrier, true);
   if (!r) r = pn_v4_unpack(n, slot, carrier, carrier + PN_V4_CARRIER, &generation);
   if (r == PN_UNAVAILABLE || r == -EBADMSG) continue;
   if (r) goto out;
@@ -780,16 +807,7 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
  for (i = 0; i < scan_end;) {
   u32 count = min_t(u64, scan_end - i, PIV_READ_BYTES / p->profile.sector_size);
   r = pn_setup_poll(); if (r) goto bad;
-  r = piv_read_range(p, i, count, NULL, ivs);
-  if (r == -EBADMSG && !verify) {
-   for (j = 0; j < count; j++) {
-    struct piv_sector *sector = NULL;
-    r = piv_load_mode(p->cc, i + j, &sector, true); if (r) goto bad;
-    memcpy(ivs + j * 16, sector->original + 4112, 16);
-    piv_sector_free(p->cc, sector);
-   }
-  }
-  if (r) goto bad;
+  r = pn_range_ivs(p, i, count, ivs, !verify); if (r) goto bad;
   for (j = 0; ks_ivs && j < count && i + j < PN_V4_KEYSLOT_AREA; j++)
    memcpy(ks_ivs + (i + j) * 16, ivs + j * 16, 16);
   i += count;

@@ -178,7 +178,8 @@ Stock-written sectors remain uniform random.
 Userspace (pivsetup) passes the v4 base context and the keyslot KEK (SETUP ABI
 4: flags INITIALIZE, AB and VERIFY). Setup scans the 112 keyslot sectors (all
 sectors with VERIFY), collects their IVs (raw stored IVs for sectors failing
-authentication, which only the keyslot SIV tag can accept) and tries
+authentication, which only the keyslot SIV tag can accept; hidden reads and the
+directory do the same for their carriers) and tries
 every keyslot replica. A keyslot that authenticates selects the A/B layout from
 its flags; the directory must then authenticate too. Otherwise setup fails with
 EKEYREJECTED. Initialization creates a random master key, keyslot 0 under the

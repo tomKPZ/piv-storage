@@ -103,7 +103,11 @@ touches, so a damaged sector returns EIO when accessed, as in stock dm-crypt.
 `--verify` instead authenticates every primary sector first and refuses the
 volume on any failure (an O(volume) audit). A decoy write covering a whole
 damaged sector replaces it (fresh IV; its hidden fragment is kept only if the
-record still authenticates).
+record still authenticates). Hidden reads use the stored IV of a carrier sector
+whose decoy data fails authentication, so damage confined to decoy data does
+not make the hidden block unavailable; the record's SIV tag still rejects any
+damaged or mixed fragment. Rewriting that hidden block waits for the decoy
+sector to be repaired.
 
 Stock `--integrity-no-journal` volumes (LUKS2 persistent flag) open only with
 `--allow-no-journal`: they keep no journal history on disk, but a crash during a

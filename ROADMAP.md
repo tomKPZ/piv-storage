@@ -1829,9 +1829,12 @@ suite-058-nojournal-sanitizer (KASAN/UBSAN/lockdep image, no-journal fixtures;
 User decision (2026-10-22): the no-journal hazard is accepted; keep no-journal
 support behind the explicit --allow-no-journal opt-in, journaled by default.
 
-Possible improvement (not done): hidden reads could use raw IVs of carrier
-sectors that fail primary authentication (SIV-checked, like keyslots), so a
-torn primary sector whose IV survived would not make its hidden block EIO.
-It changes the faults-suite expectations and is a modest availability gain.
+Hidden reads now use raw IVs of carrier sectors that fail primary
+authentication (user decision 2026-10-22; SIV-checked like keyslots and the
+directory), so data-area damage or a decoy-write tear no longer makes the hidden
+block EIO; rewriting it still needs the decoy sector repaired. Faults suite:
+hidden reads over data-area corruption now return the block; a new IV-damage
+case returns EIO. Evidence: suite-059 stock 20/20 and suite-060-nojournal
+(faults, power, v4) 8/8, no kernel reports.
 
 Open: external review; optional sanitizer build of 7.2.
