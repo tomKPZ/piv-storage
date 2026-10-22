@@ -91,10 +91,12 @@ resolved from context/evidence, not for routine implementation decisions.
   keyslot directory. Never add extra I/O for it. There is no
   uninitialized-carrier mode (removed with v3); stock carriers must be
   initialized.
-- Decoy bios are bounded to 16 KiB at power-of-two DM split boundaries, hidden
-  bios to 512 bytes. Retain the 96-tuple preparation bound,
-  ordered work and lower preflush/completion-flush semantics. Batching is within
-  one bio, not cross-bio writeback. Tail primary sectors have no hidden record.
+- Bio size bounds, preparation batch sizes, worker topology and cross-bio
+  concurrency or batching are implementation choices that may change for
+  performance (user decision 2026-10-22: the earlier one-bio-at-a-time ordered
+  worker rule was removed). Any design must still serialize updates that touch
+  the same hidden record, keep stock PREFLUSH/FUA/flush semantics and the
+  failure-scope rules above. Tail primary sectors have no hidden record.
 - Setup polls pending signals and yields between authenticated ranges and
   complete initialization records. Keep cancellation outside pn_write: completed
   records stay committed, the keyslot-area scan repeats on retry, and cancellation is

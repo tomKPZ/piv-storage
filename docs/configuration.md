@@ -283,7 +283,7 @@ What to expect:
 - **Decoy writes** are 12–50× slower than stock dm-crypt. dm-piv applies one
   write request at a time on an ordered worker: it authenticates the old
   sectors, re-encrypts and writes through the journal before starting the next
-  request (a deliberate design limit for coordinated updates). Throughput is
+  request (a current implementation limit, not a format property). Throughput is
   bound by per-request latency, not by the cipher. This difference is visible
   to anyone timing writes on the running system.
 - **Hidden writes** run at about 17–28 KiB/s (33–57 blocks per second). Each
