@@ -49,11 +49,14 @@ in scope (see below).
 The exact bytes are specified in [format-v5.md](format-v5.md). All hidden keys
 come from HKDF-SHA256 ([RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html))
 over the master key (or a keyslot KEK) with the public v5 context (records: base
-plus the layout parameters) as salt and `"pivstore/v5/" ‖ label` as info
+plus the whole 32-byte keyslot parameter block) as salt and `"pivstore/v5/" ‖ label` as info
 (`pn_hkdf`, cross-checked against the Python decoder). A KEK is a 32-byte key
 file or a passphrase through Argon2id at a user-chosen cost tier (1–4; default
 tier 3: m = 1 GiB, t = 3, p = 4; the tier is part of the salt and recorded
-nowhere).
+nowhere). pivsetup computes the four lanes sequentially (the pinned argon2
+crate has no parallel mode), so an attacker running them in parallel gains up
+to 4× in time over the defender's measured cost, not in memory
+([format-v5.md](format-v5.md#passphrase-cost-tiers)).
 
 Each hidden 4096-byte block is a deterministic SIV record: a 16-byte
 HMAC-SHA256 tag over context, group, generation and data, and ChaCha20 under
@@ -76,8 +79,9 @@ is a design argument without external review. Statistical summaries in
 (AEGIS-128 or AES-XTS + HMAC-SHA256) is visible in LUKS metadata; compare against ordinary
 volumes of the same profile.
 
-The context binds the UUID, primary capacity, sector size, the A/B layout and the
-record group. It does not bind a timestamp, the primary key or the physical
+The context binds the UUID (canonical form), primary capacity, sector size, the
+whole keyslot parameter block (version, A/B flag, block size, parity, reserved
+bytes) and the record group. It does not bind a timestamp, the primary key or the physical
 disk: a whole record copied to a clone with the same context stays valid, and
 whole-record rollback is accepted (out of scope). Fragments from different
 versions fail the tag except with probability 2^-128. Raw stored IVs of sectors
@@ -91,6 +95,19 @@ wrong key is refused at setup (`EKEYREJECTED`) instead of being allowed to
 destroy records on a later decoy write. The keyslot directory reveals keyslot
 outer keys only to holders of the master key.
 
+**Keyslot authority.** Only directory-listed keyslots open a volume (kernel
+and Python decoder): a keyslot left authenticating but unlisted by an
+interrupted add or remove is rejected like a wrong key, so a removed
+passphrase stays removed even after a crash inside the remove. Initialization
+overwrites keyslot areas 1–3 and the unused directory group with random IVs
+before writing keyslot 0, so re-initialization revokes every earlier
+passphrase and directory. Keyslot add/remove (NATIVE_KEYSLOT version 2)
+requires the caller's current hidden KEK of a listed keyslot: root with only
+the LUKS key and an active owner can neither add a passphrase it knows
+(persistent offline access to MK) nor remove the user's keyslots. Root can
+still read the plaintext views and the kernel's memory (administrator
+observer above).
+
 ## Nonce and data budgets
 
 Primary nonce uniqueness is global per primary key across addresses, devices,
@@ -100,8 +117,10 @@ not permit nonce reuse.
 **What consumes nonces.** Every primary encryption draws one 16-byte IV: stock
 dm-crypt writes (one per written sector), native decoy writes (exactly one per
 written primary sector), hidden writes (G = 687 + 3p per 4096-byte block; A/B
-writes one slot), keyslot add/remove (28 + G), initialization (28 + G + G ×
-hidden blocks; quick initialization 28 + G) and fill (G per block written; the
+writes one slot), keyslot add/remove (28 + G), initialization (4 × 28 + 2G +
+G × hidden blocks: the revocation of keyslot areas 1–3 and directory group 1,
+keyslot 0, the directory and the records; quick initialization 4 × 28 + 2G)
+and fill (G per block written; the
 check of skipped blocks only reads). Encryptions performed before a failure
 count; local collision retries happen before encryption and do not.
 
@@ -126,6 +145,13 @@ count; local collision retries happen before encryption and do not.
 
 The per-sector term dominates for hot sectors. Tail sectors, unlisted keyslot
 areas and stock writes use fully random 128-bit IVs and follow the first row only.
+Summed over the volume, the fragment-carrying sectors contribute about
+Σ_s n_s²/2^81 (n_s: lifetime rewrites of sector s), so a few very hot sectors
+dominate. The hottest are typically the keyslot sectors 0–111: they are the
+start of the decoy filesystem (an ext4 superblock and group descriptors),
+rewritten by every metadata update; at about 2^26 lifetime rewrites one such
+sector contributes about 2^-29. This does not change the 10 + 6 split, but a
+budget should count rewrites of the filesystem's hottest blocks.
 
 **Guidance (not a proven bound).** Choose a per-key budget for the deployment,
 for example at most 2^40 total primary encryptions and at most 2^24 rewrites of
@@ -220,6 +246,10 @@ IVs or LRW outputs under an earlier master key), which a single image cannot
 tell apart from records without the master key. Its later hidden writes are
 then the per-record signature above, as after a full initialization.
 It indicates hidden-volume activity to a decoy-key holder with journal access.
+A removed keyslot's (or, after re-initialization, a revoked keyslot's) old
+IVs can likewise remain in the journal until it wraps, so its passphrase stays
+testable offline from one raw image during that window; write more than a
+journal's worth of decoy data after a removal to push them out.
 No supported mitigation removes it: stock `--integrity-no-journal` would remove
 on-disk journal history, but pivsetup refuses it because a crash during a
 hidden write could then tear decoy sectors of that record's carrier

@@ -28,7 +28,8 @@ pivsetup open-blocks --device D --key-file F (--hidden-key-file F | --hidden-pas
                      [--verify] [--kdf-cost 1-4]
 pivsetup close-blocks --device D --key-file F [--name piv-native]
 pivsetup keyslot add|remove --device D --key-file F --slot 0-3
-                     [--new-key-file F | --new-passphrase-file F [--kdf-cost 1-4]]
+                     (--hidden-key-file F | --hidden-passphrase-file F [--kdf-cost 1-4])
+                     [--new-key-file F | --new-passphrase-file F [--new-kdf-cost 1-4]]
                      [--name piv-native]
 pivsetup migrate --source D --source-key-file F (--source-hidden-key-file F | --source-hidden-passphrase-file F)
                  --target D --target-key-file F
@@ -62,7 +63,8 @@ counts as `"fill": {"valid": N, "written": N, "failed": N}` and notes failed
 blocks on stderr) and
 view creation ([native-blocks.md](../docs/native-blocks.md)). Failed-attempt
 cleanup is limited to its own identity-checked mappings; close validates both
-views. `keyslot` uses NATIVE_KEYSLOT on the active owner.
+views. `keyslot` uses NATIVE_KEYSLOT (version 2) on the active owner,
+authorized by the current hidden key or passphrase of a listed keyslot.
 
 `migrate` (src/migrate.rs) is the offline rekey/resize/sector-size-change path
 (live resize and rekey are unsupported): it refuses a target that is the

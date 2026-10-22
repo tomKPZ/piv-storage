@@ -30,7 +30,7 @@ SETUP = struct.Struct('=IIQII32s128sIIQQQ')
 SETUP_VERSION = 6
 SETUP_INITIALIZE, SETUP_AB, SETUP_VERIFY, SETUP_QUICK, SETUP_FILL = 1, 8, 16, 32, 64
 STATUS = struct.Struct('=QQQIIII')  # STATUS version 4
-KEYSLOT = struct.Struct('=IIQII32s2I')
+KEYSLOT = struct.Struct('=IIQII32s32s2I')  # KEYSLOT version 2: slot, op, new KEK, authorizing KEK
 # Passphrase KEK cost tiers (--kdf-cost, docs/format-v5.md); must equal
 # rust/src/blocks.rs. Argon2id v1.3, 4 lanes, 32-byte output: tier ->
 # (memory KiB, passes). The tier is recorded nowhere and is part of the salt.
@@ -143,19 +143,27 @@ def migrate(source, source_key_file, source_hidden_key, target, target_key_file,
         return json.loads(run(args))
 
 
-def keyslot(source, key_file, slot, kek=None, *, name='piv-native', passphrase=None,
-            kdf_cost=None):
-    """Add (kek or passphrase given) or remove keyslot @slot on active v5 views."""
+def keyslot(source, key_file, slot, kek=None, *, hidden_key=None, hidden_passphrase=None, hidden_kdf_cost=None,
+            name='piv-native', passphrase=None, kdf_cost=None):
+    """Add (kek or passphrase given; @kdf_cost: the new passphrase's tier) or
+    remove keyslot @slot on active v5 views, authorized by the current hidden
+    key or passphrase (@hidden_kdf_cost: its tier) of a listed keyslot."""
     adding = kek is not None or passphrase is not None
+    if (hidden_key is None) == (hidden_passphrase is None):
+        raise ValueError('Give exactly one of hidden_key or hidden_passphrase')
     args = ['keyslot', 'add' if adding else 'remove', '--device', source, '--key-file', key_file,
             '--name', name, '--slot', slot]
-    if not adding:
-        run(args)
-        return
-    option = '--new-key-file' if kek is not None else '--new-passphrase-file'
-    if kdf_cost is not None: args += ['--kdf-cost', str(kdf_cost)]
-    with secret_file(kek if kek is not None else passphrase) as path:
-        run(args + [option, path])
+    if hidden_kdf_cost is not None: args += ['--kdf-cost', str(hidden_kdf_cost)]
+    if kdf_cost is not None: args += ['--new-kdf-cost', str(kdf_cost)]
+    auth_option = '--hidden-key-file' if hidden_key is not None else '--hidden-passphrase-file'
+    with secret_file(hidden_key if hidden_key is not None else hidden_passphrase) as auth:
+        args += [auth_option, auth]
+        if not adding:
+            run(args)
+            return
+        option = '--new-key-file' if kek is not None else '--new-passphrase-file'
+        with secret_file(kek if kek is not None else passphrase) as path:
+            run(args + [option, path])
 
 
 def native_status(device):

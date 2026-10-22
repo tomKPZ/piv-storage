@@ -15,7 +15,10 @@ from pivstore import rs
 from pivstore.blocks import open_blocks, close_blocks, keyslot, native_status
 from pivstore.kernel_api import dm
 from pivstore.kernel_owner import GuestOwner
-from pivstore.records import DATA_FRAGMENTS, FRAGMENT, correct_fragments, parity_fragments
+from pivstore.format import base_context
+from pivstore.profile import Image, UnsupportedImage
+from pivstore.records import (DATA_FRAGMENTS, FRAGMENT, KEYSLOT_SECTORS, Records, correct_fragments, open_slot,
+                              open_volume, parity_fragments, unlock)
 
 W = Path('/mnt/piv-work')
 KEY = W / 'passphrase.key'
@@ -91,6 +94,43 @@ def damage(sector):
     stock_rewrite('/dev/vdb', [sector])
 
 
+def raw_tuple_patch(path, layout, sector, data, metadata):
+    """Write raw primary @sector bytes (ciphertext and tag || IV) with the
+    views closed (aligned O_DIRECT read-modify-write of the metadata)."""
+    data_offset, tag_offset = layout.offsets(sector)
+    direct(path, data_offset, layout.sector_size, data)
+    lo = tag_offset // 512 * 512
+    hi = -(-(tag_offset + layout.tuple_bytes) // 512) * 512
+    span = bytearray(direct(path, lo, hi - lo))
+    span[tag_offset - lo:tag_offset - lo + layout.tuple_bytes] = metadata
+    direct(path, lo, hi - lo, bytes(span))
+
+
+def raw_tuple(path, layout, sector):
+    data_offset, tag_offset = layout.offsets(sector)
+    lo = tag_offset // 512 * 512
+    hi = -(-(tag_offset + layout.tuple_bytes) // 512) * 512
+    span = direct(path, lo, hi - lo)
+    return direct(path, data_offset, layout.sector_size), span[tag_offset - lo:tag_offset - lo + layout.tuple_bytes]
+
+
+class snapshot:
+    """A closed raw image of @source (views closed, journal clean) opened with
+    the independent read-only decoder; removed afterwards."""
+
+    def __init__(self, source):
+        self.path = Path('/var/tmp/piv-v5-snapshot.img')
+        subprocess.run(['dd', f'if={source}', f'of={self.path}', 'bs=1M', 'status=none'], check=True)
+        self.image = Image(self.path)
+
+    def __enter__(self):
+        return self.image
+
+    def __exit__(self, *exc):
+        self.image.close()
+        self.path.unlink()
+
+
 def readable(path, index):
     """Block @index of a hidden view, or None if it reads EIO (exact O_DIRECT)."""
     try:
@@ -101,8 +141,10 @@ def readable(path, index):
 
 
 def setup_writes():
-    """Primary encryptions of keyslot 0 (2 x 14 sectors) and one directory write."""
-    return 2 * 14 + GROUP
+    """Primary encryptions of an initialization without records: the revocation
+    of keyslots 1-3 (3 x 2 x 14 sectors) and directory group 1, keyslot 0
+    (2 x 14) and one directory write."""
+    return 4 * 2 * 14 + 2 * GROUP
 
 
 def write_profile(count=48):
@@ -222,17 +264,23 @@ assert direct(v['hidden'], BLOCK, BLOCK) == bytes(BLOCK)
 # Keyslots: add a key-file slot and passphrase slots (default tier 3 and tier
 # 1) on the active owner, rewrite the whole keyslot/directory area through the
 # decoy (fragment refresh must preserve every listed keyslot), then retire the
-# original key.
+# original key. Every KEYSLOT call is authorized by the current hidden key or
+# passphrase of a listed keyslot.
 second_key, passphrase = os.urandom(32), b'synthetic test passphrase'
 third_passphrase = b'another synthetic test passphrase'
-keyslot('/dev/vdb', KEY, 1, second_key)
-keyslot('/dev/vdb', KEY, 2, passphrase=passphrase)            # pivsetup derives the tier-3 KEK
-keyslot('/dev/vdb', KEY, 3, passphrase=third_passphrase, kdf_cost=1)
+before = status()[0]['encryptions']
+assert rejected(lambda: keyslot('/dev/vdb', KEY, 1, second_key, hidden_key=os.urandom(32))).errno == errno.EKEYREJECTED
+assert rejected(lambda: keyslot('/dev/vdb', KEY, 1, second_key, hidden_passphrase=passphrase)).errno == errno.EKEYREJECTED
+assert status()[0]['encryptions'] == before        # refused before writing anything
+keyslot('/dev/vdb', KEY, 1, second_key, hidden_key=HKEY)
+keyslot('/dev/vdb', KEY, 2, passphrase=passphrase, hidden_key=second_key)   # pivsetup derives the tier-3 KEK
+keyslot('/dev/vdb', KEY, 3, passphrase=third_passphrase, kdf_cost=1, hidden_passphrase=passphrase)
 # Independent Python Argon2id KEKs must open the same slots: Rust/Python KDF
 # parity on the real volume context, per tier.
 from pivstore.blocks import base_identity, passphrase_kek
 owner = GuestOwner('/dev/vdb', KEY)
 identity = base_identity(owner)
+layout = owner.layout
 owner.close()
 pass_kek = passphrase_kek(passphrase, identity, 3)
 third_kek = passphrase_kek(third_passphrase, identity, 1)
@@ -251,24 +299,64 @@ assert rejected(lambda: opened(key=None, hidden_passphrase=third_passphrase)).er
 assert rejected(lambda: opened(key=None, hidden_passphrase=passphrase, kdf_cost=1)).errno == errno.EKEYREJECTED
 assert rejected(lambda: opened(key=None, hidden_passphrase=third_passphrase, kdf_cost=2)).errno == errno.EKEYREJECTED
 v = opened(key=second_key)
-keyslot('/dev/vdb', KEY, 3)
+# The authorizing passphrase needs its own tier (--kdf-cost).
+assert rejected(lambda: keyslot('/dev/vdb', KEY, 3, hidden_passphrase=third_passphrase)).errno == errno.EKEYREJECTED
+keyslot('/dev/vdb', KEY, 3, hidden_passphrase=third_passphrase, hidden_kdf_cost=1)   # removes its own slot
 close_blocks('/dev/vdb', KEY)
 assert rejected(lambda: opened(key=None, hidden_passphrase=third_passphrase, kdf_cost=1)).errno == errno.EKEYREJECTED
 v = opened(key=second_key)
-keyslot('/dev/vdb', KEY, 0)            # remove the original key file's slot
-assert rejected(lambda: keyslot('/dev/vdb', KEY, 0)).errno == errno.ENOENT
+keyslot('/dev/vdb', KEY, 0, hidden_key=second_key)            # remove the original key file's slot
+assert rejected(lambda: keyslot('/dev/vdb', KEY, 0, hidden_key=second_key)).errno == errno.ENOENT
+# A removed keyslot's key no longer authorizes anything.
+assert rejected(lambda: keyslot('/dev/vdb', KEY, 3, os.urandom(32), hidden_key=HKEY)).errno == errno.EKEYREJECTED
 close_blocks('/dev/vdb', KEY)
 assert rejected(lambda: opened()).errno == errno.EKEYREJECTED
+
+# Crash window of a remove (or an add): a keyslot that authenticates but is
+# not listed in the directory. Simulated by restoring slot 2's raw sectors
+# after a complete remove (views closed, journal clean): its passphrase must
+# no longer open the volume nor authorize KEYSLOT. The independent decoder
+# confirms that slot 2 still authenticates and that open_volume rejects it.
+slot2 = range(2 * 2 * KEYSLOT_SECTORS, 2 * 3 * KEYSLOT_SECTORS)
+saved = {sector: raw_tuple('/dev/vdb', layout, sector) for sector in slot2}
 v = opened(key=second_key)
-keyslot('/dev/vdb', KEY, 2)
-assert rejected(lambda: keyslot('/dev/vdb', KEY, 1)).errno == errno.EBUSY   # last keyslot stays
+keyslot('/dev/vdb', KEY, 2, hidden_key=second_key)
 close_blocks('/dev/vdb', KEY)
+for sector in slot2:
+    raw_tuple_patch('/dev/vdb', layout, sector, *saved[sector])
 assert rejected(lambda: opened(key=None, hidden_passphrase=passphrase)).errno == errno.EKEYREJECTED
+with snapshot('/dev/vdb') as image:
+    ivs = list(image.iv_slots())
+    base = base_context(image.uuid, image.layout.primary_bytes, image.layout.sector_size)
+    assert unlock(ivs, base, pass_kek)[0] == 2               # the unlisted keyslot authenticates
+    try:
+        open_volume(image, pass_kek)
+    except UnsupportedImage:
+        pass
+    else:
+        raise AssertionError('Unlisted keyslot opened the image')
+    assert open_volume(image, second_key)[2] == 1
+v = opened(key=second_key)
+assert rejected(lambda: keyslot('/dev/vdb', KEY, 3, os.urandom(32),
+                                hidden_passphrase=passphrase)).errno == errno.EKEYREJECTED
+assert rejected(lambda: keyslot('/dev/vdb', KEY, 1, hidden_key=second_key)).errno == errno.EBUSY   # last keyslot stays
+close_blocks('/dev/vdb', KEY)
 results['keyslots'] = dict(added=[1, 2, 3], removed=[3, 0, 2], last_slot_protected=True,
                            passphrase_slots={2: 'tier 3 (default)', 3: 'tier 1'}, python_kdf_cross_check=[1, 3],
                            wrong_passphrase_rejected=True, wrong_tier_rejected=True,
-                           decoy_rewrite_of_keyslot_area_preserved=True)
+                           decoy_rewrite_of_keyslot_area_preserved=True,
+                           keyslot_ops_need_listed_credential=True, unlisted_keyslot_rejected=True)
 results['ab'] = dict(fallback_after_damaged_newest_slot=True, rewrite_encryptions=GROUP)
+
+# Re-initialization revokes every earlier keyslot and directory: capture the
+# old master key through the remaining listed slot 1 (and the stale slot 2),
+# then quick re-initialize with the original key.
+with snapshot('/dev/vdb') as image:
+    old_ivs = list(image.iv_slots())
+    base = base_context(image.uuid, image.layout.primary_bytes, image.layout.sector_size)
+    old_flags, old_master, old_parity = open_slot(old_ivs, base, second_key, 1)
+    old_records = Records(image.layout.sectors, base, old_master, ab=bool(old_flags & 1), rs_parity=old_parity)
+    old_records.decode_directory(old_ivs)                      # the old directory authenticates now
 
 # ---- Quick initialization and fill (no parity) ----
 # --quick writes only keyslot 0 and the directory: every hidden block reads EIO
@@ -292,6 +380,29 @@ for index, value in quick.items():
     assert direct(v['hidden'], index * BLOCK, BLOCK) == value
 primary_quick = subprocess.check_output(['sha256sum', v['decoy']], text=True).split()[0]
 close_blocks('/dev/vdb', KEY)
+# Revocation: the old key file and passphrase open nothing, no keyslot area
+# authenticates under them, and neither directory group authenticates under
+# the old master key (the old records are reachable through no keyslot).
+assert rejected(lambda: opened(key=second_key)).errno == errno.EKEYREJECTED
+assert rejected(lambda: opened(key=None, hidden_passphrase=passphrase)).errno == errno.EKEYREJECTED
+with snapshot('/dev/vdb') as image:
+    new_ivs = list(image.iv_slots())
+for kek in (second_key, pass_kek):
+    try:
+        unlock(new_ivs, base, kek)
+    except UnsupportedImage:
+        pass
+    else:
+        raise AssertionError('Old keyslot authenticates after re-initialization')
+for group in (0, 1):
+    first = old_records.first_sector(group)
+    try:
+        old_records.open_group(group, new_ivs[first:first + old_records.group])
+    except UnsupportedImage:
+        pass
+    else:
+        raise AssertionError(f'Old directory group {group} authenticates after re-initialization')
+results['reinitialization'] = dict(old_keyslots_revoked=True, old_directory_groups_revoked=[0, 1], quick=True)
 for kw in (dict(quick=True), dict(initialize=True, fill=True)):    # usage errors, nothing opened
     try:
         opened(**kw)
@@ -450,26 +561,6 @@ def rs_status():
     return status(STACK)[0]
 
 
-def raw_tuple_patch(sector, data, metadata):
-    """Write raw primary @sector bytes (ciphertext and tag || IV) with the
-    views closed (aligned O_DIRECT read-modify-write of the metadata)."""
-    data_offset, tag_offset = layout.offsets(sector)
-    direct(STACK, data_offset, unit, data)
-    lo = tag_offset // 512 * 512
-    hi = -(-(tag_offset + layout.tuple_bytes) // 512) * 512
-    span = bytearray(direct(STACK, lo, hi - lo))
-    span[tag_offset - lo:tag_offset - lo + layout.tuple_bytes] = metadata
-    direct(STACK, lo, hi - lo, bytes(span))
-
-
-def raw_tuple(sector):
-    data_offset, tag_offset = layout.offsets(sector)
-    lo = tag_offset // 512 * 512
-    hi = -(-(tag_offset + layout.tuple_bytes) // 512) * 512
-    span = direct(STACK, lo, hi - lo)
-    return direct(STACK, data_offset, unit), span[tag_offset - lo:tag_offset - lo + layout.tuple_bytes]
-
-
 def group_first(block):
     return KEYSLOT_AREA + G * (2 + block)
 
@@ -483,7 +574,7 @@ layout, unit, sectors = handle.layout, handle.device.sector_size, handle.device.
 handle.close()
 rs_records = (sectors - KEYSLOT_AREA) // G - 2
 assert v['hidden_bytes'] == rs_records * BLOCK, (v, rs_records)
-assert rs_status()['encryptions'] == 2 * 14 + G
+assert rs_status()['encryptions'] == 4 * 2 * 14 + 2 * G
 rs_pattern = {i: hashlib.shake_256(b'v5-rs-%d' % i).digest(BLOCK) for i in range(4)}
 for index, value in rs_pattern.items():
     before = rs_status()['encryptions']
@@ -563,18 +654,18 @@ results['rs']['errors'] = dict(corrected_per_lane=P // 2, total=len(errors), rep
 # carrier sectors after a hidden rewrite. They authenticate and carry the old
 # fragments: 4 per lane (12 consecutive sectors) still decode the NEW version;
 # 10 per lane return EIO (no A/B), never the old or a mixed block.
-old_raw = {j: raw_tuple(group_first(3) + j) for j in range(300, 330)}
+old_raw = {j: raw_tuple(STACK, layout, group_first(3) + j) for j in range(300, 330)}
 v = rs_open()
 newer = hashlib.shake_256(b'v5-rs-newer').digest(BLOCK)
 direct(v['hidden'], 3 * BLOCK, BLOCK, newer)
 rs_close()
 for j in range(300, 312):
-    raw_tuple_patch(group_first(3) + j, *old_raw[j])
+    raw_tuple_patch(STACK, layout, group_first(3) + j, *old_raw[j])
 v = rs_open()
 assert direct(v['hidden'], 3 * BLOCK, BLOCK) == newer
 rs_close()
 for j in range(312, 330):
-    raw_tuple_patch(group_first(3) + j, *old_raw[j])
+    raw_tuple_patch(STACK, layout, group_first(3) + j, *old_raw[j])
 v = rs_open()
 assert rejected(lambda: direct(v['hidden'], 3 * BLOCK, BLOCK)).errno == errno.EIO
 assert not rs_status()['failed']

@@ -171,11 +171,6 @@ bad:
 	return ret;
 }
 
-static int piv_load(struct piv_crypt *cc, u64 index, struct piv_sector **out)
-{
-	return piv_load_mode(cc, index, out, false);
-}
-
 /* Range locks over primary sector indices serialize every request that
  * rewrites sectors with every other request touching them: decoy writes
  * (their sectors), hidden writes (the block's whole record group, both slots
@@ -585,23 +580,41 @@ static int piv_batch_write(struct piv_batch *b, const u8 *ivs, bool flush, bool 
  * one authenticated CURRENT tuple through the same target before END. This is
  * not encryption, consumes no nonce, and needs no external recovery plan because
  * every byte is identical. Native journaling still protects its sector atomicity.
+ * The first sector of the keyslot area that reads and authenticates is used, so
+ * one damaged or unreadable sector (e.g. sector 0, a keyslot replica) cannot
+ * block setup, END or DETACH. The write is followed by a flush (which also
+ * commits the journal), so it needs no FUA of its own.
  */
-static int piv_checkpoint(struct piv_crypt *cc)
+#define PIV_CHECKPOINT_SECTORS 112
+static int piv_checkpoint(struct piv_control *p)
 {
-	struct piv_sector *s = NULL;
-	int ret;
+	struct piv_crypt *cc = p->cc;
+	u64 i;
+	int ret = -EIO;
 
-	ret = piv_load(cc, 0, &s);
-	if (ret)
+	for (i = 0; i < PIV_CHECKPOINT_SECTORS && i < p->profile.sectors; i++) {
+		struct piv_sector *s = NULL;
+
+		ret = piv_load_mode(cc, i, &s, true);
+		if (ret == -ENOMEM)
+			return ret;
+		if (ret)
+			continue;	/* unreadable: try the next sector */
+		if (s->bad) {
+			piv_sector_free(cc, s);
+			ret = -EBADMSG;
+			continue;
+		}
+		memcpy(page_address(s->page), s->original, cc->sector_size);
+		memcpy(s->io.integrity_metadata, s->original + 4096, cc->tuple_size);
+		ret = piv_bio(cc, s, REQ_OP_WRITE | REQ_SYNC);
+		if (!ret)
+			ret = submit_bio_wait(s->bio);
+		if (!ret)
+			ret = blkdev_issue_flush(cc->dev->bdev);
+		piv_sector_free(cc, s);
 		return ret;
-	memcpy(page_address(s->page), s->original, cc->sector_size);
-	memcpy(s->io.integrity_metadata, s->original + 4096, cc->tuple_size);
-	ret = piv_bio(cc, s, REQ_OP_WRITE | REQ_SYNC | REQ_FUA);
-	if (!ret)
-		ret = submit_bio_wait(s->bio);
-	if (!ret)
-		ret = blkdev_issue_flush(cc->dev->bdev);
-	piv_sector_free(cc, s);
+	}
 	return ret;
 }
 
@@ -654,9 +667,10 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	else if (cmd == PIV_NATIVE_STATUS) {
 		status.generation = p->profile.generation; status.version = 4;
 		status.encryptions = atomic64_read(&p->encryptions);
+		status.failed = READ_ONCE(p->failed);
 		if (p->native) {
 			status.active = 1; status.views = p->native->views;
-			status.failed = READ_ONCE(p->native->failed);
+			status.failed |= READ_ONCE(p->native->failed);
 			status.hidden_bytes = p->native->hidden_bytes;
 		}
 	} else if (cmd == PIV_NATIVE_SETUP)
@@ -672,7 +686,7 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		if (!ret && (read.sector || memchr_inv(read.iv, 0, sizeof(read.iv)) || memchr_inv(read.reserved, 0, sizeof(read.reserved)))) ret = -EINVAL;
 		if (!ret && (!p->native || p->native->views)) ret = -EBUSY;
 		if (!ret && !READ_ONCE(p->failed) && !READ_ONCE(p->native->failed)) {
-			ret = piv_checkpoint(p->cc);
+			ret = piv_checkpoint(p);
 			if (ret) { WRITE_ONCE(p->failed, true); WRITE_ONCE(p->native->failed, true); }
 		}
 		if (!ret) { pn_free(p->native); p->native = NULL; }
@@ -700,7 +714,7 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			if (!p->transaction || p->controller != file)
 				ret = -EPERM;
 			else {
-				ret = piv_checkpoint(p->cc);
+				ret = piv_checkpoint(p);
 				if (!ret) {
 					p->transaction = false;
 					p->controller = NULL;

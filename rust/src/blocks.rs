@@ -273,13 +273,31 @@ fn close_inner(owner: &mut Owner, name: &str) -> Result<()> {
     owner.remove(false)
 }
 
-pub fn keyslot(source: &Path, key_file: &Path, slot: u32, kek: Option<&[u8]>, name: &str) -> Result<()> {
+/// Add (@kek given) or remove keyslot @slot on active views. @auth: the
+/// caller's current hidden key file or passphrase (Argon2id tier @auth_tier);
+/// the kernel requires it to open a keyslot listed in the directory.
+pub fn keyslot(source: &Path, key_file: &Path, slot: u32, kek: Option<&[u8]>, auth: HiddenSecret, auth_tier: u8,
+               name: &str) -> Result<()> {
     let mut owner = Owner::open(source, key_file, name)?;
     let result = (|| {
         if owner.created || !owner.device().status()?.active {
             return Err(Error::os(libc::ENOENT, "Native views must be active to manage keyslots"));
         }
-        owner.device().keyslot(slot, kek)
+        let passphrase = matches!(auth, HiddenSecret::Passphrase(_));
+        let auth = match auth {
+            HiddenSecret::Key(key) if key.len() == 32 => key,
+            HiddenSecret::Key(_) => bail!("Hidden key must contain exactly 32 bytes"),
+            HiddenSecret::Passphrase(passphrase) => passphrase_kek(&passphrase, &base_identity(&owner), auth_tier)?,
+        };
+        owner.device().keyslot(slot, kek, &auth).map_err(|mut error| {
+            if error.errno == Some(libc::EKEYREJECTED) {
+                error.note("The current hidden key or passphrase does not open a listed keyslot");
+                if passphrase {
+                    error.note(format!("Passphrases also need their --kdf-cost tier (this attempt: {auth_tier})"));
+                }
+            }
+            error
+        })
     })();
     let cleanup = if owner.created { owner.remove(true) } else { Ok(()) };
     owner.close();

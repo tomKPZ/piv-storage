@@ -267,6 +267,45 @@ disk.close()
 disk.stock_check()
 loop.stock_check()
 disk.record(kind='whole disk, 300 MiB')
+
+# Decoy geometry matches stock dm-crypt: the view's logical block size is the
+# primary sector size, so a filesystem created through it mounts through
+# stock cryptsetup (with a 512-byte view on a 4096-byte volume, mke2fs would
+# accept 1 KiB blocks that stock dm-crypt cannot serve). The hidden view is
+# unaffected.
+views = disk.open()
+assert int(run('blockdev', '--getss', views['decoy']).stdout) == SECTOR
+assert int(run('blockdev', '--getpbsz', views['decoy']).stdout) == SECTOR
+if SECTOR > 512:
+    refused_fs = run('mkfs.ext4', '-q', '-F', '-E', 'nodiscard', '-b', '1024', views['decoy'], check=False)
+    assert refused_fs.returncode != 0, refused_fs
+run('mkfs.ext4', '-q', '-F', '-E', 'nodiscard', '-L', 'pivdecoy', views['decoy'])
+mountpoint = RUN / 'mnt'
+mountpoint.mkdir(exist_ok=True)
+payload = secrets.token_bytes(3 << 20)
+run('mount', views['decoy'], mountpoint)
+try:
+    (mountpoint / 'payload.bin').write_bytes(payload)
+finally:
+    run('umount', mountpoint)
+assert Path(views['hidden']).read_bytes() == disk.hidden
+disk.close()
+run('cryptsetup', 'open', '--readonly', '--key-file', disk.key, disk.device, 'stock-fs')
+try:
+    assert int(run('blockdev', '--getss', '/dev/mapper/stock-fs').stdout) == SECTOR
+    run('mount', '-o', 'ro,noload', '/dev/mapper/stock-fs', mountpoint)
+    try:
+        assert (mountpoint / 'payload.bin').read_bytes() == payload
+    finally:
+        run('umount', mountpoint)
+finally:
+    run('cryptsetup', 'close', 'stock-fs')
+views = disk.open()
+assert Path(views['hidden']).read_bytes() == disk.hidden
+disk.close()
+results['filesystem'] = dict(view_logical_block=SECTOR, ext4_1k_refused=SECTOR > 512,
+                             ext4_through_view_mounted_by_stock=True, hidden_preserved=True)
+print('decoy filesystem: created through the view, mounted through stock dm-crypt', flush=True)
 loop.export('devices-loop.img')
 loop.record(kind='loop device over a guest-root file', concurrent_with='disk', reopened_via='symlink')
 run('losetup', '--detach', loop_device)

@@ -118,6 +118,20 @@ def corrupt_read(sector512, value, nth=1):
     dm('reload', 'piv-test-fault', input=lines)
     dm('resume', 'piv-test-fault')
 
+def corrupt_reads(targets):
+    """Several one-sector read corruptions at once: (sector512, value) pairs,
+    first byte of each sector."""
+    lines, at = [], 0
+    for sector512, value in sorted(targets):
+        if sector512 > at:
+            lines.append(f'{at} {sector512 - at} linear /dev/vdb {at}')
+        lines.append(f'{sector512} 1 flakey /dev/vdb {sector512} 0 3600 5 corrupt_bio_byte 1 r {value} 0')
+        at = sector512 + 1
+    lines.append(f'{at} {262144 - at} linear /dev/vdb {at}')
+    dm('suspend', '--noflush', 'piv-test-fault')
+    dm('reload', 'piv-test-fault', input='\n'.join(lines) + '\n')
+    dm('resume', 'piv-test-fault')
+
 def direct(path, *, write=None, offset=0, size=BLOCK):
     if write is not None: size = len(write)
     value = mmap.mmap(-1, size)
@@ -316,14 +330,17 @@ for role in ('decoy', 'hidden'):
     status = blocks.native_status(handle.device)
     assert not status['failed']
     before_count = status['encryptions']
-    if role == 'hidden' or unit > 512:
+    if role == 'hidden':
         # A write that does not cover the failing sector entirely (any hidden
-        # write, or a 512-byte decoy write into a 4096-byte sector) needs its
-        # authenticated old data and must fail before encrypting or changing
-        # anything.
-        partial = (offset if role == 'hidden' else last * unit)
-        length = BLOCK if role == 'hidden' else 512
-        assert rejected(lambda: direct(v[role], write=b'\x5a' * length, offset=partial)).errno == errno.EIO
+        # write) needs its authenticated old data and must fail before
+        # encrypting or changing anything.
+        assert rejected(lambda: direct(v[role], write=b'\x5a' * BLOCK, offset=offset)).errno == errno.EIO
+        status = blocks.native_status(handle.device)
+        assert not status['failed'] and status['encryptions'] == before_count
+    elif unit > 512:
+        # The decoy's logical block size is the primary sector size (as stock
+        # dm-crypt): a sub-sector direct write never reaches the module.
+        assert rejected(lambda: direct(v[role], write=b'\x5a' * 512, offset=last * unit)).errno == errno.EINVAL
         status = blocks.native_status(handle.device)
         assert not status['failed'] and status['encryptions'] == before_count
     if role == 'decoy':
@@ -420,6 +437,109 @@ handle = owner(); assert not blocks.native_status(handle.device)['failed']; hand
 direct(v['hidden'], write=EXPECTED[:BLOCK]); assert verify(v) is False
 close_views(); absent()
 results.append('local hidden EIO, preserved damage and direct repair remain isolated')
+
+# A keyslot remove whose directory write fails before writing anything (the
+# carrier of the target directory group fails authentication) changes neither
+# disk nor memory: the owner stays healthy and a later decoy rewrite of the
+# keyslot's sectors refreshes them as a listed keyslot, so it still opens.
+second_hkey = os.urandom(32)
+v = open_views()
+blocks.keyslot(SOURCE, KEY, 1, second_hkey, hidden_key=HKEY)
+handle = owner(); before_count = blocks.native_status(handle.device)['encryptions']; handle.close()
+targets = [layout.offsets(112)[0], layout.offsets(112 + GROUP)[0]]       # first sector of both directory groups
+corrupt_reads([(t // 512, direct('/dev/vdb', offset=t, size=512)[0] ^ 1) for t in targets])
+try:
+    failure = rejected(lambda: blocks.keyslot(SOURCE, KEY, 1, hidden_key=HKEY))
+    assert failure.errno == errno.EBADMSG, (failure, getattr(failure, '__notes__', None))
+    handle = owner(); status = blocks.native_status(handle.device); handle.close()
+    assert not status['failed'] and status['encryptions'] == before_count, status
+    area = direct(v['decoy'], offset=2 * 14 * unit, size=2 * 14 * unit)        # keyslot 1, both replicas
+    direct(v['decoy'], write=area, offset=2 * 14 * unit)
+finally:
+    fault()
+close_views(); absent()
+v = blocks.open_blocks(SOURCE, KEY, second_hkey); subprocess.run(['udevadm', 'settle'], check=True)
+assert verify(v) is False
+blocks.keyslot(SOURCE, KEY, 1, hidden_key=second_hkey)                         # restore: slot 0 only
+close_views(); absent()
+assert rejected(lambda: blocks.open_blocks(SOURCE, KEY, second_hkey)).errno == errno.EKEYREJECTED
+absent()
+results.append('keyslot remove failing before its directory write: memory restored, slot still listed')
+
+# Sector 0 (keyslot 0, replica 0) damaged: its fragment destroyed by an
+# uncoordinated stock rewrite (persistent) and its data failing authentication
+# (read corruption). Setup, END and DETACH checkpoint the first authenticating
+# keyslot-area sector instead, and keyslot replica 1 unlocks.
+stock_rewrite(SOURCE, KEY, 0, unit)
+s0_physical = layout.offsets(0)[0]
+corrupt_read(s0_physical // 512, direct('/dev/vdb', offset=s0_physical, size=512)[0] ^ 1)
+try:
+    rejected(lambda: open_views(verify=True))
+    absent()
+    v = open_views()
+    assert rejected(lambda: direct(v['decoy'], offset=0, size=unit)).errno == errno.EIO
+    assert direct(v['hidden'], offset=0) == EXPECTED[:BLOCK]
+    handle = owner(); assert not blocks.native_status(handle.device)['failed']; handle.close()
+    close_views(); absent()                                  # DETACH checkpoint
+    # BEGIN/END on an idle private owner (END checkpoints too).
+    idle = owner()
+    try:
+        idle.device.suspend(); idle.device.begin(); idle.device.end(); idle.device.resume()
+        assert not blocks.native_status(idle.device)['failed']
+    finally:
+        idle.remove(); idle.close()
+    absent()
+finally:
+    fault()
+v = open_views(); assert verify(v) is False; close_views(); absent()
+results.append('sector 0 damaged: setup, END and DETACH checkpoint another sector; replica 1 unlocks')
+print('Sector-0 damage: setup, END, DETACH and replica-1 unlock passed', flush=True)
+
+
+def gated_setup_fault(label, **options):
+    """Hold pivsetup at its gate, fail all lower writes for exactly the SETUP
+    ioctl, then let it unwind: the write error after writing began must
+    fail-stop the owner (STATUS failed after the native state is gone)."""
+    gate = f'/run/piv-fault-{label}'
+    with blocks.spawn_open(SOURCE, KEY, HKEY, env=dict(PIVSETUP_TEST_GATE=gate, PIVSETUP_TEST_HOLD='1'),
+                           **options) as process:
+        while not Path(gate + '-ready.json').exists():
+            assert process.poll() is None, process.communicate()
+        fault('writes')
+        try:
+            Path(gate + '-gate').touch()
+            while not Path(gate + '-setup.json').exists():
+                assert process.poll() is None, process.communicate()
+        finally:
+            fault()
+        Path(gate + '-continue').touch()
+        out, err = process.communicate(timeout=120)
+        assert process.returncode == 1 and '[Errno 5]' in err, (process.returncode, err)
+    report = json.loads(Path(gate + '-setup.json').read_text())
+    assert report['errno'] == errno.EIO and report['status']['failed'] and not report['status']['active'], report
+    absent()
+    return report
+
+
+# A lower write failure during --initialize (the first write revokes keyslot
+# area 1) stops the owner; the volume keeps its previous keyslot, directory
+# and records, so it reopens unchanged after recreation.
+report = gated_setup_fault('initialize', initialize=True)
+v = open_views(); assert verify(v) is False; close_views(); absent()
+results.append(dict(setup_write_fault='initialize', owner_failed=True, encryptions=report['status']['encryptions'],
+                    previous_volume_intact=True))
+# A lower write failure during --fill (after a quick initialization) stops the
+# owner; a later fill completes and the hidden contents are restored.
+v = open_views(initialize=True, quick=True); close_views(); absent()
+report = gated_setup_fault('fill', fill=True)
+v = open_views(fill=True)
+assert v['fill']['failed'] == 0 and v['fill']['valid'] + v['fill']['written'] == len(EXPECTED) // BLOCK, v['fill']
+direct(v['hidden'], write=EXPECTED)
+assert verify(v) is False
+close_views(); absent()
+results.append(dict(setup_write_fault='fill', owner_failed=True, encryptions=report['status']['encryptions'],
+                    refill_and_restore=True))
+print('Setup write faults (initialize, fill): owner fail-stop, cleanup and recreation passed', flush=True)
 
 # Leave a closed image and complete oracles for independent authentication.
 dm('remove', '--retry', 'piv-test-fault')

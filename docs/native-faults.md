@@ -105,8 +105,8 @@ linear wrapper below stock dm-integrity and reload it as
 [dm-flakey](https://docs.kernel.org/admin-guide/device-mapper/dm-flakey.html)
 (`error_reads`, `error_writes` or one-sector `corrupt_bio_byte`) after
 activation and once udev probes drain. Targets lie in hidden record 10, away
-from sector 0, whose setup checkpoint may be served from dm-integrity's journal
-cache. Decoy requests use one aligned 128 KiB span (a whole decoy work item),
+from the keyslot area, whose setup checkpoint may be served from
+dm-integrity's journal cache (sector 0 has its own test below). Decoy requests use one aligned 128 KiB span (a whole decoy work item),
 hidden requests one 4096-byte block. A direct raw read witnesses each injected
 fault first.
 
@@ -132,9 +132,11 @@ fault first.
   decoy work item or the last carrier sector of record 10. A decoy read must
   leave a sentinel-filled direct-I/O buffer unchanged (earlier sectors may have
   decrypted privately). A hidden read of record 10 still succeeds, because only
-  primary data was corrupted and the raw IV feeds SIV-checked decoding. Partial
-  writes into the failing sector fail before encrypting; a full-sector decoy
-  write replaces it. Unrelated requests on both views continue and the same
+  primary data was corrupted and the raw IV feeds SIV-checked decoding. A
+  hidden write needing the failing sector fails before encrypting (a
+  sub-sector decoy write on a 4096-byte volume never reaches the module: the
+  decoy view's logical block size is the sector size, so the block layer
+  returns EINVAL); a full-sector decoy write replaces it. Unrelated requests on both views continue and the same
   owner passes the oracles afterwards.
 - **Setup audit**: with the same corruption, `--verify` refuses and cleans up,
   while the default keyslot-area setup opens and returns local EIO only for the
@@ -142,6 +144,20 @@ fault first.
   (raw IV, keyslot SIV or the other replica decides); `--verify` refuses.
 - **IV damage**: a flipped stored IV byte makes that hidden block and decoy
   sector EIO while neighbours stay intact.
+- **Sector 0 damage** (keyslot 0, replica 0): its fragment destroyed by a stock
+  rewrite and its data failing authentication. Default setup unlocks through
+  replica 1, `--verify` refuses, and setup, END (on an idle owner) and DETACH
+  all succeed: their journal checkpoint copies the first keyslot-area sector
+  that reads and authenticates instead of requiring sector 0.
+- **Setup write faults**: lower writes fail for exactly the SETUP ioctl of an
+  `--initialize` (its first write revokes keyslot area 1) and of a `--fill`
+  after a quick initialization. Setup returns EIO, STATUS reports the owner
+  failed (sticky, with no native state left), pivsetup removes what it
+  created, the failed initialization leaves the previous volume intact, and a
+  later fill completes and the contents are restored. Inside setup, a work item
+  whose write began and failed stops the owner at once, so the other blocks of
+  its round write nothing more; a failed flush stops it too. Cancellation
+  (EINTR) is not a failure.
 - **Uncoordinated stock rewrite** of one carrier sector (same plaintext, fresh
   IV) destroys only that hidden block; a decoy rewrite preserves the damage; a
   full hidden write repairs it.

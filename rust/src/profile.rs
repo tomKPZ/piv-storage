@@ -208,9 +208,15 @@ pub fn validate_integrity_table(table: &str, sectors: u64, raw_major: u32, raw_m
     Ok(())
 }
 
+/// Length of the v5 base context: prefix (19) + canonical UUID (36) + NUL +
+/// two LE64 values. The kernel accepts exactly this length.
+pub const BASE_CONTEXT_LENGTH: usize = 19 + 36 + 1 + 16;
+
 /// Format v5 base context (docs/format-v5.md):
-/// "pivstore/volume/v5\0" UUID NUL LE64 primary bytes LE64 sector size.
-/// The kernel appends the "/layout/" parameters for the record context.
+/// "pivstore/volume/v5\0" UUID NUL LE64 primary bytes LE64 sector size, with
+/// the UUID in lower-case canonical 8-4-4-4-12 form (owner::canonical_uuid).
+/// The kernel appends "/layout/" and the keyslot parameter block for the
+/// record context.
 pub fn base_context(uuid: &str, primary_bytes: u64, sector_size: u64) -> Vec<u8> {
     let mut value = b"pivstore/volume/v5\0".to_vec();
     value.extend_from_slice(uuid.as_bytes());
@@ -317,7 +323,7 @@ mod tests {
     fn contexts() {
         let uuid = "00000000-0000-4000-8000-000000000000";
         let base = base_context(uuid, 128 << 20, 4096);
-        assert!(base.starts_with(b"pivstore/volume/v5\0") && base.len() == 19 + 36 + 1 + 16);
+        assert!(base.starts_with(b"pivstore/volume/v5\0") && base.len() == BASE_CONTEXT_LENGTH);
         assert_eq!(&base[56..64], &(128u64 << 20).to_le_bytes());
         assert_eq!(&base[64..72], &4096u64.to_le_bytes());
     }

@@ -26,8 +26,10 @@ def main():
         primary = image.verify(primary_key)
         assert primary == args.expected_primary.read_text().strip(), 'Primary mismatch'
         # --hidden-key-file is a keyslot KEK; the layout comes from the keyslot.
-        # Strict: stored RS parity must equal the reference encoder's.
-        hidden = decode_image(image, hidden_key, strict=True)
+        # Strict: stored RS parity must equal the reference encoder's. The
+        # primary key marks failing sectors as RS erasures (none here: every
+        # sector authenticated above).
+        hidden = decode_image(image, hidden_key, strict=True, primary_key=primary_key)
         assert hidden == args.expected_hidden.read_bytes(), 'Hidden mismatch'
         ivs = list(image.iv_slots())
         assert len(set(ivs)) == image.layout.sectors, 'Duplicate CURRENT primary IV'

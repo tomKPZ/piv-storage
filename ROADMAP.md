@@ -44,6 +44,10 @@ only with a concrete need; each needs a disposable-guest test first):
   hmac-sha256. v3, the 12-byte-IV profiles, Serpent/Twofish-XTS and
   HMAC-SHA1/SHA512 stay removed (the last four by user decision 2026-10-22,
   for maintenance).
+- Format v5 is frozen (2026-10-22, after the final-review format fixes; see
+  docs/format-v5.md). Only directory-listed keyslots are authoritative,
+  initialization revokes earlier keyslots, and keyslot changes need the
+  current hidden credential.
 - Setup scans only the keyslot area; `--verify` is the full audit. A decoy write
   covering a whole sector that fails authentication replaces it; raw IVs of such
   sectors feed only SIV-checked decoding (keyslots, directory, hidden reads).

@@ -274,9 +274,10 @@ try:
         if phase == 'scan':
             assert status['encryptions'] == 0
         else:
-            # Initialization: keyslot 0 (2 x 14 sectors) and the directory (687)
-            # precede the 687-sector zero records. Fill writes records only.
-            setup = 2 * 14 + GROUP if phase == 'initialize' else 0
+            # Initialization: the revocation of keyslots 1-3 (3 x 2 x 14 sectors)
+            # and directory group 1 (687), keyslot 0 (2 x 14) and the directory
+            # (687) precede the 687-sector zero records. Fill writes records only.
+            setup = 4 * 2 * 14 + 2 * GROUP if phase == 'initialize' else 0
             completed, remainder = divmod(status['encryptions'] - setup, GROUP)
             assert not remainder and 2 <= completed < min(64, total), status
             expected[:completed * BLOCK] = bytes(completed * BLOCK)

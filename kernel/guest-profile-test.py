@@ -99,7 +99,9 @@ for repeat in range(3):
         owner = GuestOwner('/dev/vdb', KEY)
         sectors, unit = owner.device.sectors, owner.device.sector_size
         before = blocks.native_status(owner.device)['encryptions']
-        measure_reads(views['decoy'], primary, 'native-decoy')
+        # The decoy view's logical block size is the primary sector size (as stock).
+        logical = int(subprocess.check_output(['blockdev', '--getss', views['decoy']]))
+        measure_reads(views['decoy'], primary, 'native-decoy', logical)
         measure_reads(views['hidden'], EXPECTED, 'hidden', 4096)   # 4096-byte hidden blocks
         assert blocks.native_status(owner.device)['encryptions'] == before == 0
         assert not blocks.native_status(owner.device)['failed']
@@ -197,7 +199,7 @@ try:
     subprocess.run(['udevadm', 'settle'], check=True)
     # Hidden reads authenticate each 4096-byte block's 687 sectors.
     hidden_cases = (('hidden', 4096, GROUP, record_ranges), ('hidden', 16384, 4 * GROUP, 4 * record_ranges))
-    decoy_cases = (('decoy', 512, 1, 1), ('decoy', 16384, 16384 // unit, 1), ('decoy', 131072, 131072 // unit, 1))
+    decoy_cases = (('decoy', unit, 1, 1), ('decoy', 16384, 16384 // unit, 1), ('decoy', 131072, 131072 // unit, 1))
     for role, count, loads, ranges in decoy_cases + hidden_cases:
         def read():
             with mmap.mmap(-1, count) as buf:

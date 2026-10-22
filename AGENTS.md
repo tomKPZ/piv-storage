@@ -83,7 +83,7 @@ resolved from context/evidence, not for routine implementation decisions.
   (damage stays damage). Never turn corruption into authenticated zeros. Full hidden writes may repair a block after primary authentication.
 - Fresh seeded CRNG entropy is mandatory. Local proposed/replaced IV collision
   rejection is only a small check, not lifetime nonce history. Any volatile
-  per-owner encryption cap (currently 2^32) is an implementation choice that
+  per-owner encryption cap (currently 2^40) is an implementation choice that
   may be raised or removed; it does not enforce the per-key lifetime budget.
   Document probabilistic collisions, amplification, retries, rollback and
   clones. Do not resurrect an observable nonce ledger.

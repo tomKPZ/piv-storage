@@ -70,8 +70,9 @@ struct piv_native {
  bool ks_present[PN_KEYSLOTS];
  u64 dir_generation;
  int dir_slot;
- /* key: master key; context: record context (base || "/layout/" || ab ||
-  * block_log2 || parity); base: the v5 base context used for keyslots.
+ /* key: master key; context: record context (base || "/layout/" || the
+  * 32-byte keyslot parameter block); base: the 72-byte v5 base context used
+  * for keyslots.
   */
  u8 key[32], context[128], base[128], mac_key[32], enc_key[32];
  u32 context_length, base_length;
@@ -356,6 +357,21 @@ static int pn_ks_derive(struct piv_native *n, const u8 kek[32], struct pn_ks_key
 static u64 pn_ks_first(u32 slot, u32 replica) { return (2 * slot + replica) * PN_KEYSLOT_SECTORS; }
 static bool pn_parity_valid(u32 parity) { return parity == 0 || parity == 4 || parity == 8 || parity == 16; }
 
+/* The keyslot parameter block (the keyslot plaintext without MK, 32 bytes):
+ * LE32 version 5 || LE32 flags || block_log2 || rs_parity || zero[22]. It is
+ * also bound whole into the record context, so any future parameter that
+ * changes record semantics is authenticated without a new context design.
+ */
+#define PN_PARAMS 32
+static void pn_params(const struct piv_native *n, u8 params[PN_PARAMS])
+{
+	memset(params, 0, PN_PARAMS);
+	put_unaligned_le32(PN_KEYSLOT_VERSION, params);
+	put_unaligned_le32(n->ab ? PN_FLAG_AB : 0, params + 4);
+	params[8] = PN_BLOCK_LOG2;
+	params[9] = n->parity;
+}
+
 /* Keyslot plaintext: LE32 version 5 || LE32 flags || MK[32] || block_log2 ||
  * rs_parity || zero[22]. Other versions, unknown flags, a block size other
  * than 4096, unsupported parity or non-zero reserved bytes are rejected.
@@ -377,13 +393,12 @@ static int pn_ks_open(struct piv_native *n, const struct pn_ks_keys *k, u32 slot
 
 static int pn_ks_seal(struct piv_native *n, const struct pn_ks_keys *k, u32 slot, u32 replica, u8 *ivs)
 {
-	u8 plain[PN_KEYSLOT_PLAIN] = {};
+	u8 plain[PN_KEYSLOT_PLAIN], params[PN_PARAMS];
 	int r;
-	put_unaligned_le32(PN_KEYSLOT_VERSION, plain);
-	put_unaligned_le32(n->ab ? PN_FLAG_AB : 0, plain + 4);
+	pn_params(n, params);
+	memcpy(plain, params, 8);
 	memcpy(plain + 8, n->key, 32);
-	plain[40] = PN_BLOCK_LOG2;
-	plain[41] = n->parity;
+	memcpy(plain + 40, params + 8, PN_PARAMS - 8);
 	r = pn_siv_seal(n, &k->lrw, k->mac, k->enc, n->base, n->base_length, "/keyslot/",
 			2 * slot + replica, pn_ks_first(slot, replica), PN_KEYSLOT_SECTORS, PN_KEYSLOT_SECTORS,
 			0, plain, sizeof(plain), ivs);
@@ -624,21 +639,51 @@ static int pn_dir_write(struct piv_control *p, bool *mutated)
  return r;
 }
 
+/* Overwrite @count (<= PIV_BATCH_MAX) primary sectors from @first with fresh
+ * random IVs, keeping their plaintext (every sector must authenticate first),
+ * and flush: revokes whatever keyslot or record fragments they carried.
+ */
+static int pn_wipe(struct piv_control *p, u64 first, u32 count, bool *mutated)
+{
+ struct piv_batch *b = NULL;
+ u8 *ivs = kvmalloc(count * 16, GFP_NOIO);
+ u32 attempt;
+ int r = -ENOMEM;
+ if (!ivs) return r;
+ r = piv_batch_read(p, first, count, 0, 0, &b);
+ for (attempt = 0; !r && attempt < 16; attempt++) {
+  get_random_bytes(ivs, count * 16);
+  r = pn_collides(b->olds, ivs, count);
+  if (r != -EEXIST) break;
+  r = 0;
+ }
+ if (!r && attempt == 16) r = -EEXIST;
+ if (!r) r = piv_batch_write(b, ivs, true, mutated);
+ piv_batch_free(b);
+ kvfree_sensitive(ivs, count * 16);
+ return r;
+}
+
 /* Write keyslot @slot (both replicas) under @kek, or overwrite it with fresh
  * random IVs when @kek is NULL.
  */
 static int pn_ks_write(struct piv_control *p, u32 slot, const u8 *kek, struct pn_ks_keys *keys, bool *mutated)
 {
- u8 *ivs = kmalloc(PN_KEYSLOT_SECTORS * 16, GFP_NOIO);
+ u8 *ivs;
  u32 replica, attempt;
  int r = -ENOMEM;
+ if (!kek) {
+  for (replica = 0, r = 0; !r && replica < 2; replica++)
+   r = pn_wipe(p, pn_ks_first(slot, replica), PN_KEYSLOT_SECTORS, mutated);
+  return r;
+ }
+ ivs = kmalloc(PN_KEYSLOT_SECTORS * 16, GFP_NOIO);
  if (!ivs) return r;
  for (replica = 0; replica < 2; replica++) {
   struct piv_batch *b = NULL;
   r = piv_batch_read(p, pn_ks_first(slot, replica), PN_KEYSLOT_SECTORS, 0, 0, &b);
   for (attempt = 0; !r && attempt < 16; attempt++) {
-   if (kek) r = pn_ks_seal(p->native, keys, slot, replica, ivs);
-   else get_random_bytes(ivs, PN_KEYSLOT_SECTORS * 16);
+   r = pn_ks_seal(p->native, keys, slot, replica, ivs);
    if (!r) r = pn_collides(b->olds, ivs, PN_KEYSLOT_SECTORS);
    if (r != -EEXIST) break;
    r = 0;
@@ -763,22 +808,20 @@ static int pn_setup_poll(void)
 }
 
 /* v5 record keys from the master key and the layout (n->ab, n->parity):
- * context = base || "/layout/" || ab || block_log2 || rs_parity, so a volume
- * opened with other parameters fails the SIV check. Geometry: G = 687 + 3p,
- * blocks = floor((N - 112) / G) - 2, halved with A/B.
+ * context = base || "/layout/" || the 32-byte keyslot parameter block
+ * (pn_params), so a volume opened with other parameters fails the SIV check.
+ * Geometry: G = 687 + 3p, blocks = floor((N - 112) / G) - 2, halved with A/B.
  */
 static int pn_keys(struct piv_native *n, u64 sectors)
 {
  u8 tweak[32], prp[32];
  u64 groups;
  int r;
- if (!pn_parity_valid(n->parity) || n->base_length + 11 > sizeof(n->context)) return -EINVAL;
+ if (!pn_parity_valid(n->parity) || n->base_length + 8 + PN_PARAMS > sizeof(n->context)) return -EINVAL;
  memcpy(n->context, n->base, n->base_length);
  memcpy(n->context + n->base_length, "/layout/", 8);
- n->context[n->base_length + 8] = n->ab;
- n->context[n->base_length + 9] = PN_BLOCK_LOG2;
- n->context[n->base_length + 10] = n->parity;
- n->context_length = n->base_length + 11;
+ pn_params(n, n->context + n->base_length + 8);
+ n->context_length = n->base_length + 8 + PN_PARAMS;
  n->group = PN_DATA_FRAGMENTS + PN_LANES * n->parity;
  groups = sectors > PN_KEYSLOT_AREA ? (sectors - PN_KEYSLOT_AREA) / n->group : 0;
  n->records = groups > PN_DIRECTORY_GROUPS ? groups - PN_DIRECTORY_GROUPS : 0;
@@ -796,56 +839,77 @@ static int pn_keys(struct piv_native *n, u64 sectors)
  return r;
 }
 
-/* Fast key check: try every keyslot replica under the KEK. 0 on success with
- * n->key = master key and n->ab/n->parity set; PN_UNAVAILABLE if none
- * authenticates.
+/* Keyslots opening under @kek (from the 112 keyslot-area IVs @ks_ivs; no
+ * I/O): *@mask receives every slot with an authenticating replica that holds
+ * the same master key and parameters as the first one found (returned in
+ * @master, *@flags and *@parity), @outer the outer keys (identical for every
+ * slot under one KEK, since they are salted with the base context only).
+ * PN_UNAVAILABLE if no keyslot authenticates.
  */
-static int pn_unlock(struct piv_native *n, const u8 kek[32], const u8 *ks_ivs)
+static int pn_ks_find(struct piv_native *n, const u8 kek[32], const u8 *ks_ivs, u8 master[32], u32 *flags,
+		      u32 *parity, u32 *mask, u8 outer[64])
 {
  struct pn_ks_keys *k = kzalloc(sizeof(*k), GFP_NOIO);
- u32 slot, replica, flags = 0, parity = 0;
- u8 master[32];
+ u32 slot, replica, f = 0, pa = 0;
+ u8 found[32];
  int r;
+ *mask = 0;
  if (!k) return -ENOMEM;
  r = pn_ks_derive(n, kek, k);
-   for (slot = 0; !r && slot < PN_KEYSLOTS; slot++)
+ for (slot = 0; !r && slot < PN_KEYSLOTS; slot++)
   for (replica = 0; replica < 2; replica++) {
-   r = pn_ks_open(n, k, slot, replica, ks_ivs + pn_ks_first(slot, replica) * 16, &flags, &parity, master);
-   if (r != PN_UNAVAILABLE) goto out;
-   r = 0;
+   r = pn_ks_open(n, k, slot, replica, ks_ivs + pn_ks_first(slot, replica) * 16, &f, &pa, found);
+   if (r == PN_UNAVAILABLE) { r = 0; continue; }
+   if (r) break;
+   if (!*mask) { memcpy(master, found, 32); *flags = f; *parity = pa; }
+   if (!crypto_memneq(master, found, 32) && f == *flags && pa == *parity) *mask |= 1U << slot;
+   break;
   }
- r = r ? r : PN_UNAVAILABLE;
-out:
- if (!r) { memcpy(n->key, master, 32); n->ab = flags & PN_FLAG_AB; n->parity = parity; }
- memzero_explicit(master, sizeof(master));
+ if (!r && !*mask) r = PN_UNAVAILABLE;
+ if (!r) { memcpy(outer, k->tweak, 32); memcpy(outer + 32, k->prp, 32); }
+ memzero_explicit(found, sizeof(found));
  kfree_sensitive(k);
  return r;
 }
 
+/* Only keyslots the directory lists are authoritative: one of @mask must be
+ * listed with outer keys @outer.
+ */
+static bool pn_ks_listed(const struct piv_native *n, u32 mask, const u8 outer[64])
+{
+ u32 j;
+ for (j = 0; j < PN_KEYSLOTS; j++)
+  if ((mask & (1U << j)) && n->ks_present[j] && !crypto_memneq(n->ks_outer[j], outer, 64)) return true;
+ return false;
+}
+
 /* Read the directory (newest valid of groups 0/1, ordinary G-sector records
- * with the volume's parity) and load keyslot outer keys.
+ * with the volume's parity), then parse it and load the keyslot outer keys.
+ * Selecting before parsing matches the Python decoder: an older malformed
+ * slot never hides a newer valid one.
  */
 static int pn_dir_load(struct piv_control *p)
 {
  struct piv_native *n = p->native;
- size_t length = n->group * 16 + PN_DATA;
- u8 *carrier = kvmalloc(length, GFP_NOIO);
+ size_t length = n->group * 16 + 2 * PN_DATA;
+ u8 *carrier = kvmalloc(length, GFP_NOIO), *data, *best;
  u64 generation;
- int r, slot;
+ int r = 0, slot;
  n->dir_slot = -1;
  if (!carrier) return -ENOMEM;
+ data = carrier + n->group * 16;
+ best = data + PN_DATA;
  for (slot = 0; slot < 2; slot++) {
-  r = pn_read_group(p, slot, carrier, carrier + n->group * 16, &generation);
-  if (r == PN_UNAVAILABLE || r == -EBADMSG) continue;
+  r = pn_read_group(p, slot, carrier, data, &generation);
+  if (r == PN_UNAVAILABLE || r == -EBADMSG) { r = 0; continue; }
   if (r) goto out;
   if (n->dir_slot < 0 || generation > n->dir_generation) {
-   r = pn_dir_parse(n, carrier + n->group * 16);
-   if (r) goto out;
+   memcpy(best, data, PN_DATA);
    n->dir_slot = slot; n->dir_generation = generation;
   }
  }
  /* Without a directory, decoy writes would destroy other keyslots: refuse. */
- r = n->dir_slot < 0 ? -EUCLEAN : 0;
+ r = n->dir_slot < 0 ? -EUCLEAN : pn_dir_parse(n, best);
 out:
  kvfree_sensitive(carrier, length);
  return r;
@@ -853,14 +917,21 @@ out:
 
 /* Fast key check once the scan has collected every keyslot IV (no extra I/O),
  * then the record keys and the directory: decoy writes must refresh every
- * keyslot it lists, so setup refuses without it.
+ * keyslot it lists, so setup refuses without it. The unlocking keyslot must be
+ * listed: an unlisted one (a crash between the directory update and the
+ * keyslot wipe of a remove, or between the keyslot write and the directory
+ * update of an add) is rejected like a wrong key.
  */
 static int pn_setup_unlock(struct piv_control *p, struct piv_native *n, const u8 key[32], const u8 *ks_ivs)
 {
- int r = pn_unlock(n, key, ks_ivs);
+ u32 flags = 0, parity = 0, mask = 0;
+ u8 outer[64];
+ int r = pn_ks_find(n, key, ks_ivs, n->key, &flags, &parity, &mask, outer);
  if (r == PN_UNAVAILABLE) return -EKEYREJECTED;
- if (!r) r = pn_keys(n, p->profile.sectors);
+ if (!r) { n->ab = flags & PN_FLAG_AB; n->parity = parity; r = pn_keys(n, p->profile.sectors); }
  if (!r) r = pn_dir_load(p);
+ if (!r && !pn_ks_listed(n, mask, outer)) r = -EKEYREJECTED;
+ memzero_explicit(outer, sizeof(outer));
  return r;
 }
 
@@ -879,15 +950,15 @@ static bool pn_fill_local(int r) { return r == -EBADMSG || r == -EIO || r == -EN
  * write is the ordinary strict rewrite: every carrier sector must authenticate
  * before anything is written, so a damaged or unreadable carrier stays as it
  * was and counts as failed. Setup holds p->lock and no views exist, so
- * nothing changes the block between the check and the write.
+ * nothing changes the block between the check and the write. *@mutated: the
+ * write began (see pn_write).
  */
-static int pn_fill_block(struct piv_control *p, u64 index, const u8 *zero, int *outcome)
+static int pn_fill_block(struct piv_control *p, u64 index, const u8 *zero, int *outcome, bool *mutated)
 {
  struct piv_native *n = p->native;
  struct piv_range range;
  size_t length = 2 * n->group * 16 + PN_DATA;
  u8 *scratch = kvmalloc(length, GFP_NOIO);
- bool mutated = false;
  int r;
  if (!scratch) return -ENOMEM;
  pn_block_lock(p, &range, index, false);
@@ -900,10 +971,20 @@ static int pn_fill_block(struct piv_control *p, u64 index, const u8 *zero, int *
   */
  if (pn_fill_local(r)) { *outcome = PN_FILL_FAILED; return 0; }
  if (r != PN_UNAVAILABLE) return r;
- r = pn_write(p, true, index * PN_DATA, zero, PN_DATA, true, &mutated);
+ r = pn_write(p, true, index * PN_DATA, zero, PN_DATA, true, mutated);
  if (!r) *outcome = PN_FILL_WRITTEN;
- else if (!mutated && pn_fill_local(r) && !READ_ONCE(p->failed)) { *outcome = PN_FILL_FAILED; r = 0; }
+ else if (!*mutated && pn_fill_local(r) && !READ_ONCE(p->failed)) { *outcome = PN_FILL_FAILED; r = 0; }
  return r;
+}
+
+/* Fail-stop the owner (sticky): storage may be partially written or a flush
+ * failed. Views refuse all I/O, END/resume refuse, and the owner must be
+ * removed and recreated.
+ */
+static void pn_stop(struct piv_control *p)
+{
+ WRITE_ONCE(p->failed, true);
+ if (p->native) WRITE_ONCE(p->native->failed, true);
 }
 
 /* One initialization record (or fill block) per work item (setup holds
@@ -920,15 +1001,20 @@ struct pn_init_work {
  struct completion *done;
 };
 
+/* A failure once a record write began stops the owner at once, so the other
+ * work items of the round write nothing more (piv_batch_write checks it
+ * before every submission).
+ */
 static void pn_init_worker(struct work_struct *work)
 {
  struct pn_init_work *w = container_of(work, struct pn_init_work, work);
  unsigned int noio = memalloc_noio_save();
  bool mutated = false;
  if (w->fill)
-  w->result = pn_fill_block(w->p, w->index, w->zero, &w->outcome);
+  w->result = pn_fill_block(w->p, w->index, w->zero, &w->outcome, &mutated);
  else
   w->result = pn_write(w->p, true, w->index * PN_DATA, w->zero, PN_DATA, true, &mutated);
+ if (w->result && mutated) pn_stop(w->p);
  memalloc_noio_restore(noio);
  if (atomic_dec_and_test(w->pending)) complete(w->done);
 }
@@ -966,7 +1052,7 @@ static int pn_init_round(struct piv_control *p, const u8 *zero, u64 first, u32 c
  * PN_INIT_FLUSH_RECORDS records; a fill flushes at the same points if it
  * wrote anything since the last flush. Completed records stay committed, also
  * when cancelled: they are flushed before returning. A failed record write
- * already failed the attempt.
+ * already stopped the owner (pn_init_worker); a failed flush stops it here.
  */
 static int pn_records(struct piv_control *p, u64 *counts)
 {
@@ -983,16 +1069,36 @@ static int pn_records(struct piv_control *p, u64 *counts)
   if (READ_ONCE(p->failed)) { r = -EIO; break; }
   i += count;
   if (i % PN_INIT_FLUSH_RECORDS == 0 && (!counts || counts[PN_FILL_WRITTEN] != flushed)) {
-   r = blkdev_issue_flush(p->cc->dev->bdev); if (r) break;
+   r = blkdev_issue_flush(p->cc->dev->bdev);
+   if (r) { pn_stop(p); break; }
    if (counts) flushed = counts[PN_FILL_WRITTEN];
   }
  }
  if ((!r || r == -EINTR) && (!counts || counts[PN_FILL_WRITTEN] != flushed)) {
   int f = blkdev_issue_flush(p->cc->dev->bdev);
-  if (f) r = f;
+  if (f) { pn_stop(p); r = f; }
  }
  kfree_sensitive(zero);
  return r;
+}
+
+/* The exact 72-byte v5 base context of this owner (docs/format-v5.md):
+ * "pivstore/volume/v5\0" || 36-character lower-case canonical UUID || "\0" ||
+ * LE64(primary bytes) || LE64(sector size). Anything else would bind keys to
+ * a context the independent decoder cannot reproduce.
+ */
+#define PN_BASE_LENGTH (19 + 36 + 1 + 16)
+static bool pn_base_valid(const struct piv_control *p, const u8 *base, u32 length)
+{
+ u32 j;
+ if (length != PN_BASE_LENGTH || memcmp(base, "pivstore/volume/v5", 19) || base[55]) return false;
+ for (j = 0; j < 36; j++) {
+  u8 c = base[19 + j];
+  if (j == 8 || j == 13 || j == 18 || j == 23 ? c != '-' : !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+   return false;
+ }
+ return get_unaligned_le64(base + 56) == p->profile.sectors * p->profile.sector_size &&
+        get_unaligned_le64(base + 64) == p->profile.sector_size;
 }
 
 static int pn_setup(struct piv_control *p, struct file *controller, struct piv_native_setup *s)
@@ -1001,13 +1107,12 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
  u8 *ivs = NULL, *ks_ivs = NULL;
  u64 i;
  u32 j;
- bool initialize = s->flags & PIV_SETUP_INITIALIZE, ab = s->flags & PIV_SETUP_AB, mutated, ks_done = false;
+ bool initialize = s->flags & PIV_SETUP_INITIALIZE, ab = s->flags & PIV_SETUP_AB, mutated = false, ks_done = false;
  bool verify = s->flags & PIV_SETUP_VERIFY, quick = s->flags & PIV_SETUP_QUICK, fill = s->flags & PIV_SETUP_FILL;
  u64 scan_end, minimum;
  int r;
  if (s->version != 6 || s->size != sizeof(*s) || s->generation != p->profile.generation ||
-     s->context_length > 112 || s->context_length <= 19 ||
-     memcmp(s->context, "pivstore/volume/v5", 19) ||
+     s->context_length != PN_BASE_LENGTH ||
      (s->flags & ~(PIV_SETUP_INITIALIZE | PIV_SETUP_AB | PIV_SETUP_VERIFY | PIV_SETUP_QUICK | PIV_SETUP_FILL)) ||
      !pn_parity_valid(s->parity) || s->reserved || s->valid || s->written || s->failed) return -EINVAL;
  /* Format v5 needs 16-byte IVs. A/B and parity are chosen at initialization
@@ -1024,9 +1129,9 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
   */
  minimum = PN_KEYSLOT_AREA + (PN_DIRECTORY_GROUPS + (ab ? 2 : 1)) * (PN_DATA_FRAGMENTS + PN_LANES * s->parity);
  if (p->profile.sectors < minimum ||
-     p->profile.sectors > (u64)MAX_LFS_FILESIZE / p->profile.sector_size) return -EINVAL;
+     p->profile.sectors > (u64)MAX_LFS_FILESIZE / p->profile.sector_size ||
+     !pn_base_valid(p, s->context, s->context_length)) return -EINVAL;
  n = kzalloc(sizeof(*n), GFP_NOIO); if (!n) return -ENOMEM;
- memcpy(n->key, s->key, 32);
  memcpy(n->base, s->context, s->context_length);
  n->base_length = s->context_length;
  n->dir_slot = -1;
@@ -1065,7 +1170,14 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
   }
  }
  if (initialize) {
-  /* New master key; keyslot 0 wraps it under the KEK and the directory lists it. */
+  /* New master key; keyslot 0 wraps it under the KEK and the directory lists
+   * it. Revocation first: keyslot areas 1-3 (both replicas) and directory
+   * group 1 get fresh random IVs, so no earlier keyslot or directory can
+   * authenticate afterwards (old passphrases and, after a quick
+   * re-initialization, the old records become unreachable). An interrupted
+   * re-initialization may leave neither the old nor the new volume openable.
+   * Any failure once these writes began stops the owner.
+   */
   struct pn_ks_keys *k = kzalloc(sizeof(*k), GFP_NOIO);
   if (!k) { r = -ENOMEM; goto bad; }
   n->ab = ab;
@@ -1073,6 +1185,8 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
   r = pn_ks_derive(n, s->key, k);
   get_random_bytes(n->key, 32);
   if (!r) r = pn_keys(n, p->profile.sectors);
+  for (j = 1; !r && j < PN_KEYSLOTS; j++) r = pn_ks_write(p, j, NULL, NULL, &mutated);
+  if (!r) r = pn_wipe(p, pn_group_first(n, 1), n->group, &mutated);
   if (!r) {
    n->ks_present[0] = true;
    memcpy(n->ks_outer[0], k->tweak, 32); memcpy(n->ks_outer[0] + 32, k->prp, 32);
@@ -1081,7 +1195,7 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
   }
   kfree_sensitive(k);
   if (!r) r = pn_dir_write(p, &mutated);
-  if (r) goto bad;
+  if (r) { if (mutated) pn_stop(p); goto bad; }
   /* Quick: no records; never-written blocks stay unavailable until written or filled. */
   if (!quick) { r = pn_records(p, NULL); if (r) goto bad; }
  } else if (fill) {
@@ -1091,7 +1205,8 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
   s->valid = counts[PN_FILL_VALID]; s->written = counts[PN_FILL_WRITTEN]; s->failed = counts[PN_FILL_FAILED];
  }
  r = pn_setup_poll(); if (r) goto bad;
- r = piv_checkpoint(p->cc); if (r) goto bad;
+ /* As END: a failed checkpoint write or flush stops the owner. */
+ r = piv_checkpoint(p); if (r) { pn_stop(p); goto bad; }
  r = pn_setup_poll(); if (r) goto bad;
  n->ready = true; p->transaction = false; p->controller = NULL;
  kfree_sensitive(ivs); kfree_sensitive(ks_ivs);
@@ -1102,28 +1217,65 @@ bad:
  return r;
 }
 
-/* Add or remove a v5 keyslot on an active owner (same MK and parameters). The master key stays in
- * memory; records are untouched. Add writes the keyslot, then the directory;
- * remove updates the directory, then overwrites the keyslot with random IVs.
- * The last keyslot cannot be removed. Failures after a lower write fail-stop.
+/* KEYSLOT authorization: @auth (the caller's current hidden KEK) must open a
+ * keyslot that the directory lists, holding the active master key and
+ * parameters. The keyslot area is re-read (tolerantly, as at setup: the
+ * keyslot SIV tag decides). Root alone, with only the LUKS key and an active
+ * owner, can therefore neither add a known passphrase nor remove the user's.
+ */
+static int pn_authorize(struct piv_control *p, const u8 auth[32])
+{
+ struct piv_native *n = p->native;
+ u8 *ks_ivs = kmalloc(PN_KEYSLOT_AREA * 16, GFP_NOIO), master[32], outer[64];
+ u32 flags = 0, parity = 0, mask = 0;
+ int r;
+ if (!ks_ivs) return -ENOMEM;
+ r = pn_range_ivs(p, 0, PN_KEYSLOT_AREA, ks_ivs, true, NULL, 0, NULL);
+ if (!r) r = pn_ks_find(n, auth, ks_ivs, master, &flags, &parity, &mask, outer);
+ if (r == PN_UNAVAILABLE ||
+     (!r && (crypto_memneq(master, n->key, 32) || (flags & PN_FLAG_AB) != (n->ab ? PN_FLAG_AB : 0) ||
+	     parity != n->parity || !pn_ks_listed(n, mask, outer))))
+  r = -EKEYREJECTED;
+ memzero_explicit(master, sizeof(master));
+ memzero_explicit(outer, sizeof(outer));
+ kfree_sensitive(ks_ivs);
+ return r;
+}
+
+/* Add or remove a v5 keyslot on an active owner (same MK and parameters),
+ * authorized by a current listed keyslot's KEK (pn_authorize). The master key
+ * stays in memory; records are untouched. Add writes the keyslot, then the
+ * directory; remove updates the directory, then overwrites the keyslot with
+ * random IVs. The last keyslot cannot be removed. The in-memory keyslot state
+ * changes only together with the directory: a failure before any lower write
+ * restores it, and any failure after a lower write fail-stops.
  */
 static int pn_keyslot(struct piv_control *p, struct piv_native_keyslot *ks)
 {
  struct piv_native *n = p->native;
  struct pn_ks_keys *k;
- bool mutated = false;
+ struct pn_lrw saved_lrw;
+ u8 saved_outer[64];
+ bool mutated = false, saved_present;
  u32 j, present = 0;
  int r;
- if (ks->version != 1 || ks->size != sizeof(*ks) || ks->generation != p->profile.generation ||
+ if (ks->version != 2 || ks->size != sizeof(*ks) || ks->generation != p->profile.generation ||
      ks->slot >= PN_KEYSLOTS || (ks->op != PIV_KEYSLOT_ADD && ks->op != PIV_KEYSLOT_REMOVE) ||
      memchr_inv(ks->reserved, 0, sizeof(ks->reserved)) ||
      (ks->op == PIV_KEYSLOT_REMOVE && memchr_inv(ks->kek, 0, sizeof(ks->kek)))) return -EINVAL;
  if (!n || !n->ready || READ_ONCE(n->failed) || READ_ONCE(p->failed) || p->blocked) return -EBUSY;
  for (j = 0; j < PN_KEYSLOTS; j++) present += n->ks_present[j];
+ if (ks->op == PIV_KEYSLOT_ADD && n->ks_present[ks->slot]) return -EEXIST;
+ if (ks->op == PIV_KEYSLOT_REMOVE && !n->ks_present[ks->slot]) return -ENOENT;
+ if (ks->op == PIV_KEYSLOT_REMOVE && present == 1) return -EBUSY;
+ r = pn_authorize(p, ks->auth);
+ if (r) return r;
+ saved_present = n->ks_present[ks->slot];
+ memcpy(saved_outer, n->ks_outer[ks->slot], 64);
+ saved_lrw = n->ks_lrw[ks->slot];
  if (ks->op == PIV_KEYSLOT_ADD) {
-  if (n->ks_present[ks->slot]) return -EEXIST;
   k = kzalloc(sizeof(*k), GFP_NOIO);
-  if (!k) return -ENOMEM;
+  if (!k) { r = -ENOMEM; goto out; }
   r = pn_ks_derive(n, ks->kek, k);
   if (!r) r = pn_ks_write(p, ks->slot, ks->kek, k, &mutated);
   if (!r) {
@@ -1134,15 +1286,22 @@ static int pn_keyslot(struct piv_control *p, struct piv_native_keyslot *ks)
   }
   kfree_sensitive(k);
  } else {
-  if (!n->ks_present[ks->slot]) return -ENOENT;
-  if (present == 1) return -EBUSY;
   n->ks_present[ks->slot] = false;
   memzero_explicit(n->ks_outer[ks->slot], 64);
   memzero_explicit(&n->ks_lrw[ks->slot], sizeof(n->ks_lrw[ks->slot]));
   r = pn_dir_write(p, &mutated);
+  /* The directory no longer lists the slot: only now wipe it. */
   if (!r) r = pn_ks_write(p, ks->slot, NULL, NULL, &mutated);
+  else if (!mutated) {
+   n->ks_present[ks->slot] = saved_present;
+   memcpy(n->ks_outer[ks->slot], saved_outer, 64);
+   n->ks_lrw[ks->slot] = saved_lrw;
+  }
  }
  if (r && mutated) { WRITE_ONCE(p->failed, true); WRITE_ONCE(n->failed, true); }
+out:
+ memzero_explicit(saved_outer, sizeof(saved_outer));
+ memzero_explicit(&saved_lrw, sizeof(saved_lrw));
  return r;
 }
 
@@ -1340,10 +1499,12 @@ static int pn_iterate(struct dm_target *ti, iterate_devices_callout_fn fn, void 
 static void pn_hints(struct dm_target *ti, struct queue_limits *limits)
 {
 	struct pn_view *v = ti->private;
-	/* Decoy: authenticated primary-sector RMW permits 512-byte logical
-	 * requests. Hidden: one record per 4096-byte block, no RMW.
+	/* Decoy: the primary sector size, as stock dm-crypt advertises
+	 * (crypt_io_hints), so a filesystem created through the view keeps
+	 * mounting through stock dm-crypt and the view's geometry matches stock.
+	 * Hidden: one record per 4096-byte block, no RMW.
 	 */
-	limits->logical_block_size = v->hidden ? PN_DATA : 512;
+	limits->logical_block_size = v->hidden ? PN_DATA : v->p->profile.sector_size;
 	limits->physical_block_size = v->hidden ? PN_DATA : v->p->profile.sector_size;
 	limits->io_min = limits->physical_block_size; limits->dma_alignment = 511;
 }

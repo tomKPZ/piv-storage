@@ -216,6 +216,21 @@ class Image(AbstractContextManager):
             digest.update(codec.decrypt(index, ciphertext, metadata))
         return digest.hexdigest()
 
+    def codec(self, key):
+        """Primary sector codec for this image's profile (key: LUKS volume key)."""
+        from .sector import SectorCodec
+        return SectorCodec(key, self.layout.sector_size, self.encryption, self.integrity)
+
+    def authenticates(self, codec, index):
+        """Whether primary sector @index passes Linux's authentication."""
+        data_offset, tag_offset = self.layout.offsets(index)
+        try:
+            codec.authenticate(index, self.read(self.layout.sector_size, data_offset),
+                               self.read(self.layout.tuple_bytes, tag_offset))
+        except UnsupportedImage:
+            return False
+        return True
+
     def check_unchanged(self):
         current = os.fstat(self.fd)
         if (current.st_size, current.st_mtime_ns, current.st_ctime_ns) != (

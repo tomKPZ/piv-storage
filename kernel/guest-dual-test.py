@@ -82,7 +82,9 @@ owner.close()
 # The hidden view exposes 4096-byte logical and physical blocks.
 for query in ('--getss', '--getpbsz'):
     assert int(subprocess.check_output(['blockdev', query, HIDDEN])) == BLOCK, query
-assert int(subprocess.check_output(['blockdev', '--getss', DECOY])) == 512
+# The decoy view advertises the primary sector size, as stock dm-crypt does.
+sector_size = json.loads(crypt('luksDump', '--dump-json-metadata', '/dev/vdb').stdout)['segments']['0']['sector_size']
+assert int(subprocess.check_output(['blockdev', '--getss', DECOY])) == sector_size
 # Native hidden decryption returns a fixed zero-filled raw block volume.
 assert Path(HIDDEN).read_bytes() == bytes(capacity)
 fd = os.open(HIDDEN, os.O_RDWR)
@@ -99,14 +101,15 @@ assert Path(HIDDEN).read_bytes() == before_hidden
 # Exercise actual changed decoy data across carrier and metadata boundaries,
 # including the incomplete carrier tail when present. Restore with fresh IVs.
 primary_size = int(subprocess.check_output(['blockdev', '--getsize64', DECOY]))
-sector_size = json.loads(crypt('luksDump', '--dump-json-metadata', '/dev/vdb').stdout)['segments']['0']['sector_size']
-# The first record boundary (block 0 -> 1), the 32768-sector interleave and the tail.
-positions = ((BLOCK0 + GROUP) * sector_size - 512, 32768 * 512 - 512, primary_size - 512)
+# The first record boundary (block 0 -> 1), the 32768-sector interleave and the
+# tail, in whole primary sectors (the decoy's logical block size).
+unit = sector_size
+positions = ((BLOCK0 + GROUP) * sector_size - unit, 32768 * 512 - unit, primary_size - unit)
 fd = os.open(DECOY, os.O_RDWR | os.O_DIRECT)
 for position in positions:
-    length = min(1024, primary_size - position)
-    start = max(0, position - 512)
-    span = min(length + 1024, primary_size - start)
+    length = min(2 * unit, primary_size - position)
+    start = max(0, position - unit)
+    span = min(length + 2 * unit, primary_size - start)
     page = mmap.mmap(-1, span)
     assert os.preadv(fd, [page], start) == span
     original = page[:]
@@ -121,6 +124,18 @@ for position in positions:
     page[:] = original
     assert os.pwritev(fd, [page], start) == span
     os.fsync(fd); page.close(); patch.close()
+# Direct decoy I/O below the primary sector size is refused by the block
+# layer (4096-byte-sector volumes), before the module sees it.
+if unit > 512:
+    small = mmap.mmap(-1, 512)
+    for offset in (512, primary_size - 512):
+        try:
+            os.pwritev(fd, [small], offset)
+        except OSError as exc:
+            assert exc.errno == errno.EINVAL, exc
+        else:
+            raise AssertionError('Sub-sector direct decoy write accepted')
+    small.close()
 os.close(fd)
 assert Path(HIDDEN).read_bytes() == before_hidden
 # Include the last hidden block, and restore it before filesystem tests.

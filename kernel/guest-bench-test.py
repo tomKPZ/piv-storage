@@ -202,7 +202,9 @@ native_close('parity8')
 passphrase = os.urandom(16).hex().encode()
 native_open('argon2id-tier1', 'initialize', key=None, hidden_passphrase=passphrase, initialize=True, kdf_cost=1)
 for tier in (2, 3, 4):
-    blocks.keyslot('/dev/vdb', KEY, tier - 1, passphrase=passphrase, kdf_cost=tier)
+    # Authorized by the tier-1 passphrase of keyslot 0.
+    blocks.keyslot('/dev/vdb', KEY, tier - 1, passphrase=passphrase, kdf_cost=tier,
+                   hidden_passphrase=passphrase, hidden_kdf_cost=1)
 native_close('argon2id-tier1')
 for tier in (1, 2, 3, 4):
     native_open(f'argon2id-tier{tier}', 'open', key=None, hidden_passphrase=passphrase, kdf_cost=tier)

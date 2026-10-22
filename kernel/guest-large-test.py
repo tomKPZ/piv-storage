@@ -102,8 +102,9 @@ def blocks_in(offset, count):
 old_cap_block = (OLD_CAP // unit - first_sector(0)) // group
 assert size > OLD_CAP and capacity == records * BLOCK
 assert owner.raw_bytes == RAW
-# Keyslot 0 (2 x 14), the directory (687), then one 687-sector record per block.
-assert native_status(owner.device)['encryptions'] == 28 + group + records * group
+# Revocation of keyslots 1-3 (3 x 2 x 14) and directory group 1 (687), keyslot
+# 0 (2 x 14), the directory (687), then one 687-sector record per block.
+assert native_status(owner.device)['encryptions'] == 4 * 28 + 2 * group + records * group
 expected = bytearray(capacity)
 assert Path(v['hidden']).read_bytes() == expected
 for index in sorted({0, old_cap_block, capacity // BLOCK - 1}):
@@ -115,17 +116,18 @@ print(f'Initialized {size} primary / {capacity} hidden bytes, sector={unit}', fl
 
 boundary = (OLD_CAP // (32768 * 512) + 1) * 32768 * 512
 record = first_sector(old_cap_block + 1) * unit
-cases = [('old-cap-boundary', OLD_CAP - 512, 4096),
-         ('high-unaligned', OLD_CAP + 32768 + 512, 16384),
-         ('high-interleave', boundary - 512, 4096),
-         ('high-record', record - 512, 4096),
+# Whole primary sectors (the decoy's logical block size).
+cases = [('old-cap-boundary', OLD_CAP - unit, 4096),
+         ('high-unaligned', OLD_CAP + 32768 + unit, 16384),
+         ('high-interleave', boundary - unit, 4096),
+         ('high-record', record - unit, 4096),
          ('last-16k', size - 16384, 16384),
          ('last-sector', size - unit, unit)]
 tail = first_sector(records) * unit
 if tail < size:
-    cases.append(('record-tail', tail - 512, min(4096, size - tail + 512)))
+    cases.append(('record-tail', tail - unit, min(4096, size - tail + unit)))
 for label, offset, count in cases:
-    assert offset >= OLD_CAP - 512 and offset + count <= size
+    assert offset >= OLD_CAP - unit and offset + count <= size
     old = direct(v['decoy'], offset, count)
     value = hashlib.shake_256(label.encode()).digest(count)
     direct(v['decoy'], offset, count, value)

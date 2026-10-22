@@ -41,6 +41,9 @@ struct piv_devices {
 /* Native SETUP ABI version 6 (2026-10-22): format v5 only. Version 6 added
  * QUICK and FILL and the FILL output counts (read/write ioctl; the kernel
  * copies the request back with the key zeroed after a successful setup).
+ * The context must be the exact 72-byte v5 base context of this owner
+ * (prefix, lower-case canonical UUID, NUL, LE64 primary bytes, LE64 sector
+ * size); anything else is EINVAL.
  */
 struct piv_native_setup {
  __u32 version, size;
@@ -55,7 +58,10 @@ struct piv_native_setup {
   */
  __u64 valid, written, failed;
 };
-/* STATUS version 4 (2026-10-22): the always-zero v3 invalidations field was removed. */
+/* STATUS version 4 (2026-10-22): the always-zero v3 invalidations field was
+ * removed. @failed reports the sticky owner fail-stop, also after a failed
+ * setup that already freed the native state (active = 0).
+ */
 struct piv_native_status {
  __u64 generation, hidden_bytes, encryptions;
  __u32 active, views, failed, version;
@@ -87,12 +93,17 @@ struct piv_native_status {
 #define PIV_NATIVE_SETUP _IOWR('P', 12, struct piv_native_setup)
 #define PIV_NATIVE_DETACH _IOW('P', 13, struct piv_read_iv)
 #define PIV_NATIVE_STATUS _IOR('P', 14, struct piv_native_status)
-/* v5 keyslot management on an active owner (version 1, 64 bytes). */
+/* v5 keyslot management on an active owner (version 2, 96 bytes, 2026-10-22).
+ * @auth: the caller's current hidden KEK; it must open a keyslot listed in the
+ * directory with the active master key and parameters, else EKEYREJECTED.
+ * @kek: the new keyslot's KEK (ADD), zero for REMOVE.
+ */
 struct piv_native_keyslot {
  __u32 version, size;
  __u64 generation;
  __u32 slot, op;
  __u8 kek[32];
+ __u8 auth[32];
  __u32 reserved[2];
 };
 #define PIV_KEYSLOT_ADD 1U

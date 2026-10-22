@@ -126,8 +126,11 @@ Options of `open-blocks`:
 
 A/B and parity are recorded in the encrypted keyslot; later opens read them
 from there. Other commands: `pivsetup keyslot add|remove --slot 0-3` manages up
-to four keyslots on active views without rewriting hidden data (the last
-keyslot cannot be removed; `--kdf-cost` applies to a new passphrase). `pivsetup migrate` copies both views into a freshly luksFormatted
+to four keyslots on active views without rewriting hidden data. It requires
+the current hidden key or passphrase of a listed keyslot (`--hidden-key-file`
+or `--hidden-passphrase-file` with its `--kdf-cost`); `--new-kdf-cost` sets a
+new passphrase's tier, and the last keyslot cannot be removed. Re-initializing
+revokes every earlier keyslot. `pivsetup migrate` copies both views into a freshly luksFormatted
 volume, initializes it and compares both copies; it is the offline path for
 primary rekey, resize or sector-size change, since live resize/rekey is
 unsupported (stock cryptsetup refuses reencrypt and resize on integrity

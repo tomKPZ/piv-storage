@@ -10,6 +10,12 @@ keyslot KEK and passes the public context. This document is an internal
 specification, not an independent cryptographic review; tested behaviour is
 recorded in commit messages.
 
+**Status: frozen** (2026-10-22, after the final-review format changes: the
+canonical UUID, the whole keyslot parameter block in the record context, the
+exact setup context check, newest-first directory selection, revocation on
+initialization and directory-listed keyslot authority). Later changes need a
+new format version or must stay inside the reserved, must-be-zero fields.
+
 Compared with v4, v5 keeps the stock primary profiles, fragment-local
 re-randomization with 10 random + 6 payload bytes per IV, the LRW fragment
 encoding, SIV records, encrypted keyslots with a directory, A/B slots and no
@@ -146,6 +152,9 @@ LE32(version = 5) ‖ LE32(flags) ‖ MK[32] ‖ block_log2 (u8) ‖ rs_parity (
 - `rs_parity`: p ∈ {0, 4, 8, 16} parity fragments per lane (below).
 - Decoding rejects other versions, unknown flags, values outside these sets
   and non-zero reserved bytes.
+- The **parameter block** P is this plaintext without MK (32 bytes):
+  `LE32(version) ‖ LE32(flags) ‖ block_log2 ‖ rs_parity ‖ zero[22]`. It is
+  bound whole into the record context (below).
 
 The keyslot payload is the SIV layer of the records with `ctx = base`, label
 `"/keyslot/"`, id `2k + r` and 16 + 64 + 4 zero bytes in 14 fragments. Every
@@ -153,12 +162,27 @@ keyslot of a volume holds the same MK and parameters. Initialization writes
 them, and keyslot add copies them from the active owner. The keyslot itself
 has no parity: its two replicas provide redundancy.
 
+**Authority.** Only keyslots that the directory lists are authoritative. A
+keyslot that authenticates but is not listed with its outer keys (left by an
+interrupted keyslot add or remove) is rejected like a wrong key, by the kernel
+and by the Python decoder. Every slot whose replica authenticates under the
+KEK with the same MK and parameters as the first one found counts, so the
+same KEK in an unlisted and a listed slot still opens through the listed one.
+
 ## Context and key derivation
 
 ```
-base    = "pivstore/volume/v5\0" ‖ UUID (ASCII, as in LUKS2) ‖ "\0" ‖ LE64(primary_bytes) ‖ LE64(S)
-context = base ‖ "/layout/" ‖ ab (u8) ‖ block_log2 (u8) ‖ rs_parity (u8)
+base    = "pivstore/volume/v5\0" ‖ UUID ‖ "\0" ‖ LE64(primary_bytes) ‖ LE64(S)
+context = base ‖ "/layout/" ‖ P            (P: the 32-byte keyslot parameter block)
 ```
+
+`UUID` is the LUKS2 UUID in lower-case canonical 8-4-4-4-12 form (36 ASCII
+characters `[0-9a-f-]`, as Python's `str(uuid.UUID(text))` and pivsetup's
+`canonical_uuid` produce from `cryptsetup luksUUID`), so `base` is always
+72 bytes; `primary_bytes` = N·S. The kernel refuses (EINVAL) any setup
+context that is not exactly this for its own owner (prefix, UUID shape and
+NUL, `primary_bytes` = profile sectors × S, S), so a frontend bug cannot bind
+keys to a context the independent decoder would not reproduce.
 
 All keys are 32 bytes: `HKDF-SHA256(ikm, salt, info = "pivstore/v5/" ‖ label)`.
 
@@ -168,7 +192,9 @@ All keys are 32 bytes: `HKDF-SHA256(ikm, salt, info = "pivstore/v5/" ‖ label)`
 | Keyslot k keys | KEK (32 bytes) | `base` | `keyslot-tweak`, `keyslot-prp` (outer keys OK), `keyslot-mac`, `keyslot-enc` (inner keys) |
 
 Binding the layout parameters into `context` means a volume opened with
-mismatched parameters fails the SIV check instead of misreading records. The
+mismatched parameters fails the SIV check instead of misreading records.
+Binding the whole parameter block (not three chosen bytes) also binds any
+future parameter that changes record semantics, without a new context design. The
 SIV layer is deterministic: identical data at the same address gives an
 identical payload; freshness of stored bytes comes from the outer random `r`.
 A record authenticates only as a whole; fragments of different versions fail
@@ -178,7 +204,9 @@ Generations: without A/B, the record generation is 0. With A/B, a read returns
 the valid slot with the larger generation; a write targets the other slot with
 generation max + 1 (slot 0, generation 1 if neither slot is valid). The
 directory always uses this A/B rule on groups 0/1 (generation incremented per
-directory write).
+directory write); readers select the newest authenticating group first and
+then parse it (a malformed newest directory refuses setup with EUCLEAN; an
+older malformed one is ignored). Ties go to group/slot 0.
 
 ## Passphrase cost tiers
 
@@ -206,6 +234,20 @@ passes (2026-10-22; tiers 1, 2 and 4 took 0.12, 0.50 and 7.7 s). In the
 suite-077 bench guests tier 3 added 2.1–2.5 s to an open (open time minus a
 key-file open, all four profiles; see [configuration.md](configuration.md)).
 The other tiers' passes are the design targets.
+
+**Lanes are computed sequentially (decided before freezing, 2026-10-22).** The
+pinned RustCrypto `argon2` 0.5.3 has no `parallel` feature (it arrived with
+rayon in the 0.6 line, which is not vendored and would add about six crates)
+and its block-filling routine is private, so pivsetup cannot hand the four
+lanes to threads without reimplementing Argon2's core, which the project
+avoids (maintained primitives only). An attacker can run the four lanes in
+parallel, so for the same wall time on a 4-core defender the tiers buy about a
+quarter of the work a parallel implementation could; memory hardness (the
+dominant cost for guessing hardware) is unaffected. Argon2id's output does not
+depend on threading, so a later parallel implementation keeps every existing
+KEK (the Python reference already agrees); the tier parameters themselves are
+frozen by the salt, and a stronger tier can be added later as tier 5 without a
+format change.
 
 The tier is deliberately not recorded anywhere: nothing can be decrypted before
 the KEK exists, and a clear-text parameter would be public magic. The user
@@ -267,9 +309,18 @@ sector fails the read as before.
 
 **Mixed versions.** An interrupted hidden write leaves some carrier sectors with
 the old version's fragments. Those sectors authenticate, so they are errors,
-not erasures. If few enough, errors-only decoding may recover the new version;
-otherwise the result is EIO or the older A/B slot. This is a possible bonus,
-not a promise.
+not erasures. If few enough sectors carry the other version, errors-only
+decoding may recover either version: the new one when few sectors kept old
+fragments, the old one when few were rewritten. Both outcomes are whole,
+SIV-checked records; otherwise the result is EIO or the older A/B slot. This
+is a possible bonus, not a promise.
+
+**Python decoder erasures.** `decode_image` (and `pivstore unpack`) know no
+primary key by default and decode errors-only (p/2 damaged sectors per lane).
+Given the LUKS volume key (`primary_key`, `unpack --volume-key-file`;
+scripts/check_stateless.py passes it), carrier sectors failing primary
+authentication become erasures as in the kernel (p per lane). An image file
+has no unreadable sectors.
 
 **Kernel implementation.** The pinned Debian 6.12 kernel builds
 `REED_SOLOMON_DEC8` (selected by `DM_VERITY_FEC=y`), but nothing guarantees the
@@ -289,7 +340,9 @@ primary data of every touched sector before modifying it.
 - The hidden view exposes logical and physical block size 4096. Every hidden
   request is a whole number of aligned 4096-byte blocks; DM splits hidden bios
   per block, and the worker refuses anything else (EINVAL). No
-  read-modify-write exists.
+  read-modify-write exists. The decoy view advertises the primary sector size
+  as its logical and physical block size, as stock dm-crypt does, so a
+  filesystem created through it also mounts through stock dm-crypt.
 - **Hidden write (one block):** authenticate the primary data of all G carrier
   sectors (to obtain exact old IVs), seal, re-encode G fragments with fresh `r`
   and write through the journal; primary plaintext is unchanged. A fresh IV
@@ -344,16 +397,25 @@ The directory's 4096-byte data holds, for keyslot j, a 65-byte entry at offset
   authenticating returns `EKEYREJECTED`. A successful keyslot gives MK, the A/B
   flag and the parity; the directory must then authenticate and parse,
   otherwise setup refuses (`EUCLEAN`), because decoy writes would destroy the
-  unlisted keyslots. There is no mode for uninitialized stock carriers.
-- **Keyslot add/remove** (`pivsetup keyslot`, NATIVE_KEYSLOT on an active
-  owner): add writes both replicas, then the directory; remove updates the
-  directory, then overwrites both replicas with random IVs. The last keyslot
-  cannot be removed. Records are untouched; a passphrase change (or a cost-tier
-  change) is add + remove.
+  unlisted keyslots. Finally the unlocking keyslot must be listed (Authority,
+  above), otherwise `EKEYREJECTED`. There is no mode for uninitialized stock
+  carriers.
+- **Keyslot add/remove** (`pivsetup keyslot`, NATIVE_KEYSLOT version 2 on an
+  active owner): the request carries the caller's current hidden KEK, which
+  must open a listed keyslot holding the active MK and parameters (the kernel
+  re-reads the keyslot area tolerantly, as at setup), otherwise
+  `EKEYREJECTED`; root with only the LUKS key cannot add a passphrase it knows
+  or remove the user's keyslots. Add writes both replicas, then the directory;
+  remove updates the directory, then overwrites both replicas with random IVs.
+  The owner's keyslot state changes only with the directory write (restored if
+  that fails before writing; any failure after a lower write fail-stops). The
+  last keyslot cannot be removed. Records are untouched; a passphrase change
+  (or a cost-tier change) is add + remove. A crash between the two writes
+  leaves an unlisted keyslot, which is not authoritative.
 
 ## Setup and initialization
 
-pivsetup passes `base`, the KEK and the parity choice (NATIVE_SETUP ABI 6:
+pivsetup passes `base` (checked exactly, see Context), the KEK and the parity choice (NATIVE_SETUP ABI 6:
 flags INITIALIZE, AB, VERIFY, QUICK, FILL; AB, QUICK and a non-zero parity
 only with INITIALIZE, FILL only without it; the kernel returns the fill counts
 in the same structure). Setup scans only the 112 keyslot sectors by default;
@@ -361,11 +423,19 @@ in the same structure). Setup scans only the 112 keyslot sectors by default;
 failure. Pending signals are polled between ranges and rounds of records;
 completed records stay written (cancellation is not rollback).
 
-Initialization draws a fresh MK, writes keyslot 0 (both replicas) under the KEK,
-writes the directory listing it, then writes a zero record for every block (one
-slot per block with A/B). Because MK is replaced first, an interrupted
-re-initialization leaves not-yet-written blocks unavailable rather than holding
-their previous contents. The keyslot areas 1–3 keep their existing IVs.
+Initialization draws a fresh MK and first **revokes** all earlier state: it
+overwrites keyslot areas 1–3 (both replicas) and directory group 1 with fresh
+random IVs (keeping their primary plaintext, as a keyslot remove does; every
+such sector must authenticate). It then writes keyslot 0 (both replicas) under
+the KEK, writes the directory listing it into group 0, then writes a zero
+record for every block (one slot per block with A/B). Afterwards no earlier
+keyslot or directory authenticates, so old passphrases are revoked and, after
+a quick re-initialization, the old records are reachable through no keyslot
+(only someone who already extracted the old MK could still decode them; a
+full initialization overwrites them). An interrupted re-initialization may
+leave not-yet-written blocks unavailable, and, if interrupted before keyslot 0
+and the directory are written, neither the old nor the new volume openable.
+Any failure once these writes began stops the owner.
 
 **Quick initialization** (`--initialize --quick`, QUICK; not the default, user
 decision 2026-10-22) stops after the directory. No record authenticates under

@@ -26,13 +26,19 @@ def main():
     extraction.add_argument('image', type=Path)
     extraction.add_argument('--output', type=Path, required=True)
     extraction.add_argument('--hidden-key-file', type=Path, required=True)
+    extraction.add_argument('--volume-key-file', type=Path,
+                            help='optional LUKS volume key: failing primary sectors become RS erasures')
     args = parser.parse_args()
     try:
         if args.action == 'unpack':
             from .records import unpack
             with args.hidden_key_file.open('rb') as stream:
                 hidden_key = stream.read(33)
-            result = unpack(args.image, args.output, hidden_key)
+            primary_key = None
+            if args.volume_key_file:
+                with args.volume_key_file.open('rb') as stream:
+                    primary_key = stream.read(129)
+            result = unpack(args.image, args.output, hidden_key, primary_key)
             print(json.dumps(result, indent=2))
             return 0
         with Image(args.image) as image:

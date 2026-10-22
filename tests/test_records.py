@@ -8,8 +8,9 @@ from pivstore import rs
 from pivstore.format import base_context, layout_context
 from pivstore.profile import UnsupportedImage
 from pivstore.records import (DATA, DATA_FRAGMENTS, FRAGMENT, KEYSLOT_AREA, KEYSLOT_SECTORS, RANDOM_BYTES,
-                              Fragments, Keyslot, Records, block_count, correct_fragments, directory_data,
-                              group_sectors, parity_fragments, parse_directory, unlock)
+                              Fragments, Keyslot, Records, block_count, correct_fragments, decode_image,
+                              directory_data, group_sectors, open_volume, parity_fragments, parse_directory,
+                              unlock)
 
 UUID = '00000000-0000-4000-8000-000000000000'
 BASE = base_context(UUID, 128 * 1024 * 1024, 4096)
@@ -36,7 +37,11 @@ class GeometryTests(unittest.TestCase):
 
     def test_context_binds_layout(self):
         self.assertTrue(BASE.startswith(b'pivstore/volume/v5\0') and len(BASE) == 19 + 36 + 1 + 16)
-        self.assertEqual(layout_context(BASE, True, 12, 8), BASE + b'/layout/\x01\x0c\x08')
+        # The whole keyslot parameter block (keyslot plaintext without MK).
+        params = bytes([5, 0, 0, 0, 1, 0, 0, 0, 12, 8]) + bytes(22)
+        self.assertEqual(layout_context(BASE, True, 12, 8), BASE + b'/layout/' + params)
+        plain = Keyslot.plain(KEY, 1, 8)
+        self.assertEqual(params, plain[:8] + plain[40:])
         with self.assertRaises(ValueError):
             layout_context(BASE, False, 9, 0)
         with self.assertRaises(ValueError):
@@ -296,6 +301,97 @@ class RSTests(unittest.TestCase):
             except rs.DecodeError:
                 failures += 1
         self.assertGreater(failures, 40)
+
+
+class FakeImage:
+    """In-memory image for open_volume/decode_image: current IVs, and the
+    sectors that fail primary authentication (for erasure marking)."""
+
+    class Layout:
+        iv_bytes, sector_size = 16, 4096
+
+        def __init__(self, sectors):
+            self.sectors, self.primary_bytes = sectors, sectors * 4096
+
+    def __init__(self, ivs, failing=()):
+        self.uuid, self.ivs, self.failing = UUID, ivs, set(failing)
+        self.layout = self.Layout(len(ivs))
+
+    def iv_slots(self):
+        return iter(self.ivs)
+
+    def codec(self, key):
+        assert key == b'primary'
+        return 'codec'
+
+    def authenticates(self, codec, index):
+        assert codec == 'codec'
+        return index not in self.failing
+
+
+def synthetic_volume(listed, written, parity=0, data=bytes(DATA)):
+    """Random IVs with keyslots @written (slot -> KEK, all sharing MK), a
+    directory listing @listed (slots) and one hidden block holding @data."""
+    rng = random.Random(3)
+    master = bytes([7]) * 32
+    group = group_sectors(parity)
+    sectors = KEYSLOT_AREA + 3 * group
+    base = base_context(UUID, sectors * 4096, 4096)
+    ivs = [rng.randbytes(16) for _ in range(sectors)]
+    for slot, kek in written.items():
+        keyslot = Keyslot(base, kek, slot)
+        for replica in (0, 1):
+            first = keyslot.first_sector(replica)
+            ivs[first:first + KEYSLOT_SECTORS] = keyslot.encode(master, 0, replica, rs_parity=parity)
+    records = Records(sectors, base, master, rs_parity=parity)
+    directory = directory_data({slot: Keyslot(base, written[slot], slot).outer for slot in listed})
+    ivs[KEYSLOT_AREA:KEYSLOT_AREA + group] = records.encode_group(0, directory, generation=1)
+    first = records.first_sector(records.group_of(0))
+    ivs[first:first + group] = records.encode(0, data)
+    return ivs, records
+
+
+class OpenVolumeTests(unittest.TestCase):
+    A, B = bytes([1]) * 32, bytes([2]) * 32
+
+    def test_only_listed_keyslots_open(self):
+        ivs, _ = synthetic_volume(listed=[0], written={0: self.A})
+        self.assertEqual(open_volume(FakeImage(ivs), self.A)[2], 0)
+        self.assertEqual(decode_image(FakeImage(ivs), self.A), bytes(DATA))
+        # Crash windows: a keyslot written but not (or no longer) listed in the
+        # directory authenticates, yet must not open the volume.
+        ivs, _ = synthetic_volume(listed=[0], written={0: self.A, 1: self.B})
+        with self.assertRaises(UnsupportedImage):
+            open_volume(FakeImage(ivs), self.B)
+        self.assertEqual(open_volume(FakeImage(ivs), self.A)[2], 0)
+        # The same KEK in an unlisted slot 0 and a listed slot 2 opens via 2.
+        ivs, _ = synthetic_volume(listed=[2], written={0: self.A, 2: self.A})
+        self.assertEqual(open_volume(FakeImage(ivs), self.A)[2], 2)
+
+    def test_newest_directory_selected_before_parsing(self):
+        ivs, records = synthetic_volume(listed=[0], written={0: self.A})
+        bad = bytearray(directory_data({})); bad[4095] = 1           # authentic but malformed
+        group = records.group
+        ivs[KEYSLOT_AREA + group:KEYSLOT_AREA + 2 * group] = records.encode_group(1, bytes(bad), generation=0)
+        self.assertEqual(open_volume(FakeImage(ivs), self.A)[2], 0)   # older malformed slot ignored
+        ivs[KEYSLOT_AREA + group:KEYSLOT_AREA + 2 * group] = records.encode_group(1, bytes(bad), generation=2)
+        with self.assertRaises(UnsupportedImage):
+            open_volume(FakeImage(ivs), self.A)                       # newest is malformed: refused
+
+    def test_primary_key_turns_failing_sectors_into_erasures(self):
+        data = hashlib.shake_256(b'erasures').digest(DATA)
+        ivs, records = synthetic_volume(listed=[0], written={0: self.A}, parity=8, data=data)
+        first = records.first_sector(records.group_of(0))
+        rng = random.Random(9)
+        lost = []
+        for lane in range(3):                                         # p per lane: beyond errors-only
+            lost += rng.sample([j for j in range(records.group) if j % 3 == lane], 8)
+        for j in lost:
+            ivs[first + j] = rng.randbytes(16)
+        image = FakeImage(ivs, failing=[first + j for j in lost])
+        with self.assertRaises(UnsupportedImage):
+            decode_image(image, self.A)
+        self.assertEqual(decode_image(image, self.A, primary_key=b'primary'), data)
 
 
 class KeyslotTests(unittest.TestCase):

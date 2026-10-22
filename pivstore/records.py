@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from . import rs
-from .format import BLOCK_LOG2, RS_PARITIES, base_context, layout_context
+from .format import BLOCK_LOG2, FLAG_AB, KEYSLOT_VERSION, RS_PARITIES, base_context, keyslot_parameters, layout_context
 from .profile import Image, UnsupportedImage
 
 IV_BYTES = 16
@@ -33,8 +33,6 @@ DIRECTORY_GROUPS = 2
 KEYSLOTS = 4
 KEYSLOT_PLAIN = 64                          # version, flags, MK, parameters, reserved
 KEYSLOT_PAYLOAD = 16 + KEYSLOT_PLAIN        # 80 bytes in 14 fragments (84)
-KEYSLOT_VERSION = 5
-FLAG_AB = 1
 DIRECTORY_ENTRY = 65                        # present || outer tweak key || outer prp key
 
 assert DATA_FRAGMENTS == LANES * LANE_DATA == 687
@@ -207,7 +205,8 @@ class Records:
         fragments are RS-corrected (@erasures: carrier offsets known to be bad;
         errors-only without) and SIV-opened again; only a valid tag accepts.
         @strict (host checks of writer output) additionally requires the
-        stored parity fragments to equal the reference encoder's.
+        stored parity fragments to equal the reference encoder's. @erasures may
+        be a callable, evaluated only when RS decoding is needed.
         """
         if len(ivs) != self.group:
             raise UnsupportedImage('Invalid v5 carrier length')
@@ -224,6 +223,8 @@ class Records:
                                                                self.rs_parity)):
                 raise UnsupportedImage('Stored parity differs from the reference encoder')
             return found
+        if callable(erasures):
+            erasures = erasures()
         try:
             corrected = correct_fragments(fragments, self.rs_parity, erasures)
         except rs.DecodeError:
@@ -257,14 +258,20 @@ class Records:
             raise UnsupportedImage('Keyslot directory unavailable')
         return best[1]
 
-    def decode(self, index, ivs, ivs_b=None, strict=False):
-        """Data of block i; with A/B give both slots' carriers."""
+    def decode(self, index, ivs, ivs_b=None, strict=False, erasures=None):
+        """Data of block i; with A/B give both slots' carriers. @erasures:
+        optional callable group -> carrier offsets failing primary
+        authentication (evaluated only for RS decoding)."""
+        def marks(group):
+            return (lambda: erasures(group)) if erasures else ()
         if not self.ab:
-            return self.open_group(self.group_of(index), ivs, strict=strict)[1]
+            group = self.group_of(index)
+            return self.open_group(group, ivs, marks(group), strict=strict)[1]
         best = None
         for slot, carrier in enumerate((ivs, ivs_b)):
+            group = self.group_of(index, slot)
             try:
-                found = self.open_group(self.group_of(index, slot), carrier, strict=strict)
+                found = self.open_group(group, carrier, marks(group), strict=strict)
             except UnsupportedImage:
                 continue
             if best is None or found[0] > best[0]:
@@ -278,22 +285,34 @@ def hmac_equal(a, b):
     return secrets.compare_digest(a, b)
 
 
-def decode_image(image, kek, strict=False):
-    """All-or-error v5 extraction with a keyslot KEK, without the primary key;
-    the layout comes from the keyslot and the journal must be clean. @strict:
-    see Records.open_group (also applied to the directory)."""
+def decode_image(image, kek, strict=False, primary_key=None):
+    """All-or-error v5 extraction with a keyslot KEK; the layout comes from the
+    keyslot and the journal must be clean. @strict: see Records.open_group
+    (also applied to the directory).
+
+    Without @primary_key (the LUKS volume key) Reed-Solomon decoding is
+    errors-only (p/2 damaged sectors per lane). With it, carrier sectors that
+    fail primary authentication are RS erasures, as in the kernel (p per lane).
+    An image file has no unreadable sectors.
+    """
     records, _directory, _slot, ivs = open_volume(image, kek, strict)
+    codec = image.codec(primary_key) if primary_key is not None else None
 
     def carrier(group):
         first = records.first_sector(group)
         return ivs[first:first + records.group]
+
+    def erasures(group):
+        first = records.first_sector(group)
+        return [j for j in range(records.group) if not image.authenticates(codec, first + j)]
+    marks = erasures if codec is not None and records.rs_parity else None
     out = []
     for index in range(records.count):
         if records.ab:
             out.append(records.decode(index, carrier(records.group_of(index, 0)),
-                                      carrier(records.group_of(index, 1)), strict=strict))
+                                      carrier(records.group_of(index, 1)), strict=strict, erasures=marks))
         else:
-            out.append(records.decode(index, carrier(records.group_of(index)), strict=strict))
+            out.append(records.decode(index, carrier(records.group_of(index)), strict=strict, erasures=marks))
     return b''.join(out)
 
 
@@ -326,8 +345,12 @@ class Keyslot:
 
     @staticmethod
     def plain(master_key, flags, rs_parity=0, block_log2=BLOCK_LOG2):
-        """LE32(5) || LE32(flags) || MK[32] || block_log2 || rs_parity || zero[22]."""
-        return struct.pack('<II', KEYSLOT_VERSION, flags) + master_key + bytes([block_log2, rs_parity]) + bytes(22)
+        """LE32(5) || LE32(flags) || MK[32] || block_log2 || rs_parity || zero[22]
+        (the keyslot parameter block with MK inserted after the flags)."""
+        if flags & ~FLAG_AB:
+            raise ValueError('Unknown keyslot flags')
+        params = keyslot_parameters(bool(flags & FLAG_AB), block_log2, rs_parity)
+        return params[:8] + master_key + params[8:]
 
     def encode(self, master_key, flags, replica, randoms=None, rs_parity=0, plain=None):
         if plain is None:
@@ -359,16 +382,25 @@ class Keyslot:
 
 
 def unlock(ivs, base, kek):
-    """Try every keyslot replica: (slot, flags, master_key, rs_parity) or UnsupportedImage."""
+    """Try every keyslot replica: (slot, flags, master_key, rs_parity) of the
+    first authenticating slot, or UnsupportedImage."""
     for slot in range(KEYSLOTS):
-        keyslot = Keyslot(base, kek, slot)
-        for replica in (0, 1):
-            first = keyslot.first_sector(replica)
-            try:
-                return (slot,) + keyslot.open(ivs[first:first + KEYSLOT_SECTORS], replica)
-            except UnsupportedImage:
-                pass
+        found = open_slot(ivs, base, kek, slot)
+        if found is not None:
+            return (slot,) + found
     raise UnsupportedImage('No keyslot authenticates under this key')
+
+
+def open_slot(ivs, base, kek, slot):
+    """(flags, master_key, rs_parity) from either replica of keyslot @slot, or None."""
+    keyslot = Keyslot(base, kek, slot)
+    for replica in (0, 1):
+        first = keyslot.first_sector(replica)
+        try:
+            return keyslot.open(ivs[first:first + KEYSLOT_SECTORS], replica)
+        except UnsupportedImage:
+            pass
+    return None
 
 
 def directory_data(outer_keys):
@@ -394,7 +426,13 @@ def parse_directory(data):
 
 
 def open_volume(image, kek, strict=False):
-    """Unlock a v5 image with a KEK: (records, directory, slot, ivs)."""
+    """Unlock a v5 image with a KEK: (records, directory, slot, ivs).
+
+    Only a keyslot that the directory lists (with this KEK's outer keys) is
+    authoritative, as in the kernel: an unlisted one (a crash inside keyslot
+    add or remove) is rejected like a wrong key. Every slot that authenticates
+    with the same master key and parameters counts.
+    """
     if image.layout.iv_bytes != IV_BYTES:
         raise UnsupportedImage('Format v5 requires 16-byte primary IVs')
     ivs = list(image.iv_slots())
@@ -402,17 +440,23 @@ def open_volume(image, kek, strict=False):
     slot, flags, master, rs_parity = unlock(ivs, base, kek)
     records = Records(image.layout.sectors, base, master, ab=bool(flags & FLAG_AB), rs_parity=rs_parity)
     directory = parse_directory(records.decode_directory(ivs, strict))
-    return records, directory, slot, ivs
+    outer = Keyslot(base, kek, slot).outer
+    listed = [s for s in range(KEYSLOTS) if directory.get(s) == outer and
+              open_slot(ivs, base, kek, s) == (flags, master, rs_parity)]
+    if not listed:
+        raise UnsupportedImage('No keyslot authenticates under this key (unlisted keyslot)')
+    return records, directory, listed[0], ivs
 
 
-def unpack(source, output, kek):
+def unpack(source, output, kek, primary_key=None):
     """Open a keyslot with @kek, authenticate every hidden block and publish
-    a new private output file only after success; no primary key is needed."""
+    a new private output file only after success; no primary key is needed
+    (with one, sectors failing primary authentication become RS erasures)."""
     output = Path(output)
     if output.exists() or output.is_symlink():
         raise FileExistsError('Output must not exist')
     with Image(source) as image:
-        payload = decode_image(image, kek)
+        payload = decode_image(image, kek, primary_key=primary_key)
         image.check_unchanged()
         fd, name = tempfile.mkstemp(prefix='.pivstore-', suffix='.partial', dir=output.parent)
         temporary = Path(name)

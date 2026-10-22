@@ -29,7 +29,7 @@ pub const QUERY_SIZE: usize = 48; // '=IIQQIIIIII'
 pub const READ_SIZE: usize = 48; // '=IIQQ16sII'
 pub const SETUP_SIZE: usize = 216; // '=IIQII32s128sIIQQQ'
 pub const STATUS_SIZE: usize = 40; // '=QQQIIII' (STATUS version 4)
-pub const KEYSLOT_SIZE: usize = 64; // '=IIQII32s2I'
+pub const KEYSLOT_SIZE: usize = 96; // '=IIQII32s32s2I' (KEYSLOT version 2)
 
 /// SETUP ABI 6 (format v5 only): destructive initialization.
 pub const SETUP_INITIALIZE: u32 = 1;
@@ -193,7 +193,7 @@ impl KernelDevice {
     /// only). The request (with the key) is wiped whatever happens. Returns
     /// the fill counts the kernel copies back (zero without SETUP_FILL).
     pub fn setup(&self, hidden_key: &[u8], identity: &[u8], flags: u32, parity: u32) -> Result<FillCounts> {
-        if hidden_key.len() != 32 || identity.is_empty() || identity.len() > 120 {
+        if hidden_key.len() != 32 || identity.len() != crate::profile::BASE_CONTEXT_LENGTH {
             bail!("Invalid native key/context size");
         }
         let mut data = [0u8; SETUP_SIZE];
@@ -216,13 +216,15 @@ impl KernelDevice {
         result
     }
 
-    /// Add (kek given) or remove keyslot @slot on an active v5 owner.
-    pub fn keyslot(&self, slot: u32, kek: Option<&[u8]>) -> Result<()> {
-        if slot >= 4 || kek.is_some_and(|k| k.len() != 32) {
+    /// Add (kek given) or remove keyslot @slot on an active v5 owner,
+    /// authorized by @auth, the current KEK of a listed keyslot (KEYSLOT
+    /// version 2). The request (with both keys) is wiped whatever happens.
+    pub fn keyslot(&self, slot: u32, kek: Option<&[u8]>, auth: &[u8]) -> Result<()> {
+        if slot >= 4 || kek.is_some_and(|k| k.len() != 32) || auth.len() != 32 {
             bail!("Invalid keyslot request");
         }
         let mut data = [0u8; KEYSLOT_SIZE];
-        data[0..4].copy_from_slice(&1u32.to_le_bytes());
+        data[0..4].copy_from_slice(&2u32.to_le_bytes());
         data[4..8].copy_from_slice(&(KEYSLOT_SIZE as u32).to_le_bytes());
         data[8..16].copy_from_slice(&self.generation.to_le_bytes());
         data[16..20].copy_from_slice(&slot.to_le_bytes());
@@ -230,8 +232,14 @@ impl KernelDevice {
         if let Some(kek) = kek {
             data[24..56].copy_from_slice(kek);
         }
+        data[56..88].copy_from_slice(auth);
+        // SAFETY: lock the stack copy of the keys for the ioctl's duration.
+        let locked = unsafe { libc::mlock(data.as_ptr().cast(), data.len()) } == 0;
         let result = ioctl(self.fd, command(15, KEYSLOT_SIZE as u64, DIR_WRITE), &mut data);
         data.zeroize();
+        if locked {
+            unsafe { libc::munlock(data.as_ptr().cast(), data.len()) };
+        }
         result
     }
 
@@ -268,7 +276,7 @@ mod tests {
         assert_eq!(command(12, 216, 3), 0xc0d8_500c);
         assert_eq!(command(14, 48, 2), 0x8030_500e);
         assert_eq!(command(0, 48, 2), 0x8030_5000);
-        assert_eq!(command(15, 64, 1), 0x4040_500f);
+        assert_eq!(command(15, 96, 1), 0x4060_500f);
     }
 
     #[test]

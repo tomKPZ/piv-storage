@@ -201,7 +201,10 @@ no longer the cheaper guessing target at the default. The tier is recorded
 nowhere: pass the same `--kdf-cost` on every open (a wrong tier is rejected
 exactly like a wrong passphrase), and keep enough free RAM (about 1 GiB at
 tier 3 and 2 GiB at tier 4, also in an initramfs). Change the tier with
-`keyslot add --kdf-cost N` followed by `keyslot remove` of the old slot.
+`keyslot add --new-passphrase-file F --new-kdf-cost N` followed by `keyslot
+remove` of the old slot. Both are authorized by the current hidden key or
+passphrase (`--hidden-key-file`, or `--hidden-passphrase-file` with its
+`--kdf-cost`).
 
 **Recommendation.** Prefer a key file kept on separate media. If you use a
 passphrase, make it long (for example six or more random diceware words) and

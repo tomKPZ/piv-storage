@@ -2,12 +2,13 @@
 """Disposable guest: concurrent decoy/hidden I/O against exact and history oracles,
 then a lower write fault during concurrent I/O (fail-stop without hangs).
 
-Phase A: threads own interleaved 512-byte decoy stripes (so 4096-byte primary
-sectors and hidden records are shared between threads), large decoy chunks
+Phase A: threads own interleaved decoy stripes of whole primary sectors (the
+decoy's logical block size; on 512-byte volumes 4 KiB pages and hidden
+records are shared between threads), large decoy chunks
 (DM-split across work items) and hidden blocks whose carriers lie in the
 striped region. Owners read back exact values; other threads read concurrently
 and must see a value the owner has written (old or new), never EIO or a torn
-512-byte unit. Phase B: all threads write overlapping decoy ranges and one
+sector. Phase B: all threads write overlapping decoy ranges and one
 shared hidden block; every unit ends as one of the values written to it.
 Phase C: lower writes start failing while all threads run; every request must
 return, the owner must fail-stop, and after recreation every primary sector is
@@ -37,7 +38,11 @@ KEY = W / 'passphrase.key'
 HKEY = (W / 'hidden.key').read_bytes()
 PRIMARY = (W / 'expected-primary.sha256').read_text().strip()
 NAMES = ('piv-native-hidden', 'piv-native-decoy', 'piv-native', 'piv-native_dif')
-GROUP, BLOCK, UNIT = 687, 4096, 512
+GROUP, BLOCK = 687, 4096
+# Decoy oracle unit: the primary sector size, which the decoy view advertises
+# as its logical block size (as stock dm-crypt does).
+UNIT = json.loads(subprocess.check_output(['cryptsetup', 'luksDump', '--dump-json-metadata', '/dev/vdb'],
+                                          text=True))['segments']['0']['sector_size']
 THREADS = 8
 OPS = int(os.environ.get('PIV_STRESS_OPS', '48'))
 results = dict(threads=THREADS, ops_per_thread=OPS)
@@ -95,7 +100,7 @@ def value(*parts, size=UNIT):
 
 
 class History:
-    """Every value ever written (or initially present) per 512-byte decoy unit or
+    """Every value ever written (or initially present) per decoy unit (primary sector) or
     hidden block. Writers record a value before issuing it, so a concurrent read
     may return any recorded value."""
     def __init__(self):
@@ -159,7 +164,7 @@ big = (striped[1] // CHUNK + 1) * CHUNK      # large-write chunks after the stri
 big_end = big + 2 * THREADS * CHUNK
 shared = (big_end, big_end + 64 * UNIT)      # phase B overlapping writes
 assert shared[1] <= len(image)
-STRIPE = 3                                    # units; crosses 4096-byte sector boundaries
+STRIPE = 3                                    # units; crosses page and record boundaries
 
 
 def stripes_of(thread):

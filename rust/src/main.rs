@@ -29,7 +29,8 @@ usage: pivsetup open-blocks --device D --key-file F (--hidden-key-file F | --hid
                             [--verify] [--kdf-cost 1-4]
        pivsetup close-blocks --device D --key-file F [--name piv-native]
        pivsetup keyslot add|remove --device D --key-file F --slot 0-3
-                            [--new-key-file F | --new-passphrase-file F [--kdf-cost 1-4]]
+                            (--hidden-key-file F | --hidden-passphrase-file F [--kdf-cost 1-4])
+                            [--new-key-file F | --new-passphrase-file F [--new-kdf-cost 1-4]]
                             [--name piv-native]
        pivsetup migrate --source D --source-key-file F (--source-hidden-key-file F | --source-hidden-passphrase-file F)
                         --target D --target-key-file F
@@ -76,7 +77,7 @@ impl Args {
                       "--source", "--source-key-file", "--source-hidden-key-file",
                       "--source-hidden-passphrase-file", "--target", "--target-key-file",
                       "--target-hidden-key-file", "--target-hidden-passphrase-file", "--parity",
-                      "--kdf-cost", "--source-kdf-cost", "--target-kdf-cost"];
+                      "--kdf-cost", "--new-kdf-cost", "--source-kdf-cost", "--target-kdf-cost"];
         let switches = ["--initialize", "--quick", "--fill", "--ab", "--verify"];
         while let Some(word) = argv.next() {
             let (key, inline) = match word.split_once('=') {
@@ -243,9 +244,13 @@ fn run(args: Args) -> Result<()> {
         }
         "keyslot" => {
             args.only(&["--device", "--key-file", "--name", "--slot", "--new-key-file", "--new-passphrase-file",
-                        "--kdf-cost"])?;
+                        "--hidden-key-file", "--hidden-passphrase-file", "--kdf-cost", "--new-kdf-cost"])?;
             let device = args.required("--device")?;
-            let tier = kdf_cost_for(&args, "--kdf-cost", "--new-passphrase-file")?;
+            // Authorization: the current hidden key or passphrase of a listed
+            // keyslot (--kdf-cost is its tier, as for open-blocks).
+            let auth = hidden_secret(&args, "--hidden")?;
+            let auth_tier = kdf_cost_for(&args, "--kdf-cost", "--hidden-passphrase-file")?;
+            let tier = kdf_cost_for(&args, "--new-kdf-cost", "--new-passphrase-file")?;
             let slot: u32 = args.value("--slot").and_then(|s| s.parse().ok()).filter(|&s| s < 4)
                 .ok_or_else(|| Error::new("--slot must be 0, 1, 2 or 3"))?;
             let key_file = args.required("--key-file")?;
@@ -270,7 +275,7 @@ fn run(args: Args) -> Result<()> {
                 }
                 _ => return Err(Error::new(format!("Usage error\n{USAGE}"))),
             };
-            blocks::keyslot(&device, &key_file, slot, kek.as_deref(), &name)
+            blocks::keyslot(&device, &key_file, slot, kek.as_deref(), auth, auth_tier, &name)
         }
         "keygen" => {
             args.only(&["--output"])?;

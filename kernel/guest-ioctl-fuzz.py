@@ -14,8 +14,10 @@ dmesg), or any change to primary or hidden contents. Deliberately excluded,
 because they succeed legitimately and are destructive by design: SETUP with
 INITIALIZE and keyslot operations on slot 0. The former userspace IV and
 prepare/apply controls (numbers 1-4, 8-11) were removed on 2026-10-22; they are
-still sent and must return ENOTTY. Keyslot add/remove on slots 1-3 may succeed (random KEKs) and are
-left in place; the final reopen with the original key must still work.
+still sent and must return ENOTTY. KEYSLOT (version 2) carries an authorizing
+KEK: random ones are rejected (EKEYREJECTED); with the real hidden key, add and
+remove on slots 1-3 may succeed (random new KEKs) and are left in place; the
+final reopen with the original key must still work.
 """
 import ctypes
 import errno
@@ -47,7 +49,7 @@ libc.ioctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_void_p]
 # number: (size, direction) from kernel/piv-control.h (1 = write, 2 = read).
 COMMANDS = {0: (48, 2), 1: (48, 3), 2: (48, 3), 3: (4176, 3), 4: (4176, 1), 5: (48, 1), 6: (48, 1),
             7: (16, 2), 8: (48, 1), 9: (4176, 3), 10: (4176, 3), 11: (4176, 1), 12: (216, 3),
-            13: (48, 1), 14: (40, 2), 15: (64, 1)}
+            13: (48, 1), 14: (40, 2), 15: (96, 1)}
 REMOVED = {1, 2, 3, 4, 8, 9, 10, 11}  # former userspace IV/tuple controls: ENOTTY
 SETUP_SCANS = 16  # template-valid SETUPs scan the whole primary; keep them rare
 
@@ -79,7 +81,7 @@ def template(number, size, device, sectors, context):
     sector = rng.choice([0, 1, sectors - 1, sectors, sectors + 1, 2**63, 2**64 - 1,
                          rng.randrange(sectors)])
     generation = device.generation if rng.random() < 0.9 else rng.getrandbits(64)
-    version = {12: 6, 15: 1}.get(number, 2) if rng.random() < 0.9 else rng.getrandbits(32)
+    version = {12: 6, 15: 2}.get(number, 2) if rng.random() < 0.9 else rng.getrandbits(32)
     length = size if rng.random() < 0.9 else rng.choice([0, size - 1, size + 1, rng.getrandbits(32)])
     if number == 12:
         flags = rng.choice([0, 0, 0, 8, 2, 4, 16, 32, 64, rng.getrandbits(32)]) & ~1  # never INITIALIZE
@@ -95,7 +97,9 @@ def template(number, size, device, sectors, context):
     elif number == 15:
         slot = rng.choice([1, 2, 3, 4, 5, 2**32 - 1])  # never slot 0
         op = rng.choice([1, 2, 0, 3, rng.getrandbits(32)])
-        body = struct.pack('=IIQII32sII', version, length, generation, slot, op, rng.randbytes(32), 0, 0)
+        kek = rng.randbytes(32) if op == 1 or rng.random() < 0.1 else bytes(32)
+        auth = HKEY if rng.random() < 0.5 else rng.randbytes(32)
+        body = struct.pack('=IIQII32s32sII', version, length, generation, slot, op, kek, auth, 0, 0)
     elif size == 4176:
         tuple_ = bytes(4128) if rng.random() < 0.3 else rng.randbytes(4128)
         body = struct.pack('=IIQQ16sI4128sI', version, length, generation, sector,

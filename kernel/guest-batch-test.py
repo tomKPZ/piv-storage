@@ -51,18 +51,21 @@ def expected_count(offset, count):
         offset = stop
     return total
 
+# Offsets are whole primary sectors: the decoy's logical block size is the
+# primary sector size (as stock dm-crypt), so 'unaligned' means not aligned to
+# the 128 KiB work item (and, on 512-byte volumes, to 4 KiB).
 cases = [('4k', 0, 4096), ('16k', 0, 16384),
-         ('unaligned', 512, 16384),
-         ('record-boundary', (112 + 3 * group) * unit - 512, 4096),
+         ('unaligned', unit, 16384),
+         ('record-boundary', (112 + 3 * group) * unit - unit, 4096),
          ('32k', 0, 32768),
          ('128k', 0, 131072),
-         ('unaligned-128k', 512, 131072),
+         ('unaligned-128k', unit, 131072),
          ('256k-split', 0, 262144),
          ('1m-split', 1 << 20, 1 << 20),
          ('last-16k', size - 16384, 16384),
          ('last-128k', size - 131072, 131072)]
 if groups_end < size:
-    cases.append(('carrier-tail', groups_end - 512, min(4096, size - groups_end + 512)))
+    cases.append(('carrier-tail', groups_end - unit, min(4096, size - groups_end + unit)))
 for label, offset, count in cases:
     old = direct(offset, count)
     new = hashlib.shake_256(('batch-' + label).encode()).digest(count)

@@ -70,7 +70,12 @@ bio to the unbound, reclaim-capable `piv-native` workqueue (at most 16 work
 items run at once, shared by all owners); work runs in NOIO allocation scope.
 Hidden bios are split per 4096-byte block (the hidden view's logical and
 physical block size; the worker refuses anything else), decoy bios at 128 KiB
-power-of-two boundaries (at most 256 primary sectors per work item). Batching is
+power-of-two boundaries (at most 256 primary sectors per work item). The decoy
+view advertises the primary sector size as its logical and physical block
+size, exactly as stock dm-crypt does (`crypt_io_hints`), so filesystems made
+through it keep mounting through stock dm-crypt and the view's geometry is not
+a distinguisher; on 4096-byte volumes the block layer refuses sub-sector
+requests before the module sees them. Batching is
 within one bio: no cross-bio accumulation, writeback cache or delay.
 
 ### Concurrency
@@ -109,7 +114,9 @@ encryptions before encrypting.
   sector gets a fresh IV: keyslot (listed in the directory), directory and
   record sectors keep their fragment and redraw its random part; other sectors
   get uniformly random IVs. A write covering an entire sector that fails
-  authentication replaces it; a partial write to such a sector fails EIO.
+  authentication replaces it. A partial write to such a sector would fail EIO;
+  the module keeps that check, but since the view's logical block is the
+  primary sector, the block layer no longer issues partial-sector writes.
 - **Hidden read**: reads the G-sector record (G = 687 + 3p; both slots with
   A/B), using raw IVs of sectors whose decoy data fails authentication; the SIV
   tag decides. With parity, a failing tag triggers RS decoding with the
@@ -207,19 +214,25 @@ read/write access; all rewriting happens inside the kernel and other ioctl
 numbers return ENOTTY.
 
 - NATIVE_SETUP ABI 6 (216 bytes, read/write): version/size, generation, flags,
-  context_length, key[32] (keyslot KEK), context[128] (v5 base context),
+  context_length, key[32] (keyslot KEK), context[128] (the exact 72-byte v5
+  base context of this owner, checked field by field; anything else EINVAL),
   parity (0, 4, 8 or 16; non-zero only with initialize), reserved, then the
   fill output counts valid, written, failed (u64; zero on input). Flags: 1
   initialize, 8 A/B (with initialize), 16 verify, 32 quick (with initialize),
   64 fill (without initialize); other bits are rejected. After a successful
   setup the kernel copies the structure back with the key zeroed. ABI 6
   (2026-10-22) added quick, fill and the counts.
-- NATIVE_KEYSLOT (version 1, 64 bytes): version/size, generation, slot, op
-  (1 add, 2 remove), kek[32], reserved[2]. The last keyslot cannot be removed;
-  failures after a lower write fail-stop the owner.
+- NATIVE_KEYSLOT (version 2, 96 bytes, 2026-10-22): version/size, generation,
+  slot, op (1 add, 2 remove), kek[32] (the new keyslot's KEK; zero for remove),
+  auth[32] (the caller's current hidden KEK; it must open a directory-listed
+  keyslot with the active master key and parameters, else EKEYREJECTED),
+  reserved[2]. The last keyslot cannot be removed; the owner's keyslot state
+  changes only with the directory write; failures after a lower write
+  fail-stop the owner.
 - NATIVE_STATUS (version 4): generation, hidden_bytes, encryptions (u64);
-  active, views, failed, version (u32). Counters are volatile, not lifetime
-  history.
+  active, views, failed, version (u32). `failed` is the sticky owner fail-stop
+  (also after a failed setup, when active = 0). Counters are volatile, not
+  lifetime history.
 
 No user paths or file descriptors enter the persistence path.
 
