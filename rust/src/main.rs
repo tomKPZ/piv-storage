@@ -34,6 +34,7 @@ usage: pivsetup open-blocks --key-file F (--hidden-key-file F | --hidden-passphr
                         --target D --target-key-file F
                         (--target-hidden-key-file F | --target-hidden-passphrase-file F)
                         [--source /dev/vdb] [--source-kdf K] [--target-kdf K] [--ab]
+                        [--allow-no-journal]
        pivsetup keygen --output F
 
 LUKS2 volumes with 16-byte random IVs (aegis128-random + aead, or aes-, serpent- or
@@ -45,7 +46,7 @@ Volumes persisting stock --integrity-no-journal need --allow-no-journal: a crash
 during a hidden write can then destroy decoy sectors of that record.
 Passphrase KEKs use --kdf (default argon2id: 64 MiB, t=3, p=4); nothing records
 which KDF a keyslot used, so open with the same one. migrate copies both views of
-an opened source into a freshly luksFormatted AEGIS-128 target that it initializes
+an opened source into a freshly luksFormatted supported target that it initializes
 (rekey, resize or sector-size change), then re-reads and compares both views.";
 
 const MAX_PASSPHRASE: usize = 4096;

@@ -1,7 +1,8 @@
 """Read-only LUKS2/dm-integrity profile, cross-checked with stock Linux fixtures.
 
 LUKS2 header checksums and redundant-header selection are delegated to cryptsetup.
-Only the no-journal-crypto, fixed-padding, 512/4096-byte original AEGIS-128 profile is accepted.
+Only no-journal-crypto, fixed-padding, 512/4096-byte profiles with 16-byte random IVs
+(original AEGIS-128, or aes/serpent/twofish-xts-random with hmac-sha1/256/512) are accepted.
 """
 
 from contextlib import AbstractContextManager

@@ -2,11 +2,11 @@
 
 ## Mission and authorization
 
-Continue this project autonomously toward a small online prototype, now including coordinated primary writes, that
-stores an independently encrypted auxiliary payload in persistent IVs while
-preserving stock-Linux authentication and primary plaintext. Independent
-read-only userspace diagnostics remain the compatibility reference;
-the old offline mutation and FUSE/NBD services have been retired. The user intends
+Continue this project autonomously as a small online prototype that stores an
+independently encrypted auxiliary (hidden) payload in the persistent random IVs
+of a stock LUKS2 + dm-integrity volume while preserving stock-Linux
+authentication and primary plaintext. Independent read-only userspace
+diagnostics remain the compatibility reference. The user intends
 future sessions to implement it without significant human direction. Unless the
 user gives a different task, inspect current state and advance the next useful
 milestone in ROADMAP.md; do not stop after merely proposing work.
@@ -21,10 +21,11 @@ security specification. Respect tool/sandbox approval requirements.
 1. Read README.md, ROADMAP.md, applicable nested instructions, and existing design
    notes (especially docs/development.md, docs/observed-layout.md and
    docs/format-v4.md, docs/native-blocks.md, docs/native-faults.md and
-   docs/security-review.md, docs/read-performance.md and docs/large-volumes.md and docs/cancellation.md). Inspect
+   docs/security-review.md, docs/journal-atomicity.md, docs/read-performance.md,
+   docs/large-volumes.md and docs/cancellation.md). Inspect
    git status and relevant code before changing anything.
 2. Determine what is actually implemented and tested. Recheck environmental
-   assumptions as needed; the initial host is WSL2 without visible DM/KVM nodes.
+   assumptions as needed (the current host has KVM; see docs/development.md).
 3. Select a bounded task with observable exit criteria. Continue through its
    implementation and appropriate verification without routine design questions.
 4. Keep ROADMAP.md to what remains (no session history: git keeps it); record
@@ -77,7 +78,9 @@ resolved from context/evidence, not for routine implementation decisions.
   encryption counter resets at recreation and does not enforce the per-key
   lifetime budget. Document probabilistic collisions, amplification, retries,
   rollback and clones. Do not resurrect an observable nonce ledger.
-- Preserve authenticated PREPARE/exact-tuple APPLY and owner lifetime gates.
+- Preserve the kernel-internal authenticated PREPARE/exact-tuple APPLY and owner
+  lifetime gates. The control device exposes only QUERY, DEVICES, BEGIN/END,
+  SETUP, DETACH, STATUS and KEYSLOT; never re-add userspace IV or tuple access.
   Apply through the ordinary lower dm-integrity journal; its per-sector atomicity
   does not make a hidden record atomic. Failure scope follows mutation: errors
   before the first APPLY (reads, authentication, allocation, preparation) fail
@@ -102,7 +105,9 @@ resolved from context/evidence, not for routine implementation decisions.
   primary cap. Frontend/VM fixtures allow only pinned QEMU /dev/vdb at 128 or
   512 MiB, plus explicitly opted-in test wrappers. Never broaden this into
   arbitrary host-device activation as a side effect of geometry work. The actual
-  validated raw size must reach extent parsing. Live resize is unsupported.
+  validated raw size must reach extent parsing. Live resize, rekey and cipher
+  change are out of scope (stock cryptsetup refuses them on integrity volumes;
+  user decision 2026-10-22); `pivsetup migrate` is the offline path.
 - Native setup, decoy reads and carrier collection use bounded 16 KiB range
   reads. Authenticate every sector with unchanged Linux AAD/tag offsets before
   publishing any range bytes or IVs. Keep per-sector crypto counts and late-sector
@@ -130,8 +135,9 @@ resolved from context/evidence, not for routine implementation decisions.
   Keys stay in mlocked, zeroized buffers and never reach argv. Python keeps only
   diagnostics and guest test instrumentation; pivstore.blocks is a thin client
   of the binary. Test hooks are explicit PIVSETUP_TEST_* variables, never
-  monkeypatching. Diagnostics use cryptography plus the optional pinned
-  SUPERCOP AES-NI reference for original AEGIS-128 (not 128L);
+  monkeypatching. Diagnostics use cryptography (AES-XTS, HMAC) plus the
+  optional pinned SUPERCOP AES-NI reference for original AEGIS-128 (not 128L);
+  Serpent/Twofish images are HMAC-authenticated but not decrypted on the host;
   actual crypto/I/O runs in the experimental kernel module. Retain the independent
   codec and complete primary verifier as cross-checks. Only synthetic test keys.
 
@@ -181,9 +187,9 @@ data. Verify full primary hashes/authentication, corruption rejection, hidden
 round trips and nonce behavior. Add meaningful boundary/error/crash tests as
 features require them. Compare against matched ordinary controls for detectability.
 
-Matched controls live in scripts/guest-controls.sh and scripts/analyze_controls.py.
-Use pristine stock fixtures, distinguish same-workload writes from deliberate
-ordinary reencryption controls, and exclude native initialization only explicitly.
+Matched controls live in scripts/guest-controls.sh and scripts/analyze_controls.py
+(stock and native arms over the same workload). Use pristine stock fixtures and
+exclude native initialization only explicitly.
 Live journal samples are not atomic; byte statistics are descriptive, not a
 security acceptance test. Retain observed snapshot/I/O distinctions in claims.
 

@@ -1,204 +1,161 @@
-# Stateless failure semantics and experiments
+# Stateless failure semantics and fault tests
 
-> [!NOTE]
-> 2026-10-21: format v3 and the AES-GCM / ChaCha20-Poly1305 profiles were
-> removed; 2026-10-22: XTS + HMAC authenc profiles were added beside the default
-> AEGIS-128 ([format v4](format-v4.md) needs 16-byte random IVs). Results below that mention them are historical evidence for
-> the code at that time; current runs are recorded in commit messages.
+The design keeps no private recovery plan, WAL or history. Primary
+ciphertext/tag/IV updates go through the ordinary dm-integrity journal (or, with
+the opted-in `--allow-no-journal`, stock direct mode; see
+[journal-atomicity.md](journal-atomicity.md)). An interrupted hidden write may
+leave that one 512-byte hidden block unreadable. A record's whole plaintext must
+authenticate (SIV tag over all 90 fragments) before it is returned, so old and
+new carrier fragments are never mixed into a valid block. Independently valid
+blocks can still represent different times; there is no cross-block
+transaction, hidden crash recovery or rollback resistance.
 
-The external recovery/history protocol and its root-ext4 ENOSPC/compaction tests
-were removed with the stateless architecture. Historical results in Git do not
-establish the current crash behavior.
+## Failure scope
 
-Primary ciphertext/tag/IV updates go through the ordinary dm-integrity journal.
-No private cross-sector recovery plan is written. Interrupted hidden writes may
-leave one 512-byte logical block unreadable. A record's entire plaintext must
-authenticate before return; its old/new carrier fragments cannot be returned as
-valid fragments. Independently valid blocks can still represent different times.
-
-A hidden authentication failure means local EIO, not global fail-stop. Decoy
-reads remain available. A decoy write overlapping an unavailable hidden block
-stores a fresh encrypted invalid marker, never fabricated valid zeros. A full
-512-byte hidden write repairs the block after authenticating the primary carrier.
-
-Failure scope follows mutation. Reads never mutate; a write authenticates its
-whole carrier, encodes records and prepares every tuple in RAM before its first
-lower write. Any failure up to that point (lower read error, primary
-authentication failure, allocation, nonce-collision retry exhaustion, encryption
-cap, request validation) fails only that bio; preparation may still have spent
-encryption invocations. Once the APPLY loop starts, any failure, and any failed
-flush (standalone, PREFLUSH or batch), stops both views: storage may be partial
-or durability unknown. dm-integrity itself also enters a sticky failed state on
-journal/metadata write errors. Unmount/remove and recreate after correcting the
-underlying problem; do not clear an error flag on a mounted stack. An EIO write
-may have partially changed the disk. Group-scoped poisoning was not added: after
-an APPLY failure the lower journal is typically failed too, so it would not
-restore availability.
+- **Hidden authentication failure** is local: that hidden request returns EIO;
+  the owner stays healthy and decoy access is unaffected. Hidden reads use the
+  raw stored IVs of carrier sectors that fail primary authentication, so
+  data-area damage alone does not make a hidden block unavailable; IV damage does
+  (the SIV tag rejects the wrong fragment).
+- **Decoy writes over damaged hidden blocks** re-randomize only the written
+  sectors' IVs and preserve their fragments, so damage stays damage. Nothing
+  fabricates authenticated zeros. A full 512-byte hidden write repairs the block;
+  it needs authenticated plaintext of all 90 carrier sectors.
+- **Primary sectors failing authentication**: reads and partial writes return
+  EIO. A decoy write covering the entire sector replaces it with a fresh IV and
+  refreshed raw fragment (user decision 2026-10-21); the record's SIV tag still
+  decides hidden validity.
+- **Errors before the first APPLY** (lower read error, primary authentication
+  failure, allocation, nonce-collision retry exhaustion, encryption cap, request
+  validation) fail only that bio. Preparation may already have spent encryption
+  invocations.
+- **APPLY-time and flush errors** (standalone flush, PREFLUSH or completion
+  flush) stop the shared owner and both views: storage may be partial or
+  durability unknown. dm-integrity also enters its own sticky failed state on
+  journal/metadata write errors. Unmount, remove and recreate the stack after
+  correcting the underlying problem; there is no error-clearing control. An EIO
+  write may have partially changed the disk.
 
 Fault tests use only disposable synthetic guest disks. VM SIGKILL preserves the
-host page cache and is not hardware power-loss evidence. Never infer hidden
-filesystem consistency or rollback resistance from primary sector authentication.
-Executed tests and artifacts are recorded in commit messages.
+host page cache and is not hardware power-loss evidence. Primary sector
+authentication says nothing about hidden filesystem consistency or rollback.
+All fault suites run per profile through `scripts/suite.py`; executed runs are
+recorded in commit messages.
 
-## Reproduce the partial-record interruption
+## Partial-record interruption (`power` suite)
 
-First build the exact module with the native test. Use fresh output directories:
+scripts/guest-stateless-power.sh with kernel/guest-stateless-power.py
+initializes the stock fixture, then reopens it through a dm-delay wrapper
+(1 s write delay) and writes hidden block 0. An O_DIRECT raw observer reads the
+record's 90 current tag/IV tuples and the dm-integrity journal (whole-section
+commit IDs, pinned no-MAC entry layout) and cuts QEMU once some but not all of
+the 90 carrier IVs have changed (`cut-boundary.json`; a run without the cut
+fails). The observer never writes or bypasses the native owner; journal
+inspection is test instrumentation, not a recovery implementation.
 
-```sh
-python3 scripts/vm.py run --code \
-  --script scripts/guest-stateless-power.sh \
-  --power-cut-script scripts/guest-stateless-recover.sh \
-  --run-dir artifacts/stateless-power-next \
-  --data-image artifacts/control-003/control.img \
-  --share-file artifacts/stateless-next/share/experimental-dm-piv.ko \
-  --share-file kernel/guest-stateless-power.py \
-  --share-file artifacts/control-003/share/passphrase.key \
-  --share-file artifacts/control-003/hidden.key --timeout 3600
-```
+After reboot, scripts/guest-stateless-recover.sh lets stock cryptsetup replay
+the journal and requires block 0 to be complete-old, complete-new or EIO, every
+other hidden block unchanged and the full primary hash unchanged. A decoy write
+must not silently repair an EIO block; a full hidden write then repairs it.
+Stock full-primary readback and a stock dm-crypt coexistence check follow (this
+suite produces no host-verified output image). On `*-nojournal` profiles torn primary sectors are allowed only inside
+that record's carrier and are restored by full-sector decoy writes (the measured
+hazard in journal-atomicity.md).
 
-The guest initializes zeros on the stock fixture before introducing dm-delay.
-An O_DIRECT raw observer validates whole journal-section commit IDs, parses the
-pinned 48-byte (512-byte primary) or 104-byte (4096-byte primary) entries and
-combines new committed/current IV addresses. It cuts
-QEMU when some but not all carrier slots (48 for AES/ChaCha, 36 for AEGIS-128) have changed. The observer never
-writes metadata or bypasses the native owner for mutations. Journal inspection
-is test instrumentation, not a second native recovery implementation.
+## Lower-device errors and setup cleanup (`faults` suite)
 
-The reboot test accepts a complete old/new authenticated block or local EIO,
-checks all other blocks and the entire primary hash, verifies invalid-marker
-preservation and repairs the affected block. artifacts/stateless-power-003
-observed exactly 32 changed slots and EIO afterward. Stock and independent full
-primary/hidden verification passed after repair. Check cut-boundary.json,
-power-results.json and result.txt; a run without the requested cut is a failure.
+scripts/guest-faults.sh and kernel/guest-fault-test.py place a disposable
+linear wrapper below stock dm-integrity and reload it as
+[dm-flakey](https://docs.kernel.org/admin-guide/device-mapper/dm-flakey.html)
+(`error_reads`, `error_writes` or one-sector `corrupt_bio_byte`) after
+activation and once udev probes drain. Targets lie in hidden record 10, away
+from sector 0, whose setup checkpoint may be served from dm-integrity's journal
+cache. Decoy requests use an aligned 16 KiB span, hidden requests one 512-byte
+block. A direct raw read witnesses each injected fault first.
 
+- **Setup**: pivsetup's `PIVSETUP_TEST_FAIL` hook fails after cryptsetup open,
+  before/after native setup and after each public view; a lower read error is
+  injected during the kernel SETUP ioctl via `PIVSETUP_TEST_GATE`. Every
+  attempt must remove exactly what it created. Conflicting lower/public names,
+  existing owners and an unrelated replacement at close are preserved; both view
+  names are validated before either is removed. On `*-nojournal` fixtures,
+  opening without `--allow-no-journal` is refused and cleaned up.
+- **error_reads** (both views): the read and an overlapping write fail with EIO,
+  spend no encryption and leave the owner healthy; after restoration the same
+  owner generation reads and rewrites the range and passes the complete
+  primary/hidden oracles without repair.
+- **error_writes** (both views): preparation spends encryptions, APPLY hits the
+  failing write, the owner reports failure and both views keep rejecting I/O
+  after the wrapper is restored. Only teardown/recreation clears it. Hidden
+  blocks must match the oracle, with local EIO/repair allowed only for records
+  intersecting the failed request (and, without the journal, torn sectors only
+  within the request's span, restored by full-sector writes).
+- **Late-sector corruption**: the corrupted sector is the last of one 16 KiB
+  decoy work item or the last carrier sector of record 10. A decoy read must
+  leave a sentinel-filled direct-I/O buffer unchanged (earlier sectors may have
+  decrypted privately). A hidden read of record 10 still succeeds, because only
+  primary data was corrupted and the raw IV feeds SIV-checked decoding. Partial
+  writes into the failing sector fail before encrypting; a full-sector decoy
+  write replaces it. Unrelated requests on both views continue and the same
+  owner passes the oracles afterwards.
+- **Setup audit**: with the same corruption, `--verify` refuses and cleans up,
+  while the default keyslot-area setup opens and returns local EIO only for the
+  damaged decoy sector. A corrupted keyslot sector does not block default setup
+  (raw IV, keyslot SIV or the other replica decides); `--verify` refuses.
+- **IV damage**: a flipped stored IV byte makes that hidden block and decoy
+  sector EIO while neighbours stay intact.
+- **Uncoordinated stock rewrite** of one carrier sector (same plaintext, fresh
+  IV) destroys only that hidden block; a decoy rewrite preserves the damage; a
+  full hidden write repairs it.
 
-## Direct lower-device errors and setup cleanup
+The test finishes with stock full-primary readback, a closed image for host
+verification, and custom-module unload while stock crypt stays busy. Fixture
+guards stay limited to QEMU /dev/vdb (128 or 512 MiB) plus the named test
+wrappers. Cleanup is best effort, not hidden recovery, rollback, atomic
+initialization or protection against hardware that acknowledges writes without
+persisting them. These synthetic faults test authenticated-read withholding and
+scoped failure, not adversarial journal replay or physical durability.
 
-scripts/guest-faults.sh and kernel/guest-fault-test.py use a disposable linear
-wrapper below stock dm-integrity. The test reloads it as dm-flakey with up=0,
-down=3600 and either error_reads or error_writes, after activation and after udev
-probes drain. Carrier record 10 avoids sector 0, whose checkpoint can still be served from
-dm-integrity's journal cache. Decoy requests use a 16 KiB-aligned 16 KiB span
-at or beyond carrier record 10; hidden requests use one 512-byte block.
-A direct raw read witnesses error_reads before the
-selected public read, and failing writes must have spent fresh encryptions.
-These features return errors; no silently dropped writes are used.
-Their definitions were checked against the pinned v6.12.113 source in
-environment/sources.json and the [kernel documentation](https://docs.kernel.org/admin-guide/device-mapper/dm-flakey.html).
+## Concurrent lifecycle and flush/FUA ordering (`lifecycle` suite)
 
-For each view, direct reads and writes trigger the corresponding lower error.
-With error_reads, the read and a write needing the same carrier must fail with
-EIO, spend no encryption and leave the owner healthy; after the wrapper is
-restored the SAME owner generation must read and rewrite that range and pass the
-complete primary/hidden oracle without repair. With error_writes, preparation
-spends encryptions, APPLY reaches the failing lower write, the owner must report
-failure and both views must keep rejecting direct reads and writes after the
-wrapper is restored. Only teardown/recreation clears that fail-stop. Stock
-journal replay and full-primary verification follow; hidden blocks must match
-the original oracle, with local EIO/whole-block repair allowed only for carrier
-records intersecting the failed request. A separate fresh-IV primary rewrite tests local
-hidden EIO, invalid-marker preservation and direct repair without global failure.
-
-Setup tests fail after cryptsetup creates mappings, before native setup, during
-kernel authentication, after native setup and after each public-view creation.
-They also preserve conflicting lower/public names, existing idle/active owners,
-and an unrelated replacement at close. Both view names are validated before any
-is removed. Runtime DM UUIDs/device numbers identify resources; no new disk or
-external persistent state is introduced. A final custom-module unload checks
-that descriptors/target references were released while stock crypt stays busy.
-
-Use a CLOSED native output with its complete expected views, not an uninitialized
-control image:
-
-```sh
-python3 scripts/vm.py run --code --script scripts/guest-faults.sh \
-  --run-dir artifacts/faults-next \
-  --data-image artifacts/separate-native-4096-002/share/dual-final.img \
-  --share-file artifacts/separate-kernel-512-002/share/experimental-dm-piv.ko \
-  --share-file kernel/guest-fault-test.py \
-  --share-file artifacts/control-003/share/passphrase.key \
-  --share-file artifacts/control-003/hidden.key \
-  --share-file artifacts/separate-native-4096-002/share/expected-hidden-volume \
-  --share-file artifacts/separate-native-4096-002/share/expected-primary.sha256 \
-  --timeout 3600
-```
-
-The wrapper guard remains QEMU-only /dev/vdb at 128 MiB. The test never mounts
-filesystems on a failed project stack. Restore the fault source and unmount both
-views before teardown in normal use. Resource cleanup is best effort and is not
-hidden recovery, rollback, atomic initialization or a guarantee against hardware
-that acknowledges writes without persisting them.
-
-
-## Concurrent lifecycle and explicit flush/FUA evidence
-
-scripts/guest-lifecycle.sh builds a SEPARATE test-only piv-io-test.ko against the
-pinned guest headers and loads it alongside the previously verified dm-piv.ko.
-Never link this helper into the production module or load it on the host. Its
-root-only write interface accepts two integers (public view and request mode),
-reads 512 bytes at sector 0 and writes those SAME bytes with plain, FUA or
-PREFLUSH|FUA flags, or submits a flush. It accepts no keys, paths, offsets or user
-payload. The helper is unloaded before lifecycle stress begins.
+scripts/guest-lifecycle.sh builds a separate test-only piv-io-test.ko
+(kernel/piv-io-test.c) against the pinned guest headers and loads it beside
+dm-piv.ko. Never link it into the production module or load it on the host. Its
+root-only interface accepts two integers (public view, request mode), reads 512
+bytes at sector 0 and writes the same bytes with plain, FUA or PREFLUSH|FUA
+flags, or submits a flush. It accepts no keys, paths, offsets or payload and is
+unloaded before stress begins.
 
 Dynamic kprobe entry/return events around pn_worker, pn_write,
-blkdev_issue_flush and bio_endio record function metadata and results, not
-plaintext or keys. Trace parsing requires complete non-overlapping ordered
-workers, successful paired lower flush returns, a completed flush before write
+blkdev_issue_flush and bio_endio record function metadata and results, never
+plaintext or keys. kernel/lifecycle_trace.py requires complete non-overlapping
+ordered workers, successful paired lower flushes, a completed flush before write
 return and public completion, and a preflush before a PREFLUSH payload (possibly
-in a separate DM-split flush bio). A standalone flush must also reach a native
+in a separate DM-split flush bio); a standalone flush must reach a native
 worker. Probe misses, ring-buffer overruns, missing events and negative results
-are failures, not skipped coverage. See the [kernel kprobe tracing documentation](https://docs.kernel.org/trace/kprobetrace.html)
-for the event/profile interface. Probes are removed before module unload.
+fail the test. See the [kprobe tracing documentation](https://docs.kernel.org/trace/kprobetrace.html).
 
-Concurrent writers own disjoint logical regions that share carrier groups,
-change/read/restore their data, and interleave direct and O_DSYNC writes with
-fsync. Another thread suspends/resumes public views during that workload. Held
-public descriptors must prevent removal, close and unload without changing
-mapping identities. A request queued while a public view is suspended must wait
-for resume while its peer remains usable. Complete primary/hidden oracles are
-checked afterward and after a new owner generation. Stock full-primary readback
-and custom unload finish the test.
+Concurrent writers own disjoint logical regions sharing carrier groups and mix
+direct and O_DSYNC writes with fsync while another thread suspends/resumes the
+public views. Held descriptors must block removal, close and unload without
+changing mapping identities; a request queued on a suspended view waits for
+resume while its peer stays usable. Complete oracles are checked afterwards and
+after a new owner generation, followed by stock full-primary readback and
+unload.
 
-This is a public-view lifecycle contract. Direct administrative suspension or
-replacement of the PRIVATE owner/lower mappings while views are active remains
-outside the supported workflow. Successful kernel flush return/order is not
-proof that physical hardware honored persistence, hidden-record atomicity, or a
-debug-kernel/lockdep audit (see docs/sanitizer.md for the later sanitizer runs).
+This is a public-view lifecycle contract. Administrative suspension or
+replacement of the private owner/lower mappings while views are active is
+unsupported. Kernel flush return/order does not prove that hardware honoured
+persistence or that a hidden record is atomic. Sanitizer runs are described in
+[sanitizer.md](sanitizer.md).
 
-Example using a CLOSED native fixture and a matched module (fresh run directory):
+## Running
 
 ```sh
-python3 scripts/vm.py run --code --script scripts/guest-lifecycle.sh \
-  --run-dir artifacts/lifecycle-next \
-  --data-image artifacts/separate-native-4096-002/share/dual-final.img \
-  --share-file artifacts/batch-native-4096-001/share/experimental-dm-piv.ko \
-  --share-file kernel/piv-io-test.c --share-file kernel/guest-lifecycle-test.py \
-  --share-file kernel/lifecycle_trace.py \
-  --share-file artifacts/control-003/share/passphrase.key \
-  --share-file artifacts/control-003/hidden.key \
-  --share-file artifacts/separate-native-4096-002/share/expected-hidden-volume \
-  --share-file artifacts/separate-native-4096-002/share/expected-primary.sha256 \
-  --timeout 2400
+python3 scripts/suite.py --prefix artifacts/faults-next --profile aegis-4096 \
+  --scaffold artifacts/stage-next/scaffold.tar --suites faults,power,lifecycle
 ```
 
-## Late-sector corruption in batched reads
-
-The range-read regression extends guest-fault-test.py with a one-sector
-`dm-flakey` read replacement below dm-integrity. It uses the documented
-[corrupt_bio_byte feature](https://docs.kernel.org/admin-guide/device-mapper/dm-flakey.html)
-to flip the first byte of a selected ciphertext sector on reads only, leaving
-backing bytes and writes unchanged. A direct raw read witnesses the replacement
-before testing authentication. The chosen sector is the last in one aligned
-16 KiB decoy work item or the last carrier sector of hidden record 10, away from
-the setup checkpoint's journal cache.
-
-Earlier sectors may have decrypted into private pages when this last sector
-fails. A direct-I/O caller buffer prefilled with a sentinel must remain entirely
-unchanged on EIO. The owner must stay healthy: a write overlapping the corrupt
-carrier must fail before spending any encryption, unrelated requests on both
-views must succeed during the fault, and after removal the same owner must pass
-the complete primary/hidden oracles with no repair. A separate setup attempt with the same later-sector corruption must
-fail, remove its own mappings and permit a healthy full reopen after restoration.
-These synthetic faults test authenticated-read withholding and scoped failure,
-not adversarial journal replay, physical corruption durability or atomicity of
-application requests spanning multiple public bios.
+Use `--reuse-native PREFIX` to start from a previous matrix's verified native
+run. suite.py verifies every closed output image on the host with
+scripts/check_stateless.py; see [development.md](development.md).

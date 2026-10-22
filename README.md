@@ -2,219 +2,218 @@
 
 Research prototype exposing two writable Linux device-mapper devices: a decoy
 volume and an independently encrypted hidden volume carried in the decoy's
-persistent random IVs. The primary volume is an ordinary LUKS2 volume with
-16-byte random IVs: original AEGIS-128 (`aegis128-random`, the default) or an
-XTS + HMAC authenc profile (`aes-`, `serpent-` or `twofish-xts-random` with
-`--integrity hmac-sha1|hmac-sha256|hmac-sha512`); the hidden
-volume uses the fragment-local [format v4](docs/format-v4.md). Both devices
-expose plaintext block I/O and support their own filesystem. Setup exits; the
-kernel owns subsequent I/O.
+persistent random IVs. The primary volume is an ordinary stock LUKS2 volume over
+dm-integrity that stores a fresh random 16-byte IV per sector; the hidden volume
+uses [format v4](docs/format-v4.md). Both devices expose plaintext 512-byte
+logical-block I/O and can hold their own filesystem. Setup exits; the kernel
+owns all subsequent I/O.
 
-Format v4 needs stock profiles that store a fresh random 16-byte IV per sector
-(10 random + 6 hidden bytes each; see [format-v4.md](docs/format-v4.md)). The
-earlier format v3 and the 12-byte-IV AES-GCM / ChaCha20-Poly1305 profiles were
-removed on 2026-10-21; the XTS + HMAC profiles were added on 2026-10-22. Under
-XTS + HMAC a repeated IV only reveals equal plaintext at that sector (HMAC still
-prevents forgery), whereas under AEGIS-128 it is a key compromise; see
-[security-review.md](docs/security-review.md). Serpent/Twofish images are
-authenticated but not decrypted by the host diagnostics (no maintained Python
-implementation); stock dm-crypt checks their plaintext in the guests.
+This is not a proven indistinguishability construction or reliable production
+storage. README and ROADMAP are provisional research notes; the internal
+[security and threat-model review](docs/security-review.md) defines observer
+boundaries and open assumptions. Independent cryptographic review remains open.
 
-The current architecture has **no external persistent metadata, nonce ledger or
-recovery file**. It retains the ordinary LUKS2/dm-integrity layout and journal.
-Volatile ownership locks live in /run. A separate mounted root filesystem is not
-an architectural requirement: activation needs only the static `pivsetup`
-binary, cryptsetup/dmsetup, the keys and the matching module (verified on a
-Python-free RAM-root initramfs). Deployment remains restricted to our pinned
-QEMU guest and synthetic 128 or 512 MiB disks, not general host or production
-use. [Larger-volume support](docs/large-volumes.md) goes beyond the former
-256 MiB primary cap; live resizing is not implemented.
-[Read and activation profiling](docs/read-performance.md) records measured costs
-and bounded primary read batching. Every sector still authenticates before
-plaintext or carrier IVs are returned.
+## Components
 
-The separate `dm-piv.ko` module registers `piv-crypt` and `piv-view`, alongside
-the stock `dm-crypt` module's `crypt` target. Stock encrypted filesystems may
-remain mounted while our module loads, serves its paired devices and unloads.
-It is a standalone implementation of the per-sector AEAD path (no dm-crypt
-fork); it does not hook or replace the stock target. Builds still need the
-matching kernel headers.
+- `kernel/dm-piv.ko`: standalone out-of-tree module (no dm-crypt fork or patch)
+  registering `piv-crypt` (private owner over stock dm-integrity) and
+  `piv-view` (the public decoy and hidden views). It reproduces the Linux LUKS2
+  per-sector AEAD layout and coexists with stock dm-crypt/dm-integrity, even
+  while stock encrypted filesystems are mounted. See
+  [kernel/README.md](kernel/README.md) and [native-blocks.md](docs/native-blocks.md).
+- `pivsetup`: static Rust setup binary ([rust/README.md](rust/README.md)) that
+  drives cryptsetup/dmsetup and the module's control device. Keys are read from
+  files into mlocked, zeroized buffers and never appear in argv.
+- `pivstore` (Python): independent read-only diagnostics (`inspect`, `verify`,
+  `extract-ivs`, `unpack`) and guest test instrumentation. Not needed at runtime.
 
-README and ROADMAP are provisional research notes. This is not a proven
-indistinguishability construction or reliable production storage. The internal
-[security and threat-model review](docs/security-review.md) defines the observer
-boundaries and open assumptions; independent cryptographic review remains open.
+There is **no external persistent metadata, nonce ledger, WAL or recovery
+file**: only ordinary LUKS2/dm-integrity structures and encrypted records inside
+IVs. Volatile ownership locks live in /run. Activation needs only `pivsetup`,
+cryptsetup/dmsetup, the keys and the matching module; it has been tested from a
+Python-free RAM-root initramfs. Use is restricted to the pinned disposable QEMU
+guest and synthetic 128 or 512 MiB disks (`/dev/vdb`), not real hosts or disks.
 
-## Use
+## Supported primary profiles
 
-Setup is the static Rust `pivsetup` binary (rust/), built rootlessly on the
-host with `python3 scripts/build_pivsetup.py` and shared into the guest; the
-Python package keeps only independent read-only diagnostics. Follow
-[build and test instructions](docs/native-blocks.md). Inside the guest:
+| Cipher | Integrity | Tag | Metadata tuple |
+| --- | --- | ---: | ---: |
+| `aegis128-random` (default; original AEGIS-128, **not AEGIS-128L**) | `aead` | 16 | 32 |
+| `aes-`, `serpent-` or `twofish-xts-random` | `hmac-sha1` / `hmac-sha256` / `hmac-sha512` | 20 / 32 / 64 | 36 / 48 / 80 |
+
+512- or 4096-byte encryption sectors, integrity v4 fixed padding and the stock
+dm-integrity journal (default). XTS profiles use dm-crypt's authenc key
+encoding: a 32- or 64-byte XTS key followed by the HMAC key. Under XTS + HMAC a
+repeated IV reveals only equal plaintext at that sector (HMAC still prevents
+forgery); under AEGIS-128 it is a key compromise (see the
+[security review](docs/security-review.md)). The cipher is visible in LUKS
+metadata; compare detectability against a matched ordinary volume of the same
+profile.
+
+Stock `--integrity-no-journal` volumes (persistent LUKS2 flag) open only with
+`--allow-no-journal`: a crash during a hidden write can then tear decoy sectors
+of that record, not only the sectors being written
+([journal-atomicity.md](docs/journal-atomicity.md)).
+
+## Usage
+
+Build on the host with `python3 scripts/build_pivsetup.py`; see
+[development.md](docs/development.md) for the VM harness and
+[native-blocks.md](docs/native-blocks.md) for the module. Inside the guest:
 
 ```sh
+pivsetup keygen --output /mnt/piv-work/hidden.key
 pivsetup open-blocks --device /dev/vdb \
   --key-file /mnt/piv-work/passphrase.key \
   --hidden-key-file /mnt/piv-work/hidden.key --initialize
+# ... use /dev/mapper/piv-native-decoy and /dev/mapper/piv-native-hidden ...
+pivsetup close-blocks --device /dev/vdb --key-file /mnt/piv-work/passphrase.key
 ```
 
-This returns /dev/mapper/piv-native-decoy and /dev/mapper/piv-native-hidden.
-Both 512- and 4096-byte primary sectors are supported; activation reads the
-geometry from LUKS metadata. Both public devices use 512-byte logical blocks.
-For our 128 MiB disk fixtures:
+`--key-file` is the stock LUKS passphrase. Options of `open-blocks`:
+
+- `--initialize` **destroys all existing hidden contents**: it writes a new
+  random master key, keyslot 0, the directory and authenticated zero blocks,
+  preserving every decoy plaintext byte. Reopen without it. Stock carriers must
+  be initialized before hidden use (stock cryptsetup still opens the decoy).
+- `--ab` (with `--initialize`): two record slots per block, so an interrupted
+  hidden write leaves the previous version readable, at half capacity.
+- `--hidden-passphrase-file F` instead of `--hidden-key-file`, with
+  `--kdf argon2id` (default; 64 MiB, t=3, p=4) or `--kdf scrypt`. Nothing
+  records the KDF, so use the same one on every open.
+- `--verify`: authenticate every primary sector first and refuse the volume on
+  any failure (an O(volume) audit). By default setup scans only the 112-sector
+  keyslot area, in constant time.
+- `--allow-no-journal`: accept a no-journal volume (above).
+- `--name` (default `piv-native`), `--device` (default `/dev/vdb`).
+
+Other commands: `pivsetup keyslot add|remove --slot 0-3` manages up to four
+keyslots on active views without rewriting hidden data (the last keyslot cannot
+be removed). `pivsetup migrate` copies both views into a freshly luksFormatted
+volume, initializes it and compares both copies; it is the offline path for
+primary rekey, resize or sector-size change, since live resize/rekey is
+unsupported (stock cryptsetup refuses reencrypt and resize on integrity
+volumes). See [rust/README.md](rust/README.md).
+
+Capacity on the 128 MiB fixtures (AEGIS-128; XTS + HMAC tuples are larger, so
+slightly fewer sectors):
 
 | Sector bytes | Decoy bytes | Hidden bytes | Hidden bytes with `--ab` |
 | ---: | ---: | ---: | ---: |
 | 4096 | 115,572,736 | 158,720 | 79,360 |
 | 512 | 109,060,096 | 1,209,856 | 604,672 |
 
+The hidden payload fraction is 512/(90·S) of primary capacity for sector size
+S: 0.139% at 4096 bytes, 1.11% at 512 (half with `--ab`). Setup never creates
+filesystems. Unmount both filesystems before `close-blocks`. Larger geometry
+uses checked kernel bounds ([large-volumes.md](docs/large-volumes.md)), but the
+fixture guard admits only 128 and 512 MiB disks.
+
+## Format v4 in brief
+
+The first 112 primary sectors hold four encrypted keyslots (two replicas each,
+no public magic), then two directory records (A/B), then one record per hidden
+512-byte block: block i at sector 112 + 90·(2 + i) (two slots per block with
+`--ab`). Each stored IV is LRW-AES(10 fresh random bytes ‖ 6 payload bytes)
+tweaked by sector; 90 fragments form one SIV record (HMAC-SHA256 tag,
+ChaCha20) authenticating context, address, generation and data. Keys derive via
+HKDF-SHA256 from the master key with public context. Tail sectors beyond the
+last whole record carry nothing. Details: [format-v4.md](docs/format-v4.md).
+
 A decoy write re-randomizes only the IVs of the sectors it writes (one primary
-encryption per written sector, as stock dm-crypt). A hidden write re-encodes its
-whole 90-sector record. `--ab` keeps two record slots per block so an
-interrupted hidden write leaves the previous version readable, at half the
-capacity. A random master key lives in up to four encrypted keyslots (no public
-header); the hidden key file is a keyslot key, or use `--hidden-passphrase-file`
-(Argon2id by default, `--kdf scrypt` as the alternative; use the same KDF on
-every open). Later opens read the layout from the keyslot.
-`pivsetup keyslot add|remove --slot N` adds or retires keys on active views
-without rewriting hidden data. `pivsetup migrate` copies both views into a new,
-freshly formatted volume (primary rekey, resize or sector-size change) and
-verifies both copies; see [rust/README.md](rust/README.md).
+encryption per written sector, as stock dm-crypt), keeping their fragments. A
+hidden write re-encodes its whole 90-sector record with a fresh generation.
 
-The hidden volume is already encrypted underneath its block interface. Setup
-never creates filesystems. **--initialize destroys all existing hidden contents**
-(it writes a new master key, keyslot 0 and the directory, then authenticated
-zeros), while preserving every decoy plaintext byte. Reopen without this flag.
-Ctrl-C or SIGTERM can [cancel activation/initialization](docs/cancellation.md);
-an interrupted initialization leaves the not-yet-written blocks unavailable, and
-lower I/O can delay interruption. Unmount both filesystems before:
+## Authentication, failures and crashes
 
-```sh
-pivsetup close-blocks --device /dev/vdb \
-  --key-file /mnt/piv-work/passphrase.key
-```
+- Without `--initialize`, a keyslot must authenticate under the hidden key (the
+  **wrong-key guard**, EKEYREJECTED otherwise) and the directory must be
+  readable; setup then removes its own mappings.
+- Every request authenticates exactly the primary sectors it touches; damage
+  returns EIO when accessed, as in stock dm-crypt. Original primary data is
+  authenticated before modification and only requested decoy bytes change.
+- A decoy write covering an entire primary sector that fails authentication
+  replaces it (fresh IV, refreshed fragment); partial writes to it fail EIO.
+- Hidden reads, keyslots and the directory use raw stored IVs of sectors whose
+  decoy data fails authentication; only the record's SIV tag decides validity,
+  so damage confined to decoy data does not make a hidden block unavailable
+  (IV damage does). Hidden writes stay strict: all 90 carrier sectors must
+  authenticate first.
+- A damaged hidden record returns EIO for that block only; decoy writes preserve
+  its damaged fragments, so corruption never becomes valid zeros. Repair a block
+  with a complete 512-byte direct-I/O write (buffered sub-page writes may first
+  read unavailable neighbours).
+- Errors before the first applied tuple (lower reads, authentication,
+  allocation, preparation) fail only that bio. A failed flush or any failure
+  after a write begins applying tuples stops the shared owner (fail-stop);
+  remove and recreate the stack after fixing the fault
+  ([native-faults.md](docs/native-faults.md)).
+- The stock journal makes individual primary sector updates atomic, **not** a
+  90-sector hidden record. Without `--ab`, power loss can leave a hidden block
+  unreadable; with `--ab` the previous version stays readable. No cross-block
+  ordering, rollback protection or hidden filesystem recovery is promised.
+  Whole-record rollback is accepted.
+- SIGINT/SIGTERM [cancel setup](docs/cancellation.md) between authenticated
+  ranges and initialization records. Completed records stay; an interrupted
+  `--initialize` leaves later blocks unavailable. Cleanup removes only the
+  attempt's own identity-checked mappings and never rolls back disk writes.
 
-A failed setup attempts to remove only its own mappings. Conflicting names are
-preserved, and cleanup failures are reported with the original error. Close also
-validates both view mappings before removal and can release an idle private owner.
-Cleanup releases resources; it does not roll back a partial initialization.
+## Nonces and limitations
 
-Opening without `--initialize` requires a keyslot to authenticate under the
-hidden key (or passphrase KDF) and the keyslot directory to be readable;
-otherwise setup fails (EKEYREJECTED for a wrong key) and removes its mappings.
-This **wrong-key guard** uses keyslot IVs collected by setup's scan of the
-112-sector keyslot area. Setup does not read the rest of the volume (constant
-time on any size); every later request authenticates exactly the sectors it
-touches, so a damaged sector returns EIO when accessed, as in stock dm-crypt.
-`--verify` instead authenticates every primary sector first and refuses the
-volume on any failure (an O(volume) audit). A decoy write covering a whole
-damaged sector replaces it (fresh IV; its hidden fragment is kept only if the
-record still authenticates). Hidden reads use the stored IV of a carrier sector
-whose decoy data fails authentication, so damage confined to decoy data does
-not make the hidden block unavailable; the record's SIV tag still rejects any
-damaged or mixed fragment. Rewriting that hidden block waits for the decoy
-sector to be repaired.
+Primary IV uniqueness is probabilistic. A decoy rewrite keeps a sector's 6
+payload bytes and draws 10 fresh random bytes, so n rewrites of one sector
+repeat an IV with probability about n²/2^81; IVs of distinct sectors behave as
+independent 128-bit values. Encodings use fresh seeded kernel randomness and
+reject duplicates only within one update and its replaced IVs; there is **no
+historical collision detection**. The 2^32 per-owner encryption cap resets on
+reopen and does not enforce the per-key lifetime budget, to which all writes,
+retries, failed preparations and clones count. VM snapshot restores, image
+clones and cloned RNG state invalidate these estimates. A 512-byte hidden write
+reencrypts 90 primary sectors (360 KiB at 4096-byte sectors, 45 KiB at 512)
+plus journal overhead; decoy writes have no hidden amplification.
 
-Stock `--integrity-no-journal` volumes (LUKS2 persistent flag) open only with
-`--allow-no-journal`: they keep no journal history on disk, but a crash during a
-hidden write can destroy decoy sectors of that record, not just sectors being
-written (docs/journal-atomicity.md). The journal remains the default. A stock carrier has no keyslot: initialize it, or use stock
-cryptsetup for decoy-only access. A damaged hidden record returns EIO locally;
-decoy writes preserve its (damaged) fragments, so corruption never becomes valid
-zeros. Repair an unavailable block with a complete 512-byte direct-I/O write: a
-smaller buffered write can trigger a page-sized read that also includes
-unavailable neighbors.
+Each stored IV is expected to look uniformly random without the hidden key under
+the assumptions in [format-v4.md](docs/format-v4.md); layout compatibility and
+statistical tests are not a deniability proof.
+[Matched ordinary-Linux controls](docs/detectability.md) show a decoy write
+changes exactly the IVs an ordinary write changes. Explicit limitations: a
+single raw image can contain journal history; a decoy-key holder can decrypt
+retained journal entries and may see a hidden write's 90 sectors reencrypted
+with unchanged plaintext
+([security review](docs/security-review.md#journal-history-and-the-decoy-key-holder));
+multiple snapshots, hidden-write amplification, memory, installed software, keys
+and host artifacts; no protection against root, a compromised kernel, memory or
+crash dumps, swap or malicious firmware. Keyslots allow offline guessing, so
+prefer high-entropy key files; passphrases are only as strong as the KDF cost.
+Multi-snapshot observers, rollback resistance and coercion-resistant alternative
+openings are out of scope.
 
-There is no compatibility with previous hidden formats or external state. There
-is no legacy decoder, bootstrap, compaction command, FUSE/NBD or offline writer.
-
-## Integrity and crash limits
-
-Each 512-byte hidden block is one SIV record (tag over context, address,
-generation and data) in 90 primary IVs, after 112 keyslot sectors and two
-directory records. A record authenticates only as a whole, so old and new
-fragments never mix silently; whole-record rollback and independently valid
-records from different times are still accepted. Original primary data is
-authenticated before modification, and only requested decoy bytes change.
-
-The stock dm-integrity journal protects individual primary ciphertext/tag/IV
-updates. It does **not** make a 90-sector hidden record update atomic (see
-[journal-atomicity.md](docs/journal-atomicity.md)). Without `--ab`, power loss or
-storage errors can leave a hidden block unreadable; with `--ab` the previous
-version stays readable. No cross-block ordering, rollback protection or hidden
-filesystem recovery is promised. Failures that leave storage unchanged are local
-to the request: lower read errors, primary or hidden authentication failures,
-allocation and preparation failures return EIO (or the specific error) and both
-views keep serving other requests. A failed flush, or any failure once a write
-has begun applying tuples, leaves storage or durability unknown and stops the
-shared owner; remove and recreate the stack after fixing the underlying fault.
-
-Primary IV uniqueness is probabilistic. A decoy rewrite of a sector keeps its 6
-hidden bytes and draws 10 fresh random bytes, so n rewrites of one sector repeat
-a nonce with probability about n²/2^81; across distinct sectors the IVs behave
-as independent 128-bit values. Every encoding uses fresh seeded kernel
-randomness, with rejection of duplicates within the proposed update and its
-replaced IVs. There is **no historical collision detection**. A 2^32 per-owner
-encryption cap is only a diagnostic guard: reopening resets it. All writes,
-retries, failed preparations and clones count toward the real per-key budget.
-A 512-byte hidden write reencrypts 90 primary sectors (360 KiB at 4096-byte
-sectors, 45 KiB at 512), before ordinary journal overhead; decoy writes have no
-hidden amplification. guest-v4-test measures write costs (write_profile).
-
-Never rely on snapshot-restored RNG state or replay cached encryption plans. A
-repeated primary IV under one key is AEAD nonce reuse. VM snapshot restores,
-image clones and cloned RNG state all invalidate the estimates above.
-
-## Disk format and diagnostics
-
-Supported profile: one LUKS2 AEGIS-128/random segment (`--cipher
-aegis128-random --integrity aead --key-size 128`), zero IV tweak, 512- or
-4096-byte primary sectors, 128-bit primary tags, integrity v4 fixed padding,
-32-byte metadata tuples (128-bit IV), 32768-sector interleaving (512-byte units)
-and an unencrypted/un-MACed stock journal. Native activation delegates journal
-replay to Linux. Offline image diagnostics reject a dirty journal and
-unsupported geometry. Linux `aegis128` is the original five-state algorithm,
-**not AEGIS-128L**. The selected cipher is visible in LUKS metadata; compare
-detectability against a matched ordinary AEGIS-128 volume.
+## Diagnostics
 
 ```sh
-python3 -m pivstore inspect artifacts/control-001/control.img
-python3 -m pivstore verify artifacts/control-001/control.img \
-  --volume-key-file artifacts/control-001/share/volume.key
-python3 -m pivstore unpack artifacts/suite-next/aegis-4096-native/share/dual-final.img \
-  --hidden-key-file artifacts/control-001/hidden.key --output artifacts/hidden.raw
-PIV_FIXTURE=artifacts/control-001 python3 -W error::ResourceWarning -m unittest discover -v
+python3 -m pivstore inspect PREFIX/aegis-4096-control/control.img
+python3 -m pivstore verify PREFIX/aegis-4096-control/control.img \
+  --volume-key-file PREFIX/aegis-4096-control/share/volume.key
+python3 -m pivstore unpack PREFIX/aegis-4096-native/share/dual-final.img \
+  --hidden-key-file PREFIX/aegis-4096-control/hidden.key --output hidden.raw
 ```
 
-Primary verification needs the pinned optional x86 AES-NI
-[AEGIS-128 diagnostic reference](docs/development.md#original-aegis-128-diagnostics).
-Native activation, early boot and hidden extraction do not need that library.
-unpack opens a keyslot with the given key file, authenticates all hidden blocks
-and publishes a new private output file only after success; no primary key is
-needed. verify authenticates the complete primary image and prints its
-plaintext hash. extract-ivs performs no primary verification. Keys belong in
+`verify` authenticates the complete primary image and prints its plaintext hash;
+AEGIS-128 needs the pinned [SUPERCOP diagnostic
+reference](docs/development.md#original-aegis-128-diagnostics), AES-XTS + HMAC
+uses `cryptography`, and Serpent/Twofish images are HMAC-authenticated only
+(guests check their plaintext with stock dm-crypt). `unpack` opens a keyslot,
+authenticates every hidden block and publishes a private output file only on
+success. `extract-ivs` performs no primary verification. Offline diagnostics
+reject a dirty journal; native activation lets Linux replay it. Keys belong in
 private files, never command arguments or commits.
 
-Gross IV carrier capacity is 16/S of primary capacity for encryption-sector
-size S; the v4 payload fraction is 512/(90·S): 0.139% at 4096 bytes or 1.11% at
-512 bytes (half with `--ab`). Smaller primary sectors require more ordinary
-tag/IV metadata, reducing decoy capacity on a fixed raw disk.
+## Further reading
 
-Every stored IV is an LRW-AES output over fresh randomness and a hidden
-fragment, expected to look uniformly random without the hidden key under the
-primitive assumptions in [format-v4.md](docs/format-v4.md). Layout compatibility
-and statistical tests are not a deniability proof. Even a single raw image can
-contain journal history. Keyslots allow offline key guessing, so prefer
-independent high-entropy key files; passphrases are only as strong as the KDF
-cost allows. Multiple snapshots, ordinary journal traces, hidden-write
-amplification, memory, installed software, keys and other host artifacts remain
-explicit limitations. There is no protection against root, a compromised
-kernel, live-memory or crash dumps, swap, or malicious storage firmware. A
-holder of the decoy key can decrypt retained journal entries and may see a
-hidden write's 90 sectors reencrypted with unchanged plaintext (see the
-[security review](docs/security-review.md#journal-history-and-the-decoy-key-holder)).
-[Matched ordinary-Linux controls](docs/detectability.md) show that a v4 decoy
-write changes exactly the IVs an ordinary write changes. These results provide
-no multi-snapshot/workload-observing deniability guarantee. See
-[roadmap](ROADMAP.md) for remaining work, commit messages for executed runs, and
-[observed layout](docs/observed-layout.md) for source evidence.
+[ROADMAP.md](ROADMAP.md) (remaining work), [development.md](docs/development.md)
+(harness and tests), [native-blocks.md](docs/native-blocks.md),
+[native-faults.md](docs/native-faults.md),
+[read-performance.md](docs/read-performance.md),
+[observed-layout.md](docs/observed-layout.md) (source evidence),
+[sanitizer.md](docs/sanitizer.md), [kernel-port.md](docs/kernel-port.md).
+Executed test runs are recorded in commit messages.

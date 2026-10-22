@@ -1,179 +1,125 @@
 # Matched ordinary-Linux controls
 
-> [!NOTE]
-> 2026-10-21: format v3 and the AES-GCM / ChaCha20-Poly1305 profiles were
-> removed; 2026-10-22: XTS + HMAC authenc profiles were added beside the default
-> AEGIS-128 ([format v4](format-v4.md) needs 16-byte random IVs). Results below that mention them are historical evidence for
-> the code at that time; current runs are recorded in commit messages.
-
-This experiment measures observable differences. It does not certify plausible
-deniability or prove single-snapshot indistinguishability. The implementation
-and on-disk encoding are unchanged.
+This experiment measures observable differences between ordinary stock Linux
+writes and the same writes through the native owner. It does not certify
+plausible deniability or prove single-snapshot indistinguishability.
 
 ## Controls and observer access
 
-Each profile starts from one ordinary stock-Linux fixture. Three sequential arms
-restore that fixture onto ONLY guest-owned /dev/vdb with every mapping closed:
+Each profile starts from one ordinary stock-Linux fixture. Two sequential arms
+(`kernel/guest-controls-test.py`) restore that fixture onto only the guest-owned
+`/dev/vdb` with every mapping closed:
 
-- stock: unmodified cryptsetup/dm-crypt, ordinary requested writes.
-- stock-refresh: unmodified cryptsetup/dm-crypt, application-level read/modify/
-  rewrite of every complete carrier group intersecting each requested write.
-  This control encodes no hidden records; unchanged primary bytes are simply
-  rewritten through ordinary encryption.
-- native: dm-piv, hidden zeros initialized before its own baseline, then exactly
-  the same requested primary writes. Hidden zeros must survive the workload.
+- **stock**: unmodified cryptsetup/dm-crypt, ordinary requested writes.
+- **native**: dm-piv, hidden zeros initialized (format v4) before its own
+  baseline, then exactly the same requested primary writes through the decoy
+  view. Hidden zeros must survive the workload.
 
-The custom module is loaded only for the last arm. Each arm gets a closed before
-snapshot and a closed after snapshot. Key, UUID, geometry and primary plaintext
-are deliberately matched; fresh CRNG state evolves through the experiment and is
-never restored. These are sequential synthetic clones, not independently sampled
-volumes. Native initialization is excluded from its workload trace, but would
-itself be visible to an observer with earlier snapshots.
+The custom module is loaded only for the native arm. Each arm gets a closed
+before snapshot and a closed after snapshot. Key, UUID, geometry and primary
+plaintext are deliberately matched; fresh CRNG state evolves and is never
+restored. These are sequential synthetic clones, not independently sampled
+volumes. Native initialization is excluded from the workload trace, but would
+itself be visible to an observer with earlier snapshots (it rewrites keyslot 0,
+the directory and every record carrier with unchanged plaintext).
 
-The workload is a primary-sector write at 0, 4 KiB ending at the first carrier
-boundary, 16 KiB across the third carrier boundary, and a same-plaintext sector
-rewrite in group 5. Nontrivial test bytes are deterministic. All requests satisfy
-stock primary alignment. Both stock and native final primary plaintexts must
-match exactly; host analysis independently authenticates every before/after
-sector and verifies only the requested bytes changed. Native hidden records
-must independently decode to the expected zeros.
+The workload (`scripts/control_metrics.py`, `span` = 90 primary sectors) writes
+one primary sector at offset 0, 4 KiB ending at `span`, 16 KiB straddling
+`3·span`, and rewrites one sector at `5·span` with its own plaintext. Offsets
+are decoy-view bytes, so the writes touch the keyslot area, the directory and a
+record. Test bytes are deterministic. Both final primary plaintexts must match
+exactly; host analysis (`scripts/analyze_controls.py`) independently
+authenticates every before/after sector, verifies only the requested bytes
+changed and decodes the native hidden contents with the hidden key (used only
+for correctness, never as a detector). No hidden write occurs in the workload;
+the hidden-write signature is discussed in
+[security-review.md](security-review.md#journal-history-and-the-decoy-key-holder).
 
-Observer measurements are deliberately separated:
+Observer measurements are separated:
 
 - Without keys: public geometry/header compatibility, changed IV/ciphertext
   extents between snapshots, descriptive IV byte statistics, public journal
-  addresses and physical-vdb block submissions during the workload.
+  addresses and `/dev/vdb` block submissions during the workload.
 - With the primary key: authenticated plaintext changes versus same-plaintext
-  reencryption. The hidden key is used only by correctness verification, never
-  as a proposed detector.
+  reencryption.
 - With host/runtime access: the installed module, process memory, tracing and
   operational artifacts remain outside any disk-only concealment claim.
 
 ## Measurements and limits
 
-Closed images use the existing strict LUKS/integrity parser. The analysis checks
-identical LUKS prefixes, identical supported layout, exact changed-IV support,
-all primary plaintext bytes, current IV duplicates and native hidden contents.
-It counts changed physical 512-byte units by header, superblock, journal,
-metadata area and data area. Area labels include ordinary padding; they are not
-claims that each changed byte is a live tag or ciphertext byte.
+Closed images use the strict LUKS/integrity parser. The analysis checks
+identical LUKS prefixes and layout, exact changed-IV positions, all primary
+plaintext bytes, current-IV duplicates and native hidden contents. It counts
+changed physical 512-byte units by superblock, journal, metadata area and data
+area; area labels include ordinary padding.
 
-The block_bio_queue trace is filtered to /dev/vdb and rejects overruns. It counts
-submissions and repeated submitted bytes, not SSD/media writes, completed bytes
-or a fixed amplification ratio. Capture includes a non-atomic direct journal
-read and one second after fsync. Some journal-to-data propagation can occur only
-at close, outside the trace window; all after snapshots are taken after close.
-Background journal scheduling and pre-baseline history affect these figures.
+The `block_bio_queue` trace is filtered to `/dev/vdb` and rejects overruns. It
+counts submissions and queued bytes, not media writes or a fixed amplification
+ratio. Capture includes a non-atomic direct journal read and one second after
+fsync; some journal-to-data propagation happens only at close, outside the trace
+window. Live journal reads may race background updates: only sections with
+consistent commit IDs are described and none is an atomic or authenticated
+snapshot. The stock journal is neither encrypted nor MACed.
 
-Live journal reads may race background updates. Only sections with consistent
-pinned commit IDs are described, invalid sections are counted and no replay is
-attempted. Even an accepted section is NOT an atomic or authenticated snapshot.
-The supported stock journal is neither encrypted nor MACed.
+Byte summaries (one-bit fraction, empirical byte entropy, byte chi-square, zlib
+ratio over all IV bytes) are descriptive. No p-values, classifier accuracy,
+acceptance threshold or security proof is inferred; a few synthetic samples
+cannot establish pseudorandomness against arbitrary steganalysis.
 
-Byte summaries include one-bit frequency, empirical byte entropy, byte-frequency
-chi-square and zlib ratio for all IV bytes and corresponding 32/528/16-byte slices
-of complete 576-byte groups in EVERY arm. Those slices are salt/ciphertext/tag
-only in the native encoding; stock slices have no such meaning. No p-values,
-classifier accuracy, acceptance threshold, statistical independence or security
-proof is inferred. A small collection of synthetic samples cannot establish
-pseudorandomness against arbitrary steganalysis.
+## Executed results (format v4, original AEGIS-128)
 
-## Executed results
+Measured on the 128 MiB `aegis-4096` and `aegis-512` fixtures (pinned Debian
+6.12.113 guest, run `artifacts/suite-061` on 2026-10-22, before the XTS + HMAC
+profiles were added; artifacts are not committed). The XTS + HMAC profiles have not been measured with
+this experiment; the decoy-write rule is profile-independent, but no result is
+claimed for them.
 
-AES-GCM with 4096-byte primary sectors, artifacts/controls-4096-001:
+| Profile / arm | Changed primary IVs | Changed plaintext sectors | Same-plaintext reencryption | Changed journal / metadata / data 512 B units (closed) |
+| --- | ---: | ---: | ---: | --- |
+| AEGIS 4096 / stock | 7 | 6 | 1 | 1,848 / 4 / 56 |
+| AEGIS 4096 / native | 7 | 6 | 1 | 1,848 / 4 / 56 |
+| AEGIS 512 / stock | 42 | 41 | 1 | 2,024 / 6 / 42 |
+| AEGIS 512 / native | 42 | 41 | 1 | 2,024 / 6 / 42 |
 
-| Arm | Changed primary IVs | Changed plaintext sectors | Same-plaintext reencryption |
-| --- | ---: | ---: | ---: |
-| stock |7|6|1|
-| stock-refresh |192|6|186|
-| native |192|6|186|
-
-All three arms authenticated and ended with the same primary hash. Native hidden
-contents remained zero. Geometry and LUKS prefixes matched exactly. All current
-IVs were distinct. All-IV empirical byte entropy was 7.99943 (stock), 7.99944
-(stock-refresh), 7.99952 (native) bits/byte; these are observations, not a pass.
-
-Observed queued journal bytes were 540,672 / 1,216,512 / 2,973,696 respectively.
-Closed snapshots changed all 1,848 stock journal sectors but 792 native journal
-sectors in this run. The live samples contained 7 / 192 / 67 entries respectively,
-with all 7 sections commit-ID-consistent. These counts depend on timing, flushes
-and earlier journal contents; neither larger nor smaller journal differences
-uniquely identify hidden data.
-
-The known primary workload is readily distinguishable from ordinary requested
-writes using multiple snapshots or observed I/O. The ordinary whole-group
-refresh control matches the native changed-IV positions EXACTLY, showing that
-extra same-plaintext reencryption alone does not establish hidden payload
-existence. It does not make the native workload identical to the ordinary one.
-There is no basis here for a multi-snapshot/workload-observing deniability claim.
-
-Original AEGIS-128 with 512-byte primary sectors,
-artifacts/controls-512-001:
-
-| Arm | Changed primary IVs | Changed plaintext sectors | Same-plaintext reencryption |
-| --- | ---: | ---: | ---: |
-| stock |42|41|1|
-| stock-refresh |144|41|103|
-| native |144|41|103|
-
-Again, all complete primary outputs matched and native hidden contents remained
-zero. Layout/header checks and current-IV uniqueness passed. All-IV empirical
-byte entropy was 7.999928 (stock and stock-refresh) and 7.999951 (native).
-Queued journal bytes were 180,224 / 405,504 / 585,728. All three closed journals
-changed 2,024 physical 512-byte units. Live samples contained 42 / 180 / 253 entries,
-with all 23 sections commit-ID-consistent. Repeated sector updates and the native
-setup checkpoint can appear in live samples; entry counts are not unique-sector
-counts or exact encryption counters. Trace differences remain observable even
-when the native and stock-refresh closed changed-IV positions match.
-
-All-IV descriptive summaries (no security acceptance rule):
+In both profiles the native changed-IV positions equal the stock ones exactly:
+a v4 decoy write changes only the IVs of the sectors it writes. Both arms
+authenticated every sector (28,216 / 213,008), ended with the same primary hash,
+had no duplicate current IVs, and the native hidden contents (158,720 /
+1,209,856 bytes) remained zero.
 
 | Profile / arm | One-bit fraction | Byte entropy | Byte chi-square | zlib ratio |
 | --- | ---: | ---: | ---: | ---: |
-| AES4096 / stock | 0.499461 | 7.999434 | 265.15 | 1.000328 |
-| AES4096 / stock-refresh | 0.499543 | 7.999440 | 262.73 | 1.000328 |
-| AES4096 / native | 0.500127 | 7.999523 | 223.61 | 1.000328 |
-| AEGIS512 / stock | 0.499848 | 7.999928 | 339.92 | 1.000307 |
-| AEGIS512 / stock-refresh | 0.499849 | 7.999928 | 339.65 | 1.000307 |
-| AEGIS512 / native | 0.500059 | 7.999951 | 229.94 | 1.000307 |
+| AEGIS 4096 / stock | 0.499687 | 7.999631 | 231.60 | 1.000323 |
+| AEGIS 4096 / native | 0.499990 | 7.999634 | 229.37 | 1.000323 |
+| AEGIS 512 / stock | 0.500143 | 7.999943 | 268.06 | 1.000307 |
+| AEGIS 512 / native | 0.499754 | 7.999947 | 251.23 | 1.000307 |
 
-Host analysis independently authenticated six before/after images per profile:
-28,244 sectors per AES image and 213,008 per AEGIS image. Native hidden checks
-covered 301,056 and 3,028,992 bytes. Full descriptive statistics, changed-index
-lists, physical differences, trace counts and journal addresses are in each
-ignored artifacts/controls-*/analysis.json. No unexpected kernel/compiler
-warnings occurred in either successful guest experiment. The 37 host tests passed
-with ResourceWarning errors and no skips.
+Live I/O still differs. Queued journal bytes were 540,672 (stock) / 540,672
+(native) at 4096-byte sectors and 180,224 / 225,280 at 512. Submission counts
+differ in shape: the stock arm shows read-ahead reads (92 and 94 events), the
+native owner bounded synchronous range reads (36 and 171 events). Live journal
+samples held 7 / 8 and 42 / 43 entries. These counts depend on timing, flushes
+and earlier journal contents; they identify the use of the native stack to an
+I/O observer, not hidden data.
+
+Interpretation: for decoy writes, the closed-snapshot footprint (changed IVs,
+plaintext and physical units) matched stock in this run. That does not make the
+native stack indistinguishable: live I/O traces differ, initialization and
+hidden writes rewrite carriers with unchanged plaintext, and there is no basis
+here for a multi-snapshot or workload-observing deniability claim.
 
 ## Reproduce
 
-Use a pristine CLOSED ordinary fixture, not a previous native output. A fresh
-run directory is mandatory; all restores happen inside the guarded guest.
+Run the `controls` suite on a pristine stock fixture through the suite runner
+(see [development.md](development.md)); it restores the fixture inside the
+guarded guest and writes `analysis.json` next to the run:
 
 ```sh
-python3 scripts/vm.py run --code --script scripts/guest-controls.sh \
-  --run-dir artifacts/controls-next \
-  --data-image artifacts/control-003/control.img \
-  --share-file artifacts/batch-native-4096-001/share/experimental-dm-piv.ko \
-  --share-file kernel/guest-controls-test.py --share-file scripts/control_metrics.py \
-  --share-file artifacts/control-003/share/passphrase.key \
-  --share-file artifacts/control-003/hidden.key --timeout 3600
-python3 scripts/analyze_controls.py artifacts/controls-next/share \
-  --volume-key-file artifacts/control-003/share/volume.key \
-  --hidden-key-file artifacts/control-003/hidden.key > artifacts/controls-next/analysis.json
+python3 scripts/suite.py --prefix artifacts/suite-next \
+  --scaffold artifacts/scaffold-next.tar \
+  --profile aegis-4096 --profile aegis-512 --suites controls
 ```
 
-Use the AEGIS512 stock fixture and matching passphrase/primary key for that
-profile. Its host authentication requires the pinned optional original AEGIS
-reference described in development.md; guest/native crypto does not. The scripts
-need no additional host packages. JSON, traces, snapshots, keys and large outputs
-stay ignored. No hidden metadata, persistent ledger or driver mitigation is
-introduced by this diagnostic experiment.
-
-The numerical control runs above predate bounded primary read batching. That
-optimization preserves record bytes, primary AEAD checks and prepared-tuple write
-semantics, but can change scheduling and read traces. Journal timing/counts were
-not remeasured after it; do not treat these historical transcripts as exact
-current-runtime performance predictions. See read-performance.md for the new
-read measurements. The existing known-workload distinctions still constrain
-claims; a faster read path does not establish deniability.
+Host authentication of AEGIS images requires the pinned optional original
+AEGIS-128 reference described in development.md. JSON, traces, snapshots, keys
+and large outputs stay ignored.

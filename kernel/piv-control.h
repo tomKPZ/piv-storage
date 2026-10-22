@@ -38,7 +38,7 @@ struct piv_devices {
 	__u32 owner_major, owner_minor, lower_major, lower_minor;
 };
 #define PIV_DEVICES _IOR('P', 7, struct piv_devices)
-/* Native SETUP ABI version 4 (2026-10-21): format v4 only (AEGIS-128). */
+/* Native SETUP ABI version 4 (2026-10-21): format v4 only. */
 struct piv_native_setup {
  __u32 version, size;
  __u64 generation;

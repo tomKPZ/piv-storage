@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Three sequential matched arms on guest-owned disposable /dev/vdb only."""
+"""Two sequential matched arms (stock, native) on guest-owned disposable /dev/vdb only."""
 from dataclasses import asdict
 import hashlib
 import json

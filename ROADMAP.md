@@ -21,9 +21,10 @@ and limits are in README.md and docs/.
 ## Remaining work
 
 1. **External cryptographic review** of the whole stored encoding (format v4:
-   LRW-AES fragments, SIV records, keyslots/directory, KDFs) and of the
-   AEGIS-128 and XTS + HMAC primary profiles' usage and the nonce-budget guidance in docs/security-review.md. Needs an
-   outside reviewer; findings override everything below.
+   LRW-AES fragments, SIV records, keyslots/directory, KDFs), of the AEGIS-128
+   and XTS + HMAC primary profiles' usage and of the nonce-budget guidance in
+   docs/security-review.md. Needs an outside reviewer; findings override
+   everything below.
 2. **Sanitizer build of the 7.2 port kernel** (optional; the KASAN image is
    6.12 only). docs/kernel-port.md.
 3. **Kernels between 6.12 and 7.2 and other distributions** (optional). The
@@ -49,4 +50,7 @@ and limits are in README.md and docs/.
   scope.
 - The control device exposes only QUERY, DEVICES, BEGIN/END, SETUP, DETACH,
   STATUS and KEYSLOT; no userspace IV or tuple access.
-- Migration (`pivsetup migrate`) is the rekey/resize path; no online rekey.
+- Migration (`pivsetup migrate`) is the rekey/resize/cipher-change path. Live
+  resize, rekey and cipher change are not supported (user decision 2026-10-22):
+  stock cryptsetup refuses them on integrity volumes, so the prototype does not
+  add features the stock stack lacks.

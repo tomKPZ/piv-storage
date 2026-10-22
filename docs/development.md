@@ -1,200 +1,150 @@
-# Development environment and control fixture
+# Development environment and test harness
 
-Run from the repository root as an ordinary host user:
-
-```sh
-python3 scripts/fetch_sources.py
-python3 scripts/vm.py prepare
-python3 scripts/suite.py --prefix artifacts/control-001 --profile aegis-4096 --scaffold <staged scaffold.tar>
-```
-
-Choose a new run directory each time; the runner refuses to overwrite one.
-The first download is approximately 390 MiB. Allow several minutes under TCG.
-No host root, host device mapper, host loop devices, SSH server, ISO authoring
-tools, or custom kernel is required. Optional `--accel kvm` requires actual
-permission to use /dev/kvm. Default `--timeout 1200` covers boot and task execution.
-
-The guest base is the SHA-512-pinned Debian 13 nocloud build 20261017-2634.
-It boots the Debian 6.12.113+deb13-amd64 kernel. The runner creates a separate
-qcow2 OS overlay and a sparse 128 MiB raw data disk exposed as /dev/vdb by
-default. --blank-mib 512 explicitly selects the other approved fixture size; see
-[large-volumes.md](large-volumes.md). Copied images must be regular 128/512 MiB
-files; the runner copies them before attaching the private copy. The
-base stays unchanged. Network access uses QEMU user networking without forwarded
-ports. The runner completes first-boot setup with a random ephemeral root login
-credential, logging console output only after login to avoid credential echo.
-Only the private run/share directory is exported through 9p; the repository and
-host home directory are not shared. Scripts passed to this runner are trusted
-guest-root programs and can modify the contents of that share.
-
-The control script installs cryptsetup-bin and libcryptsetup12 version 2:2.7.5-2
-in the guest and records all installed package versions. Repositories remain
-live; dependency resolution is not fully snapshot-pinned. If the explicit
-cryptsetup versions disappear, fail and revise the environment deliberately.
-Do not silently test a different version. The base image checksum was obtained
-from Debian's HTTPS checksum list; detached-signature verification has not been
-implemented. Package downloads use the guest's normal APT signature verification.
-
-scripts/guest-control.sh formats /dev/vdb with stock cryptsetup. Its environment
-selects the profile: `PIV_PRIMARY_CIPHER` (default `aegis128-random`, or
-`aes-`/`serpent-`/`twofish-xts-random` with `PIV_INTEGRITY=hmac-sha1|hmac-sha256|hmac-sha512`),
-`PIV_SECTOR_SIZE` (4096 default, or 512) and `PIV_NO_JOURNAL=1`. suite.py writes
-a one-line task per profile (`--profile aegis-4096`, `aes-sha256-512`, ...):
+Everything runs from the repository root as an ordinary host user. No host root,
+host device mapper, loop devices, SSH server or custom host kernel is needed;
+experimental kernel code is built and loaded only inside disposable guests.
 
 ```sh
-python3 scripts/suite.py --prefix artifacts/suite-next --profile aes-sha256-4096 \
-  --scaffold artifacts/stage-next/scaffold.tar
-```
-
-All control generation and stock readback checks share the same
-body.
-
-Each profile writes distinct deterministic synthetic plaintext
-to every primary sector, closes the mapping, reopens it read-only using stock
-cryptsetup, and hashes every primary byte. Password-keyslot PBKDF2 uses a very low
-iteration count solely to accelerate disposable tests. This is not a recommended
-real-volume password configuration.
-
-## Faster runs: provisioned image and parallel matrix
-
-Without /dev/kvm every run is QEMU TCG emulation, and first boot plus live APT
-setup costs one to several minutes per run. `python3 scripts/vm.py provision`
-boots the pinned base once, installs the union of pinned guest packages
-(cryptsetup 2:2.7.5-2, Python, cryptography, matched 6.12.113 headers, gcc-14,
-make, patch), enables serial root autologin, sets no root password, masks the
-persisted random seed and records the installed package list. The result is a
-read-only qcow2 in ignored downloads/, keyed by the base checksum, package list
-and provisioning script; changing any of them builds a new image.
-
-`vm.py run --provisioned` backs the disposable overlay with that image and
-copies its metadata to `guest-image.json` in the run directory. guest_packages
-then resolves the same pinned packages offline (`apt-get --no-download`), and
-falls back to the normal network path if anything is missing. Every run, with
-or without provisioning, receives host entropy through virtio-rng. Per-run
-`packages.tsv` remains the provenance record. Provisioning repositories were
-live; re-provision deliberately rather than assuming a snapshot pin.
-
-`scripts/suite.py` runs the matrix in parallel, one fresh run directory per VM:
-
-```sh
+python3 scripts/fetch_sources.py          # pinned upstream sources into vendor/
+python3 scripts/vm.py prepare             # pinned Debian base image (~390 MiB)
+python3 scripts/vm.py provision           # optional cached provisioned image
+python3 scripts/build_pivsetup.py         # static pivsetup; prints path and SHA-256
+python3 scripts/fetch_kernel.py vendor/kernel-build/next
+tar -cf artifacts/scaffold-next.tar -C vendor/kernel-build/next .
 python3 scripts/suite.py --prefix artifacts/suite-next \
-  --profile aegis-4096 --profile aegis-512 \
-  --scaffold artifacts/stage-next/scaffold.tar
+  --profile aegis-4096 --profile aegis-512 --scaffold artifacts/scaffold-next.tar
 ```
 
-Per profile it creates a stock fixture (or uses --control), runs the native
-dual-view/early-build test, then runs the selected suites concurrently
-(`--suites routine`, the default: faults, profile, cancel, lifecycle, batch,
-early, power and v4; `--suites all` adds the opt-in controls, sector, migrate
-and fuzz, meant for changes in their own areas; migrate attaches a second 512 MiB blank
-disk, /dev/vdc, via `vm.py --second-blank-mib`; fuzz runs
-kernel/guest-table-fuzz.py (table/constructor fuzzing) and
-kernel/guest-ioctl-fuzz.py, seeded control-ioctl fuzzing with
-`PIV_FUZZ_STEPS`/`PIV_FUZZ_SEED` overrides, best on the sanitizer image). Profiles are aegis-4096 and aegis-512, the XTS + HMAC profiles
-`<aes|serpent|twofish>-<sha1|sha256|sha512>-<4096|512>`, plus aegis-4096-nojournal
-and aegis-512-nojournal (fixtures persisting stock --integrity-no-journal; guest_code
-then exports PIV_ALLOW_NO_JOURNAL=1 so the test client passes --allow-no-journal). `--suites-for PROFILE=LIST` narrows the suites of matching profiles.
-`--reuse-native PREFIX` skips the native step and starts the suites from a
-previous matrix's passed, host-verified native run when the module input
-(scaffold or module SHA-256, recorded in summary.json) and base image match;
-use it to iterate on one suite in about a minute instead of rerunning native.
+Use a new run directory or prefix each time; the runners refuse to overwrite.
 
-Rerun policy: the routine set (about 6 minutes on KVM for both profiles) after
-kernel or pivsetup changes; only the affected suite (with --reuse-native) for
-test-only changes; opt-in suites when their area changes; the sanitizer matrix
-at milestones or after significant kernel C changes. It independently verifies every closed output image with
-check_stateless.py. `--jobs` bounds concurrent VMs; `--fresh` disables the
-provisioned image; `--accel` defaults to kvm when /dev/kvm is usable (else tcg).
-It also builds the static Rust setup frontend once (scripts/build_pivsetup.py:
-system rustc/cargo, CARGO_HOME under ignored downloads/cargo, committed
-Cargo.lock, static glibc) and shares it into every VM; summary.json records its
-SHA-256. summary.json records pass/fail, timings and host checks; a
-suite that was not run counts as a failure. Original AEGIS-128 host checks need
-PIV_AEGIS_REFERENCE (below).
+## Guest VM (scripts/vm.py)
 
-## Artifacts
+The guest base is the SHA-512-pinned Debian 13 nocloud build 20261017-2634,
+booting 6.12.113+deb13-amd64. `vm.py run` creates a disposable qcow2 OS overlay
+and a sparse raw data disk exposed as /dev/vdb: 128 MiB by default,
+`--blank-mib 512` for the other approved size ([large-volumes.md](large-volumes.md)),
+or `--data-image` to attach a private copy of an existing 128/512 MiB image.
+`--second-blank-mib` adds /dev/vdc (migration tests), `--power-cut-script`
+reboots the same disks after a simulated power cut, and `--code` exports the
+package source read-only. vm.py freezes scripts/guest-common.sh (guards,
+package setup, module build/load, provenance) into every run; reuse it rather
+than duplicating guards.
 
-- `control.img`: raw test volume, outside the guest OS overlay.
-- `guest.qcow2`: disposable OS overlay; may contain guest login state and caches.
-- `console.log`: post-login console transcript, including task failures.
-- `share/volume.key`, `share/passphrase.key`: randomly generated disposable test
-  keys; never display, commit or reuse them for real data.
-- `share/luks.json`, `integrity-dump.txt`, `integrity-table.txt`,
-  `primary-status.txt`: observed configuration without exposed volume keys.
-- `share/expected.sha256`, `actual.sha256`: full primary plaintext digests.
-- `share/image.sha256`: final raw disk digest.
-- `share/kernel.txt`, `kernel.config`, `cryptsetup-version.txt`, `packages.tsv`:
-  guest provenance.
-- `share/result.txt`: created only after all task checks succeed.
+Networking is QEMU user mode without forwarded ports; host entropy is supplied
+through virtio-rng. Only the private run/share directory is exported via 9p;
+the repository and home directory are not shared. Scripts passed to the runner
+are trusted guest-root programs. Use 9p only for scripts and small results,
+never for loop-backed block workloads (an early loop-on-9p attempt triggered
+unexplained 9p kernel BUGs).
 
-Success requires the runner to exit zero AND the matching full-volume hashes.
-An existing image or a kernel fault is not a successful fixture. If the guest
-times out, preserve its transcript for diagnosis and discard that run as a
-source of trusted fixtures. These VM checks establish primary compatibility for
-the attached image, not hardware crash durability or plausible deniability.
+The guest installs cryptsetup-bin/libcryptsetup12 2:2.7.5-2 and records all
+package versions in `packages.tsv`. Repositories are live; dependency resolution
+is not snapshot-pinned. If the pinned versions disappear, fail and revise the
+environment deliberately. The base checksum comes from Debian's HTTPS checksum
+list; detached-signature verification is not implemented.
 
-## Verify an output image
+`vm.py provision` boots the base once and installs the union of guest packages
+(cryptsetup, Python, cryptography, matching headers, gcc-14, make) with serial
+root autologin and a masked persisted random seed. The read-only qcow2 in
+ignored downloads/ is keyed by base checksum, package list and provisioning
+script. `vm.py run --provisioned` uses it and resolves packages offline,
+falling back to the network if anything is missing.
 
-Every suite verifies its closed output images on the host with
-`scripts/check_stateless.py` (independent primary authentication and hidden
-decoding) and inside the guest with stock dm-crypt readback; there is no
-separate verification VM task.
+## Test matrix (scripts/suite.py)
+
+Per profile, suite.py creates a stock fixture with scripts/guest-control.sh
+(or uses `--control DIR`), runs the native dual-view and early-build test, then
+runs the selected suites concurrently, one fresh VM per suite.
+
+- Profiles: `aegis-4096`, `aegis-512`, `aegis-4096-nojournal`,
+  `aegis-512-nojournal` (stock `--integrity-no-journal`; the client then passes
+  `--allow-no-journal`) and `<aes|serpent|twofish>-<sha1|sha256|sha512>-<4096|512>`.
+- `--suites routine` (default): faults, profile, cancel, lifecycle, batch,
+  early, power, v4. `--suites all` adds controls, migrate (second 512 MiB disk)
+  and fuzz (seeded control-ioctl fuzzing with `PIV_FUZZ_STEPS`/`PIV_FUZZ_SEED`,
+  plus dm table/constructor fuzzing; best on the sanitizer image). An explicit
+  comma list also works; `--suites-for PROFILE=LIST` narrows per profile.
+- `--reuse-native PREFIX` skips the native step and starts from a previous
+  passed, host-verified native run with the same module input and base image.
+- `--base-image` selects a derived guest image (sanitizer or port, below);
+  `--memory-mib`, `--jobs`, `--fresh` (no provisioned image) and `--accel`
+  (default kvm when usable, else tcg).
+
+suite.py builds pivsetup once and shares it into every VM, verifies every closed
+output image on the host with scripts/check_stateless.py (independent primary
+authentication and hidden decoding; AEGIS needs `PIV_AEGIS_REFERENCE`, below),
+fails any run whose console shows kernel reports (KASAN, UBSAN, lockdep, BUG,
+WARNING, Oops, kmemleak), and writes `summary.json` with pass/fail, timings, host checks
+and module/pivsetup SHA-256s. A suite that did not run counts as a failure.
+
+Rerun policy: the routine set after kernel or pivsetup changes; only the
+affected suite (with `--reuse-native`) for test-only changes; opt-in suites when
+their area changes; the sanitizer matrix at milestones or after significant
+kernel C changes. Executed runs are recorded in commit messages.
+
+## Guest kernels
+
+- Default: pinned Debian 6.12.113 (module built against the guest headers).
+- Sanitizer: KASAN/UBSAN/lockdep/kmemleak kernel from
+  scripts/build_debug_kernel.py; see [sanitizer.md](sanitizer.md).
+- Port: Debian trixie-backports 7.2.9 image from scripts/build_port_image.py;
+  see [kernel-port.md](kernel-port.md).
+
+Guards accept the derived images only with their marker files.
+
+## Stock fixtures
+
+scripts/guest-control.sh formats /dev/vdb with stock cryptsetup, selected by
+`PIV_PRIMARY_CIPHER` (default `aegis128-random`, or `aes-`/`serpent-`/
+`twofish-xts-random` with `PIV_INTEGRITY=hmac-sha1|hmac-sha256|hmac-sha512`),
+`PIV_SECTOR_SIZE` (4096 default, or 512) and `PIV_NO_JOURNAL=1`. It writes
+distinct deterministic synthetic plaintext to every primary sector, reopens
+read-only with stock cryptsetup and hashes every primary byte. Keyslot PBKDF2
+uses a very low iteration count solely to speed up disposable tests.
+
+Control run artifacts: `control.img` (raw test volume), `guest.qcow2`
+(disposable overlay), `console.log` (post-login transcript), `share/volume.key`
+and `share/passphrase.key` (disposable test keys; never display, commit or
+reuse), `hidden.key` (from `pivsetup keygen`), `share/luks.json` and integrity
+dumps/tables (no keys), `share/expected.sha256`/`actual.sha256`,
+`share/image.sha256`, provenance (`kernel.txt`, `kernel.config`,
+`cryptsetup-version.txt`, `packages.tsv`) and `share/result.txt` (written only
+after all checks pass). Success requires a zero exit and matching full-volume
+hashes. Timed-out or failed runs must not become trusted fixtures. These checks
+establish primary compatibility, not hardware crash durability or deniability.
 
 ## Source subset
 
-`environment/sources.json` records URLs, upstream versions, and SHA-256 hashes.
-`scripts/fetch_sources.py` validates them into ignored vendor/. These are upstream
-files, not the complete Debian-patched kernel source. Inspect distro changes if
-behavior differs. A full Linux checkout is unnecessary for the initial review.
-
-## Native integration
-
-See docs/native-blocks.md for the paired writable-device tests and kernel/README.md
-for module staging/control regressions. Use vm.py run --code to freeze the setup
-package for each run. Only independent diagnostics remain from the offline tools;
-FUSE/NBD services, mutation commands and their guest tests have been retired.
-
-## Observed infrastructure failure
-
-The first control attempt used a guest loop device backed by a writable file on
-9p. Under Debian kernel 6.12.113 and QEMU TCG, this triggered list corruption and
-kernel BUG traces involving p9_release_pages/p9_virtio_zc_request during format.
-Root cause has not been established. Do not infer an AEAD failure from it.
-
-The revised harness attaches the host raw file directly as a virtio block disk.
-Use 9p only for scripts and small result files, not loop-backed block workloads.
-Failed run artifacts remain ignored and must not be used as golden fixtures.
+`environment/sources.json` records URLs, versions and SHA-256 hashes;
+scripts/fetch_sources.py validates them into ignored vendor/. These are
+upstream files (the reviewed dm-crypt/dm-integrity layout reference and the
+AEGIS reference), not the Debian-patched kernel tree. scripts/fetch_kernel.py
+stages the complete module source for guest builds.
 
 ## Original AEGIS-128 diagnostics
 
-The aegis-* profiles select --cipher aegis128-random --integrity aead
---key-size 128. This is Linux's original AEGIS-128, not AEGIS-128L. Native
-activation needs no additional userspace cryptography library.
+The aegis profiles use `--cipher aegis128-random --integrity aead --key-size
+128`, Linux's original AEGIS-128, not AEGIS-128L. Python cryptography and
+libaegis do not implement it, so host primary verification uses the AES-NI
+implementation from SUPERCOP revision 200cd30ca1f501463bd5cdd3da115a20d688d8fb
+(SHA-256 pinned). It is test instrumentation, not a runtime dependency: native
+activation, hidden extraction and initramfs activation never load it. The
+wrapper accepts only supported sector sizes, checks authentication before
+returning plaintext and wipes its output buffer; it does not promise complete
+key erasure. Use only disposable keys.
 
-Python cryptography and modern libaegis do not implement the original variant.
-The optional independent diagnostic oracle uses the AES-NI implementation from
-SUPERCOP revision 200cd30ca1f501463bd5cdd3da115a20d688d8fb, SHA-256 pinned in
-environment/sources.json. This historical reference is test instrumentation,
-not a new production crypto dependency or an implementation maintained here.
-Actual primary I/O uses the maintained pinned Linux crypto implementation.
-The wrapper accepts only our sector sizes, checks authentication before returning
-plaintext and wipes its output buffer on success/failure; it does not promise
-complete reference-stack/Python key erasure. Only use disposable synthetic keys.
-
-On an x86 host with AES-NI and an existing C compiler:
+On an x86 host with AES-NI and a C compiler:
 
 ```sh
-python3 scripts/fetch_sources.py
 python3 scripts/build_aegis_reference.py vendor/aegis-reference-next
 export PIV_AEGIS_REFERENCE="$PWD/vendor/aegis-reference-next/libaegis128-reference.so"
-PIV_FIXTURE=artifacts/aegis-control-4096-next python3 -W error::ResourceWarning -m unittest discover -v
-python3 -m pivstore verify artifacts/aegis-control-4096-next/control.img \
-  --volume-key-file artifacts/aegis-control-4096-next/share/volume.key
+PIV_FIXTURE=artifacts/suite-next/aegis-4096-control \
+  python3 -W error::ResourceWarning -m unittest discover -v
 ```
 
-No host root or installed crypto package is required for this helper. The library
-path is an explicit trusted diagnostic input; never point it at untrusted code.
-Native open/close, hidden extraction and initramfs activation do not load it.
-For the focused guest sector test, additionally share this library as
-libaegis128-reference.so; QEMU's max CPU provides AES-NI. Full paired-device,
-interruption and early-boot tests use kernel crypto alone.
+The library path is a trusted diagnostic input; never point it at untrusted
+code. AES-XTS + HMAC images are verified with `cryptography`; Serpent/Twofish
+images are HMAC-authenticated only on the host.
+
+See [native-blocks.md](native-blocks.md) for the module and paired devices and
+[kernel/README.md](../kernel/README.md) for module build rules.

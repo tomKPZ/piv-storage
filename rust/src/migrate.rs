@@ -1,8 +1,8 @@
 //! Offline migration into a freshly formatted, initialized target volume.
 //!
 //! This one workflow provides primary rekey (a new LUKS volume key), resize
-//! and sector-size change: both views of an AEGIS-128 format v4 source are
-//! copied into the matching views of a new AEGIS-128 format v4 target, then
+//! and sector-size change: both views of a format v4 source on any supported profile
+//! are copied into the matching views of a new format v4 target, then
 //! re-read from both devices with O_DIRECT and compared byte for byte. The
 //! target hidden volume is destructively initialized first. Source contents
 //! are only read (activation still writes ordinary journal metadata); the

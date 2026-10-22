@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Stateless paired views over format v4 (docs/format-v4.md; AEGIS-128 16-byte
- * IVs only since 2026-10-21, when format v3 and the 12-byte-IV profiles were
- * removed). Only stock dm-integrity persists recovery information. Whole
+/* Stateless paired views over format v4 (docs/format-v4.md; 16-byte random IVs:
+ * AEGIS-128 or XTS + HMAC). Only stock dm-integrity persists recovery information. Whole
  * hidden blocks authenticate, but interrupted multi-sector writes can destroy
  * them (A/B slots keep the previous version). All work is serialized under the
  * owner lock in NOIO context.
@@ -770,7 +769,7 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
      memcmp(s->context, "pivstore/volume/v4", 19) ||
      (s->flags & ~(PIV_SETUP_INITIALIZE | PIV_SETUP_AB | PIV_SETUP_VERIFY)) ||
      memchr_inv(s->reserved, 0, sizeof(s->reserved))) return -EINVAL;
- /* Format v4 needs 16-byte IVs (AEGIS-128). A/B is chosen at initialization
+ /* Format v4 needs 16-byte IVs. A/B is chosen at initialization
   * and afterwards read from the keyslot.
   */
  if (p->profile.iv_size != 16 || (ab && !initialize)) return -EINVAL;
