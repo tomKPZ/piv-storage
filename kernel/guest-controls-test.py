@@ -108,9 +108,10 @@ for arm in ('stock', 'native'):
     assert not re.search(r'(?:overrun|dropped events):\s*[1-9]', stats), stats
     after_hash = subprocess.check_output(['sha256sum', path], text=True).split()[0]
     if arm == 'native':
-        # Format v4: 112 keyslot sectors, two directory groups, 90-sector records.
-        records = (layout.sectors - 112) // 90 - 2
-        assert Path('/dev/mapper/piv-native-hidden').read_bytes() == bytes(records * 512)
+        # Format v5: 112 keyslot sectors, two directory groups, 687-sector records
+        # of 4096-byte hidden blocks.
+        records = (layout.sectors - 112) // 687 - 2
+        assert Path('/dev/mapper/piv-native-hidden').read_bytes() == bytes(records * 4096)
     closed(arm)
     copy_disk(arm + '-after.img')
     if arm == 'native': subprocess.run(['rmmod', 'dm_piv'], check=True)

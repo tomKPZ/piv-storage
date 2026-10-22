@@ -100,7 +100,7 @@ for repeat in range(3):
         sectors, unit = owner.device.sectors, owner.device.sector_size
         before = blocks.native_status(owner.device)['encryptions']
         measure_reads(views['decoy'], primary, 'native-decoy')
-        measure_reads(views['hidden'], EXPECTED, 'hidden')
+        measure_reads(views['hidden'], EXPECTED, 'hidden', 4096)   # 4096-byte hidden blocks
         assert blocks.native_status(owner.device)['encryptions'] == before == 0
         assert not blocks.native_status(owner.device)['failed']
         owner.close()
@@ -159,12 +159,13 @@ try:
         registered.append(event)
     (T / 'events/piv_profile/enable').write_text('1')
     per_range = 16384 // unit
-    v4_ranges = (90 + per_range - 1) // per_range  # one 90-sector record
+    GROUP = 687                                       # format v5 record without parity
+    record_ranges = (GROUP + per_range - 1) // per_range  # one 687-sector record
     # Default setup scans only the 112 keyslot sectors (the keyslot check runs
     # on their IVs); the directory (groups 0 and 1) is then read and
     # authenticated. --verify would scan every sector instead.
-    setup_expected = dict(load=1, range=(112 + per_range - 1) // per_range + 2 * v4_ranges,
-                          crypto=112 + 1 + 2 * 90, write=0, checkpoint=1)
+    setup_expected = dict(load=1, range=(112 + per_range - 1) // per_range + 2 * record_ranges,
+                          crypto=112 + 1 + 2 * GROUP, write=0, checkpoint=1)
     # Bracket exactly the SETUP ioctl with pivsetup's gate (before) and hold
     # (after) hooks; the binary waits at each point for our marker file.
     counted_gate = '/run/piv-profile-counted'
@@ -190,8 +191,8 @@ try:
         return json.loads(out)
     views = counted_open()
     subprocess.run(['udevadm', 'settle'], check=True)
-    # Hidden reads authenticate each block's 90 sectors.
-    hidden_cases = (('hidden', 512, 90, v4_ranges), ('hidden', 4096, 8 * 90, 8 * v4_ranges))
+    # Hidden reads authenticate each 4096-byte block's 687 sectors.
+    hidden_cases = (('hidden', 4096, GROUP, record_ranges), ('hidden', 16384, 4 * GROUP, 4 * record_ranges))
     for role, count, loads, ranges in (('decoy', 512, 1, 1), ('decoy', 16384, per_range, 1)) + hidden_cases:
         def read():
             with mmap.mmap(-1, count) as buf:
@@ -217,7 +218,7 @@ crypt('open', '--readonly', '--key-file', KEY, '/dev/vdb', 'piv-stock-profile')
 assert subprocess.check_output(['sha256sum', '/dev/mapper/piv-stock-profile'], text=True).split()[0] == PRIMARY
 crypt('close', 'piv-stock-profile')
 subprocess.run(['dd', 'if=/dev/vdb', 'of=' + str(W / 'profile-final.img'), 'bs=1M', 'status=none'], check=True)
-results.update(primary_sector=unit, primary_sectors=sectors, group=90, format=4,
+results.update(primary_sector=unit, primary_sectors=sectors, group=687, format=5,
                cache_state='warm guest/host caches; O_DIRECT bypasses public page cache only',
                timings_include_python_comparison=True, probes_used_during_timing=False, bounded_range_reads=True)
 (W / 'profile-results.json').write_text(json.dumps(results, indent=2) + '\n')

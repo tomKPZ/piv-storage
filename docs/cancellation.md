@@ -88,9 +88,11 @@ sent; a signal delivered before entering the kernel does not count.
   witnessed): a second raw SETUP caller is interrupted while the first holds the
   setup mutex and must report EINTR before the first scan is cancelled. The
   encryption counter must stay zero.
-- **Initialize** (25 ms lower write delay, at least two pn_write entries
-  witnessed): the retained counter must equal 28 keyslot + 90 directory + 90 per
-  completed record, with at least two and fewer than 64 records completed.
+- **Initialize** (2 ms lower write delay, short enough that one 687-sector
+  record finishes within the signal-to-exit timeout; at least two pn_write
+  entries witnessed): the retained counter must equal 28 keyslot + 687
+  directory + 687 per completed record, with at least two and fewer than 64
+  records completed.
 
 Each cancellation must report EINTR with inactive status, no views, zero hidden
 capacity and no failure, exit 130 without cleanup notes, leave no mappings or

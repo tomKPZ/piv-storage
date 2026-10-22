@@ -27,11 +27,11 @@ pub fn command(number: u64, size: u64, direction: u64) -> u64 {
 
 pub const QUERY_SIZE: usize = 48; // '=IIQQIIIIII'
 pub const READ_SIZE: usize = 48; // '=IIQQ16sII'
-pub const SETUP_SIZE: usize = 192; // '=IIQII32s128s2I'
+pub const SETUP_SIZE: usize = 192; // '=IIQII32s128sII'
 pub const STATUS_SIZE: usize = 40; // '=QQQIIII' (STATUS version 4)
 pub const KEYSLOT_SIZE: usize = 64; // '=IIQII32s2I'
 
-/// SETUP ABI 4 (format v4 only): destructive initialization.
+/// SETUP ABI 5 (format v5 only): destructive initialization.
 pub const SETUP_INITIALIZE: u32 = 1;
 /// With SETUP_INITIALIZE: A/B record slots.
 pub const SETUP_AB: u32 = 8;
@@ -175,19 +175,21 @@ impl KernelDevice {
         Ok(status)
     }
 
-    /// ABI 4 SETUP. The request (with the key) is wiped whatever happens.
-    pub fn setup(&self, hidden_key: &[u8], identity: &[u8], flags: u32) -> Result<()> {
+    /// ABI 5 SETUP (@parity: RS parity fragments per lane, initialization
+    /// only). The request (with the key) is wiped whatever happens.
+    pub fn setup(&self, hidden_key: &[u8], identity: &[u8], flags: u32, parity: u32) -> Result<()> {
         if hidden_key.len() != 32 || identity.is_empty() || identity.len() > 120 {
             bail!("Invalid native key/context size");
         }
         let mut data = [0u8; SETUP_SIZE];
-        data[0..4].copy_from_slice(&4u32.to_le_bytes());
+        data[0..4].copy_from_slice(&5u32.to_le_bytes());
         data[4..8].copy_from_slice(&(SETUP_SIZE as u32).to_le_bytes());
         data[8..16].copy_from_slice(&self.generation.to_le_bytes());
         data[16..20].copy_from_slice(&flags.to_le_bytes());
         data[20..24].copy_from_slice(&(identity.len() as u32).to_le_bytes());
         data[24..56].copy_from_slice(hidden_key);
         data[56..56 + identity.len()].copy_from_slice(identity);
+        data[184..188].copy_from_slice(&parity.to_le_bytes());
         // SAFETY: lock the stack copy of the key for the ioctl's duration.
         let locked = unsafe { libc::mlock(data.as_ptr().cast(), data.len()) } == 0;
         let result = ioctl(self.fd, command(12, SETUP_SIZE as u64, DIR_WRITE), &mut data);
@@ -198,7 +200,7 @@ impl KernelDevice {
         result
     }
 
-    /// Add (kek given) or remove keyslot @slot on an active v4 owner.
+    /// Add (kek given) or remove keyslot @slot on an active v5 owner.
     pub fn keyslot(&self, slot: u32, kek: Option<&[u8]>) -> Result<()> {
         if slot >= 4 || kek.is_some_and(|k| k.len() != 32) {
             bail!("Invalid keyslot request");

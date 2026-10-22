@@ -20,7 +20,7 @@ security specification. Respect tool/sandbox approval requirements.
 
 1. Read README.md, ROADMAP.md, applicable nested instructions, and existing design
    notes (especially docs/development.md, docs/observed-layout.md and
-   docs/format-v4.md, docs/native-blocks.md, docs/native-faults.md and
+   docs/format-v5.md, docs/native-blocks.md, docs/native-faults.md and
    docs/security-review.md, docs/journal-atomicity.md, docs/read-performance.md,
    docs/large-volumes.md and docs/cancellation.md). Inspect
    git status and relevant code before changing anything.
@@ -51,15 +51,18 @@ resolved from context/evidence, not for routine implementation decisions.
   LUKS/dm-integrity structures and encrypted records inside IVs. No separate
   partition, root-ext4 file or hidden-volume metadata dependency. /run ownership
   locks are volatile. Early activation must be possible from an initramfs.
-- Format v4 (docs/format-v4.md, user-approved 2026-10-20) is the only
-  implemented hidden format until format v5 (docs/format-v5.md, design
-  user-approved 2026-10-22: 4 KiB records, keyslot parameters, Argon2id cost
-  tiers, optional Reed–Solomon parity) replaces it outright. v4: LRW-randomized fragments (10 random + 6 payload bytes per 16-byte
-  IV), 90-fragment SIV records, encrypted keyslots (no public magic) with a
-  directory, Argon2id passphrase KEKs and optional A/B slots. Never add a persistent encryption counter. Format v3, its invalid
-  markers and the 12-byte-IV AES-GCM/ChaCha20-Poly1305 profiles were removed
-  by user decision (2026-10-21, "option A"); do not reintroduce them (they cannot
-  carry v4). The "AEGIS-128 only" part of option A was reversed on 2026-10-22.
+- Format v5 (docs/format-v5.md, design user-approved 2026-10-22) is the only
+  hidden format; it replaced format v4 outright (no migration, no dual
+  support). v5: LRW-randomized fragments (10 random + 6 payload bytes per
+  16-byte IV), 4 KiB SIV records of 687 fragments plus optional Reed–Solomon
+  parity (3p fragments, p ∈ {4, 8, 16}, off by default), encrypted keyslots (no
+  public magic) carrying the layout parameters, a directory, Argon2id
+  passphrase KEKs with cost tiers 1–4 (default 3, recorded nowhere) and
+  optional A/B slots. Never add a persistent encryption counter. Formats v3
+  and v4, v3's invalid markers and the 12-byte-IV AES-GCM/ChaCha20-Poly1305
+  profiles were removed (v3/12-byte IVs by user decision 2026-10-21, "option
+  A"; they cannot carry v5); do not reintroduce them. The "AEGIS-128 only"
+  part of option A was reversed on 2026-10-22.
   To reduce maintenance (user decision 2026-10-22, after the suite-072 bench)
   stock no-journal volumes (refused: little dm-piv gain, torn decoy sectors on
   a crash; docs/journal-atomicity.md), the scrypt KDF and the Serpent/Twofish
@@ -68,8 +71,11 @@ resolved from context/evidence, not for routine implementation decisions.
   Multi-snapshot observers, rollback resistance and alternative hidden openings
   under coercion are out of scope. Never put host-specific (e.g. corporate
   kernel) identifiers in the repository.
-- One authenticated record covers exactly one hidden 512-byte logical block in
-  90 primary IVs (A/B: two records per block). Full-block authentication prevents old/new fragment mixing;
+- One authenticated record covers exactly one hidden 4096-byte logical block in
+  G = 687 + 3p primary IVs (A/B: two records per block); the hidden view's
+  logical block size is 4096. Full-block authentication prevents old/new
+  fragment mixing; RS parity only adds availability and never accepts a
+  record without its SIV tag;
   cross-block transactions, hidden crash recovery and rollback resistance are
   NOT goals. Interrupted updates may leave hidden blocks returning EIO.
 - Decoy access must not depend on hidden-record authentication. A decoy write

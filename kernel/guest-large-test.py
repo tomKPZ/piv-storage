@@ -26,7 +26,7 @@ OLD_CAP = 256 * 1024 * 1024
 results = dict(cases=[], faults=[])
 
 
-def direct(path, offset, count=512, write=None):
+def direct(path, offset, count=4096, write=None):   # 4096: hidden logical block
     with mmap.mmap(-1, count) as buf:
         fd = os.open(path, os.O_RDWR | os.O_DIRECT)
         try:
@@ -70,8 +70,9 @@ v = open_views(initialize=True)
 results['initialize_seconds'] = time.monotonic() - start
 owner = GuestOwner('/dev/vdb', KEY)
 unit, sectors, iv = owner.device.sector_size, owner.device.sectors, owner.device.iv_size
-# Format v4 geometry: 112 keyslot sectors, two directory groups, 90-sector records.
-group, size = 90, sectors * unit
+# Format v5 geometry: 112 keyslot sectors, two directory groups, 687-sector
+# records (no parity) of 4096-byte hidden blocks.
+group, size, BLOCK = 687, sectors * unit, 4096
 records = (sectors - 112) // group - 2
 capacity = v['hidden_bytes']
 def first_sector(block): return 112 + group * (2 + block)
@@ -80,17 +81,17 @@ def blocks_in(offset, count):
     low, high = offset // unit, (offset + count - 1) // unit
     return range(max(0, (low - 112) // group - 2), min(records, max(0, (high - 112) // group - 1)))
 old_cap_block = (OLD_CAP // unit - first_sector(0)) // group
-assert size > OLD_CAP and capacity == records * 512
+assert size > OLD_CAP and capacity == records * BLOCK
 assert owner.raw_bytes == RAW
-# Keyslot 0 (2 x 14), the directory (90), then one 90-sector record per block.
+# Keyslot 0 (2 x 14), the directory (687), then one 687-sector record per block.
 assert native_status(owner.device)['encryptions'] == 28 + group + records * group
 expected = bytearray(capacity)
 assert Path(v['hidden']).read_bytes() == expected
-for index in sorted({0, old_cap_block, capacity // 512 - 1}):
-    value = hashlib.shake_256(b'large-hidden-' + index.to_bytes(8, 'little')).digest(512)
-    direct(v['hidden'], index * 512, write=value)
-    expected[index * 512:(index + 1) * 512] = value
-    assert direct(v['hidden'], index * 512) == value
+for index in sorted({0, old_cap_block, capacity // BLOCK - 1}):
+    value = hashlib.shake_256(b'large-hidden-' + index.to_bytes(8, 'little')).digest(BLOCK)
+    direct(v['hidden'], index * BLOCK, write=value)
+    expected[index * BLOCK:(index + 1) * BLOCK] = value
+    assert direct(v['hidden'], index * BLOCK) == value
 print(f'Initialized {size} primary / {capacity} hidden bytes, sector={unit}', flush=True)
 
 boundary = (OLD_CAP // (32768 * 512) + 1) * 32768 * 512
@@ -113,7 +114,7 @@ for label, offset, count in cases:
     # Check every affected hidden block, including records preserved across a
     # partial primary-sector write and records near the unused tail.
     for index in blocks_in(offset, count):
-        assert direct(v['hidden'], index * 512) == expected[index * 512:(index + 1) * 512]
+        assert direct(v['hidden'], index * BLOCK) == expected[index * BLOCK:(index + 1) * BLOCK]
     direct(v['decoy'], offset, count, old)
     assert direct(v['decoy'], offset, count) == old
     results['cases'].append(dict(case=label, offset=offset, bytes=count))
@@ -121,12 +122,12 @@ for label, offset, count in cases:
 
 # End-of-device reads cannot wrap to low addresses or change shared health.
 for role, end in (('decoy', size), ('hidden', capacity)):
-    with mmap.mmap(-1, 512) as buf:
-        buf[:] = b'\xa5' * 512
+    with mmap.mmap(-1, BLOCK) as buf:
+        buf[:] = b'\xa5' * BLOCK
         fd = os.open(v[role], os.O_RDWR | os.O_DIRECT)
         try:
             assert os.preadv(fd, [buf], end) == 0
-            assert buf[:] == b'\xa5' * 512
+            assert buf[:] == b'\xa5' * BLOCK
             try:
                 os.pwritev(fd, [buf], end)
             except OSError as error:
@@ -176,7 +177,7 @@ for fault in ('reads', 'corruption'):
                f'{sector512} 1 flakey /dev/vdb {sector512} 0 3600 5 corrupt_bio_byte 1 r {replacement} 0\n'
                f'{sector512 + 1} {raw_sectors - sector512 - 1} linear /dev/vdb {sector512 + 1}\n')
         assert direct(SOURCE, physical) == bytes([replacement]) + original[1:]
-        role, offset, count = 'hidden', capacity - 512, 512
+        role, offset, count = 'hidden', capacity - BLOCK, BLOCK
     with mmap.mmap(-1, count) as buf:
         sentinel = b'\xa5' * count
         buf[:] = sentinel
@@ -210,6 +211,6 @@ subprocess.run(['cryptsetup', 'close', 'piv-stock'], check=True)
 subprocess.run(['dd', 'if=/dev/vdb', 'of=' + str(W / 'large-final.img'), 'bs=1M', 'status=none'], check=True)
 results.update(raw_bytes=RAW, primary_bytes=size, hidden_bytes=capacity,
                primary_sectors=sectors, sector_size=unit, iv_bytes=iv,
-               format=4, unused_tail_sectors=sectors - first_sector(records))
+               format=5, unused_tail_sectors=sectors - first_sector(records))
 (W / 'large-results.json').write_text(json.dumps(results, indent=2) + '\n')
 (W / 'result.txt').write_text('Larger geometry, high addresses, record/tail boundaries, faults, full oracles and stock verification passed\n')

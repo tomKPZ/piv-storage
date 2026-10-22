@@ -71,15 +71,15 @@ not establish arbitrary-profile support.
 
 ## Observed 128 MiB fixtures
 
-Read from the stock fixtures with `python3 -m pivstore inspect`. Hidden bytes are format v4 without
-A/B ([format-v4.md](format-v4.md)); A/B halves them.
+Read from the stock fixtures with `python3 -m pivstore inspect`. Hidden bytes are format v5 without
+A/B or parity ([format-v5.md](format-v5.md)); A/B halves the block count.
 
 | Profile | S | Tuple | Journal sections × sectors (entries/section) | Initial | Metadata run | Primary sectors | Hidden bytes |
 | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: |
-| AEGIS | 4096 | 32 | 7 × 264 (32) | 1,856 | 256 | 28,216 | 158,720 |
-| XTS + HMAC-SHA256 | 4096 | 48 | 7 × 264 (32) | 1,856 | 384 | 28,104 | 158,208 |
-| AEGIS | 512 | 32 | 23 × 88 (80) | 2,032 | 2,048 | 213,008 | 1,209,856 |
-| XTS + HMAC-SHA256 | 512 | 48 | 32 × 64 (56) | 2,056 | 3,072 | 205,816 | 1,168,896 |
+| AEGIS | 4096 | 32 | 7 × 264 (32) | 1,856 | 256 | 28,216 | 155,648 |
+| XTS + HMAC-SHA256 | 4096 | 48 | 7 × 264 (32) | 1,856 | 384 | 28,104 | 155,648 |
+| AEGIS | 512 | 32 | 23 × 88 (80) | 2,032 | 2,048 | 213,008 | 1,257,472 |
+| XTS + HMAC-SHA256 | 512 | 48 | 32 × 64 (56) | 2,056 | 3,072 | 205,816 | 1,216,512 |
 
 The lower dm-integrity table has `interleave_sectors:32768`, `fix_padding`,
 `block_size:4096` (4096-byte profiles only), `journal_sectors` equal to the

@@ -86,13 +86,25 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(Path(path).read_bytes(), b'synthetic')
             self.assertFalse(Path(path).exists())
 
+    def test_open_args_layout_and_cost_options(self):
+        args = blocks.open_args('/dev/vdb', 'k', 's', passphrase=True, initialize=True, parity=8, kdf_cost=1)
+        self.assertEqual(args[-4:], ['--parity', '8', '--kdf-cost', '1'])
+        self.assertNotIn('--parity', blocks.open_args('/dev/vdb', 'k', 's'))
+        self.assertEqual(blocks.SETUP.size, 192)
+        self.assertEqual(blocks.SETUP_VERSION, 5)
+
     def test_passphrase_kek_cross_check_vectors(self):
         # Same vectors as rust/tests/*.hex (Rust/Python KDF parity).
         vectors = Path(__file__).resolve().parents[1] / 'rust/tests'
-        self.assertEqual(blocks.passphrase_kek(b'pw', b'ctx').hex(),
-                         (vectors / 'argon2id-pw-ctx.hex').read_text().strip())
-        with self.assertRaises(ValueError):
-            blocks.passphrase_kek(b'', b'ctx')
+        for tier in (1, 3):
+            self.assertEqual(blocks.passphrase_kek(b'pw', b'ctx', tier).hex(),
+                             (vectors / f'argon2id-pw-ctx-tier{tier}.hex').read_text().strip())
+        # The tier is part of the salt: different tiers give unrelated KEKs.
+        self.assertNotEqual(blocks.passphrase_kek(b'pw', b'ctx', 1), blocks.passphrase_kek(b'pw', b'ctx', 2))
+        self.assertEqual(blocks.DEFAULT_KDF_COST, 3)
+        for bad in (dict(passphrase=b'', base_context=b'ctx'), dict(passphrase=b'pw', base_context=b'ctx', tier=5)):
+            with self.assertRaises(ValueError):
+                blocks.passphrase_kek(**bad)
 
 
 if __name__ == '__main__':

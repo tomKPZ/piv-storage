@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline migration (pivsetup migrate) into a new AEGIS-128 format v4 volume.
+"""Offline migration (pivsetup migrate) into a new AEGIS-128 format v5 volume.
 
 The target on /dev/vdc is a freshly luksFormatted 512 MiB disk with a new
 volume key (rekey), 512-byte sectors (a sector-size change for the 4096-byte
@@ -66,7 +66,7 @@ results['refusals'] = [
     refused('Unsupported disposable test device', SOURCE, KEY, HKEY, TARGET, TKEY, TKEK),
 ]
 
-result = migrate(SOURCE, KEY, HKEY, TARGET, TKEY, TKEK, ab=True, allow_second_disk=True)
+result = migrate(SOURCE, KEY, HKEY, TARGET, TKEY, TKEK, ab=True, parity=4, allow_second_disk=True)
 assert result['verified'] is True, result
 assert result['decoy']['target_bytes'] > result['decoy']['bytes'], result
 assert result['hidden']['bytes'] == len(EXPECTED), result
@@ -81,7 +81,8 @@ assert sha256_prefix(v['decoy'], result['decoy']['bytes']) == PRIMARY
 assert Path(v['hidden']).read_bytes() == EXPECTED
 close_blocks(SOURCE, KEY)
 
-# The target authenticates only with its own key (A/B layout from the keyslot).
+# The target authenticates only with its own key (A/B layout and RS parity from
+# the keyslot).
 try:
     open_blocks(TARGET, TKEY, HKEY, allow_second_disk=True)
     raise AssertionError('target opened with the source hidden key')
@@ -103,4 +104,4 @@ try:
 finally:
     subprocess.run(['cryptsetup', 'close', 'piv-stock'], check=True)
 (W / 'migrate-results.json').write_text(json.dumps(results, indent=2) + '\n')
-(W / 'result.txt').write_text('Migration to a rekeyed, larger, 512-byte-sector A/B AEGIS-128 v4 volume passed\n')
+(W / 'result.txt').write_text('Migration to a rekeyed, larger, 512-byte-sector A/B parity-4 AEGIS-128 v5 volume passed\n')

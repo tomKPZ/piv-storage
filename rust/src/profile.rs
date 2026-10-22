@@ -8,7 +8,7 @@ use crate::json::Value;
 
 /// (LUKS encryption, LUKS integrity type, exact dm-crypt cipher spec, tag bytes).
 /// The two supported stock profiles whose random 16-byte IVs live in
-/// dm-integrity metadata, as format v4 requires: AEGIS-128 (default) and
+/// dm-integrity metadata, as format v5 requires: AEGIS-128 (default) and
 /// AES-XTS + HMAC-SHA256 (user decision 2026-10-22; other XTS ciphers and HMACs
 /// were dropped to reduce maintenance).
 pub const PRIMARY_PROFILES: [(&str, &str, &str, u64); 2] = [
@@ -208,11 +208,11 @@ pub fn validate_integrity_table(table: &str, sectors: u64, raw_major: u32, raw_m
     Ok(())
 }
 
-/// Format v4 base context (docs/format-v4.md):
-/// "pivstore/volume/v4\0" UUID NUL LE64 primary bytes LE64 sector size.
-/// The kernel appends "/ab" itself for the A/B layout.
-pub fn context_v4(uuid: &str, primary_bytes: u64, sector_size: u64) -> Vec<u8> {
-    let mut value = b"pivstore/volume/v4\0".to_vec();
+/// Format v5 base context (docs/format-v5.md):
+/// "pivstore/volume/v5\0" UUID NUL LE64 primary bytes LE64 sector size.
+/// The kernel appends the "/layout/" parameters for the record context.
+pub fn base_context(uuid: &str, primary_bytes: u64, sector_size: u64) -> Vec<u8> {
+    let mut value = b"pivstore/volume/v5\0".to_vec();
     value.extend_from_slice(uuid.as_bytes());
     value.push(0);
     value.extend_from_slice(&primary_bytes.to_le_bytes());
@@ -316,9 +316,9 @@ mod tests {
     #[test]
     fn contexts() {
         let uuid = "00000000-0000-4000-8000-000000000000";
-        let v4 = context_v4(uuid, 128 << 20, 4096);
-        assert!(v4.starts_with(b"pivstore/volume/v4\0") && v4.len() == 19 + 36 + 1 + 16);
-        assert_eq!(&v4[56..64], &(128u64 << 20).to_le_bytes());
-        assert_eq!(&v4[64..72], &4096u64.to_le_bytes());
+        let base = base_context(uuid, 128 << 20, 4096);
+        assert!(base.starts_with(b"pivstore/volume/v5\0") && base.len() == 19 + 36 + 1 + 16);
+        assert_eq!(&base[56..64], &(128u64 << 20).to_le_bytes());
+        assert_eq!(&base[64..72], &4096u64.to_le_bytes());
     }
 }

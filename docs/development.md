@@ -59,7 +59,7 @@ runs the selected suites concurrently, one fresh VM per suite.
 - Profiles: `aegis-4096`, `aegis-512`, `aes-sha256-4096` and `aes-sha256-512`
   (AES-XTS + HMAC-SHA256).
 - `--suites routine` (default): faults, profile, cancel, lifecycle, batch,
-  early, power, v4. `--suites all` adds controls, migrate (second 512 MiB disk)
+  early, power, v5. `--suites all` adds controls, migrate (second 512 MiB disk)
   and fuzz (seeded control-ioctl fuzzing with `PIV_FUZZ_STEPS`/`PIV_FUZZ_SEED`,
   plus dm table/constructor fuzzing; best on the sanitizer image). `bench`
   (the [configuration.md](configuration.md) measurements, on the pristine
@@ -70,7 +70,13 @@ runs the selected suites concurrently, one fresh VM per suite.
   passed, host-verified native run with the same module input and base image.
 - `--base-image` selects a derived guest image (sanitizer or port, below);
   `--memory-mib`, `--jobs`, `--fresh` (no provisioned image) and `--accel`
-  (default kvm when usable, else tcg).
+  (default kvm when usable, else tcg). Guest RAM defaults to 1 GiB; the v5
+  and bench suites raise it to 3 and 3.5 GiB (Argon2id tiers 3 and 4 need 1
+  and 2 GiB); `--memory-mib` can only raise these floors.
+- The v5 suite also compiles `kernel/piv-rs.inc` unchanged into the
+  freestanding harness `kernel/piv-rs-test.c` (guest gcc, loaded with ctypes;
+  the guest has no libc headers) and compares RS parity and corrections with
+  `pivstore/rs.py`.
 
 suite.py builds pivsetup once and shares it into every VM, verifies every closed
 output image on the host with scripts/check_stateless.py (independent primary

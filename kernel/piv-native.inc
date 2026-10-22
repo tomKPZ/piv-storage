@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Stateless paired views over format v4 (docs/format-v4.md; 16-byte random IVs:
+/* Stateless paired views over format v5 (docs/format-v5.md; 16-byte random IVs:
  * AEGIS-128 or XTS + HMAC). Only stock dm-integrity persists recovery information. Whole
  * hidden blocks authenticate, but interrupted multi-sector writes can destroy
  * them (A/B slots keep the previous version). All work is serialized under the
@@ -9,30 +9,34 @@
  * mean a block medium error and is never treated as unavailability.
  */
 #define PN_UNAVAILABLE 1
-#define PN_DATA 512
-#define PN_MAX_ENTRIES 96
 /* Power-of-two DM split boundary: a decoy work item touches at most 32
- * primary sectors (16 KiB / 512), within PN_MAX_ENTRIES prepared tuples. No
- * cross-bio accumulation or delayed completion is used.
+ * primary sectors (16 KiB / 512). No cross-bio accumulation or delayed
+ * completion is used.
  */
 #define PN_DECOY_BYTES 16384
-/* Format v4 (docs/format-v4.md), 16-byte IVs only: each primary IV carries
- * LRW-AES(r[10] || d[6]) with tweak = primary sector; one 512-byte block is a
- * 536-byte SIV payload in 90 fragments. Keyslots/directory are reserved.
+#define PN_DECOY_ENTRIES (PN_DECOY_BYTES / 512)
+/* Format v5 (docs/format-v5.md), 16-byte IVs only: each primary IV carries
+ * LRW-AES(r[10] || d[6]) with tweak = primary sector; one 4096-byte block is a
+ * 4122-byte SIV payload in 687 fragments, followed by 3p Reed-Solomon parity
+ * fragments when the keyslot enables parity p. Keyslots/directory are reserved.
  */
-#define PN_V4_RANDOM 10
-#define PN_V4_FRAGMENT 6
-#define PN_V4_PLAIN 520
-#define PN_V4_PAYLOAD 536
-#define PN_V4_GROUP 90
-#define PN_V4_CARRIER (PN_V4_GROUP * 16)
-#define PN_V4_KEYSLOTS 4
-#define PN_V4_KEYSLOT_SECTORS 14
-#define PN_V4_KEYSLOT_PLAIN 64
-#define PN_V4_KEYSLOT_AREA (PN_V4_KEYSLOTS * 2 * PN_V4_KEYSLOT_SECTORS)
-#define PN_V4_RESERVED (PN_V4_KEYSLOT_AREA + 2 * PN_V4_GROUP)
-#define PN_V4_FLAG_AB 1U
-#define PN_MAX_CARRIER (2 * PN_V4_CARRIER)
+#define PN_BLOCK_LOG2 12
+#define PN_DATA (1U << PN_BLOCK_LOG2)
+#define PN_RANDOM 10
+#define PN_FRAGMENT 6
+#define PN_PLAIN (8 + PN_DATA)
+#define PN_DATA_FRAGMENTS 687
+#define PN_LANES 3
+#define PN_LANE_DATA (PN_DATA_FRAGMENTS / PN_LANES)
+#define PN_MAX_PARITY 16
+#define PN_MAX_GROUP (PN_DATA_FRAGMENTS + PN_LANES * PN_MAX_PARITY)
+#define PN_KEYSLOTS 4
+#define PN_KEYSLOT_SECTORS 14
+#define PN_KEYSLOT_PLAIN 64
+#define PN_KEYSLOT_VERSION 5
+#define PN_KEYSLOT_AREA (PN_KEYSLOTS * 2 * PN_KEYSLOT_SECTORS)
+#define PN_DIRECTORY_GROUPS 2
+#define PN_FLAG_AB 1U
 struct pn_entry {
  __le64 sector;
  __le32 primary;
@@ -48,21 +52,25 @@ struct piv_native {
  struct crypto_shash *hmac;
  /* record outer keys, keyslot outer keys from the directory */
  struct crypto_skcipher *chacha;
- struct pn_lrw rec, ks_lrw[PN_V4_KEYSLOTS];
- u8 ks_outer[PN_V4_KEYSLOTS][64];
- bool ks_present[PN_V4_KEYSLOTS];
+ struct pn_lrw rec, ks_lrw[PN_KEYSLOTS];
+ u8 ks_outer[PN_KEYSLOTS][64];
+ bool ks_present[PN_KEYSLOTS];
  u64 dir_generation;
  int dir_slot;
- /* key: master key; context: record context (base, + "/ab" with A/B);
-  * base: the v4 base context used for keyslots and record keys.
+ /* key: master key; context: record context (base || "/layout/" || ab ||
+  * block_log2 || parity); base: the v5 base context used for keyslots.
   */
  u8 key[32], context[128], base[128], mac_key[32], enc_key[32];
  u32 context_length, base_length;
+ /* group: sectors per record (687 + 3 * parity) */
+ u32 group, parity;
  u64 hidden_bytes, records;
  bool ready, failed, ab;
  unsigned int views;
 };
 static struct workqueue_struct *pn_wq;
+
+#include "piv-rs.inc"
 
 static int pn_hash(struct crypto_shash *tfm, const void *data, size_t len, u8 out[32])
 {
@@ -75,7 +83,7 @@ static int pn_hash(struct crypto_shash *tfm, const void *data, size_t len, u8 ou
 	return r;
 }
 
-/* HKDF-SHA256 with an arbitrary-length salt (v4 key schedule). */
+/* HKDF-SHA256 with an arbitrary-length salt (v5 key schedule). */
 static int pn_hkdf(struct piv_native *n, const u8 ikm[32], const u8 *salt, size_t salt_length,
 		   const char *label, u8 out[32])
 {
@@ -83,7 +91,7 @@ static int pn_hkdf(struct piv_native *n, const u8 ikm[32], const u8 *salt, size_
 	size_t length = strlen(label);
 	int r;
 	if (length + 13 > sizeof(info)) return -EINVAL;
-	memcpy(info, "pivstore/v4/", 12); memcpy(info + 12, label, length); info[12 + length] = 1;
+	memcpy(info, "pivstore/v5/", 12); memcpy(info + 12, label, length); info[12 + length] = 1;
 	r = crypto_shash_setkey(n->hmac, salt, salt_length);
 	if (!r) r = pn_hash(n->hmac, ikm, 32, prk);
 	if (!r) r = crypto_shash_setkey(n->hmac, prk, 32);
@@ -93,27 +101,27 @@ static int pn_hkdf(struct piv_native *n, const u8 ikm[32], const u8 *salt, size_
 }
 
 /* LRW-AES tweakable PRP over 16-byte IVs with tweak = primary sector. */
-static void pn_v4_mask(const struct pn_lrw *k, u64 sector, u8 mask[16])
+static void pn_mask(const struct pn_lrw *k, u64 sector, u8 mask[16])
 {
 	u8 tweak[16] = {};
 	put_unaligned_le64(sector, tweak);
 	aes_encrypt(&k->tweak, mask, tweak);
 }
 
-static void pn_v4_encode(const struct pn_lrw *k, u64 sector, const u8 value[16], u8 iv[16])
+static void pn_encode(const struct pn_lrw *k, u64 sector, const u8 value[16], u8 iv[16])
 {
 	u8 mask[16], block[16];
-	pn_v4_mask(k, sector, mask);
+	pn_mask(k, sector, mask);
 	crypto_xor_cpy(block, value, mask, 16);
 	aes_encrypt(&k->prp, iv, block);
 	crypto_xor(iv, mask, 16);
 	memzero_explicit(block, sizeof(block));
 }
 
-static void pn_v4_decode(const struct pn_lrw *k, u64 sector, const u8 iv[16], u8 value[16])
+static void pn_decode(const struct pn_lrw *k, u64 sector, const u8 iv[16], u8 value[16])
 {
 	u8 mask[16], block[16];
-	pn_v4_mask(k, sector, mask);
+	pn_mask(k, sector, mask);
 	crypto_xor_cpy(block, iv, mask, 16);
 	aes_decrypt(&k->prp, value, block);
 	crypto_xor(value, mask, 16);
@@ -132,8 +140,8 @@ static int pn_lrw_init(struct pn_lrw *k, const u8 tweak[32], const u8 prp[32])
 }
 
 /* tag = HMAC-SHA256(mac, context || label(8|9) || LE64(id) || plain)[0:16] */
-static int pn_v4_tag(struct piv_native *n, const u8 mac[32], const u8 *context, size_t context_length,
-		     const char *label, u64 id, const u8 *plain, size_t plain_length, u8 tag[16])
+static int pn_tag(struct piv_native *n, const u8 mac[32], const u8 *context, size_t context_length,
+		  const char *label, u64 id, const u8 *plain, size_t plain_length, u8 tag[16])
 {
 	size_t label_length = strlen(label), length = context_length + label_length + 8 + plain_length;
 	u8 *buffer = kmalloc(length, GFP_NOIO), digest[32];
@@ -151,13 +159,13 @@ static int pn_v4_tag(struct piv_native *n, const u8 mac[32], const u8 *context, 
 	return r;
 }
 
-/* ChaCha20(enc, counter 0, nonce = tag[0:12]) in place on a heap buffer. */
-/* ChaCha20 keystream XOR over @buffer. Callers may pass stack memory, which a
+/* ChaCha20(enc, counter 0, nonce = tag[0:12]) keystream XOR over @buffer.
+ * Callers may pass stack memory, which a
  * scatterlist must never reference (VMAP_STACK: virt_to_page() of a vmalloc
  * address names the wrong page; CONFIG_DEBUG_SG BUG()s). Bounce through the
  * linear heap. Found by the KASAN/DEBUG_SG sanitizer guest (2026-10-21).
  */
-static int pn_v4_stream(struct piv_native *n, const u8 enc[32], const u8 tag[16], u8 *buffer, size_t length)
+static int pn_stream(struct piv_native *n, const u8 enc[32], const u8 tag[16], u8 *buffer, size_t length)
 {
 	struct skcipher_request *req;
 	struct scatterlist sg;
@@ -180,104 +188,143 @@ out:
 	return r;
 }
 
-/* SIV over fragments: payload = tag || ChaCha20(plain) || zero padding, carried
- * as the 6-byte suffixes of @count LRW-decoded IVs starting at @first.
+/* The 6-byte payload suffixes of @count LRW-decoded IVs starting at @first. */
+static void pn_fragments(const struct pn_lrw *k, u64 first, u32 count, const u8 *ivs, u8 *payload)
+{
+	u8 value[16];
+	u32 j;
+	for (j = 0; j < count; j++) {
+		pn_decode(k, first + j, ivs + j * 16, value);
+		memcpy(payload + j * PN_FRAGMENT, value + PN_RANDOM, PN_FRAGMENT);
+	}
+	memzero_explicit(value, sizeof(value));
+}
+
+/* SIV open of payload = tag || ChaCha20(plain) || zero padding (@bytes long).
  * PN_UNAVAILABLE if padding or tag do not verify.
+ */
+static int pn_payload_open(struct piv_native *n, const u8 mac[32], const u8 enc[32], const u8 *context,
+			   size_t context_length, const char *label, u64 id, const u8 *payload, size_t bytes,
+			   u8 *plain, size_t plain_length)
+{
+	u8 tag[16];
+	int r = memchr_inv(payload + 16 + plain_length, 0, bytes - 16 - plain_length) ? PN_UNAVAILABLE : 0;
+	if (!r) {
+		memcpy(plain, payload + 16, plain_length);
+		r = pn_stream(n, enc, payload, plain, plain_length);
+	}
+	if (!r) r = pn_tag(n, mac, context, context_length, label, id, plain, plain_length, tag);
+	if (!r && crypto_memneq(tag, payload, 16)) r = PN_UNAVAILABLE;
+	if (r) memzero_explicit(plain, plain_length);
+	return r;
+}
+
+/* SIV over fragments (keyslots): the payload is carried as the 6-byte
+ * suffixes of @count LRW-decoded IVs starting at @first.
  */
 static int pn_siv_open(struct piv_native *n, const struct pn_lrw *k, const u8 mac[32], const u8 enc[32],
 		       const u8 *context, size_t context_length, const char *label, u64 id,
 		       u64 first, u32 count, const u8 *ivs, u8 *plain, size_t plain_length)
 {
-	size_t bytes = count * PN_V4_FRAGMENT;
-	u8 *payload = kmalloc(bytes, GFP_NOIO), value[16], tag[16];
-	u32 j;
+	size_t bytes = count * PN_FRAGMENT;
+	u8 *payload = kmalloc(bytes, GFP_NOIO);
 	int r;
 	if (!payload) return -ENOMEM;
-	for (j = 0; j < count; j++) {
-		pn_v4_decode(k, first + j, ivs + j * 16, value);
-		memcpy(payload + j * PN_V4_FRAGMENT, value + PN_V4_RANDOM, PN_V4_FRAGMENT);
-	}
-	memzero_explicit(value, sizeof(value));
-	r = memchr_inv(payload + 16 + plain_length, 0, bytes - 16 - plain_length) ? PN_UNAVAILABLE : 0;
-	if (!r) {
-		memcpy(plain, payload + 16, plain_length);
-		r = pn_v4_stream(n, enc, payload, plain, plain_length);
-	}
-	if (!r) r = pn_v4_tag(n, mac, context, context_length, label, id, plain, plain_length, tag);
-	if (!r && crypto_memneq(tag, payload, 16)) r = PN_UNAVAILABLE;
-	if (r) memzero_explicit(plain, plain_length);
+	pn_fragments(k, first, count, ivs, payload);
+	r = pn_payload_open(n, mac, enc, context, context_length, label, id, payload, bytes, plain, plain_length);
 	kfree_sensitive(payload);
 	return r;
 }
 
-/* Fresh fragments for @plain: @ivs receives @count new IVs from @first. */
+/* Fresh fragments for @plain: @ivs receives @count new IVs from @first. The
+ * payload is tag || ct || zero padding up to @data_fragments fragments, then
+ * (with @parity) the 3p RS parity fragments.
+ */
 static int pn_siv_seal(struct piv_native *n, const struct pn_lrw *k, const u8 mac[32], const u8 enc[32],
 		       const u8 *context, size_t context_length, const char *label, u64 id,
-		       u64 first, u32 count, const u8 *plain, size_t plain_length, u8 *ivs)
+		       u64 first, u32 count, u32 data_fragments, u32 parity, const u8 *plain,
+		       size_t plain_length, u8 *ivs)
 {
-	size_t bytes = count * PN_V4_FRAGMENT;
+	size_t bytes = count * PN_FRAGMENT;
 	u8 *payload = kzalloc(bytes, GFP_NOIO), value[16];
 	u32 j;
 	int r;
 	if (!payload) return -ENOMEM;
-	r = pn_v4_tag(n, mac, context, context_length, label, id, plain, plain_length, payload);
+	r = pn_tag(n, mac, context, context_length, label, id, plain, plain_length, payload);
 	if (!r) {
 		memcpy(payload + 16, plain, plain_length);
-		r = pn_v4_stream(n, enc, payload, payload + 16, plain_length);
+		r = pn_stream(n, enc, payload, payload + 16, plain_length);
 	}
+	if (!r && parity) pn_rs_parity(payload, parity, payload + data_fragments * PN_FRAGMENT);
 	for (j = 0; !r && j < count; j++) {
-		get_random_bytes(value, PN_V4_RANDOM);
-		memcpy(value + PN_V4_RANDOM, payload + j * PN_V4_FRAGMENT, PN_V4_FRAGMENT);
-		pn_v4_encode(k, first + j, value, ivs + j * 16);
+		get_random_bytes(value, PN_RANDOM);
+		memcpy(value + PN_RANDOM, payload + j * PN_FRAGMENT, PN_FRAGMENT);
+		pn_encode(k, first + j, value, ivs + j * 16);
 	}
 	memzero_explicit(value, sizeof(value));
 	kfree_sensitive(payload);
 	return r;
 }
 
-/* Groups follow the 112 keyslot sectors; groups 0-1 are the directory. Block i
- * uses group 2+i, or groups 2+2i/3+2i (slots A/B) with A/B.
+/* Groups of n->group sectors follow the 112 keyslot sectors; groups 0-1 are
+ * the directory. Block i uses group 2+i, or groups 2+2i/3+2i (slots A/B) with A/B.
  */
-static u64 pn_v4_group_first(u64 group) { return PN_V4_KEYSLOT_AREA + group * PN_V4_GROUP; }
-static u64 pn_v4_group(struct piv_native *n, u64 index, u32 slot)
+static u64 pn_group_first(struct piv_native *n, u64 group) { return PN_KEYSLOT_AREA + group * n->group; }
+static u64 pn_group(struct piv_native *n, u64 index, u32 slot)
 {
-	return 2 + (n->ab ? 2 * index + slot : index);
+	return PN_DIRECTORY_GROUPS + (n->ab ? 2 * index + slot : index);
 }
-/* First sector after the last record group; [PN_V4_KEYSLOT_AREA, end) carries
+/* First sector after the last record group; [PN_KEYSLOT_AREA, end) carries
  * directory and record fragments under the master-key outer keys.
  */
-static u64 pn_v4_area_end(struct piv_native *n)
+static u64 pn_area_end(struct piv_native *n)
 {
-	return pn_v4_group_first(2 + (n->ab ? 2 * n->records : n->records));
+	return pn_group_first(n, PN_DIRECTORY_GROUPS + (n->ab ? 2 * n->records : n->records));
 }
 
-static int pn_v4_unpack(struct piv_native *n, u64 group, const u8 *ivs, u8 *data, u64 *generation)
+/* Open one record group from its n->group IVs. Fast path: SIV over the data
+ * fragments. With parity, a failing tag triggers RS errors-and-erasures
+ * decoding (@erased: carrier offsets that failed authentication or could not
+ * be read) and a second SIV check; only a valid tag accepts.
+ */
+static int pn_unpack(struct piv_native *n, u64 group, const u8 *ivs, const unsigned long *erased,
+		     u8 *data, u64 *generation)
 {
-	u8 *plain = kmalloc(PN_V4_PLAIN, GFP_NOIO);
-	int r;
-	if (!plain) return -ENOMEM;
-	r = pn_siv_open(n, &n->rec, n->mac_key, n->enc_key, n->context, n->context_length, "/record/",
-			group, pn_v4_group_first(group), PN_V4_GROUP, ivs, plain, PN_V4_PLAIN);
+	size_t bytes = PN_DATA_FRAGMENTS * PN_FRAGMENT;
+	u8 *plain = kmalloc(PN_PLAIN, GFP_NOIO), *fragments = kmalloc(n->group * PN_FRAGMENT, GFP_NOIO);
+	int r = -ENOMEM;
+	if (!plain || !fragments) goto out;
+	pn_fragments(&n->rec, pn_group_first(n, group), n->group, ivs, fragments);
+	r = pn_payload_open(n, n->mac_key, n->enc_key, n->context, n->context_length, "/record/", group,
+			    fragments, bytes, plain, PN_PLAIN);
+	if (r == PN_UNAVAILABLE && n->parity) {
+		r = pn_rs_correct(fragments, n->parity, erased) ? PN_UNAVAILABLE : 0;
+		if (!r) r = pn_payload_open(n, n->mac_key, n->enc_key, n->context, n->context_length, "/record/",
+					    group, fragments, bytes, plain, PN_PLAIN);
+	}
 	if (!r) memcpy(data, plain + 8, PN_DATA);
 	if (!r && generation) *generation = get_unaligned_le64(plain);
+out:
 	kfree_sensitive(plain);
+	kfree_sensitive(fragments);
 	return r;
 }
 
-static int pn_v4_pack(struct piv_native *n, u64 group, u64 generation, const u8 *data, u8 *ivs)
+static int pn_pack(struct piv_native *n, u64 group, u64 generation, const u8 *data, u8 *ivs)
 {
-	u8 *plain = kmalloc(PN_V4_PLAIN, GFP_NOIO);
+	u8 *plain = kmalloc(PN_PLAIN, GFP_NOIO);
 	int r;
 	if (!plain) return -ENOMEM;
 	put_unaligned_le64(generation, plain);
 	memcpy(plain + 8, data, PN_DATA);
 	r = pn_siv_seal(n, &n->rec, n->mac_key, n->enc_key, n->context, n->context_length, "/record/",
-			group, pn_v4_group_first(group), PN_V4_GROUP, plain, PN_V4_PLAIN, ivs);
+			group, pn_group_first(n, group), n->group, PN_DATA_FRAGMENTS, n->parity, plain,
+			PN_PLAIN, ivs);
 	kfree_sensitive(plain);
 	return r;
 }
 
-/* Keyslot keys from a KEK (salt = base context, without the A/B suffix). */
+/* Keyslot keys from a KEK (salt = base context, without the layout suffix). */
 struct pn_ks_keys { struct pn_lrw lrw; u8 tweak[32], prp[32], mac[32], enc[32]; };
 static int pn_ks_derive(struct piv_native *n, const u8 kek[32], struct pn_ks_keys *k)
 {
@@ -288,34 +335,40 @@ static int pn_ks_derive(struct piv_native *n, const u8 kek[32], struct pn_ks_key
 	if (!r) r = pn_lrw_init(&k->lrw, k->tweak, k->prp);
 	return r;
 }
-static u64 pn_ks_first(u32 slot, u32 replica) { return (2 * slot + replica) * PN_V4_KEYSLOT_SECTORS; }
+static u64 pn_ks_first(u32 slot, u32 replica) { return (2 * slot + replica) * PN_KEYSLOT_SECTORS; }
+static bool pn_parity_valid(u32 parity) { return parity == 0 || parity == 4 || parity == 8 || parity == 16; }
 
-/* Keyslot plaintext: LE32 version 4 || LE32 flags || MK[32] || zero[24]. */
+/* Keyslot plaintext: LE32 version 5 || LE32 flags || MK[32] || block_log2 ||
+ * rs_parity || zero[22]. Other versions, unknown flags, a block size other
+ * than 4096, unsupported parity or non-zero reserved bytes are rejected.
+ */
 static int pn_ks_open(struct piv_native *n, const struct pn_ks_keys *k, u32 slot, u32 replica,
-		      const u8 *ivs, u32 *flags, u8 master[32])
+		      const u8 *ivs, u32 *flags, u32 *parity, u8 master[32])
 {
-	u8 plain[PN_V4_KEYSLOT_PLAIN];
+	u8 plain[PN_KEYSLOT_PLAIN];
 	int r = pn_siv_open(n, &k->lrw, k->mac, k->enc, n->base, n->base_length, "/keyslot/",
-			    2 * slot + replica, pn_ks_first(slot, replica), PN_V4_KEYSLOT_SECTORS, ivs,
+			    2 * slot + replica, pn_ks_first(slot, replica), PN_KEYSLOT_SECTORS, ivs,
 			    plain, sizeof(plain));
-	if (!r && (get_unaligned_le32(plain) != 4 || (get_unaligned_le32(plain + 4) & ~PN_V4_FLAG_AB) ||
-		   memchr_inv(plain + 40, 0, 24)))
+	if (!r && (get_unaligned_le32(plain) != PN_KEYSLOT_VERSION || (get_unaligned_le32(plain + 4) & ~PN_FLAG_AB) ||
+		   plain[40] != PN_BLOCK_LOG2 || !pn_parity_valid(plain[41]) || memchr_inv(plain + 42, 0, 22)))
 		r = PN_UNAVAILABLE;
-	if (!r) { *flags = get_unaligned_le32(plain + 4); memcpy(master, plain + 8, 32); }
+	if (!r) { *flags = get_unaligned_le32(plain + 4); *parity = plain[41]; memcpy(master, plain + 8, 32); }
 	memzero_explicit(plain, sizeof(plain));
 	return r;
 }
 
 static int pn_ks_seal(struct piv_native *n, const struct pn_ks_keys *k, u32 slot, u32 replica, u8 *ivs)
 {
-	u8 plain[PN_V4_KEYSLOT_PLAIN] = {};
+	u8 plain[PN_KEYSLOT_PLAIN] = {};
 	int r;
-	put_unaligned_le32(4, plain);
-	put_unaligned_le32(n->ab ? PN_V4_FLAG_AB : 0, plain + 4);
+	put_unaligned_le32(PN_KEYSLOT_VERSION, plain);
+	put_unaligned_le32(n->ab ? PN_FLAG_AB : 0, plain + 4);
 	memcpy(plain + 8, n->key, 32);
+	plain[40] = PN_BLOCK_LOG2;
+	plain[41] = n->parity;
 	r = pn_siv_seal(n, &k->lrw, k->mac, k->enc, n->base, n->base_length, "/keyslot/",
-			2 * slot + replica, pn_ks_first(slot, replica), PN_V4_KEYSLOT_SECTORS, plain,
-			sizeof(plain), ivs);
+			2 * slot + replica, pn_ks_first(slot, replica), PN_KEYSLOT_SECTORS, PN_KEYSLOT_SECTORS,
+			0, plain, sizeof(plain), ivs);
 	memzero_explicit(plain, sizeof(plain));
 	return r;
 }
@@ -325,7 +378,7 @@ static void pn_dir_build(struct piv_native *n, u8 *data)
 {
 	u32 j;
 	memset(data, 0, PN_DATA);
-	for (j = 0; j < PN_V4_KEYSLOTS; j++) if (n->ks_present[j]) {
+	for (j = 0; j < PN_KEYSLOTS; j++) if (n->ks_present[j]) {
 		data[j * 65] = 1;
 		memcpy(data + j * 65 + 1, n->ks_outer[j], 64);
 	}
@@ -334,8 +387,8 @@ static void pn_dir_build(struct piv_native *n, u8 *data)
 static int pn_dir_parse(struct piv_native *n, const u8 *data)
 {
 	u32 j;
-	if (memchr_inv(data + PN_V4_KEYSLOTS * 65, 0, PN_DATA - PN_V4_KEYSLOTS * 65)) return -EUCLEAN;
-	for (j = 0; j < PN_V4_KEYSLOTS; j++) {
+	if (memchr_inv(data + PN_KEYSLOTS * 65, 0, PN_DATA - PN_KEYSLOTS * 65)) return -EUCLEAN;
+	for (j = 0; j < PN_KEYSLOTS; j++) {
 		const u8 *e = data + j * 65;
 		if (e[0] > 1 || (!e[0] && memchr_inv(e + 1, 0, 64))) return -EUCLEAN;
 		n->ks_present[j] = e[0];
@@ -346,27 +399,28 @@ static int pn_dir_parse(struct piv_native *n, const u8 *data)
 }
 
 /* Decoy-write rule: keep the 6 payload bytes of the old IV, refresh the 10 random bytes. */
-static void pn_v4_refresh(const struct pn_lrw *k, u64 sector, const u8 old[16], u8 iv[16])
+static void pn_refresh(const struct pn_lrw *k, u64 sector, const u8 old[16], u8 iv[16])
 {
 	u8 value[16];
 	do {
-		pn_v4_decode(k, sector, old, value);
-		get_random_bytes(value, PN_V4_RANDOM);
-		pn_v4_encode(k, sector, value, iv);
+		pn_decode(k, sector, old, value);
+		get_random_bytes(value, PN_RANDOM);
+		pn_encode(k, sector, value, iv);
 	} while (!memcmp(iv, old, 16));
 	memzero_explicit(value, sizeof(value));
 }
 
 /* New IV for a decoy-written sector: fragment refresh where a keyslot (known
- * from the directory), the directory or a record lives; otherwise random.
+ * from the directory), the directory or a record (data or parity fragment)
+ * lives; otherwise random.
  */
-static void pn_v4_decoy_iv(struct piv_native *n, u64 sector, const u8 old[16], u8 iv[16])
+static void pn_decoy_iv(struct piv_native *n, u64 sector, const u8 old[16], u8 iv[16])
 {
-	if (sector < PN_V4_KEYSLOT_AREA) {
-		u32 slot = sector / (2 * PN_V4_KEYSLOT_SECTORS);
-		if (n->ks_present[slot]) { pn_v4_refresh(&n->ks_lrw[slot], sector, old, iv); return; }
-	} else if (sector < pn_v4_area_end(n)) {
-		pn_v4_refresh(&n->rec, sector, old, iv);
+	if (sector < PN_KEYSLOT_AREA) {
+		u32 slot = sector / (2 * PN_KEYSLOT_SECTORS);
+		if (n->ks_present[slot]) { pn_refresh(&n->ks_lrw[slot], sector, old, iv); return; }
+	} else if (sector < pn_area_end(n)) {
+		pn_refresh(&n->rec, sector, old, iv);
 		return;
 	}
 	do get_random_bytes(iv, 16); while (!memcmp(iv, old, 16));
@@ -377,30 +431,45 @@ static void pn_v4_decoy_iv(struct piv_native *n, u64 sector, const u8 old[16], u
  * takes the raw stored IV of each failing sector. Only SIV-checked decoding
  * (keyslots, the directory, hidden reads) may use that: its tag rejects any
  * damaged, missing or mixed fragment, so nothing unauthenticated is accepted.
+ * With @erased (hidden records with parity), a range read error also falls
+ * back to per-sector loads; sectors failing authentication or unreadable are
+ * marked there (bit @at + j) as RS erasures, unreadable ones with zero IVs,
+ * and *@unreadable counts the latter.
  */
-static int pn_range_ivs(struct piv_control *p, u64 index, u32 count, u8 *ivs, bool tolerant)
+static int pn_range_ivs(struct piv_control *p, u64 index, u32 count, u8 *ivs, bool tolerant,
+			unsigned long *erased, u32 at, u32 *unreadable)
 {
  u32 j, iv = p->profile.iv_size;
  int r = piv_read_range(p, index, count, NULL, ivs);
- if (r != -EBADMSG || !tolerant) return r;
+ if (!tolerant || !r || (r != -EBADMSG && (!erased || r == -ENOMEM || r == -EINVAL))) return r;
  for (j = 0; j < count; j++) {
   struct piv_sector *s = NULL;
-  r = piv_load_mode(p->cc, index + j, &s, true); if (r) return r;
+  r = piv_load_mode(p->cc, index + j, &s, true);
+  if (r && erased && r != -ENOMEM) {
+   memset(ivs + j * iv, 0, iv);
+   __set_bit(at + j, erased);
+   (*unreadable)++;
+   continue;
+  }
+  if (r) return r;
   memcpy(ivs + j * iv, s->original + PIV_IV_AT(p->cc), iv);
+  if (s->bad && erased) __set_bit(at + j, erased);
   piv_sector_free(p->cc, s);
  }
  return 0;
 }
 
 /* Authenticate primary data before accepting its carrier, even for replacement
- * (strict: writes need the authenticated old sectors). Reads pass @tolerant.
+ * (strict: writes need the authenticated old sectors). Reads pass @tolerant
+ * (and with parity @erased, see pn_range_ivs).
  */
-static int pn_carrier_mode(struct piv_control *p, u64 first, u32 group, u8 *carrier, bool tolerant)
+static int pn_carrier_mode(struct piv_control *p, u64 first, u32 group, u8 *carrier, bool tolerant,
+			   unsigned long *erased, u32 *unreadable)
 {
  u32 j = 0, iv = p->profile.iv_size;
  while (j < group) {
   u32 count = min_t(u32, group - j, PIV_READ_BYTES / p->profile.sector_size);
-  int r = pn_range_ivs(p, first + j, count, carrier + j * iv, tolerant);
+  int r = pn_range_ivs(p, first + j, count, carrier + j * iv, tolerant, erased, j, unreadable);
   if (r) return r;
   j += count;
  }
@@ -408,13 +477,32 @@ static int pn_carrier_mode(struct piv_control *p, u64 first, u32 group, u8 *carr
 }
 static int pn_carrier_at(struct piv_control *p, u64 first, u32 group, u8 *carrier)
 {
- return pn_carrier_mode(p, first, group, carrier, false);
+ return pn_carrier_mode(p, first, group, carrier, false, NULL, NULL);
 }
-/* Read block i's record(s). With A/B, *slot returns the newest valid slot (or
- * -1 if none) and *generation its generation; @carrier needs 2 * 1440 bytes.
- * Returns PN_UNAVAILABLE when no slot authenticates.
+
+/* Collect and open one record group for reading. Raw IVs of sectors failing
+ * authentication feed SIV-checked decoding; with parity, those and unreadable
+ * sectors are RS erasures. An unreadable carrier whose record still does not
+ * authenticate returns -EIO (a medium error is never mere unavailability, so
+ * A/B never falls back over it); otherwise PN_UNAVAILABLE.
  */
-static int pn_v4_read(struct piv_control *p, u64 index, u8 *carrier, u8 *data, int *slot, u64 *generation)
+static int pn_read_group(struct piv_control *p, u64 group, u8 *carrier, u8 *data, u64 *generation)
+{
+ struct piv_native *n = p->native;
+ unsigned long erased[BITS_TO_LONGS(PN_MAX_GROUP)] = {};
+ u32 unreadable = 0;
+ int r = pn_carrier_mode(p, pn_group_first(n, group), n->group, carrier, true,
+			 n->parity ? erased : NULL, &unreadable);
+ if (!r) r = pn_unpack(n, group, carrier, erased, data, generation);
+ if (r == PN_UNAVAILABLE && unreadable) r = -EIO;
+ return r;
+}
+
+/* Read block i's record(s). With A/B, *slot returns the newest valid slot (or
+ * -1 if none) and *generation its generation; @carrier needs 2 * n->group * 16
+ * bytes. Returns PN_UNAVAILABLE when no slot authenticates.
+ */
+static int pn_read_slots(struct piv_control *p, u64 index, u8 *carrier, u8 *data, int *slot, u64 *generation)
 {
  struct piv_native *n = p->native;
  u32 i, slots = n->ab ? 2 : 1;
@@ -423,10 +511,8 @@ static int pn_v4_read(struct piv_control *p, u64 index, u8 *carrier, u8 *data, i
  u8 *candidate = kmalloc(PN_DATA, GFP_NOIO);
  if (!candidate) return -ENOMEM;
  for (i = 0; i < slots; i++) {
-  u64 group = pn_v4_group(n, index, i);
   /* Hidden decoding only needs the IVs; the record's SIV tag decides. */
-  r = pn_carrier_mode(p, pn_v4_group_first(group), PN_V4_GROUP, carrier + i * PN_V4_CARRIER, true);
-  if (!r) r = pn_v4_unpack(n, group, carrier + i * PN_V4_CARRIER, candidate, &found);
+  r = pn_read_group(p, pn_group(n, index, i), carrier + i * n->group * 16, candidate, &found);
   /* A primary sector failing authentication makes only this slot unavailable. */
   if (r == PN_UNAVAILABLE || r == -EBADMSG) continue;
   if (r) goto out;
@@ -441,7 +527,7 @@ out:
 }
 static int pn_read_record(struct piv_control *p, u64 index, u8 *carrier, u8 *data)
 {
- return pn_v4_read(p, index, carrier, data, NULL, NULL);
+ return pn_read_slots(p, index, carrier, data, NULL, NULL);
 }
 static void pn_free(struct piv_native *n)
 {
@@ -504,15 +590,17 @@ done:
  * plaintext unchanged). Old IVs are read and authenticated first. -EEXIST if a
  * fresh IV repeats an old or another fresh one (callers re-encode and retry).
  */
-static int pn_v4_replace(struct piv_control *p, u64 first, u32 count, const u8 *fresh, bool *mutated)
+static int pn_replace(struct piv_control *p, u64 first, u32 count, const u8 *fresh, bool *mutated)
 {
- struct pn_entry *entries = kvcalloc(PN_MAX_ENTRIES, sizeof(*entries), GFP_NOIO);
- u8 *olds = kmalloc(PN_MAX_ENTRIES * 16, GFP_NOIO);
+ struct pn_entry *entries = NULL;
+ u8 *olds = NULL;
  u32 i, j;
- int r = -ENOMEM;
+ int r = -E2BIG;
+ if (!count || count > PN_MAX_GROUP) return r;
+ entries = kvcalloc(count, sizeof(*entries), GFP_NOIO);
+ olds = kvmalloc(count * 16, GFP_NOIO);
+ r = -ENOMEM;
  if (!entries || !olds) goto done;
- r = -E2BIG;
- if (!count || count > PN_MAX_ENTRIES) goto done;
  r = pn_carrier_at(p, first, count, olds); if (r) goto done;
  r = -EEXIST;
  for (i = 0; i < count; i++) {
@@ -525,24 +613,27 @@ static int pn_v4_replace(struct piv_control *p, u64 first, u32 count, const u8 *
  if (count > (1ULL << 32) - p->encryptions) goto done;
  r = pn_commit(p, true, 0, NULL, 0, entries, fresh, count, mutated);
 done:
- kvfree_sensitive(entries, PN_MAX_ENTRIES * sizeof(*entries));
- kfree_sensitive(olds);
+ if (entries) kvfree_sensitive(entries, count * sizeof(*entries));
+ if (olds) kvfree_sensitive(olds, count * 16);
  return r;
 }
 
-/* Encode and write one record group, retrying local IV collisions. */
-static int pn_v4_write_group(struct piv_control *p, u64 group, u64 generation, const u8 *data, bool *mutated)
+/* Encode and write one record group (G fragments, parity included),
+ * retrying local IV collisions.
+ */
+static int pn_write_group(struct piv_control *p, u64 group, u64 generation, const u8 *data, bool *mutated)
 {
- u8 *ivs = kmalloc(PN_V4_CARRIER, GFP_NOIO);
+ struct piv_native *n = p->native;
+ u8 *ivs = kvmalloc(n->group * 16, GFP_NOIO);
  u32 attempt;
  int r = -ENOMEM;
  if (!ivs) return r;
  for (attempt = 0; attempt < 16; attempt++) {
-  r = pn_v4_pack(p->native, group, generation, data, ivs);
-  if (!r) r = pn_v4_replace(p, pn_v4_group_first(group), PN_V4_GROUP, ivs, mutated);
+  r = pn_pack(n, group, generation, data, ivs);
+  if (!r) r = pn_replace(p, pn_group_first(n, group), n->group, ivs, mutated);
   if (r != -EEXIST || *mutated) break;
  }
- kfree_sensitive(ivs);
+ kvfree_sensitive(ivs, n->group * 16);
  return r;
 }
 
@@ -555,7 +646,7 @@ static int pn_dir_write(struct piv_control *p, bool *mutated)
  if (!data) return -ENOMEM;
  if (n->dir_generation == U64_MAX) { kfree(data); return -EOVERFLOW; }
  pn_dir_build(n, data);
- r = pn_v4_write_group(p, slot, n->dir_generation + 1, data, mutated);
+   r = pn_write_group(p, slot, n->dir_generation + 1, data, mutated);
  if (!r) { n->dir_slot = slot; n->dir_generation++; }
  kfree_sensitive(data);
  return r;
@@ -566,15 +657,15 @@ static int pn_dir_write(struct piv_control *p, bool *mutated)
  */
 static int pn_ks_write(struct piv_control *p, u32 slot, const u8 *kek, struct pn_ks_keys *keys, bool *mutated)
 {
- u8 *ivs = kmalloc(PN_V4_KEYSLOT_SECTORS * 16, GFP_NOIO);
+ u8 *ivs = kmalloc(PN_KEYSLOT_SECTORS * 16, GFP_NOIO);
  u32 replica, attempt;
  int r = -ENOMEM;
  if (!ivs) return r;
  for (replica = 0; replica < 2; replica++) {
   for (attempt = 0; attempt < 16; attempt++) {
    if (kek) r = pn_ks_seal(p->native, keys, slot, replica, ivs);
-   else { get_random_bytes(ivs, PN_V4_KEYSLOT_SECTORS * 16); r = 0; }
-   if (!r) r = pn_v4_replace(p, pn_ks_first(slot, replica), PN_V4_KEYSLOT_SECTORS, ivs, mutated);
+       else { get_random_bytes(ivs, PN_KEYSLOT_SECTORS * 16); r = 0; }
+    if (!r) r = pn_replace(p, pn_ks_first(slot, replica), PN_KEYSLOT_SECTORS, ivs, mutated);
    if (r != -EEXIST || *mutated) break;
   }
   if (r) break;
@@ -583,12 +674,13 @@ static int pn_ks_write(struct piv_control *p, u32 slot, const u8 *kek, struct pn
  return r;
 }
 
-/* Format v4 write. A hidden write re-encodes its whole record (with A/B, into
- * the slot not holding the newest valid version); a decoy write re-randomizes
- * only the IVs of the primary sectors it writes, preserving their fragments.
+/* Format v5 write. A hidden write (one 4096-byte block) re-encodes its whole
+ * record (with A/B, into the slot not holding the newest valid version); a
+ * decoy write re-randomizes only the IVs of the primary sectors it writes,
+ * preserving their fragments.
  */
-static int pn_write_v4(struct piv_control *p, bool hidden, u64 offset, const u8 *data, u32 bytes,
-		       bool *mutated)
+static int pn_write_blocks(struct piv_control *p, bool hidden, u64 offset, const u8 *data, u32 bytes,
+			   bool *mutated)
 {
  struct piv_native *n = p->native;
  struct pn_entry *entries;
@@ -600,19 +692,20 @@ static int pn_write_v4(struct piv_control *p, bool hidden, u64 offset, const u8 
   if (bytes != PN_DATA || offset % PN_DATA || offset / PN_DATA >= n->records) return -EINVAL;
   index = offset / PN_DATA;
   if (n->ab) {
-   scratch = kmalloc(2 * PN_V4_CARRIER + PN_DATA, GFP_NOIO);
+   size_t length = 2 * n->group * 16 + PN_DATA;
+   scratch = kvmalloc(length, GFP_NOIO);
    if (!scratch) return -ENOMEM;
-   r = pn_v4_read(p, index, scratch, scratch + 2 * PN_V4_CARRIER, &slot, &generation);
-   kfree_sensitive(scratch);
+   r = pn_read_slots(p, index, scratch, scratch + 2 * n->group * 16, &slot, &generation);
+   kvfree_sensitive(scratch, length);
    if (r && r != PN_UNAVAILABLE) return r;
    slot = (r || slot < 0) ? 0 : !slot;
    generation = r ? 1 : generation + 1;
    if (!generation) return -EOVERFLOW;
   }
-  return pn_v4_write_group(p, pn_v4_group(n, index, slot), generation, data, mutated);
+  return pn_write_group(p, pn_group(n, index, slot), generation, data, mutated);
  }
- entries = kvcalloc(PN_MAX_ENTRIES, sizeof(*entries), GFP_NOIO);
- ivs = kmalloc(PN_MAX_ENTRIES * 16, GFP_NOIO);
+ entries = kvcalloc(PN_DECOY_ENTRIES, sizeof(*entries), GFP_NOIO);
+ ivs = kmalloc(PN_DECOY_ENTRIES * 16, GFP_NOIO);
  r = -ENOMEM;
  if (!entries || !ivs) goto done;
  for (index = offset / unit; index <= (offset + bytes - 1) / unit; index++) {
@@ -623,7 +716,7 @@ static int pn_write_v4(struct piv_control *p, bool hidden, u64 offset, const u8 
    * still valid, so damage stays damage and is never made authentic.
    */
   bool full = index * unit >= offset && (index + 1) * unit <= offset + bytes;
-  if (count == PN_MAX_ENTRIES) { r = -E2BIG; goto done; }
+  if (count == PN_DECOY_ENTRIES) { r = -E2BIG; goto done; }
   r = piv_load_mode(p->cc, index, &s, full); if (r) goto done;
   entries[count].sector = cpu_to_le64(index);
   entries[count].replace = s->bad;
@@ -634,7 +727,7 @@ static int pn_write_v4(struct piv_control *p, bool hidden, u64 offset, const u8 
  for (attempt = 0; attempt < 16; attempt++) {
   bool collision = false;
   for (i = 0; i < count; i++)
-   pn_v4_decoy_iv(n, le64_to_cpu(entries[i].sector), entries[i].old, ivs + i * 16);
+       pn_decoy_iv(n, le64_to_cpu(entries[i].sector), entries[i].old, ivs + i * 16);
   for (i = 0; i < count; i++) {
    for (j = 0; j < count; j++) if (!memcmp(ivs + i * 16, entries[j].old, 16)) collision = true;
    for (j = 0; j < i; j++) if (!memcmp(ivs + i * 16, ivs + j * 16, 16)) collision = true;
@@ -644,7 +737,7 @@ static int pn_write_v4(struct piv_control *p, bool hidden, u64 offset, const u8 
  if (attempt == 16) { r = -EEXIST; goto done; }
  r = pn_commit(p, false, offset, data, bytes, entries, ivs, count, mutated);
 done:
- kvfree_sensitive(entries, PN_MAX_ENTRIES * sizeof(*entries));
+ if (entries) kvfree_sensitive(entries, PN_DECOY_ENTRIES * sizeof(*entries));
  kfree_sensitive(ivs);
  return r;
 }
@@ -656,7 +749,7 @@ done:
 static noinline int pn_write(struct piv_control *p, bool hidden, u64 offset, const u8 *data, u32 bytes,
 			     bool *mutated)
 {
- return pn_write_v4(p, hidden, offset, data, bytes, mutated);
+ return pn_write_blocks(p, hidden, offset, data, bytes, mutated);
 }
 
 /* Cooperative setup only: never interrupt an in-flight hidden-record write.
@@ -668,15 +761,26 @@ static int pn_setup_poll(void)
  return signal_pending(current) ? -EINTR : 0;
 }
 
-/* v4 record keys from the master key; context = base (+ "/ab"). */
-static int pn_v4_keys(struct piv_native *n, u64 sectors)
+/* v5 record keys from the master key and the layout (n->ab, n->parity):
+ * context = base || "/layout/" || ab || block_log2 || rs_parity, so a volume
+ * opened with other parameters fails the SIV check. Geometry: G = 687 + 3p,
+ * blocks = floor((N - 112) / G) - 2, halved with A/B.
+ */
+static int pn_keys(struct piv_native *n, u64 sectors)
 {
  u8 tweak[32], prp[32];
+ u64 groups;
  int r;
+ if (!pn_parity_valid(n->parity) || n->base_length + 11 > sizeof(n->context)) return -EINVAL;
  memcpy(n->context, n->base, n->base_length);
- n->context_length = n->base_length;
- if (n->ab) { memcpy(n->context + n->context_length, "/ab", 3); n->context_length += 3; }
- n->records = (sectors - PN_V4_RESERVED) / PN_V4_GROUP;
+ memcpy(n->context + n->base_length, "/layout/", 8);
+ n->context[n->base_length + 8] = n->ab;
+ n->context[n->base_length + 9] = PN_BLOCK_LOG2;
+ n->context[n->base_length + 10] = n->parity;
+ n->context_length = n->base_length + 11;
+ n->group = PN_DATA_FRAGMENTS + PN_LANES * n->parity;
+ groups = sectors > PN_KEYSLOT_AREA ? (sectors - PN_KEYSLOT_AREA) / n->group : 0;
+ n->records = groups > PN_DIRECTORY_GROUPS ? groups - PN_DIRECTORY_GROUPS : 0;
  if (n->ab) n->records /= 2;
  if (!n->records) return -EINVAL;
  n->hidden_bytes = n->records * PN_DATA;
@@ -690,46 +794,49 @@ static int pn_v4_keys(struct piv_native *n, u64 sectors)
 }
 
 /* Fast key check: try every keyslot replica under the KEK. 0 on success with
- * n->key = master key and n->ab set; PN_UNAVAILABLE if none authenticates.
+ * n->key = master key and n->ab/n->parity set; PN_UNAVAILABLE if none
+ * authenticates.
  */
-static int pn_v4_unlock(struct piv_native *n, const u8 kek[32], const u8 *ks_ivs)
+static int pn_unlock(struct piv_native *n, const u8 kek[32], const u8 *ks_ivs)
 {
  struct pn_ks_keys *k = kzalloc(sizeof(*k), GFP_NOIO);
- u32 slot, replica, flags = 0;
+ u32 slot, replica, flags = 0, parity = 0;
  u8 master[32];
  int r;
  if (!k) return -ENOMEM;
  r = pn_ks_derive(n, kek, k);
- for (slot = 0; !r && slot < PN_V4_KEYSLOTS; slot++)
+   for (slot = 0; !r && slot < PN_KEYSLOTS; slot++)
   for (replica = 0; replica < 2; replica++) {
-   r = pn_ks_open(n, k, slot, replica, ks_ivs + pn_ks_first(slot, replica) * 16, &flags, master);
+   r = pn_ks_open(n, k, slot, replica, ks_ivs + pn_ks_first(slot, replica) * 16, &flags, &parity, master);
    if (r != PN_UNAVAILABLE) goto out;
    r = 0;
   }
  r = r ? r : PN_UNAVAILABLE;
 out:
- if (!r) { memcpy(n->key, master, 32); n->ab = flags & PN_V4_FLAG_AB; }
+ if (!r) { memcpy(n->key, master, 32); n->ab = flags & PN_FLAG_AB; n->parity = parity; }
  memzero_explicit(master, sizeof(master));
  kfree_sensitive(k);
  return r;
 }
 
-/* Read the directory (newest valid of groups 0/1) and load keyslot outer keys. */
+/* Read the directory (newest valid of groups 0/1, ordinary G-sector records
+ * with the volume's parity) and load keyslot outer keys.
+ */
 static int pn_dir_load(struct piv_control *p)
 {
  struct piv_native *n = p->native;
- u8 *carrier = kmalloc(PN_V4_CARRIER + PN_DATA, GFP_NOIO);
+ size_t length = n->group * 16 + PN_DATA;
+ u8 *carrier = kvmalloc(length, GFP_NOIO);
  u64 generation;
  int r, slot;
  n->dir_slot = -1;
  if (!carrier) return -ENOMEM;
  for (slot = 0; slot < 2; slot++) {
-  r = pn_carrier_mode(p, pn_v4_group_first(slot), PN_V4_GROUP, carrier, true);
-  if (!r) r = pn_v4_unpack(n, slot, carrier, carrier + PN_V4_CARRIER, &generation);
+  r = pn_read_group(p, slot, carrier, carrier + n->group * 16, &generation);
   if (r == PN_UNAVAILABLE || r == -EBADMSG) continue;
   if (r) goto out;
   if (n->dir_slot < 0 || generation > n->dir_generation) {
-   r = pn_dir_parse(n, carrier + PN_V4_CARRIER);
+   r = pn_dir_parse(n, carrier + n->group * 16);
    if (r) goto out;
    n->dir_slot = slot; n->dir_generation = generation;
   }
@@ -737,7 +844,7 @@ static int pn_dir_load(struct piv_control *p)
  /* Without a directory, decoy writes would destroy other keyslots: refuse. */
  r = n->dir_slot < 0 ? -EUCLEAN : 0;
 out:
- kfree_sensitive(carrier);
+ kvfree_sensitive(carrier, length);
  return r;
 }
 
@@ -747,9 +854,9 @@ out:
  */
 static int pn_setup_unlock(struct piv_control *p, struct piv_native *n, const u8 key[32], const u8 *ks_ivs)
 {
- int r = pn_v4_unlock(n, key, ks_ivs);
+ int r = pn_unlock(n, key, ks_ivs);
  if (r == PN_UNAVAILABLE) return -EKEYREJECTED;
- if (!r) r = pn_v4_keys(n, p->profile.sectors);
+ if (!r) r = pn_keys(n, p->profile.sectors);
  if (!r) r = pn_dir_load(p);
  return r;
 }
@@ -762,23 +869,26 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
  u32 j;
  bool initialize = s->flags & PIV_SETUP_INITIALIZE, ab = s->flags & PIV_SETUP_AB, mutated, ks_done = false;
  bool verify = s->flags & PIV_SETUP_VERIFY;
- u64 scan_end;
+ u64 scan_end, minimum;
  int r;
- if (s->version != 4 || s->size != sizeof(*s) || s->generation != p->profile.generation ||
-     s->context_length > 120 || s->context_length <= 19 ||
-     memcmp(s->context, "pivstore/volume/v4", 19) ||
+ if (s->version != 5 || s->size != sizeof(*s) || s->generation != p->profile.generation ||
+     s->context_length > 112 || s->context_length <= 19 ||
+     memcmp(s->context, "pivstore/volume/v5", 19) ||
      (s->flags & ~(PIV_SETUP_INITIALIZE | PIV_SETUP_AB | PIV_SETUP_VERIFY)) ||
-     memchr_inv(s->reserved, 0, sizeof(s->reserved))) return -EINVAL;
- /* Format v4 needs 16-byte IVs. A/B is chosen at initialization
+     !pn_parity_valid(s->parity) || s->reserved) return -EINVAL;
+ /* Format v5 needs 16-byte IVs. A/B and parity are chosen at initialization
   * and afterwards read from the keyslot.
   */
- if (p->profile.iv_size != 16 || (ab && !initialize)) return -EINVAL;
+ if (p->profile.iv_size != 16 || ((ab || s->parity) && !initialize)) return -EINVAL;
  if (p->native || !piv_quiesced(p) || !p->transaction || p->controller != controller || p->failed) return -EBUSY;
  /* Bound every primary byte offset by the kernel's signed file limit.
   * Fragment indices, hidden capacity and 512-byte addresses are then smaller;
   * all per-request allocations remain bounded independently of volume size.
+  * Minimum: keyslots, the directory and one block (112 + 3G, A/B 112 + 4G);
+  * without initialize the keyslot's parity may raise G (pn_keys rechecks).
   */
- if (p->profile.sectors < PN_V4_RESERVED + PN_V4_GROUP * (ab ? 2 : 1) ||
+ minimum = PN_KEYSLOT_AREA + (PN_DIRECTORY_GROUPS + (ab ? 2 : 1)) * (PN_DATA_FRAGMENTS + PN_LANES * s->parity);
+ if (p->profile.sectors < minimum ||
      p->profile.sectors > (u64)MAX_LFS_FILESIZE / p->profile.sector_size) return -EINVAL;
  n = kzalloc(sizeof(*n), GFP_NOIO); if (!n) return -ENOMEM;
  memcpy(n->key, s->key, 32);
@@ -799,19 +909,19 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
   * their raw stored IVs: replicas exist for this, and the keyslot SIV tag
   * rejects any damaged fragment, so nothing unauthenticated is accepted.
   */
- scan_end = verify ? p->profile.sectors : PN_V4_KEYSLOT_AREA;
+ scan_end = verify ? p->profile.sectors : PN_KEYSLOT_AREA;
  ivs = kmalloc(PIV_READ_BYTES / 512 * 16, GFP_NOIO);
- if (!initialize) ks_ivs = kzalloc(PN_V4_KEYSLOT_AREA * 16, GFP_NOIO);
+ if (!initialize) ks_ivs = kzalloc(PN_KEYSLOT_AREA * 16, GFP_NOIO);
  if (!ivs || (!initialize && !ks_ivs)) { r = -ENOMEM; goto bad; }
  for (i = 0; i < scan_end;) {
   u32 count = min_t(u64, scan_end - i, PIV_READ_BYTES / p->profile.sector_size);
   r = pn_setup_poll(); if (r) goto bad;
-  r = pn_range_ivs(p, i, count, ivs, !verify); if (r) goto bad;
-  for (j = 0; ks_ivs && j < count && i + j < PN_V4_KEYSLOT_AREA; j++)
+  r = pn_range_ivs(p, i, count, ivs, !verify, NULL, 0, NULL); if (r) goto bad;
+  for (j = 0; ks_ivs && j < count && i + j < PN_KEYSLOT_AREA; j++)
    memcpy(ks_ivs + (i + j) * 16, ivs + j * 16, 16);
   i += count;
-  /* Unlock as soon as the keyslot area is collected (sectors >= RESERVED). */
-  if (ks_ivs && !ks_done && i >= PN_V4_KEYSLOT_AREA) {
+  /* Unlock as soon as the keyslot area is collected. */
+  if (ks_ivs && !ks_done && i >= PN_KEYSLOT_AREA) {
    ks_done = true;
    r = pn_setup_unlock(p, n, s->key, ks_ivs);
    if (r) goto bad;
@@ -822,9 +932,10 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
   struct pn_ks_keys *k = kzalloc(sizeof(*k), GFP_NOIO);
   if (!k) { r = -ENOMEM; goto bad; }
   n->ab = ab;
+  n->parity = s->parity;
   r = pn_ks_derive(n, s->key, k);
   get_random_bytes(n->key, 32);
-  if (!r) r = pn_v4_keys(n, p->profile.sectors);
+  if (!r) r = pn_keys(n, p->profile.sectors);
   if (!r) {
    n->ks_present[0] = true;
    memcpy(n->ks_outer[0], k->tweak, 32); memcpy(n->ks_outer[0] + 32, k->prp, 32);
@@ -854,7 +965,7 @@ bad:
  return r;
 }
 
-/* Add or remove a v4 keyslot on an active owner. The master key stays in
+/* Add or remove a v5 keyslot on an active owner (same MK and parameters). The master key stays in
  * memory; records are untouched. Add writes the keyslot, then the directory;
  * remove updates the directory, then overwrites the keyslot with random IVs.
  * The last keyslot cannot be removed. Failures after a lower write fail-stop.
@@ -867,11 +978,11 @@ static int pn_keyslot(struct piv_control *p, struct piv_native_keyslot *ks)
  u32 j, present = 0;
  int r;
  if (ks->version != 1 || ks->size != sizeof(*ks) || ks->generation != p->profile.generation ||
-     ks->slot >= PN_V4_KEYSLOTS || (ks->op != PIV_KEYSLOT_ADD && ks->op != PIV_KEYSLOT_REMOVE) ||
+     ks->slot >= PN_KEYSLOTS || (ks->op != PIV_KEYSLOT_ADD && ks->op != PIV_KEYSLOT_REMOVE) ||
      memchr_inv(ks->reserved, 0, sizeof(ks->reserved)) ||
      (ks->op == PIV_KEYSLOT_REMOVE && memchr_inv(ks->kek, 0, sizeof(ks->kek)))) return -EINVAL;
  if (!n || !n->ready || n->failed || p->failed || p->blocked) return -EBUSY;
- for (j = 0; j < PN_V4_KEYSLOTS; j++) present += n->ks_present[j];
+ for (j = 0; j < PN_KEYSLOTS; j++) present += n->ks_present[j];
  if (ks->op == PIV_KEYSLOT_ADD) {
   if (n->ks_present[ks->slot]) return -EEXIST;
   k = kzalloc(sizeof(*k), GFP_NOIO);
@@ -901,14 +1012,15 @@ static int pn_keyslot(struct piv_control *p, struct piv_native_keyslot *ks)
 static int pn_read(struct piv_control *p, bool hidden, u64 offset, u8 *data, u32 bytes)
 {
  u64 unit = hidden ? PN_DATA : p->profile.sector_size, first = offset / unit, last = (offset + bytes - 1) / unit, i;
- u8 *record = kmalloc(hidden ? PN_MAX_CARRIER + PN_DATA : PIV_READ_BYTES, GFP_NOIO);
+ size_t carrier = 2 * PN_MAX_GROUP * 16, length = hidden ? carrier + PN_DATA : PIV_READ_BYTES;
+ u8 *record = kvmalloc(length, GFP_NOIO);
  int r = 0;
  if (!record) return -ENOMEM;
  for (i = first; i <= last; i++) {
   u64 start = i * unit, lo = max(start, offset), hi = min(start + unit, offset + bytes);
   if (hidden) {
-   r = pn_read_record(p, i, record, record + PN_MAX_CARRIER); if (r) break;
-   memcpy(data + lo - offset, record + PN_MAX_CARRIER + lo - start, hi - lo);
+   r = pn_read_record(p, i, record, record + carrier); if (r) break;
+   memcpy(data + lo - offset, record + carrier + lo - start, hi - lo);
   } else {
    u32 count = min_t(u64, last - i + 1, PIV_READ_BYTES / unit);
    r = piv_read_range(p, i, count, record, NULL); if (r) break;
@@ -917,7 +1029,7 @@ static int pn_read(struct piv_control *p, bool hidden, u64 offset, u8 *data, u32
    i += count - 1;
   }
  }
- kfree_sensitive(record); return r;
+ kvfree_sensitive(record, length); return r;
 }
 
 struct pn_view { struct piv_control *p; struct dm_dev *owner; bool hidden; };
@@ -934,6 +1046,16 @@ static void pn_copy_bio(struct bio *bio, u8 *buffer, bool to_bio)
 		else memcpy(buffer + offset, at + vec.bv_offset, vec.bv_len);
 		kunmap_local(at); offset += vec.bv_len;
 	}
+}
+
+/* noinline: the lifecycle test traces native completions here. A probe on
+ * bio_endio also fires for interrupt-context lower completions, which can nest
+ * inside another probe's handler and be missed; this is process context only.
+ */
+static noinline void pn_endio(struct bio *bio, blk_status_t status)
+{
+	bio->bi_status = status;
+	bio_endio(bio);
 }
 
 static void pn_worker(struct work_struct *work)
@@ -954,8 +1076,10 @@ static void pn_worker(struct work_struct *work)
 		r = blkdev_issue_flush(p->cc->dev->bdev);
 	} else {
 		u64 limit = w->hidden ? p->native->hidden_bytes : p->profile.sectors * p->profile.sector_size;
+		/* Hidden requests are whole aligned 4096-byte blocks (DM splits per block). */
 		if (!bytes || bytes > (w->hidden ? PN_DATA : PN_DECOY_BYTES) || (w->offset & 511) ||
-		    (bytes & 511) || w->offset > limit || bytes > limit - w->offset) { r = -EINVAL; goto done; }
+		    (bytes & 511) || (w->hidden && (bytes != PN_DATA || w->offset % PN_DATA)) ||
+		    w->offset > limit || bytes > limit - w->offset) { r = -EINVAL; goto done; }
 		buffer = kmalloc(bytes, GFP_NOIO);
 		if (!buffer) { r = -ENOMEM; goto done; }
 		if (bio_op(bio) == REQ_OP_READ) {
@@ -982,7 +1106,7 @@ static void pn_worker(struct work_struct *work)
 	if (r < 0 && (mutated || flushing)) { p->failed = true; p->native->failed = true; }
 done:
 	kfree_sensitive(buffer); memalloc_noio_restore(noio); mutex_unlock(&p->lock);
-	bio->bi_status = errno_to_blk_status(r > 0 ? -EIO : r); bio_endio(bio);
+	pn_endio(bio, errno_to_blk_status(r > 0 ? -EIO : r));
 	kref_put(&p->refs, piv_free); kfree(w);
 }
 
@@ -1027,7 +1151,7 @@ static int pn_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	mutex_unlock(&found->lock);
 	if (r) { dm_put_device(ti, v->owner); goto free_ref; }
 	ti->private = v; ti->num_flush_bios = 1;
-	r = dm_set_target_max_io_len(ti, v->hidden ? 1 : PN_DECOY_BYTES / 512);
+	r = dm_set_target_max_io_len(ti, (v->hidden ? PN_DATA : PN_DECOY_BYTES) / 512);
 	if (!r) return 0;
 	mutex_lock(&found->lock); found->native->views &= ~(v->hidden ? 2 : 1); mutex_unlock(&found->lock);
 	dm_put_device(ti, v->owner);
@@ -1051,10 +1175,12 @@ static int pn_iterate(struct dm_target *ti, iterate_devices_callout_fn fn, void 
 static void pn_hints(struct dm_target *ti, struct queue_limits *limits)
 {
 	struct pn_view *v = ti->private;
-	/* Authenticated primary-sector RMW permits 512-byte logical requests. */
-	limits->logical_block_size = 512;
-	limits->physical_block_size = v->p->profile.sector_size;
-	limits->io_min = v->p->profile.sector_size; limits->dma_alignment = 511;
+	/* Decoy: authenticated primary-sector RMW permits 512-byte logical
+	 * requests. Hidden: one record per 4096-byte block, no RMW.
+	 */
+	limits->logical_block_size = v->hidden ? PN_DATA : 512;
+	limits->physical_block_size = v->hidden ? PN_DATA : v->p->profile.sector_size;
+	limits->io_min = limits->physical_block_size; limits->dma_alignment = 511;
 }
 static void pn_status(struct dm_target *ti, status_type_t type, unsigned int flags, char *result, unsigned int maxlen)
 {
@@ -1063,7 +1189,7 @@ static void pn_status(struct dm_target *ti, status_type_t type, unsigned int fla
 	DMEMIT("%s %llu %s", v->owner->name, (unsigned long long)v->p->profile.generation, v->hidden ? "hidden" : "decoy");
 }
 static struct target_type piv_view_target = {
-	.name = "piv-view", .version = {0, 3, 0}, .module = THIS_MODULE,
+	.name = "piv-view", .version = {0, 4, 0}, .module = THIS_MODULE,
 	.ctr = pn_ctr, .dtr = pn_dtr, .map = pn_map, .iterate_devices = pn_iterate,
 	.io_hints = pn_hints, .status = pn_status,
 };

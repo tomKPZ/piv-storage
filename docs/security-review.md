@@ -1,8 +1,9 @@
 # Security and threat-model review
 
 Internal, source-led engineering assessment of the current standalone module
-(`kernel/{dm-piv.c,piv-control.inc,piv-native.inc}`), pivsetup (`rust/src/`) and
-the independent decoders (`pivstore/{records_v4,format,sector,profile}.py`). It
+(`kernel/{dm-piv.c,piv-control.inc,piv-native.inc,piv-rs.inc}`), pivsetup
+(`rust/src/`) and the independent decoders
+(`pivstore/{records,rs,format,sector,profile}.py`). It
 is not an independent cryptographic audit or certification. No known
 exploitable implementation defect is open; that is not an assertion that none
 exist. The whole-encoding pseudorandomness argument still needs external review.
@@ -16,14 +17,14 @@ keys (32-byte key files, or passphrases through the keyslot KDF), trusted
 setup/kernel/crypto implementations, seeded non-rewound randomness, exclusive
 coordinated writes and a supported layout. Key-length validation cannot
 establish entropy or independence. The primary passphrase protects a LUKS
-keyslot; the hidden key unlocks a hidden keyslot ([format-v4.md](format-v4.md)).
+keyslot; the hidden key unlocks a hidden keyslot ([format-v5.md](format-v5.md)).
 
 | Observer or adversary | Supported reasoning and limits |
 | --- | --- |
 | Passive reader of current IV slots, without hidden key | The encoding is expected to be pseudorandom under the composition assumptions below. This has not been proved or independently reviewed. |
 | Reader of a complete raw disk image | Also sees LUKS configuration, the journal and residual storage. A single image can contain write history. No full-image indistinguishability guarantee follows from current-IV randomness. |
 | Reader with primary key but no hidden key | Can authenticate/decrypt primary sectors and inspect IVs. Primary-key disclosure alone is not intended to reveal the hidden key. No coercion or alternative-opening protocol is implemented. |
-| Snapshot, journal-history, known-workload or live-I/O observer | A hidden write's 90 same-plaintext reencryptions are observable. Decoy writes matched stock closed-snapshot footprints in the AEGIS matched controls, but I/O traces still differ. No deniability against these observers is claimed. |
+| Snapshot, journal-history, known-workload or live-I/O observer | A hidden write's G (687 + 3p) same-plaintext reencryptions are observable. Decoy writes matched stock closed-snapshot footprints in the AEGIS matched controls, but I/O traces still differ. No deniability against these observers is claimed. |
 | Active raw-storage attacker without keys | Can destroy data and replay old valid tuples/records. Authentication rejects altered protected content, subject to cipher assumptions; it does not provide availability, freshness or authenticated metadata/journal ordering. |
 | Holder of primary key or decoy write access | Can destroy hidden data through uncoordinated (stock) writes; cannot be relied upon to preserve it. |
 | Holder of hidden-device access or hidden key | Receives plaintext or can decrypt/forge hidden records. Filesystem permissions are the access-control boundary. |
@@ -43,17 +44,22 @@ coercion-resistant alternative hidden openings (these would only move coercion
 from one hidden key to the next). Retained single-image journal history remains
 in scope (see below).
 
-## Encoding review (format v4)
+## Encoding review (format v5)
 
-The exact bytes are specified in [format-v4.md](format-v4.md). All hidden keys
+The exact bytes are specified in [format-v5.md](format-v5.md). All hidden keys
 come from HKDF-SHA256 ([RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html))
-over the master key (or a keyslot KEK) with the public v4 context as salt and
-`"pivstore/v4/" ‖ label` as info (`pn_hkdf`, cross-checked against the Python
-decoder). A KEK is a 32-byte key file or a passphrase through Argon2id
-(m = 64 MiB, t = 3, p = 4, fixed and not recorded).
+over the master key (or a keyslot KEK) with the public v5 context (records: base
+plus the layout parameters) as salt and `"pivstore/v5/" ‖ label` as info
+(`pn_hkdf`, cross-checked against the Python decoder). A KEK is a 32-byte key
+file or a passphrase through Argon2id at a user-chosen cost tier (1–4; default
+tier 3: m = 1 GiB, t = 3, p = 4; the tier is part of the salt and recorded
+nowhere).
 
-Each hidden block is a deterministic SIV record: a 16-byte HMAC-SHA256 tag over
-context, group, generation and data, and ChaCha20 under `tag[0:12]`. Identical
+Each hidden 4096-byte block is a deterministic SIV record: a 16-byte
+HMAC-SHA256 tag over context, group, generation and data, and ChaCha20 under
+`tag[0:12]`. Optional Reed–Solomon parity fragments are a deterministic
+function of that payload, stored inside the same LRW encoding; decoding them
+never accepts anything without the SIV tag. Identical
 data at the same address gives an identical record payload; freshness of the
 stored bytes comes from the outer encoding, where every 16-byte IV is an LRW-AES
 output on (10 fresh random bytes ‖ 6 payload bytes) tweaked by the primary
@@ -93,9 +99,9 @@ not permit nonce reuse.
 
 **What consumes nonces.** Every primary encryption draws one 16-byte IV: stock
 dm-crypt writes (one per written sector), native decoy writes (exactly one per
-written primary sector), hidden writes (90 per 512-byte block; A/B writes one
-slot), keyslot add/remove (28 + 90) and initialization (28 + 90 + 90 × hidden
-blocks). Tuples prepared before a failure count; local collision retries before
+written primary sector), hidden writes (G = 687 + 3p per 4096-byte block; A/B
+writes one slot), keyslot add/remove (28 + G) and initialization (28 + G + G ×
+hidden blocks). Tuples prepared before a failure count; local collision retries before
 preparation and exact replays do not.
 
 **Consequence of a repeat, per profile.**
@@ -115,7 +121,7 @@ preparation and exact replays do not.
 | Term | Model | Example values |
 | --- | --- | --- |
 | Whole key, IVs at different sectors | about q²/2^129 (uniform 128-bit IVs) | q = 2^32: 2^-65; 2^40: 2^-49; 2^48: 2^-33 |
-| One sector rewritten n times (v4 fragments carry 80 random bits) | about n²/2^81 | n = 2^20: 2^-41; 2^24: 2^-33; 2^32: 2^-17 |
+| One sector rewritten n times (v5 fragments carry 80 random bits) | about n²/2^81 | n = 2^20: 2^-41; 2^24: 2^-33; 2^32: 2^-17 |
 
 The per-sector term dominates for hot sectors. Tail sectors, unlisted keyslot
 areas and stock writes use fully random 128-bit IVs and follow the first row only.
@@ -188,14 +194,15 @@ From source/layout reasoning; no journal-forensic reconstruction experiment was
 performed. The journal retains recent sector writes (ciphertext, tag, IV and
 sector number) until wraparound. The 128 MiB fixtures have about 1 MiB of journal
 (1,848–2,048 journal sectors depending on profile), so only a few recent hidden
-writes (90 primary sectors each, 360 KiB of data at 4096-byte sectors) can
-remain. A single raw image therefore carries a short write history even though
+writes (687 primary sectors each without parity, 2.7 MiB of data at 4096-byte
+sectors) can remain; at 4096-byte sectors the journal holds less than one
+record write. A single raw image therefore carries a short write history even though
 multi-snapshot observers are out of scope.
 
 | Observer | What retained journal entries can show |
 | --- | --- |
-| No keys | Recently rewritten sector numbers and old IVs; runs of 90 contiguous sectors rewritten together. |
-| Decoy-key holder (coercion case) | Old and new primary plaintext of those sectors: 90 contiguous sectors reencrypted with unchanged plaintext, unusual for ordinary filesystems. |
+| No keys | Recently rewritten sector numbers and old IVs; runs of contiguous record sectors rewritten together. |
+| Decoy-key holder (coercion case) | Old and new primary plaintext of those sectors: contiguous record sectors reencrypted with unchanged plaintext, unusual for ordinary filesystems. |
 | Hidden-key holder | Potentially older versions of hidden records from correctly associated fragments. |
 
 Decoy writes change only the IVs of the sectors written, like stock writes, so
@@ -213,9 +220,10 @@ numbers only from keyless observers.
 The important findings are limitations, stated explicitly rather than treated as
 solved: full-image journal history, the hidden-write signature, unenforced
 lifetime budgets, offline guessing, replay acceptance and trusted-host/key
-requirements. Host regressions (`tests/test_records_v4.py`) reject mixed
-fragment versions, wrong keys, swapped A/B slots and the wrong layout; acceptance
-of an old whole record or of valid blocks from different times follows from the
-design and has no dedicated v4 regression. External cryptographic
+requirements. Host regressions (`tests/test_records.py`) reject mixed
+fragment versions, wrong keys, swapped A/B slots, the wrong layout and
+miscorrected RS output; acceptance of an old whole record or of valid blocks
+from different times follows from the design and has no dedicated v5
+regression. External cryptographic
 review of the entire encoding is still required before stronger concealment
 claims. Active metadata/journal attack fixtures remain separate work.

@@ -23,13 +23,13 @@ test "$3" = piv-crypt || fail "owner target is $3"
 grep -q "\"hidden_bytes\": $(stat -c %s /piv/expected-hidden-volume)\$" /run/open.json || fail 'hidden size'
 cmp "$H" /piv/expected-hidden-volume || fail 'hidden contents'
 
-# One hidden block write, readback and restore. Plain dd options only: the
-# initramfs dd may be busybox (no iflag/oflag=direct). Buffered 512-byte writes
-# read their whole page first, and every block here is valid.
-dd if=/piv/early-block of="$H" bs=512 count=1 conv=notrunc && sync
+# One 4096-byte hidden block (the hidden view's logical block size) write,
+# readback and restore. Plain dd options only: the initramfs dd may be busybox
+# (no iflag/oflag=direct); every block here is valid.
+dd if=/piv/early-block of="$H" bs=4096 count=1 conv=notrunc && sync
 echo 3 > /proc/sys/vm/drop_caches
-dd if="$H" bs=512 count=1 | cmp - /piv/early-block || fail 'hidden write'
-dd if=/piv/expected-hidden-volume of="$H" bs=512 count=1 conv=notrunc && sync
+dd if="$H" bs=4096 count=1 | cmp - /piv/early-block || fail 'hidden write'
+dd if=/piv/expected-hidden-volume of="$H" bs=4096 count=1 conv=notrunc && sync
 # A same-data decoy rewrite must preserve every hidden byte.
 dd if="$D" of=/run/decoy0 bs=4096 count=1
 dd if=/run/decoy0 of="$D" bs=4096 count=1 conv=notrunc && sync

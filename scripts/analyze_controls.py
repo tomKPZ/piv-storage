@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from control_metrics import workload, payload, byte_statistics, region, trace_summary, journal_sample
 from pivstore.profile import Image
-from pivstore.records_v4 import decode_image
+from pivstore.records import decode_image
 from pivstore.sector import SectorCodec
 
 
@@ -56,7 +56,7 @@ def analyze(root, primary_key, hidden_key):
                 if old_tuple[16:] != new_tuple[16:]:
                     changed_iv.append(index)
                     if old == new: same_plain_reencrypted.append(index)
-            # Format v4 decoy writes change only the requested sectors' IVs, like stock.
+            # Format v5 decoy writes change only the requested sectors' IVs, like stock.
             assert set(changed_iv) == requested, (name, sorted(set(changed_iv) ^ requested)[:16])
             assert len(set(ivs)) == len(ivs), 'Duplicate CURRENT IV'
             primary_before, primary_after = digest_before.hexdigest(), digest_after.hexdigest()
@@ -85,8 +85,8 @@ def analyze(root, primary_key, hidden_key):
     if set(arms) != {'stock', 'native'}: raise ValueError('Missing control arm')
     assert arms['native']['changed_iv_indices'] == arms['stock']['changed_iv_indices']
     return dict(layout=manifest['layout'], encryption=manifest['encryption'], luks_header_sha256=header,
-                native_format=4, native_iv_footprint_matches='stock',
-                arms=arms, conclusion='Matched-workload IV footprints: native (format v4) equals stock. No indistinguishability proof.',
+                native_format=5, native_iv_footprint_matches='stock',
+                arms=arms, conclusion='Matched-workload IV footprints: native (format v5) equals stock. No indistinguishability proof.',
                 limits=['One synthetic volume per profile; sequential same-key arms and fresh evolving CRNG.',
                         'Native initialization precedes its baseline; initialization itself is excluded from workload trace.',
                         'Trace counts are submissions in a bounded window, not physical media bytes or stable timing.',

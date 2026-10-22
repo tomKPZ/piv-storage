@@ -23,6 +23,7 @@ SOURCE = '/dev/mapper/piv-test-delay'
 KEY = W / 'passphrase.key'
 HKEY = (W / 'hidden.key').read_bytes()
 SETUP_CMD = command(12, blocks.SETUP.size, 1)
+BLOCK, GROUP = 4096, 687         # format v5 hidden block and record (no parity)
 
 
 def write_json(name, value):
@@ -154,27 +155,27 @@ def verify(v, unavailable_from=None):
     if unavailable_from is None:
         assert Path(v['hidden']).read_bytes() == expected
         return
-    # Interrupted v4 re-initialization: a new master key was written first, so
+    # Interrupted v5 re-initialization: a new master key was written first, so
     # completed leading blocks are zeros and every later block is unavailable
     # (old records no longer authenticate) rather than retaining old content.
     # Exact O_DIRECT reads: buffered page reads would include unavailable neighbours.
     fd = os.open(v['hidden'], os.O_RDONLY | os.O_DIRECT)
     try:
-        with mmap.mmap(-1, unavailable_from * 512) as buf:
-            assert os.preadv(fd, [buf], 0) == unavailable_from * 512
-            assert buf[:] == expected[:unavailable_from * 512]
+        with mmap.mmap(-1, unavailable_from * BLOCK) as buf:
+            assert os.preadv(fd, [buf], 0) == unavailable_from * BLOCK
+            assert buf[:] == expected[:unavailable_from * BLOCK]
     finally:
         os.close(fd)
-    for index in (unavailable_from, len(expected) // 512 - 1):
+    for index in (unavailable_from, len(expected) // BLOCK - 1):
         fd = os.open(v['hidden'], os.O_RDONLY | os.O_DIRECT)
         try:
-            with mmap.mmap(-1, 512) as buf:
+            with mmap.mmap(-1, BLOCK) as buf:
                 try:
-                    os.preadv(fd, [buf], index * 512)
+                    os.preadv(fd, [buf], index * BLOCK)
                 except OSError as exc:
                     assert exc.errno == errno.EIO
                 else:
-                    raise AssertionError(f'Block {index} after interrupted v4 initialization was readable')
+                    raise AssertionError(f'Block {index} after interrupted v5 initialization was readable')
         finally:
             os.close(fd)
 
@@ -191,8 +192,10 @@ try:
         probe_command(f'p:piv_cancel/{event} {symbol(function)}')
         registered.append(event)
     for phase, event in (('scan', 'range'), ('initialize', 'write')):
+        # A v5 record write is 687 sector writes: a short per-write delay keeps
+        # one record within the signal-to-exit timeout.
         reload(read_ms=25 if phase == 'scan' else 0,
-               write_ms=25 if phase == 'initialize' else 0)
+               write_ms=2 if phase == 'initialize' else 0)
         process = spawn(phase)
         wait_until(lambda: (W / (phase + '-ready.json')).exists())
         (T / f'events/piv_cancel/{event}/filter').write_text(f'common_pid == {process.pid}')
@@ -237,11 +240,11 @@ try:
         if phase == 'scan':
             assert status['encryptions'] == 0
         else:
-            # Keyslot 0 (2 x 14 sectors) and the directory (90) precede the
-            # 90-sector zero records.
-            completed, remainder = divmod(status['encryptions'] - 2 * 14 - 90, 90)
-            assert not remainder and 2 <= completed < min(64, len(expected) // 512), status
-            expected[:completed * 512] = bytes(completed * 512)
+            # Keyslot 0 (2 x 14 sectors) and the directory (687) precede the
+            # 687-sector zero records.
+            completed, remainder = divmod(status['encryptions'] - 2 * 14 - GROUP, GROUP)
+            assert not remainder and 2 <= completed < min(64, len(expected) // BLOCK), status
+            expected[:completed * BLOCK] = bytes(completed * BLOCK)
             unavailable_from = completed
         verify(v, unavailable_from)
         blocks.close_blocks(SOURCE, KEY, allow_test_stack=True)

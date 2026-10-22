@@ -11,7 +11,7 @@ Each profile starts from one ordinary stock-Linux fixture. Two sequential arms
 `/dev/vdb` with every mapping closed:
 
 - **stock**: unmodified cryptsetup/dm-crypt, ordinary requested writes.
-- **native**: dm-piv, hidden zeros initialized (format v4) before its own
+- **native**: dm-piv, hidden zeros initialized (format v5) before its own
   baseline, then exactly the same requested primary writes through the decoy
   view. Hidden zeros must survive the workload.
 
@@ -23,7 +23,8 @@ volumes. Native initialization is excluded from the workload trace, but would
 itself be visible to an observer with earlier snapshots (it rewrites keyslot 0,
 the directory and every record carrier with unchanged plaintext).
 
-The workload (`scripts/control_metrics.py`, `span` = 90 primary sectors) writes
+The workload (`scripts/control_metrics.py`, `span` = 687 primary sectors, one
+v5 record without parity) writes
 one primary sector at offset 0, 4 KiB ending at `span`, 16 KiB straddling
 `3·span`, and rewrites one sector at `5·span` with its own plaintext. Offsets
 are decoy-view bytes, so the writes touch the keyslot area, the directory and a
@@ -66,7 +67,19 @@ ratio over all IV bytes) are descriptive. No p-values, classifier accuracy,
 acceptance threshold or security proof is inferred; a few synthetic samples
 cannot establish pseudorandomness against arbitrary steganalysis.
 
-## Executed results (format v4, original AEGIS-128)
+## Executed results (format v5, all supported profiles)
+
+The 2026-10-22 format v5 matrix (`artifacts/suite-076-v5`, controls suite on
+the 128 MiB `aegis-4096`, `aegis-512`, `aes-sha256-4096` and `aes-sha256-512`
+fixtures) repeated the experiment with the v5 workload span. In every profile
+the native changed-IV positions equal the stock ones exactly (7 changed IVs, 6
+changed plaintext sectors and 1 same-plaintext reencryption at 4096-byte
+sectors; 42 / 41 / 1 at 512), both arms authenticated every primary sector and
+ended with the same primary hash, and the native hidden zeros survived. The
+byte statistics and live-I/O counts are in each run's `analysis.json` (not
+committed); the caveats below apply unchanged.
+
+## Earlier results (format v4, original AEGIS-128)
 
 Measured on the 128 MiB `aegis-4096` and `aegis-512` fixtures (pinned Debian
 6.12.113 guest, run `artifacts/suite-061` on 2026-10-22, before the AES-XTS +
@@ -83,7 +96,8 @@ claimed for them.
 | AEGIS 512 / native | 42 | 41 | 1 | 2,024 / 6 / 42 |
 
 In both profiles the native changed-IV positions equal the stock ones exactly:
-a v4 decoy write changes only the IVs of the sectors it writes. Both arms
+a v4 decoy write changes only the IVs of the sectors it writes (v5 keeps the
+same decoy-write rule). Both arms
 authenticated every sector (28,216 / 213,008), ended with the same primary hash,
 had no duplicate current IVs, and the native hidden contents (158,720 /
 1,209,856 bytes) remained zero.

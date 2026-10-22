@@ -24,8 +24,8 @@ disposable 128 or 512 MiB /dev/vdb ([rust/README.md](../rust/README.md)). It:
 2. opens the volume with cryptsetup (Linux replays the journal), suspends the
    crypt mapping, reloads its private table as `piv-crypt ... piv_control`,
    resumes, and checks the owner table against the validated LUKS cipher;
-3. begins coordinated ownership and issues NATIVE_SETUP (ABI 4) with the
-   keyslot KEK and v4 base context. The kernel waits for a seeded CRNG
+3. begins coordinated ownership and issues NATIVE_SETUP (ABI 5) with the
+   keyslot KEK, the v5 base context and (at initialization) the RS parity. The kernel waits for a seeded CRNG
    (without holding the owner lifecycle lock), then scans the 112-sector keyslot
    area (every primary sector with `--verify`, refusing on any failure);
 4. with `--initialize`, writes a new master key, keyslot 0, the directory and
@@ -61,9 +61,10 @@ The private `piv-crypt` mapping never accepts ordinary writes; before native
 ownership it serves bounded authenticated reads, and while ownership is active
 it rejects all bios. Public `piv-view` map callbacks queue bounded work to the
 ordered reclaim-capable `piv-native` workqueue; work runs under the shared lock
-in NOIO allocation scope. Hidden bios are split to 512 bytes, decoy bios at
-16 KiB power-of-two boundaries (at most 32 primary sectors per work item,
-within the 96-tuple preparation bound). Batching is within one bio: no
+in NOIO allocation scope. Hidden bios are split per 4096-byte block (the hidden
+view's logical and physical block size; the worker refuses anything else),
+decoy bios at 16 KiB power-of-two boundaries (at most 32 primary sectors per
+work item). Batching is within one bio: no
 cross-bio accumulation, writeback cache or delay.
 
 - **Decoy write**: authenticated primary-sector read-modify-write. Each written
@@ -71,9 +72,11 @@ cross-bio accumulation, writeback cache or delay.
   record sectors keep their fragment and redraw its random part; other sectors
   get uniformly random IVs. A write covering an entire sector that fails
   authentication replaces it; a partial write to such a sector fails EIO.
-- **Hidden read**: reads the 90-sector record (both slots with A/B), using raw
-  IVs of sectors whose decoy data fails authentication; the SIV tag decides.
-- **Hidden write**: authenticates all 90 carrier sectors (both slots with A/B),
+- **Hidden read**: reads the G-sector record (G = 687 + 3p; both slots with
+  A/B), using raw IVs of sectors whose decoy data fails authentication; the SIV
+  tag decides. With parity, a failing tag triggers RS decoding with the
+  failing or unreadable sectors as erasures, then a second SIV check.
+- **Hidden write**: authenticates all G carrier sectors (both slots with A/B),
   seals the block with a fresh generation and fresh fragments, prepares all
   primary tuples in RAM and applies the exact tuples through the lower journal.
   There is no durable cross-sector plan; without A/B a crash can destroy the
@@ -93,9 +96,8 @@ failure returns EIO for that block without stopping the owner. Internally,
 hidden unavailability is the positive sentinel `PN_UNAVAILABLE`; Linux
 `BLK_STS_MEDIUM` (-ENODATA) is a storage error, never mistaken for it.
 
-Damaged hidden blocks need a full 512-byte direct-I/O write for targeted repair;
-buffered sub-page writes may first read a 4096-byte page containing unavailable
-blocks.
+Damaged hidden blocks are repaired by a full 4096-byte block write (the only
+write size the hidden view accepts).
 
 ### Bounded authenticated reads
 
@@ -115,10 +117,10 @@ NATIVE_STATUS and NATIVE_KEYSLOT. There is no userspace IV, tuple or primary
 read/write access; prepare/apply exists only inside the kernel and other ioctl
 numbers return ENOTTY.
 
-- NATIVE_SETUP ABI 4 (192 bytes): version/size, generation, flags,
-  context_length, key[32] (keyslot KEK), context[128] (v4 base context),
-  reserved[2]. Flags: 1 initialize, 8 A/B (with initialize), 16 verify; other
-  bits are rejected.
+- NATIVE_SETUP ABI 5 (192 bytes): version/size, generation, flags,
+  context_length, key[32] (keyslot KEK), context[128] (v5 base context),
+  parity (0, 4, 8 or 16; non-zero only with initialize), reserved. Flags: 1
+  initialize, 8 A/B (with initialize), 16 verify; other bits are rejected.
 - NATIVE_KEYSLOT (version 1, 64 bytes): version/size, generation, slot, op
   (1 add, 2 remove), kek[32], reserved[2]. The last keyslot cannot be removed;
   failures after a lower write fail-stop the owner.
@@ -143,8 +145,9 @@ file-offset bounds ([large-volumes.md](large-volumes.md)).
 
 Source split: dm-piv.c owns the owner target and per-sector AEAD;
 piv-control.inc the privileged controls, authenticated tuple
-preparation/application and lifetime gates; piv-native.inc the hidden v4
-crypto, both views and the ordered workqueue. The independent Python codec and
+preparation/application and lifetime gates; piv-native.inc the hidden v5
+crypto, both views and the ordered workqueue; piv-rs.inc the Reed–Solomon
+encoder and errors-and-erasures decoder. The independent Python codec and
 primary verifier remain cross-checks of kernel output.
 
 ## Reproduce

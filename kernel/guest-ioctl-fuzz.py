@@ -79,13 +79,16 @@ def template(number, size, device, sectors, context):
     sector = rng.choice([0, 1, sectors - 1, sectors, sectors + 1, 2**63, 2**64 - 1,
                          rng.randrange(sectors)])
     generation = device.generation if rng.random() < 0.9 else rng.getrandbits(64)
-    version = {12: 4, 15: 1}.get(number, 2) if rng.random() < 0.9 else rng.getrandbits(32)
+    version = {12: 5, 15: 1}.get(number, 2) if rng.random() < 0.9 else rng.getrandbits(32)
     length = size if rng.random() < 0.9 else rng.choice([0, size - 1, size + 1, rng.getrandbits(32)])
     if number == 12:
         flags = rng.choice([0, 0, 0, 8, 2, 4, 16, rng.getrandbits(32)]) & ~1  # never INITIALIZE
         clen = len(context) if rng.random() < 0.8 else rng.choice([0, 127, 128, 129, rng.getrandbits(32)])
+        # SETUP ABI 5: parity (0/4/8/16, INITIALIZE only) then a reserved word.
+        parity = rng.choice([0, 0, 0, 4, 8, 16, 5, rng.getrandbits(32)])
+        reserved = 0 if rng.random() < 0.9 else rng.getrandbits(32)
         body = struct.pack('=IIQII32s128sII', version, length, generation, flags, clen,
-                           rng.randbytes(32), context.ljust(128, b'\0')[:128], 0, 0)
+                           rng.randbytes(32), context.ljust(128, b'\0')[:128], parity, reserved)
     elif number == 15:
         slot = rng.choice([1, 2, 3, 4, 5, 2**32 - 1])  # never slot 0
         op = rng.choice([1, 2, 0, 3, rng.getrandbits(32)])

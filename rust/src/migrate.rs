@@ -1,8 +1,8 @@
 //! Offline migration into a freshly formatted, initialized target volume.
 //!
 //! This one workflow provides primary rekey (a new LUKS volume key), resize
-//! and sector-size change: both views of a format v4 source on any supported profile
-//! are copied into the matching views of a new format v4 target, then
+//! and sector-size change: both views of a format v5 source on any supported profile
+//! are copied into the matching views of a new format v5 target, then
 //! re-read from both devices with O_DIRECT and compared byte for byte. The
 //! target hidden volume is destructively initialized first. Source contents
 //! are only read (activation still writes ordinary journal metadata); the
@@ -133,6 +133,14 @@ fn copy_view(source: &str, target: &str, length: u64) -> Result<()> {
     Ok(())
 }
 
+/// Target layout (A/B, RS parity) and the passphrase cost tiers of both sides.
+pub struct MigrateOptions {
+    pub ab: bool,
+    pub parity: u32,
+    pub source_kdf_cost: u8,
+    pub target_kdf_cost: u8,
+}
+
 pub struct Report {
     pub decoy_bytes: u64,
     pub decoy_target_bytes: u64,
@@ -165,16 +173,18 @@ fn copy_both(src: &Views, dst: &Views) -> Result<Report> {
 #[allow(clippy::too_many_arguments)]
 pub fn migrate(source: &Path, source_key_file: &Path, source_secret: HiddenSecret,
                target: &Path, target_key_file: &Path, target_secret: HiddenSecret,
-               ab: bool, allow: Allow) -> Result<Report> {
+               layout: &MigrateOptions, allow: Allow) -> Result<Report> {
     let canonical = |p: &Path| std::fs::canonicalize(p).map_err(Error::from);
     if canonical(source)? == canonical(target)? || path_str(source)? == path_str(target)? {
         bail!("Source and target must be different devices");
     }
     let src = open_blocks(source, source_key_file, source_secret,
-                          &OpenOptions { name: SOURCE_NAME, initialize: false, ab: false, verify: false, allow })?;
+                          &OpenOptions { name: SOURCE_NAME, initialize: false, ab: false, verify: false, parity: 0,
+                                         kdf_cost: layout.source_kdf_cost, allow })?;
     let result = (|| {
         let dst = open_blocks(target, target_key_file, target_secret,
-                              &OpenOptions { name: TARGET_NAME, initialize: true, ab, verify: false, allow })?;
+                              &OpenOptions { name: TARGET_NAME, initialize: true, ab: layout.ab, verify: false,
+                                             parity: layout.parity, kdf_cost: layout.target_kdf_cost, allow })?;
         let copied = copy_both(&src, &dst);
         let closed = close_blocks(target, target_key_file, TARGET_NAME, allow);
         match (copied, closed) {

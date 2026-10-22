@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Pinned disposable guest: configuration benchmark on a pristine stock fixture.
 
-Times stock and native activation, decoy and hidden throughput, A/B and the
-Argon2id passphrase keyslot, checking every byte read back. Destroys the fixture's decoy
+Times stock and native activation, decoy and hidden throughput (4096-byte
+hidden blocks), A/B, RS parity and the Argon2id passphrase cost tiers,
+checking every byte read back. Destroys the fixture's decoy
 contents (guest-owned copy only). Results: bench-results.json.
 """
 import hashlib
@@ -163,7 +164,7 @@ decoy_bytes, hidden_bytes = size(views['decoy']), size(views['hidden'])
 hidden_len = min(hidden_bytes, HIDDEN_LIMIT) // HIDDEN_CHUNK * HIDDEN_CHUNK or hidden_bytes
 decoy_hash = workload('single', views['decoy'], 'decoy', DECOY_BYTES, DECOY_BYTES, DECOY_CHUNK, 4096,
                       RANDOM_DECOY)
-hidden_hash = workload('single', views['hidden'], 'hidden', 0, hidden_len, HIDDEN_CHUNK, 512, RANDOM_HIDDEN)
+hidden_hash = workload('single', views['hidden'], 'hidden', 0, hidden_len, HIDDEN_CHUNK, 4096, RANDOM_HIDDEN)
 native_close('single')
 for repeat in range(3):
     views = native_open('single', 'open')
@@ -179,18 +180,33 @@ native_close('single')
 views = native_open('ab', 'initialize', initialize=True, ab=True)
 ab_bytes = size(views['hidden'])
 ab_len = min(ab_bytes, HIDDEN_LIMIT) // HIDDEN_CHUNK * HIDDEN_CHUNK or ab_bytes
-ab_hash = workload('ab', views['hidden'], 'hidden', 0, ab_len, HIDDEN_CHUNK, 512, RANDOM_HIDDEN)
+ab_hash = workload('ab', views['hidden'], 'hidden', 0, ab_len, HIDDEN_CHUNK, 4096, RANDOM_HIDDEN)
 native_close('ab')
 views = native_open('ab', 'open')
 assert hashlib.sha256(transfer(views['hidden'], 0, ab_len, HIDDEN_CHUNK)[0]).hexdigest() == ab_hash
 native_close('ab')
 
-# Argon2id passphrase KEK: initialization and open time (synthetic random passphrase).
+# Reed-Solomon parity p = 8 (G = 711 sectors per record).
+views = native_open('parity8', 'initialize', initialize=True, parity=8)
+parity_bytes = size(views['hidden'])
+parity_len = min(parity_bytes, HIDDEN_LIMIT) // HIDDEN_CHUNK * HIDDEN_CHUNK or parity_bytes
+parity_hash = workload('parity8', views['hidden'], 'hidden', 0, parity_len, HIDDEN_CHUNK, 4096, RANDOM_HIDDEN)
+native_close('parity8')
+views = native_open('parity8', 'open')
+assert hashlib.sha256(transfer(views['hidden'], 0, parity_len, HIDDEN_CHUNK)[0]).hexdigest() == parity_hash
+native_close('parity8')
+
+# Argon2id passphrase KEK cost tiers (synthetic random passphrase): initialize
+# with tier 1, add tiers 2-4 as further keyslots, then time an open per tier
+# (pivsetup's KDF plus the same keyslot-area setup as a key-file open).
 passphrase = os.urandom(16).hex().encode()
-native_open('argon2id', 'initialize', key=None, hidden_passphrase=passphrase, initialize=True)
-native_close('argon2id')
-native_open('argon2id', 'open', key=None, hidden_passphrase=passphrase)
-native_close('argon2id')
+native_open('argon2id-tier1', 'initialize', key=None, hidden_passphrase=passphrase, initialize=True, kdf_cost=1)
+for tier in (2, 3, 4):
+    blocks.keyslot('/dev/vdb', KEY, tier - 1, passphrase=passphrase, kdf_cost=tier)
+native_close('argon2id-tier1')
+for tier in (1, 2, 3, 4):
+    native_open(f'argon2id-tier{tier}', 'open', key=None, hidden_passphrase=passphrase, kdf_cost=tier)
+    native_close(f'argon2id-tier{tier}')
 
 # Stock Linux still authenticates every primary sector and sees both decoy regions.
 subprocess.run(['rmmod', 'dm_piv'], check=True)
@@ -202,6 +218,7 @@ crypt('close', 'piv-stock-bench')
 
 results.update(primary_sector=unit, raw_bytes=size('/dev/vdb'), stock_bytes=stock_bytes,
                decoy_bytes=decoy_bytes, hidden_bytes=hidden_bytes, ab_hidden_bytes=ab_bytes,
+               parity8_hidden_bytes=parity_bytes, format=5,
                cpu=next(line.split(':', 1)[1].strip() for line in Path('/proc/cpuinfo').read_text().splitlines()
                         if line.startswith('model name')),
                vcpus=os.cpu_count(), kernel=os.uname().release,

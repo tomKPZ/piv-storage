@@ -1,4 +1,4 @@
-//! Paired native views (pivstore/blocks.py): open, close and v4 keyslots.
+//! Paired native views (pivstore/blocks.py): open, close and v5 keyslots.
 
 use std::path::Path;
 
@@ -7,22 +7,29 @@ use crate::cmd::{dm, dm_ok};
 use crate::error::{Error, Result};
 use crate::ioctl::{KernelDevice, SETUP_AB, SETUP_INITIALIZE, SETUP_VERIFY};
 use crate::owner::{mapping_identity, remove_mapping, Allow, GuestOwner};
-use crate::profile::context_v4;
+use crate::profile::base_context;
 use crate::secret::Secret;
 use crate::{hooks, signals};
 
-/// Argon2id parameters (RFC 9106 second recommendation, user decision
-/// 2026-10-21): 64 MiB, 3 passes, 4 lanes. Nothing is stored in clear, so
-/// they must be identical on every open (pivstore.blocks.ARGON2ID).
-const ARGON2_M_KIB: u32 = 64 * 1024;
-const ARGON2_T: u32 = 3;
+/// Argon2id cost tiers (`--kdf-cost`, docs/format-v5.md): (memory KiB,
+/// passes), 4 lanes. Nothing is stored in clear, so the tier must be given on
+/// every open (pivstore.blocks.ARGON2ID_TIERS).
+const ARGON2_TIERS: [(u32, u32); 4] = [(64 * 1024, 3), (256 * 1024, 3), (1024 * 1024, 3), (2048 * 1024, 6)];
 const ARGON2_P: u32 = 4;
+/// Default tier: cryptsetup's LUKS2 Argon2id memory and lanes (user decision 2026-10-22).
+pub const DEFAULT_KDF_COST: u8 = 3;
+/// RS parity choices per lane (`--parity`, only with --initialize).
+pub const PARITIES: [u32; 3] = [4, 8, 16];
 
 pub struct OpenOptions<'a> {
     pub name: &'a str,
     pub initialize: bool,
     pub ab: bool,
     pub verify: bool,
+    /// Reed–Solomon parity fragments per lane (0 = off); only with initialize.
+    pub parity: u32,
+    /// Argon2id cost tier for passphrases (1-4).
+    pub kdf_cost: u8,
     pub allow: Allow,
 }
 
@@ -41,21 +48,44 @@ pub enum HiddenSecret {
 pub fn base_identity(owner: &GuestOwner) -> Vec<u8> {
     let device = owner.device();
     let primary_bytes = device.sectors * device.sector_size;
-    context_v4(&owner.uuid, primary_bytes, device.sector_size)
+    base_context(&owner.uuid, primary_bytes, device.sector_size)
 }
 
-/// KEK for a v4 keyslot from a passphrase: Argon2id with salt v4 base
-/// context || "/kek/argon2id" (the only passphrase KDF since scrypt was
-/// removed by user decision 2026-10-22).
-pub fn passphrase_kek(passphrase: &[u8], base_context: &[u8]) -> Result<Secret> {
+/// Parse `--kdf-cost` (1-4, default 3).
+pub fn kdf_cost(value: Option<&str>) -> Result<u8> {
+    match value {
+        None => Ok(DEFAULT_KDF_COST),
+        Some(text) => text.parse::<u8>().ok().filter(|t| (1..=4).contains(t))
+            .ok_or_else(|| Error::new("--kdf-cost must be 1, 2, 3 or 4")),
+    }
+}
+
+/// Parse `--parity` (4, 8 or 16; absent = 0).
+pub fn parity(value: Option<&str>) -> Result<u32> {
+    match value {
+        None => Ok(0),
+        Some(text) => text.parse::<u32>().ok().filter(|p| PARITIES.contains(p))
+            .ok_or_else(|| Error::new("--parity must be 4, 8 or 16")),
+    }
+}
+
+/// KEK for a v5 keyslot from a passphrase: Argon2id at cost @tier with salt
+/// base context || "/kek/argon2id/" || ASCII tier digit (the only passphrase
+/// KDF since scrypt was removed by user decision 2026-10-22).
+pub fn passphrase_kek(passphrase: &[u8], base_context: &[u8], tier: u8) -> Result<Secret> {
     if passphrase.is_empty() {
         bail!("Empty passphrase");
     }
+    if !(1..=4).contains(&tier) {
+        bail!("Unsupported KDF cost tier");
+    }
+    let (memory, passes) = ARGON2_TIERS[usize::from(tier - 1)];
     let mut salt = base_context.to_vec();
-    salt.extend_from_slice(b"/kek/argon2id");
+    salt.extend_from_slice(b"/kek/argon2id/");
+    salt.push(b'0' + tier);
     let mut kek = Secret::with_capacity(32);
     kek.push(&[0u8; 32])?;
-    let params = argon2::Params::new(ARGON2_M_KIB, ARGON2_T, ARGON2_P, Some(32))
+    let params = argon2::Params::new(memory, passes, ARGON2_P, Some(32))
         .map_err(|e| Error::new(e.to_string()))?;
     argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
         .hash_password_into(passphrase, &salt, &mut kek)
@@ -63,19 +93,22 @@ pub fn passphrase_kek(passphrase: &[u8], base_context: &[u8]) -> Result<Secret> 
     Ok(kek)
 }
 
-fn setup_flags(initialize: bool, ab: bool, verify: bool) -> Result<u32> {
+fn setup_flags(initialize: bool, ab: bool, verify: bool, parity: u32) -> Result<u32> {
     if ab && !initialize {
         bail!("--ab applies only with --initialize (the layout is read from the keyslot afterwards)");
+    }
+    if parity != 0 && (!initialize || !PARITIES.contains(&parity)) {
+        bail!("--parity 4, 8 or 16 applies only with --initialize (it is read from the keyslot afterwards)");
     }
     Ok((if initialize { SETUP_INITIALIZE } else { 0 }) | (if ab { SETUP_AB } else { 0 })
         | (if verify { SETUP_VERIFY } else { 0 }))
 }
 
-fn native_setup(device: &KernelDevice, key: &[u8], identity: &[u8], flags: u32) -> Result<()> {
+fn native_setup(device: &KernelDevice, key: &[u8], identity: &[u8], flags: u32, parity: u32) -> Result<()> {
     hooks::fail("before-setup")?;
     hooks::before_setup(device, identity)?;
     let started = std::time::Instant::now();
-    let result = device.setup(key, identity, flags);
+    let result = device.setup(key, identity, flags, parity);
     let interrupted = matches!(&result, Err(e) if e.errno == Some(libc::EINTR)) && signals::cancelled();
     hooks::after_setup(device, started.elapsed(), &result, interrupted);
     match result {
@@ -139,21 +172,27 @@ fn open_inner(owner: &mut GuestOwner, secret: HiddenSecret, options: &OpenOption
             return Err(Error::os(libc::EEXIST, "Public view name is already in use"));
         }
     }
-    let flags = setup_flags(options.initialize, options.ab, options.verify)?;
+    let flags = setup_flags(options.initialize, options.ab, options.verify, options.parity)?;
     let identity = base_identity(owner);
+    let passphrase = matches!(secret, HiddenSecret::Passphrase(_));
     let key = match secret {
         HiddenSecret::Key(key) => key,
-        HiddenSecret::Passphrase(passphrase) => passphrase_kek(&passphrase, &identity)?,
+        HiddenSecret::Passphrase(passphrase) => passphrase_kek(&passphrase, &identity, options.kdf_cost)?,
     };
     owner.validate()?;
     signals::check()?;
     let device = owner.device();
     device.suspend()?;
     device.begin()?;
-    if let Err(mut error) = native_setup(device, &key, &identity, flags) {
+    if let Err(mut error) = native_setup(device, &key, &identity, flags, options.parity) {
         if error.errno == Some(libc::EKEYREJECTED) {
             error.note("No keyslot authenticated: wrong hidden key or passphrase, or a carrier never \
                         initialized (use --initialize)");
+            if passphrase {
+                error.note(format!("Passphrases also need the --kdf-cost tier used when the keyslot was \
+                                    written (this attempt: {}); a wrong tier looks like a wrong passphrase",
+                                   options.kdf_cost));
+            }
         }
         return Err(error);
     }
@@ -255,21 +294,47 @@ mod tests {
 
     #[test]
     fn setup_flags_match_kernel_abi() {
-        // kernel/piv-control.h: INITIALIZE = 1, AB = 8, VERIFY = 16 (SETUP ABI 4).
-        assert_eq!(setup_flags(false, false, false).unwrap(), 0);
-        assert_eq!(setup_flags(true, false, false).unwrap(), 1);
-        assert_eq!(setup_flags(true, true, false).unwrap(), 9);
-        assert_eq!(setup_flags(false, false, true).unwrap(), 16);
-        assert!(setup_flags(false, true, false).is_err());
+        // kernel/piv-control.h: INITIALIZE = 1, AB = 8, VERIFY = 16 (SETUP ABI 5).
+        assert_eq!(setup_flags(false, false, false, 0).unwrap(), 0);
+        assert_eq!(setup_flags(true, false, false, 0).unwrap(), 1);
+        assert_eq!(setup_flags(true, true, false, 8).unwrap(), 9);
+        assert_eq!(setup_flags(false, false, true, 0).unwrap(), 16);
+        assert!(setup_flags(false, true, false, 0).is_err());
+        assert!(setup_flags(false, false, false, 4).is_err());
+        assert!(setup_flags(true, false, false, 5).is_err());
+    }
+
+    #[test]
+    fn option_parsing() {
+        assert_eq!(kdf_cost(None).unwrap(), 3);
+        assert_eq!(kdf_cost(Some("1")).unwrap(), 1);
+        assert!(kdf_cost(Some("0")).is_err() && kdf_cost(Some("5")).is_err() && kdf_cost(Some("x")).is_err());
+        assert_eq!(parity(None).unwrap(), 0);
+        assert_eq!(parity(Some("16")).unwrap(), 16);
+        assert!(parity(Some("0")).is_err() && parity(Some("2")).is_err());
     }
 
     #[test]
     fn passphrase_kek_matches_python_reference() {
         let hex = |s: &Secret| s.iter().map(|b| format!("{b:02x}")).collect::<String>();
-        // cryptography Argon2id(salt=b'ctx/kek/argon2id', length=32, iterations=3,
-        // lanes=4, memory_cost=65536).derive(b'pw')
-        let kek = passphrase_kek(b"pw", b"ctx").unwrap();
-        assert_eq!(hex(&kek), include_str!("../tests/argon2id-pw-ctx.hex").trim());
-        assert!(passphrase_kek(b"", b"ctx").is_err());
+        // pivstore.blocks.passphrase_kek(b'pw', b'ctx', tier): cryptography
+        // Argon2id(salt=b'ctx/kek/argon2id/<tier>', length=32, lanes=4, ...).
+        let kek = passphrase_kek(b"pw", b"ctx", 1).unwrap();
+        assert_eq!(hex(&kek), include_str!("../tests/argon2id-pw-ctx-tier1.hex").trim());
+        let kek = passphrase_kek(b"pw", b"ctx", 3).unwrap();
+        assert_eq!(hex(&kek), include_str!("../tests/argon2id-pw-ctx-tier3.hex").trim());
+        assert!(passphrase_kek(b"", b"ctx", 1).is_err());
+        assert!(passphrase_kek(b"pw", b"ctx", 0).is_err() && passphrase_kek(b"pw", b"ctx", 5).is_err());
+    }
+
+    /// Timing of every tier (release build): cargo test --release -- --ignored tier_timing --nocapture
+    #[test]
+    #[ignore]
+    fn tier_timing() {
+        for tier in 1..=4 {
+            let started = std::time::Instant::now();
+            passphrase_kek(b"pw", b"ctx", tier).unwrap();
+            println!("tier {tier}: {:.3} s", started.elapsed().as_secs_f64());
+        }
     }
 }

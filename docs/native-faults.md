@@ -3,8 +3,9 @@
 The design keeps no private recovery plan, WAL or history. Primary
 ciphertext/tag/IV updates go through the ordinary dm-integrity journal (the
 only supported mode; see [journal-atomicity.md](journal-atomicity.md)). An interrupted hidden write may
-leave that one 512-byte hidden block unreadable. A record's whole plaintext must
-authenticate (SIV tag over all 90 fragments) before it is returned, so old and
+leave that one 4096-byte hidden block unreadable (unless RS parity recovers it).
+A record's whole plaintext must authenticate (SIV tag over all 687 data
+fragments, after any RS correction) before it is returned, so old and
 new carrier fragments are never mixed into a valid block. Independently valid
 blocks can still represent different times; there is no cross-block
 transaction, hidden crash recovery or rollback resistance.
@@ -18,8 +19,16 @@ transaction, hidden crash recovery or rollback resistance.
   (the SIV tag rejects the wrong fragment).
 - **Decoy writes over damaged hidden blocks** re-randomize only the written
   sectors' IVs and preserve their fragments, so damage stays damage. Nothing
-  fabricates authenticated zeros. A full 512-byte hidden write repairs the block;
-  it needs authenticated plaintext of all 90 carrier sectors.
+  fabricates authenticated zeros. A full 4096-byte hidden write repairs the
+  block; it needs authenticated plaintext of all G carrier sectors.
+- **Unreadable or damaged carrier sectors with parity** (`--parity p`): up to p
+  per lane (erasures: unreadable or failing authentication) or p/2 per lane
+  (foreign fragments in authenticating sectors) are corrected on read; beyond
+  that the block returns EIO, never other data. An unreadable carrier whose
+  record still fails returns EIO and never falls back to an older A/B slot.
+  Hidden writes stay strict. The v5 suite injects dm `error` segments over
+  chosen carrier sectors and stock rewrites, and restores old raw tuples to
+  emulate an interrupted rewrite (mixed versions).
 - **Primary sectors failing authentication**: reads and partial writes return
   EIO. A decoy write covering the entire sector replaces it with a fresh IV and
   refreshed raw fragment (user decision 2026-10-21); the record's SIV tag still
@@ -46,9 +55,9 @@ recorded in commit messages.
 scripts/guest-stateless-power.sh with kernel/guest-stateless-power.py
 initializes the stock fixture, then reopens it through a dm-delay wrapper
 (1 s write delay) and writes hidden block 0. An O_DIRECT raw observer reads the
-record's 90 current tag/IV tuples and the dm-integrity journal (whole-section
+record's 687 current tag/IV tuples and the dm-integrity journal (whole-section
 commit IDs, pinned no-MAC entry layout) and cuts QEMU once some but not all of
-the 90 carrier IVs have changed (`cut-boundary.json`; a run without the cut
+the 687 carrier IVs have changed (`cut-boundary.json`; a run without the cut
 fails). The observer never writes or bypasses the native owner; journal
 inspection is test instrumentation, not a recovery implementation.
 
@@ -67,7 +76,7 @@ linear wrapper below stock dm-integrity and reload it as
 (`error_reads`, `error_writes` or one-sector `corrupt_bio_byte`) after
 activation and once udev probes drain. Targets lie in hidden record 10, away
 from sector 0, whose setup checkpoint may be served from dm-integrity's journal
-cache. Decoy requests use an aligned 16 KiB span, hidden requests one 512-byte
+cache. Decoy requests use an aligned 16 KiB span, hidden requests one 4096-byte
 block. A direct raw read witnesses each injected fault first.
 
 - **Setup**: pivsetup's `PIVSETUP_TEST_FAIL` hook fails after cryptsetup open,
@@ -117,14 +126,16 @@ scoped failure, not adversarial journal replay or physical durability.
 scripts/guest-lifecycle.sh builds a separate test-only piv-io-test.ko
 (kernel/piv-io-test.c) against the pinned guest headers and loads it beside
 dm-piv.ko. Never link it into the production module or load it on the host. Its
-root-only interface accepts two integers (public view, request mode), reads 512
-bytes at sector 0 and writes the same bytes with plain, FUA or PREFLUSH|FUA
-flags, or submits a flush. It accepts no keys, paths, offsets or payload and is
+root-only interface accepts two integers (public view, request mode), reads 4096
+bytes at sector 0 (the hidden view's logical block) and writes the same bytes
+with plain, FUA or PREFLUSH|FUA flags, or submits a flush. It accepts no keys, paths, offsets or payload and is
 unloaded before stress begins.
 
 Dynamic kprobe entry/return events around pn_worker, pn_write,
-blkdev_issue_flush and bio_endio record function metadata and results, never
-plaintext or keys. kernel/lifecycle_trace.py requires complete non-overlapping
+blkdev_issue_flush and pn_endio (the worker's public-bio completion; a
+bio_endio probe also caught about 20,000 interrupt-context lower completions
+per v5 run, a few of which nested in another probe's handler and were counted
+as misses) record function metadata and results, never plaintext or keys. kernel/lifecycle_trace.py requires complete non-overlapping
 ordered workers, successful paired lower flushes, a completed flush before write
 return and public completion, and a preflush before a PREFLUSH payload (possibly
 in a separate DM-split flush bio); a standalone flush must reach a native

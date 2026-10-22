@@ -35,7 +35,7 @@ PROFILES = {
     'aes-sha256-4096': dict(PIV_PRIMARY_CIPHER='aes-xts-random', PIV_INTEGRITY='hmac-sha256', PIV_SECTOR_SIZE='4096'),
     'aes-sha256-512': dict(PIV_PRIMARY_CIPHER='aes-xts-random', PIV_INTEGRITY='hmac-sha256', PIV_SECTOR_SIZE='512'),
 }
-SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early', 'power', 'controls', 'v4', 'migrate', 'fuzz',
+SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early', 'power', 'controls', 'v5', 'migrate', 'fuzz',
           'bench')
 # Routine tier: run after kernel or pivsetup changes. The opt-in remainder is for
 # changes in its own area: controls (descriptive write-pattern statistics),
@@ -43,7 +43,10 @@ SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early', 'power',
 # fuzz (control ioctls and table constructors; most useful on the sanitizer).
 # bench (docs/configuration.md numbers) is explicit only and should run with
 # --jobs 1; 'all' excludes it.
-DEFAULT_SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early', 'power', 'v4')
+DEFAULT_SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early', 'power', 'v5')
+# Guest RAM floors (MiB): Argon2id tier 3 (1 GiB, the default --kdf-cost) runs
+# in pivsetup and in the Python cross-check; bench also measures tier 4 (2 GiB).
+SUITE_MEMORY_MIB = {'v5': 3072, 'bench': 3584}
 SUITE_SETS = {'routine': DEFAULT_SUITES, 'all': tuple(s for s in SUITES if s != 'bench')}
 lock = threading.Lock()
 
@@ -90,15 +93,16 @@ class Matrix:
         self.results = {}
         self.slots = threading.Semaphore(args.jobs)
 
-    def vm(self, name, script, run_dir, *, data=None, shares=(), timeout=3600, extra=()):
+    def vm(self, name, script, run_dir, *, data=None, shares=(), timeout=3600, extra=(), memory_mib=None):
         command = [sys.executable, str(ROOT / 'scripts/vm.py'), 'run', '--script', str(script),
                    '--run-dir', str(run_dir), '--timeout', str(timeout), '--accel', self.args.accel, *extra]
         if self.args.base_image:
             command += ['--base-image', str(self.args.base_image)]
         elif self.args.provisioned:
             command.append('--provisioned')
-        if self.args.memory_mib:
-            command += ['--memory-mib', str(self.args.memory_mib)]
+        memory = max(self.args.memory_mib or 0, memory_mib or 0)
+        if memory:
+            command += ['--memory-mib', str(memory)]
         if data:
             command += ['--data-image', str(data)]
         for path in (*shares, self.args.pivsetup):
@@ -188,8 +192,9 @@ class Matrix:
                         [ko, ROOT / 'kernel/guest-migrate-test.py', *keys, *oracles], None),
             'fuzz': (ROOT / 'scripts/guest-fuzz.sh', final,
                      [ko, ROOT / 'kernel/guest-table-fuzz.py', ROOT / 'kernel/guest-ioctl-fuzz.py', *keys, *oracles], None),
-            'v4': (ROOT / 'scripts/guest-v4.sh', control / 'control.img',
-                   [ko, ROOT / 'kernel/guest-v4-test.py', *keys], 'v4-final.img'),
+            'v5': (ROOT / 'scripts/guest-v5.sh', control / 'control.img',
+                   [ko, ROOT / 'kernel/guest-v5-test.py', ROOT / 'kernel/piv-rs-test.c',
+                    ROOT / 'kernel/piv-rs.inc', *keys], 'v5-final.img'),
             'bench': (ROOT / 'scripts/guest-bench.sh', control / 'control.img',
                       [ko, ROOT / 'kernel/guest-bench-test.py', *keys], None),
             'controls': (ROOT / 'scripts/guest-controls.sh', control / 'control.img',
@@ -224,7 +229,8 @@ class Matrix:
                 extra += ['--power-cut-script', str(ROOT / 'scripts/guest-stateless-recover.sh')]
             if name == 'migrate':
                 extra += ['--second-blank-mib', '512']
-            if not self.vm(key, script, run_dir, data=data, shares=files, extra=extra):
+            if not self.vm(key, script, run_dir, data=data, shares=files, extra=extra,
+                           memory_mib=SUITE_MEMORY_MIB.get(name)):
                 return
             out = run_dir / 'share'
             if name == 'cancel':
@@ -236,7 +242,7 @@ class Matrix:
                                         cwd=ROOT, capture_output=True, text=True)
                 (run_dir / 'analysis.json').write_text(result.stdout)
                 self.record(key, dict(host_verified=result.returncode == 0))
-            elif name == 'v4':
+            elif name == 'v5':
                 self.host_check(key, out / output, control, out / 'expected-primary.sha256',
                                 out / 'expected-hidden-volume')
             elif output:

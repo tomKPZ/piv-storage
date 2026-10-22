@@ -18,12 +18,12 @@ mutually exclusive) and are copied before attaching.
 
 - Primary indices, record indices, capacities and byte offsets are 64-bit.
   Sector counts are checked before multiplying by the sector size.
-- Format v4 geometry: 112 keyslot sectors and two 90-sector directory groups,
-  then one 90-sector record per hidden block, so hidden capacity is
-  `(floor((sectors - 112) / 90) - 2) * 512` bytes (half with `--ab`). Primary
-  sectors after the last complete record carry no hidden data.
-- Range reads stay at most 16 KiB; write preparation at most 96 tuples per
-  batch. The small 32-bit counters describe bounded requests, not whole-volume
+- Format v5 geometry: 112 keyslot sectors and two G-sector directory groups,
+  then one G-sector record per 4096-byte hidden block (G = 687 + 3p), so hidden
+  capacity is `(floor((sectors - 112) / G) - 2) * 4096` bytes (half with
+  `--ab`). Primary sectors after the last complete record carry no hidden data.
+- Range reads stay at most 16 KiB; write preparation at most G tuples (one
+  record, at most 735) or 32 decoy sectors per request. The small 32-bit counters describe bounded requests, not whole-volume
   extents.
 - Public workers check `offset <= limit` and `bytes <= limit - offset` before
   computing request ends; mapped sector-to-byte conversion is checked first.
@@ -78,7 +78,7 @@ cryptsetup, write deterministic primary plaintext, generate a synthetic hidden
 key and run kernel/guest-large-test.py:
 
 - Full initialization with the exact expected encryption count
-  (28 + 90 + 90 per record), complete primary hash preservation, and hidden
+  (28 + G + G per record), complete primary hash preservation, and hidden
   writes at block 0, beyond 256 MiB of primary and at the last block.
 - Decoy writes/readback/restore across 256 MiB, at high unaligned offsets,
   integrity interleave and record boundaries, the last 16 KiB and sector, and

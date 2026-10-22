@@ -7,7 +7,7 @@ import zlib
 
 
 def workload(layout):
-    span = 90 * layout.sector_size  # one format v4 record
+    span = 687 * layout.sector_size  # one format v5 record (no parity)
     return [('sector', 0, layout.sector_size, False),
             ('4k', span - 4096, 4096, False),
             ('16k', 3 * span - 8192, 16384, False),

@@ -21,9 +21,9 @@ views = open_blocks('/dev/mapper/piv-test-delay', w / 'passphrase.key',
 owner = GuestOwner('/dev/mapper/piv-test-delay', w / 'passphrase.key', allow_test_stack=True)
 layout = owner.layout
 owner.close()
-# Hidden block 0's record: after 112 keyslot sectors and two 90-sector
-# directory groups (format v4).
-first, group = 112 + 2 * 90, 90
+# Hidden block 0's record: after 112 keyslot sectors and two 687-sector
+# directory groups (format v5, no parity).
+first, group = 112 + 2 * 687, 687
 start = layout.offsets(first)[1]
 base = start // 512 * 512
 skip = start - base
@@ -62,7 +62,7 @@ def committed_new_ivs():
                 if journal[at + iv_at:at + iv_at + layout.iv_bytes] != before[index]: changed.add(index)
     return changed
 old = (w / 'expected-hidden-volume').read_bytes()
-new = b'partial-record power cut'.ljust(512, b'!')
+new = b'partial-record power cut'.ljust(4096, b'!')
 (w / 'power-new-block').write_bytes(new)
 (w / 'power-old-hidden').write_bytes(old)
 (w / 'power-primary.sha256').write_text(subprocess.check_output(['sha256sum', views['decoy']], text=True).split()[0] + '\n')
@@ -70,9 +70,9 @@ os.sync()
 errors = []
 def writer():
     try:
-        value = mmap.mmap(-1, 512); value[:] = new
+        value = mmap.mmap(-1, 4096); value[:] = new
         fd = os.open(views['hidden'], os.O_RDWR | os.O_DIRECT)
-        assert os.pwritev(fd, [value], 0) == 512
+        assert os.pwritev(fd, [value], 0) == 4096
         os.fsync(fd); os.close(fd); value.close()
     except BaseException as exc: errors.append(repr(exc))
 thread = threading.Thread(target=writer); thread.start()

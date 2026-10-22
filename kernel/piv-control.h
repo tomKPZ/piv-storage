@@ -38,21 +38,23 @@ struct piv_devices {
 	__u32 owner_major, owner_minor, lower_major, lower_minor;
 };
 #define PIV_DEVICES _IOR('P', 7, struct piv_devices)
-/* Native SETUP ABI version 4 (2026-10-21): format v4 only. */
+/* Native SETUP ABI version 5 (2026-10-22): format v5 only. */
 struct piv_native_setup {
  __u32 version, size;
  __u64 generation;
- __u32 flags, context_length; /* see PIV_SETUP_*; context = v4 base context */
+ __u32 flags, context_length; /* see PIV_SETUP_*; context = v5 base context */
  __u8 key[32], context[128];   /* key: keyslot KEK */
- __u32 reserved[2];
+ __u32 parity;                 /* RS parity fragments per lane: 0, 4, 8, 16; INITIALIZE only */
+ __u32 reserved;
 };
 /* STATUS version 4 (2026-10-22): the always-zero v3 invalidations field was removed. */
 struct piv_native_status {
  __u64 generation, hidden_bytes, encryptions;
  __u32 active, views, failed, version;
 };
-/* Destructively initialize: new master key, keyslot 0 under the KEK, the
- * directory, then authenticated zeros in every hidden block. Without it, a
+/* Destructively initialize: new master key, keyslot 0 under the KEK (with
+ * the A/B flag and the parity), the directory, then authenticated zeros in
+ * every 4096-byte hidden block. Without it, a
  * keyslot must authenticate under the KEK or setup returns EKEYREJECTED.
  */
 #define PIV_SETUP_INITIALIZE 1U
@@ -66,7 +68,7 @@ struct piv_native_status {
 #define PIV_NATIVE_SETUP _IOW('P', 12, struct piv_native_setup)
 #define PIV_NATIVE_DETACH _IOW('P', 13, struct piv_read_iv)
 #define PIV_NATIVE_STATUS _IOR('P', 14, struct piv_native_status)
-/* v4 keyslot management on an active owner (version 1, 64 bytes). */
+/* v5 keyslot management on an active owner (version 1, 64 bytes). */
 struct piv_native_keyslot {
  __u32 version, size;
  __u64 generation;

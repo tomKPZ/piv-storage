@@ -22,7 +22,8 @@ static int test_bio(struct block_device *bdev, struct page *page, blk_opf_t op)
 	if (!bio)
 		return -ENOMEM;
 	bio->bi_iter.bi_sector = 0;
-	if (bio_add_page(bio, page, 512, 0) != 512) {
+	/* One 4096-byte block: the hidden view's logical block size (format v5). */
+	if (bio_add_page(bio, page, 4096, 0) != 4096) {
 		bio_put(bio);
 		return -EINVAL;
 	}

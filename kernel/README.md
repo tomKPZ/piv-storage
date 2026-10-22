@@ -1,12 +1,13 @@
 # dm-piv kernel module
 
-`dm-piv.ko` is a standalone out-of-tree module (dm-piv.c plus piv-control.inc
-and piv-native.inc; no dm-crypt fork or patch) registering `piv-crypt` and the
+`dm-piv.ko` is a standalone out-of-tree module (dm-piv.c plus piv-control.inc,
+piv-native.inc and piv-rs.inc; no dm-crypt fork or patch) registering `piv-crypt` and the
 paired `piv-view` targets. dm-piv.c implements only the per-sector AEAD path
 over stock dm-integrity, reproducing the Linux LUKS2 layout (AAD =
 LE64(512-byte sector) ‖ IV, tuple = tag ‖ IV) for the supported stock profiles:
 original AEGIS-128 (default) or AES-XTS + HMAC-SHA256 authenc, always with stored random
-16-byte IVs, 512- or 4096-byte sectors, hidden format v4. It coexists with
+16-byte IVs, 512- or 4096-byte sectors, hidden format v5 (4096-byte hidden
+blocks, optional Reed–Solomon parity in `piv-rs.inc`). It coexists with
 unmodified dm-crypt and never requires unloading it, even while an ordinary
 encrypted filesystem is busy. Interfaces and tests:
 [native-blocks.md](../docs/native-blocks.md).
@@ -36,7 +37,10 @@ encrypted filesystem is busy. Interfaces and tests:
   is no userspace IV, tuple or primary read/write control; prepare/apply exists
   only inside the kernel.
 - kernel/piv-io-test.c is a separate guest-only exact-bio-flags helper; never
-  link it into dm-piv or load it on the host.
+  link it into dm-piv or load it on the host. kernel/piv-rs-test.c is a
+  guest-only freestanding userspace harness that compiles piv-rs.inc unchanged
+  for the v5 suite's RS cross-check against pivstore/rs.py; never link it into
+  dm-piv or load it on the host.
 
 ## Staging and tests
 

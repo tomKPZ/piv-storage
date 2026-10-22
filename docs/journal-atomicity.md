@@ -1,9 +1,10 @@
 # Journal atomicity
 
-Question: can the stock dm-integrity journal make one hidden record (90 primary
-sectors) atomic across power loss? Answer: no. The journal gives per-sector
-primary atomicity only; per-block hidden atomicity comes from the optional A/B
-record slots ([format-v4.md](format-v4.md)).
+Question: can the stock dm-integrity journal make one hidden record (687 + 3p
+primary sectors) atomic across power loss? Answer: no. The journal gives
+per-sector primary atomicity only; per-block hidden atomicity comes from the
+optional A/B record slots ([format-v5.md](format-v5.md)), and optional RS
+parity may recover a record with few mixed-version sectors.
 
 ## Evidence
 
@@ -20,7 +21,7 @@ review only):
   reservations, which can land in different commits.
 - A journal section holds at most 80 entries in every supported profile (32 for
   AEGIS at 4096-byte sectors, 80 at 512; 32 and 56 for XTS + HMAC-SHA256; see
-  [observed-layout.md](observed-layout.md)), so a 90-sector record always spans
+  [observed-layout.md](observed-layout.md)), so a 687-sector record always spans
   more than one section even if it were submitted as one bio.
 - The native owner applies one tuple per lower write and flushes every 32
   tuples and at the end of the request.
@@ -28,8 +29,9 @@ review only):
 **Experiment** (guest power test, `kernel/guest-stateless-power.py` and
 `scripts/guest-stateless-recover.sh`): a hidden write (no A/B) runs over a
 dm-delay test stack and QEMU is killed mid-write; the volume is then replayed by
-stock Linux. With the journal (AEGIS 4096 and 512), 32 of the record's 90
-carrier IVs were changed in committed journal or current state, the block
+stock Linux. With the journal (format v5, all four supported profiles in the
+2026-10-22 v5 matrix), 32 of the record's 687 carrier IVs were changed in
+committed journal or current state when the VM was cut, the block
 returned EIO after replay, no primary sector was torn, other hidden blocks and
 all primary plaintext were unchanged, a decoy write did not make the damaged
 block valid, and a later full hidden write repaired it. This kills the VM, not

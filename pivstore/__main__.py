@@ -29,7 +29,7 @@ def main():
     args = parser.parse_args()
     try:
         if args.action == 'unpack':
-            from .records_v4 import unpack
+            from .records import unpack
             with args.hidden_key_file.open('rb') as stream:
                 hidden_key = stream.read(33)
             result = unpack(args.image, args.output, hidden_key)

@@ -15,20 +15,20 @@ v = open_blocks('/dev/vdb', w / 'passphrase.key', (w / 'hidden.key').read_bytes(
 old = (w / 'power-old-hidden').read_bytes()
 new = (w / 'power-new-block').read_bytes()
 fd = os.open(v['hidden'], os.O_RDWR | os.O_DIRECT)
-buf = mmap.mmap(-1, 512)
+buf = mmap.mmap(-1, 4096)       # format v5: 4096-byte hidden blocks
 try:
     os.preadv(fd, [buf], 0)
 except OSError as exc:
     assert exc.errno == errno.EIO
     outcome = 'EIO'
 else:
-    assert buf[:] in (old[:512], new)
-    outcome = 'complete-old' if buf[:] == old[:512] else 'complete-new'
+    assert buf[:] in (old[:4096], new)
+    outcome = 'complete-old' if buf[:] == old[:4096] else 'complete-new'
 # Direct reads of all other blocks must still work after local EIO. The full
 # decoy hash below reads every primary sector: the journal leaves none torn.
-for i in range(1, len(old) // 512):
-    assert os.preadv(fd, [buf], i * 512) == 512
-    assert buf[:] == old[i * 512:(i + 1) * 512]
+for i in range(1, len(old) // 4096):
+    assert os.preadv(fd, [buf], i * 4096) == 4096
+    assert buf[:] == old[i * 4096:(i + 1) * 4096]
 assert subprocess.check_output(['sha256sum', v['decoy']], text=True).split()[0] == (w / 'power-primary.sha256').read_text().strip()
 # Decoy can still write; unavailable records stay unavailable rather than zeros.
 decoy = os.open(v['decoy'], os.O_RDWR | os.O_DIRECT)
@@ -39,7 +39,7 @@ if outcome == 'EIO':
     try: os.preadv(fd, [buf], 0)
     except OSError as exc: assert exc.errno == errno.EIO
     else: raise AssertionError('Decoy write silently repaired damaged hidden block')
-buf[:] = old[:512]
+buf[:] = old[:4096]
 os.pwritev(fd, [buf], 0); os.fsync(fd); os.close(fd); buf.close()
 assert Path(v['hidden']).read_bytes() == old
 close_blocks('/dev/vdb', w / 'passphrase.key')

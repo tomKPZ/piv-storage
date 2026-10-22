@@ -19,8 +19,8 @@ v = open_blocks('/dev/vdb', KEY, (W / 'hidden.key').read_bytes())
 subprocess.run(['udevadm', 'settle'], check=True)
 owner = GuestOwner('/dev/vdb', KEY)
 unit = owner.device.sector_size
-# Format v4: a decoy write re-encrypts exactly the sectors it touches.
-group = 90  # record size in primary sectors (records start after 112 + 180)
+# Format v5: a decoy write re-encrypts exactly the sectors it touches.
+group = 687  # record size in primary sectors without parity (records start after 112 + 2 * 687)
 size = owner.device.sectors * unit
 groups_end = (112 + (owner.device.sectors - 112) // group * group) * unit
 # Current target contract; historical pre-batching runs retain frozen harnesses.
@@ -88,5 +88,5 @@ assert subprocess.check_output(['sha256sum', '/dev/mapper/piv-stock'], text=True
 subprocess.run(['cryptsetup', 'close', 'piv-stock'], check=True)
 subprocess.run(['dd', 'if=/dev/vdb', 'of=' + str(W / 'batch-final.img'), 'bs=1M', 'status=none'], check=True)
 (W / 'batch-results.json').write_text(json.dumps(dict(batched=batched, primary_sector=unit,
-    format=4, group=group, cases=results), indent=2) + '\n')
+    format=5, group=group, cases=results), indent=2) + '\n')
 (W / 'result.txt').write_text('Batch counts, direct read/write/restore, full oracles, reopen and stock verification passed\n')

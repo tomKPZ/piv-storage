@@ -399,7 +399,7 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	if (cmd == PIV_NATIVE_SETUP) {
 		setup = memdup_user((void __user *)arg, sizeof(*setup));
 		if (IS_ERR(setup)) return PTR_ERR(setup);
-		if (setup->version != 4 || setup->size != sizeof(*setup)) {
+		if (setup->version != 5 || setup->size != sizeof(*setup)) {
 			ret = -EINVAL; goto out;
 		}
 		/* Early boot: wait for seeded CRNG without holding owner lifecycle lock. */
@@ -550,7 +550,7 @@ static int piv_register(struct piv_crypt *cc, struct dm_target *ti)
 	struct piv_control *p;
 	int ret;
 
-	/* Pin the tested stock profiles (16-byte random IVs for format v4: AEGIS-128
+	/* Pin the tested stock profiles (16-byte random IVs for format v5: AEGIS-128
 	 * or XTS + HMAC authenc); this is not a general API. The constructor already
 	 * parsed the profile; re-check the invariants this code relies on.
 	 */

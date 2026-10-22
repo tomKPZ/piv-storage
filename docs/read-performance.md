@@ -12,8 +12,8 @@ partial authentication failure. Setup's keyslot/directory scan (and the
 `--verify` full audit), decoy reads and hidden carrier collection use it;
 prepared-tuple application keeps the scalar path. There is no persistent cache,
 lazy verification or cross-bio accumulation: DM still splits decoy bios at
-16 KiB and hidden bios at 512 bytes, and one hidden 512-byte read authenticates
-its whole 90-sector carrier.
+16 KiB and hidden bios per 4096-byte block, and one hidden block read
+authenticates its whole 687-sector carrier (G = 687 + 3p with parity).
 
 One range call submits one read to dm-integrity; the lower target may split it
 or serve it from its journal/cache, so call counts are not physical-media read
@@ -50,11 +50,11 @@ settles, and assertions use exact per-operation deltas. With
 
 | Operation | range reads | primary authentications | other |
 | --- | ---: | ---: | --- |
-| SETUP (keyslot area, directory, checkpoint) | ⌈112/r⌉ + 2·⌈90/r⌉ | 112 + 180 + 1 | 1 checkpoint (one scalar load), 0 writes |
+| SETUP (keyslot area, directory, checkpoint) | ⌈112/r⌉ + 2·⌈687/r⌉ | 112 + 1374 + 1 | 1 checkpoint (one scalar load), 0 writes |
 | 512-byte decoy read | 1 | 1 | |
 | 16 KiB decoy read | 1 | r | |
-| 512-byte hidden read | ⌈90/r⌉ | 90 | |
-| 4 KiB hidden read | 8·⌈90/r⌉ | 720 | |
+| 4 KiB hidden read | ⌈687/r⌉ | 687 | |
+| 16 KiB hidden read | 4·⌈687/r⌉ | 2748 | |
 
 Probe counts establish calls, not time spent. No probe is enabled during
 timings.
@@ -71,7 +71,8 @@ page cache, and the stock pass plus repeated opens warm lower, host and device
 caches. Medians of three samples are not confidence intervals. There is no
 claim about cold start, physical media, production throughput or a controlled
 cipher comparison (profiles differ in cipher, tag size and geometry). Hidden
-reads cost 90 primary authentications per 512 bytes regardless of request size.
+reads cost 687 primary authentications per 4096-byte block regardless of
+request size (no parity; RS decoding runs only after a failed tag).
 Current results live in each run's `profile-results.json`; the sequential
 `bench` suite's user-facing write/read/activation numbers are in
 [configuration.md](configuration.md).

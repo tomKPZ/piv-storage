@@ -4,8 +4,9 @@ Research prototype exposing two writable Linux device-mapper devices: a decoy
 volume and an independently encrypted hidden volume carried in the decoy's
 persistent random IVs. The primary volume is an ordinary stock LUKS2 volume over
 dm-integrity that stores a fresh random 16-byte IV per sector; the hidden volume
-uses [format v4](docs/format-v4.md). Both devices expose plaintext 512-byte
-logical-block I/O and can hold their own filesystem. Setup exits; the kernel
+uses [format v5](docs/format-v5.md). The decoy device exposes 512-byte and the
+hidden device 4096-byte logical blocks of plaintext; each can hold its own
+filesystem. Setup exits; the kernel
 owns all subsequent I/O.
 
 This is not a proven indistinguishability construction or reliable production
@@ -81,16 +82,23 @@ pivsetup close-blocks --device /dev/vdb --key-file /mnt/piv-work/passphrase.key
   be initialized before hidden use (stock cryptsetup still opens the decoy).
 - `--ab` (with `--initialize`): two record slots per block, so an interrupted
   hidden write leaves the previous version readable, at half capacity.
+- `--parity 4|8|16` (with `--initialize`; off by default): Reed–Solomon parity
+  fragments per record lane, so a hidden block survives up to that many
+  unreadable or damaged carrier sectors per lane, for 1.7–7% of the capacity.
 - `--hidden-passphrase-file F` instead of `--hidden-key-file`; the passphrase
-  KEK is always Argon2id (64 MiB, t=3, p=4).
+  KEK is Argon2id at cost tier `--kdf-cost 1-4` (64 MiB, 256 MiB, 1 GiB
+  (default 3) or 2 GiB; 4 lanes). The tier is recorded nowhere: give the same
+  tier on every open (a wrong tier looks like a wrong passphrase). Tier 3
+  needs about 1 GiB of free RAM.
 - `--verify`: authenticate every primary sector first and refuse the volume on
   any failure (an O(volume) audit). By default setup scans only the 112-sector
   keyslot area, in constant time.
 - `--name` (default `piv-native`), `--device` (default `/dev/vdb`).
 
-Other commands: `pivsetup keyslot add|remove --slot 0-3` manages up to four
-keyslots on active views without rewriting hidden data (the last keyslot cannot
-be removed). `pivsetup migrate` copies both views into a freshly luksFormatted
+A/B and parity are recorded in the encrypted keyslot; later opens read them
+from there. Other commands: `pivsetup keyslot add|remove --slot 0-3` manages up
+to four keyslots on active views without rewriting hidden data (the last
+keyslot cannot be removed; `--kdf-cost` applies to a new passphrase). `pivsetup migrate` copies both views into a freshly luksFormatted
 volume, initializes it and compares both copies; it is the offline path for
 primary rekey, resize or sector-size change, since live resize/rekey is
 unsupported (stock cryptsetup refuses reencrypt and resize on integrity
@@ -99,31 +107,36 @@ volumes). See [rust/README.md](rust/README.md).
 Capacity on the 128 MiB fixtures (AEGIS-128; XTS + HMAC-SHA256 tuples are
 larger, so slightly fewer sectors):
 
-| Sector bytes | Decoy bytes | Hidden bytes | Hidden bytes with `--ab` |
-| ---: | ---: | ---: | ---: |
-| 4096 | 115,572,736 | 158,720 | 79,360 |
-| 512 | 109,060,096 | 1,209,856 | 604,672 |
+| Sector bytes | Decoy bytes | Hidden bytes | with `--ab` | with `--parity 8` |
+| ---: | ---: | ---: | ---: | ---: |
+| 4096 | 115,572,736 | 155,648 | 77,824 | 151,552 |
+| 512 | 109,060,096 | 1,257,472 | 626,688 | 1,216,512 |
 
-The hidden payload fraction is 512/(90·S) of primary capacity for sector size
-S: 0.139% at 4096 bytes, 1.11% at 512 (half with `--ab`). Setup never creates
+The hidden payload fraction is about 4096/(687·S) of primary capacity for
+sector size S: 0.146% at 4096 bytes, 1.16% at 512 (half with `--ab`, 3p/687
+less with parity), minus a fixed 112 + 2G sectors for keyslots and the
+directory. The 38 hidden blocks of a 128 MiB 4096-byte-sector volume are too
+few for mke2fs (about 55 blocks of 4 KiB minimum). Setup never creates
 filesystems. Unmount both filesystems before `close-blocks`. Larger geometry
 uses checked kernel bounds ([large-volumes.md](docs/large-volumes.md)), but the
 fixture guard admits only 128 and 512 MiB disks.
 
-## Format v4 in brief
+## Format v5 in brief
 
 The first 112 primary sectors hold four encrypted keyslots (two replicas each,
-no public magic), then two directory records (A/B), then one record per hidden
-512-byte block: block i at sector 112 + 90·(2 + i) (two slots per block with
-`--ab`). Each stored IV is LRW-AES(10 fresh random bytes ‖ 6 payload bytes)
-tweaked by sector; 90 fragments form one SIV record (HMAC-SHA256 tag,
-ChaCha20) authenticating context, address, generation and data. Keys derive via
-HKDF-SHA256 from the master key with public context. Tail sectors beyond the
-last whole record carry nothing. Details: [format-v4.md](docs/format-v4.md).
+no public magic; they carry the master key, the A/B flag and the parity), then
+two directory records (A/B), then one record per hidden 4096-byte block: block
+i at sector 112 + G·(2 + i) with G = 687 + 3p (two slots per block with `--ab`).
+Each stored IV is LRW-AES(10 fresh random bytes ‖ 6 payload bytes) tweaked by
+sector; 687 fragments form one SIV record (HMAC-SHA256 tag, ChaCha20)
+authenticating context, layout, address, generation and data, followed by 3p
+Reed–Solomon parity fragments when enabled. Keys derive via HKDF-SHA256 from
+the master key with public context. Tail sectors beyond the last whole record
+carry nothing. Details: [format-v5.md](docs/format-v5.md).
 
 A decoy write re-randomizes only the IVs of the sectors it writes (one primary
 encryption per written sector, as stock dm-crypt), keeping their fragments. A
-hidden write re-encodes its whole 90-sector record with a fresh generation.
+hidden write re-encodes its whole G-sector record with a fresh generation.
 
 ## Authentication, failures and crashes
 
@@ -138,19 +151,21 @@ hidden write re-encodes its whole 90-sector record with a fresh generation.
 - Hidden reads, keyslots and the directory use raw stored IVs of sectors whose
   decoy data fails authentication; only the record's SIV tag decides validity,
   so damage confined to decoy data does not make a hidden block unavailable
-  (IV damage does). Hidden writes stay strict: all 90 carrier sectors must
-  authenticate first.
+  (IV damage does, unless parity corrects it). Hidden writes stay strict: all
+  G carrier sectors must authenticate first.
 - A damaged hidden record returns EIO for that block only; decoy writes preserve
   its damaged fragments, so corruption never becomes valid zeros. Repair a block
-  with a complete 512-byte direct-I/O write (buffered sub-page writes may first
-  read unavailable neighbours).
+  with a complete 4096-byte write. With `--parity`, a record decodes despite up
+  to p unreadable or authentication-failing carrier sectors per lane (or p/2
+  sectors with foreign fragments); RS output is accepted only through the SIV
+  tag.
 - Errors before the first applied tuple (lower reads, authentication,
   allocation, preparation) fail only that bio. A failed flush or any failure
   after a write begins applying tuples stops the shared owner (fail-stop);
   remove and recreate the stack after fixing the fault
   ([native-faults.md](docs/native-faults.md)).
 - The stock journal makes individual primary sector updates atomic, **not** a
-  90-sector hidden record. Without `--ab`, power loss can leave a hidden block
+  G-sector hidden record. Without `--ab`, power loss can leave a hidden block
   unreadable; with `--ab` the previous version stays readable. No cross-block
   ordering, rollback protection or hidden filesystem recovery is promised.
   Whole-record rollback is accepted.
@@ -175,23 +190,25 @@ reject duplicates only within one update and its replaced IVs; there is **no
 historical collision detection**. The 2^32 per-owner encryption cap resets on
 reopen and does not enforce the per-key lifetime budget, to which all writes,
 retries, failed preparations and clones count. VM snapshot restores, image
-clones and cloned RNG state invalidate these estimates. A 512-byte hidden write
-reencrypts 90 primary sectors (360 KiB at 4096-byte sectors, 45 KiB at 512)
-plus journal overhead; decoy writes have no hidden amplification.
+clones and cloned RNG state invalidate these estimates. A 4096-byte hidden
+write reencrypts G = 687 + 3p primary sectors (2.7 MiB at 4096-byte sectors,
+344 KiB at 512, without parity) plus journal overhead; decoy writes have no
+hidden amplification.
 
 Each stored IV is expected to look uniformly random without the hidden key under
-the assumptions in [format-v4.md](docs/format-v4.md); layout compatibility and
+the assumptions in [format-v5.md](docs/format-v5.md); layout compatibility and
 statistical tests are not a deniability proof.
 [Matched ordinary-Linux controls](docs/detectability.md) show a decoy write
 changes exactly the IVs an ordinary write changes. Explicit limitations: a
 single raw image can contain journal history; a decoy-key holder can decrypt
-retained journal entries and may see a hidden write's 90 sectors reencrypted
+retained journal entries and may see a hidden write's G sectors reencrypted
 with unchanged plaintext
 ([security review](docs/security-review.md#journal-history-and-the-decoy-key-holder));
 multiple snapshots, hidden-write amplification, memory, installed software, keys
 and host artifacts; no protection against root, a compromised kernel, memory or
 crash dumps, swap or malicious firmware. Keyslots allow offline guessing, so
-prefer high-entropy key files; passphrases are only as strong as the KDF cost.
+prefer high-entropy key files; passphrases are only as strong as the KDF cost
+tier.
 Multi-snapshot observers, rollback resistance and coercion-resistant alternative
 openings are out of scope.
 

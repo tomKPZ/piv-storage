@@ -82,7 +82,7 @@ struct piv_io {
 /*
  * The two supported stock LUKS2 profiles (aegis128-random + aead, aes-xts-random
  * + hmac-sha256) whose random 16-byte IVs live in dm-integrity metadata, as
- * format v4 requires.
+ * format v5 requires.
  * enc_a/enc_b: accepted encryption key sizes in bytes; mac: HMAC key size (the
  * dm-crypt default, the digest size); tag: integrity tag bytes.
  */
@@ -519,6 +519,7 @@ static int __init piv_module_init(void)
 {
 	int r = -ENOMEM;
 
+	pn_gf_init();
 	pn_wq = alloc_ordered_workqueue("piv-native", WQ_MEM_RECLAIM);
 	piv_io_wq = alloc_workqueue("kpiv_io", WQ_MEM_RECLAIM | WQ_UNBOUND, 0);
 	if (!pn_wq || !piv_io_wq)

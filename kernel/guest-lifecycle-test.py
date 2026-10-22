@@ -27,7 +27,7 @@ EXPECTED = (W / 'expected-hidden-volume').read_bytes()
 PRIMARY = (W / 'expected-primary.sha256').read_text().strip()
 results = {}
 
-def direct(path, offset, count=512, write=None, sync=False):
+def direct(path, offset, count=4096, write=None, sync=False):   # 4096: hidden logical block
     buf = mmap.mmap(-1, count)
     fd = os.open(path, os.O_RDWR | os.O_DIRECT | (os.O_DSYNC if sync else 0))
     try:
@@ -65,7 +65,7 @@ def probe_command(value):
 
 v = open_views()
 owner = GuestOwner('/dev/vdb', KEY)
-unit, group = owner.device.sector_size, 90  # format v4 record size in primary sectors
+unit, group = owner.device.sector_size, 687  # format v5 record size in primary sectors (no parity)
 generation = owner.device.generation
 owner.close()
 
@@ -73,7 +73,11 @@ owner.close()
 probes = [('worker', 'pn_worker', False), ('worker_done', 'pn_worker', True),
           ('write', 'pn_write', False), ('write_done', 'pn_write', True),
           ('flush', 'blkdev_issue_flush', False), ('flush_done', 'blkdev_issue_flush', True),
-          ('endio', 'bio_endio', False)]
+          ('endio', 'pn_endio', False)]
+# Completions are traced at pn_endio (the worker's upper-bio completion,
+# process context). A bio_endio probe also fired for about 20,000
+# interrupt-context lower completions per v5 run, which occasionally nested in
+# another (ftrace-based) probe handler and were counted as missed.
 trace_control('current_tracer', 'nop')
 trace_control('tracing_on', 0)
 trace_control('trace_clock', 'global')
@@ -136,8 +140,8 @@ progress = 0
 def writer(role, index):
     global progress
     path = v[role]
-    offset = (index * 2 * group * unit if role == 'decoy' else index * 2 * 512)
-    count = 16384 if role == 'decoy' else 512
+    offset = (index * 2 * group * unit if role == 'decoy' else index * 2 * 4096)
+    count = 16384 if role == 'decoy' else 4096
     old = direct(path, offset, count)
     barrier.wait(timeout=30)
     for turn in range(8):
@@ -191,7 +195,7 @@ for role in ('decoy', 'hidden'):
     peer = 'hidden' if role == 'decoy' else 'decoy'
     peer_before = direct(v[peer], 0)
     queued_fd = os.open(v[role], os.O_RDWR | os.O_DIRECT)
-    queued_data = mmap.mmap(-1, 512)
+    queued_data = mmap.mmap(-1, 4096)
     queued_data[:] = old
     dm('suspend', '--noflush', name)
     with ThreadPoolExecutor(max_workers=1) as pool:
@@ -200,7 +204,7 @@ for role in ('decoy', 'hidden'):
         def queued():
             task['tid'] = threading.get_native_id()
             entered.set()
-            assert os.pwritev(queued_fd, [queued_data], 0) == 512
+            assert os.pwritev(queued_fd, [queued_data], 0) == 4096
             os.fsync(queued_fd)
         future = pool.submit(queued)
         assert entered.wait(timeout=10)

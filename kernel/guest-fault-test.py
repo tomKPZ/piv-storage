@@ -22,17 +22,20 @@ PRIMARY = (W / 'expected-primary.sha256').read_text().strip()
 NAMES = ('piv-native-hidden', 'piv-native-decoy', 'piv-native', 'piv-native_dif')
 results = []
 
-# Format v4 geometry (docs/format-v4.md): 112 keyslot sectors, two directory
-# groups, then 90-sector records (every supported profile has 16-byte IVs).
+# Format v5 geometry (docs/format-v5.md): 112 keyslot sectors, two directory
+# groups, then 687-sector records for 4096-byte hidden blocks (the native
+# fixture has no parity; every supported profile has 16-byte IVs).
+GROUP, BLOCK = 687, 4096
+
 def record_span(device, block):
     """First and last primary sector carrying hidden block @block."""
-    first = 112 + 90 * (2 + block)
-    return first, first + 89
+    first = 112 + GROUP * (2 + block)
+    return first, first + GROUP - 1
 
 def blocks_touched(device, first, last):
     """Hidden blocks with a fragment in primary sectors first..last."""
-    low, high = (first - 112) // 90 - 2, (last - 112) // 90 - 2
-    return range(max(0, low), high + 1) if last >= 112 + 180 else range(0)
+    low, high = (first - 112) // GROUP - 2, (last - 112) // GROUP - 2
+    return range(max(0, low), high + 1) if last >= 112 + 2 * GROUP else range(0)
 
 def unreadable(path, unit, sectors, chunk=65536):
     """Primary sectors whose decoy reads fail (O_DIRECT, per-sector on error)."""
@@ -114,7 +117,7 @@ def corrupt_read(sector512, value, nth=1):
     dm('reload', 'piv-test-fault', input=lines)
     dm('resume', 'piv-test-fault')
 
-def direct(path, *, write=None, offset=0, size=512):
+def direct(path, *, write=None, offset=0, size=BLOCK):
     if write is not None: size = len(write)
     value = mmap.mmap(-1, size)
     fd = os.open(path, os.O_RDWR | os.O_DIRECT)
@@ -132,14 +135,14 @@ def direct(path, *, write=None, offset=0, size=512):
 def verify(views, unavailable=()):
     assert subprocess.check_output(['sha256sum', views['decoy']], text=True).split()[0] == PRIMARY
     repaired = False
-    for index in range(len(EXPECTED) // 512):
-        expected = EXPECTED[index * 512:(index + 1) * 512]
+    for index in range(len(EXPECTED) // BLOCK):
+        expected = EXPECTED[index * BLOCK:(index + 1) * BLOCK]
         try:
-            actual = direct(views['hidden'], offset=index * 512)
+            actual = direct(views['hidden'], offset=index * BLOCK)
         except OSError as exc:
             assert index in unavailable and exc.errno == errno.EIO
-            direct(views['hidden'], write=expected, offset=index * 512)
-            actual = direct(views['hidden'], offset=index * 512)
+            direct(views['hidden'], write=expected, offset=index * BLOCK)
+            actual = direct(views['hidden'], offset=index * BLOCK)
             repaired = True
         assert actual == expected, index
     return repaired
@@ -215,9 +218,9 @@ for role in ('decoy', 'hidden'):
         # Sector0 may be served from dm-integrity's cached setup checkpoint.
         # Choose record10, which setup did not write, and witness the raw fault.
         unit = handle.device.sector_size
-        size = 512 if role == 'hidden' else 16384
+        size = BLOCK if role == 'hidden' else 16384
         start = record_span(handle.device, 10)[0] * unit
-        offset = 10 * 512 if role == 'hidden' else ((start + size - 1) // size) * size
+        offset = 10 * BLOCK if role == 'hidden' else ((start + size - 1) // size) * size
         affected = (range(10, 11) if role == 'hidden' else
                     blocks_touched(handle.device, offset // unit, (offset + size - 1) // unit))
         old = direct(v[role], offset=offset, size=size)
@@ -238,7 +241,7 @@ for role in ('decoy', 'hidden'):
             # Removing the fault does not clear the shared owner's fail-stop.
             for other in ('decoy', 'hidden'):
                 assert rejected(lambda: direct(v[other])).errno == errno.EIO
-                assert rejected(lambda: direct(v[other], write=old[:512])).errno == errno.EIO
+                assert rejected(lambda: direct(v[other], write=old[:BLOCK])).errno == errno.EIO
             handle.close()
             close_views(); absent()
             v = open_views()
@@ -282,9 +285,9 @@ for role in ('decoy', 'hidden'):
     generation = handle.device.generation
     unit = handle.device.sector_size
     layout = handle.layout
-    size = 16384 if role == 'decoy' else 512
+    size = 16384 if role == 'decoy' else BLOCK
     first10, last10 = record_span(handle.device, 10)
-    offset = ((first10 * unit + size - 1) // size) * size if role == 'decoy' else 10 * 512
+    offset = ((first10 * unit + size - 1) // size) * size if role == 'decoy' else 10 * BLOCK
     last = ((offset + size - 1) // unit if role == 'decoy' else last10)
     physical = handle.layout.offsets(last)[0]
     plaintext = direct(v[role], offset=offset, size=size)  # authenticated, before the fault
@@ -318,7 +321,8 @@ for role in ('decoy', 'hidden'):
         # authenticated old data and must fail before encrypting or changing
         # anything.
         partial = (offset if role == 'hidden' else last * unit)
-        assert rejected(lambda: direct(v[role], write=b'\x5a' * 512, offset=partial, size=512)).errno == errno.EIO
+        length = BLOCK if role == 'hidden' else 512
+        assert rejected(lambda: direct(v[role], write=b'\x5a' * length, offset=partial)).errno == errno.EIO
         status = blocks.native_status(handle.device)
         assert not status['failed'] and status['encryptions'] == before_count
     if role == 'decoy':
@@ -330,7 +334,7 @@ for role in ('decoy', 'hidden'):
         status = blocks.native_status(handle.device)
         assert not status['failed'] and status['encryptions'] == before_count + size // unit, status
     # Unrelated requests on both views continue during the fault.
-    assert direct(v['hidden'], offset=0) == EXPECTED[:512]
+    assert direct(v['hidden'], offset=0) == EXPECTED[:BLOCK]
     direct(v['decoy'], offset=0)
     fault()
     assert handle.device.generation == generation
@@ -353,8 +357,8 @@ try:
     # Data-area damage: the decoy sector fails, its hidden block still reads.
     assert rejected(lambda: direct(v['decoy'], offset=last10 * unit,
                                    size=unit)).errno == errno.EIO
-    assert direct(v['hidden'], offset=10 * 512) == EXPECTED[10 * 512:11 * 512]
-    assert direct(v['hidden'], offset=0) == EXPECTED[:512]
+    assert direct(v['hidden'], offset=10 * BLOCK) == EXPECTED[10 * BLOCK:11 * BLOCK]
+    assert direct(v['hidden'], offset=0) == EXPECTED[:BLOCK]
     handle = owner(); assert not blocks.native_status(handle.device)['failed']; handle.close()
     close_views(); absent()
 finally:
@@ -374,9 +378,9 @@ iv_byte = direct('/dev/vdb', offset=tag_physical, size=512)[layout.tag_bytes] ^ 
 corrupt_read(tag_physical // 512, iv_byte, nth=layout.tag_bytes + 1)
 try:
     v = open_views()
-    assert rejected(lambda: direct(v['hidden'], offset=10 * 512)).errno == errno.EIO
+    assert rejected(lambda: direct(v['hidden'], offset=10 * BLOCK)).errno == errno.EIO
     assert rejected(lambda: direct(v['decoy'], offset=iv_sector * unit, size=unit)).errno == errno.EIO
-    assert direct(v['hidden'], offset=11 * 512) == EXPECTED[11 * 512:12 * 512]
+    assert direct(v['hidden'], offset=11 * BLOCK) == EXPECTED[11 * BLOCK:12 * BLOCK]
     handle = owner(); assert not blocks.native_status(handle.device)['failed']; handle.close()
     close_views(); absent()
 finally:
@@ -393,7 +397,7 @@ try:
     rejected(lambda: open_views(verify=True))
     absent()
     v = open_views()
-    assert direct(v['hidden'], offset=0) == EXPECTED[:512]
+    assert direct(v['hidden'], offset=0) == EXPECTED[:BLOCK]
     close_views(); absent()
 finally:
     fault()
@@ -404,7 +408,7 @@ damaged = record_span(None, 0)[0]  # sector 0 is a keyslot replica
 stock_rewrite(SOURCE, KEY, damaged, unit)
 v = open_views()
 assert rejected(lambda: direct(v['hidden'])).errno == errno.EIO
-assert direct(v['hidden'], offset=512) == EXPECTED[512:1024]
+assert direct(v['hidden'], offset=BLOCK) == EXPECTED[BLOCK:2 * BLOCK]
 handle = owner(); assert not blocks.native_status(handle.device)['failed']; handle.close()
 # Rewrite the decoy bytes carrying that sector: re-randomizes only that sector,
 # preserving the damage.
@@ -412,7 +416,7 @@ decoy_offset = damaged * unit // 4096 * 4096
 direct(v['decoy'], write=direct(v['decoy'], offset=decoy_offset), offset=decoy_offset)
 assert rejected(lambda: direct(v['hidden'])).errno == errno.EIO
 handle = owner(); assert not blocks.native_status(handle.device)['failed']; handle.close()
-direct(v['hidden'], write=EXPECTED[:512]); assert verify(v) is False
+direct(v['hidden'], write=EXPECTED[:BLOCK]); assert verify(v) is False
 close_views(); absent()
 results.append('local hidden EIO, preserved damage and direct repair remain isolated')
 

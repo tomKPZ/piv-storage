@@ -19,10 +19,10 @@ DECOY = '/dev/mapper/piv-native-decoy'
 HIDDEN = '/dev/mapper/piv-native-hidden'
 
 NAMES = ('piv-native-hidden', 'piv-native-decoy', 'piv-native', 'piv-native_dif')
-# Format v4 layout (docs/format-v4.md): 112 keyslot sectors, 90-sector records,
-# two directory groups; hidden block 0 starts at primary sector 112 + 2 * 90.
-V4_KEYSLOT_AREA, V4_GROUP = 112, 90
-V4_BLOCK0 = V4_KEYSLOT_AREA + 2 * V4_GROUP
+# Format v5 layout (docs/format-v5.md): 112 keyslot sectors, 687-sector records
+# (no parity), two directory groups; hidden block 0 starts at sector 112 + 2 * 687.
+KEYSLOT_AREA, GROUP, BLOCK = 112, 687, 4096
+BLOCK0 = KEYSLOT_AREA + 2 * GROUP
 
 def absent():
     for name in NAMES:
@@ -46,7 +46,7 @@ def setup(initialize=False, rejected=False):
     segment = json.loads(crypt('luksDump', '--dump-json-metadata', '/dev/vdb').stdout)['segments']['0']
     assert segment['encryption'] in ('aegis128-random', 'aes-xts-random'), segment
     sectors = primary_bytes // segment['sector_size']
-    expected = ((sectors - V4_KEYSLOT_AREA) // V4_GROUP - 2) * 512
+    expected = ((sectors - KEYSLOT_AREA) // GROUP - 2) * BLOCK
     assert value['hidden_bytes'] == expected, (value, expected)
     assert value['decoy'] == DECOY and value['hidden'] == HIDDEN
     return value
@@ -79,6 +79,10 @@ for number, size, direction in ((1, 48, 3), (2, 48, 3), (3, 4176, 3), (4, 4176, 
     else:
         raise AssertionError(f'Removed control {number} still accepted')
 owner.close()
+# The hidden view exposes 4096-byte logical and physical blocks.
+for query in ('--getss', '--getpbsz'):
+    assert int(subprocess.check_output(['blockdev', query, HIDDEN])) == BLOCK, query
+assert int(subprocess.check_output(['blockdev', '--getss', DECOY])) == 512
 # Native hidden decryption returns a fixed zero-filled raw block volume.
 assert Path(HIDDEN).read_bytes() == bytes(capacity)
 fd = os.open(HIDDEN, os.O_RDWR)
@@ -97,7 +101,7 @@ assert Path(HIDDEN).read_bytes() == before_hidden
 primary_size = int(subprocess.check_output(['blockdev', '--getsize64', DECOY]))
 sector_size = json.loads(crypt('luksDump', '--dump-json-metadata', '/dev/vdb').stdout)['segments']['0']['sector_size']
 # The first record boundary (block 0 -> 1), the 32768-sector interleave and the tail.
-positions = ((V4_BLOCK0 + V4_GROUP) * sector_size - 512, 32768 * 512 - 512, primary_size - 512)
+positions = ((BLOCK0 + GROUP) * sector_size - 512, 32768 * 512 - 512, primary_size - 512)
 fd = os.open(DECOY, os.O_RDWR | os.O_DIRECT)
 for position in positions:
     length = min(1024, primary_size - position)
@@ -121,12 +125,22 @@ os.close(fd)
 assert Path(HIDDEN).read_bytes() == before_hidden
 # Include the last hidden block, and restore it before filesystem tests.
 fd = os.open(HIDDEN, os.O_RDWR | os.O_DIRECT)
-page = mmap.mmap(-1, 512); page[:] = b'T' * 512
-assert os.pwritev(fd, [page], capacity - 512) == 512
+page = mmap.mmap(-1, BLOCK); page[:] = b'T' * BLOCK
+assert os.pwritev(fd, [page], capacity - BLOCK) == BLOCK
 os.fsync(fd)
-assert Path(HIDDEN).read_bytes() == before_hidden[:-512] + b'T' * 512
-page[:] = before_hidden[-512:]
-assert os.pwritev(fd, [page], capacity - 512) == 512
+assert Path(HIDDEN).read_bytes() == before_hidden[:-BLOCK] + b'T' * BLOCK
+# Direct hidden I/O below the 4096-byte logical block size is refused.
+small = mmap.mmap(-1, 512)
+for offset in (capacity - 512, capacity - BLOCK):
+    try:
+        os.pwritev(fd, [small], offset)
+    except OSError as exc:
+        assert exc.errno == errno.EINVAL, exc
+    else:
+        raise AssertionError('Sub-block direct hidden write accepted')
+small.close()
+page[:] = before_hidden[-BLOCK:]
+assert os.pwritev(fd, [page], capacity - BLOCK) == BLOCK
 os.fsync(fd); os.close(fd); page.close()
 close(); setup()
 assert Path(HIDDEN).read_bytes() == before_hidden
@@ -135,7 +149,7 @@ print('Native block RMW, hidden preservation and reopen passed', flush=True)
 # fresh random IV) destroys one record. Sector 0 is a keyslot replica, so damage
 # the first sector of block 0's record.
 close()
-damaged = V4_BLOCK0
+damaged = BLOCK0
 unit = json.loads(crypt('luksDump', '--dump-json-metadata', '/dev/vdb').stdout)['segments']['0']['sector_size']
 subprocess.run(['cryptsetup', 'open', '--key-file', str(W / 'passphrase.key'), '/dev/vdb', 'piv-stock-rw'], check=True)
 try:
@@ -151,7 +165,7 @@ setup()
 def unavailable(index):
     fd = os.open(HIDDEN, os.O_RDONLY)
     try:
-        try: os.pread(fd, 512, index * 512)
+        try: os.pread(fd, BLOCK, index * BLOCK)
         except OSError as exc: assert exc.errno == 5
         else: raise AssertionError('Unavailable block was returned as valid')
     finally: os.close(fd)
@@ -170,7 +184,7 @@ owner = GuestOwner('/dev/vdb', W / 'passphrase.key')
 assert not native_status(owner.device)['failed']
 owner.close()
 fd = os.open(HIDDEN, os.O_RDWR | os.O_DIRECT)
-page = mmap.mmap(-1, 512); page[:] = before_hidden[:512]
+page = mmap.mmap(-1, BLOCK); page[:] = before_hidden[:BLOCK]
 os.pwritev(fd, [page], 0); os.fsync(fd); os.close(fd); page.close()
 assert Path(HIDDEN).read_bytes() == before_hidden
 close()
@@ -187,14 +201,18 @@ absent()
 setup()
 assert Path(HIDDEN).read_bytes() == before_hidden
 print('Damaged-record isolation, damage preservation on decoy writes, repair and wrong-key refusal passed', flush=True)
-# Real filesystems mounted on BOTH native block devices, simultaneously.
+# Real filesystems mounted on BOTH native block devices, simultaneously. The
+# hidden view has 4096-byte logical blocks, so ext2 needs 4 KiB blocks, and
+# mke2fs needs about 55 of them: v5 on 128 MiB 4096-byte-sector fixtures gives
+# only 38, so there the hidden side writes raw 4 KiB blocks concurrently instead.
 primary = Path('/run/piv-primary'); primary.mkdir(exist_ok=True)
 hidden = Path('/run/piv-hidden-volume'); hidden.mkdir(exist_ok=True)
-# v4 on 4096-byte sectors gives only 158,720 hidden bytes: use 1 KiB blocks there.
-block = '4096' if capacity >= 256 * 1024 else '1024'
-subprocess.run(['mkfs.ext2', '-q', '-F', '-b', block, '-N', '32', HIDDEN], check=True)
+hidden_fs = capacity >= 64 * BLOCK
+if hidden_fs:
+    subprocess.run(['mkfs.ext2', '-q', '-F', '-b', '4096', '-N', '16', HIDDEN], check=True)
 subprocess.run(['mount', DECOY, str(primary)], check=True)
-subprocess.run(['mount', HIDDEN, str(hidden)], check=True)
+if hidden_fs:
+    subprocess.run(['mount', HIDDEN, str(hidden)], check=True)
 errors = []
 
 def writer(path, seed, size):
@@ -213,12 +231,32 @@ def writer(path, seed, size):
     except BaseException as exc:
         errors.append(repr(exc))
 
+def raw_writer(seed, blocks):
+    """Direct 4 KiB writes into hidden blocks 1..blocks, then readback."""
+    try:
+        value = hashlib.shake_256(seed).digest(blocks * BLOCK)
+        fd = os.open(HIDDEN, os.O_RDWR | os.O_DIRECT)
+        with mmap.mmap(-1, BLOCK) as page:
+            for i in range(blocks):
+                page[:] = value[i * BLOCK:(i + 1) * BLOCK]
+                assert os.pwritev(fd, [page], (1 + i) * BLOCK) == BLOCK
+                os.fsync(fd)
+            for i in range(blocks):
+                assert os.preadv(fd, [page], (1 + i) * BLOCK) == BLOCK
+                assert page[:] == value[i * BLOCK:(i + 1) * BLOCK]
+        os.close(fd)
+        (W / 'expected-hidden-new').write_bytes(value)
+    except BaseException as exc:
+        errors.append(repr(exc))
+
 a = threading.Thread(target=writer, args=(primary / 'decoy-new', b'native decoy file', 8192))
-b = threading.Thread(target=writer, args=(hidden / 'hidden-new', b'native hidden file', 8192))
+b = (threading.Thread(target=writer, args=(hidden / 'hidden-new', b'native hidden file', 8192)) if hidden_fs
+     else threading.Thread(target=raw_writer, args=(b'native hidden raw blocks', 4)))
 a.start(); b.start(); a.join(timeout=600); b.join(timeout=600)
 assert not a.is_alive() and not b.is_alive() and not errors, errors
 assert hashlib.sha256((primary / 'primary.bin').read_bytes()).hexdigest() == (W / 'primary-file.sha256').read_text().strip()
-subprocess.run(['umount', str(hidden)], check=True)
+if hidden_fs:
+    subprocess.run(['umount', str(hidden)], check=True)
 subprocess.run(['umount', str(primary)], check=True)
 # Capture complete logical views before teardown for independent crypto checks.
 subprocess.run(['blockdev', '--flushbufs', DECOY], check=True)
@@ -227,10 +265,15 @@ subprocess.run(['blockdev', '--flushbufs', HIDDEN], check=True)
 (W / 'expected-hidden-volume').write_bytes(Path(HIDDEN).read_bytes())
 close(); setup()
 subprocess.run(['mount', DECOY, str(primary)], check=True)
-subprocess.run(['mount', HIDDEN, str(hidden)], check=True)
 assert (primary / 'decoy-new').read_bytes() == (W / 'expected-decoy-new').read_bytes()
-assert (hidden / 'hidden-new').read_bytes() == (W / 'expected-hidden-new').read_bytes()
-subprocess.run(['umount', str(hidden)], check=True); subprocess.run(['umount', str(primary)], check=True)
+if hidden_fs:
+    subprocess.run(['mount', HIDDEN, str(hidden)], check=True)
+    assert (hidden / 'hidden-new').read_bytes() == (W / 'expected-hidden-new').read_bytes()
+    subprocess.run(['umount', str(hidden)], check=True)
+else:
+    expected = (W / 'expected-hidden-new').read_bytes()
+    assert Path(HIDDEN).read_bytes()[BLOCK:BLOCK + len(expected)] == expected
+subprocess.run(['umount', str(primary)], check=True)
 # Refresh expected primary: RW filesystem mounts change ordinary primary metadata.
 (W / 'expected-primary.sha256').write_text(subprocess.check_output(['sha256sum', DECOY], text=True).split()[0] + '\n')
 (W / 'expected-hidden-volume').write_bytes(Path(HIDDEN).read_bytes())
@@ -243,5 +286,6 @@ actual = subprocess.check_output(['sha256sum', '/dev/mapper/piv-stock'], text=Tr
 assert actual == (W / 'expected-primary.sha256').read_text().strip()
 crypt('close', 'piv-stock')
 subprocess.run(['dd', 'if=/dev/vdb', 'of=' + str(W / 'dual-final.img'), 'bs=1M', 'status=none'], check=True)
-(W / 'result.txt').write_text('Two native writable block views, concurrent ext4/ext2, reopen and stock full-primary readback passed\n')
+(W / 'result.txt').write_text('Two native writable block views, concurrent ext4/ext2 (raw hidden blocks on small '
+                              'hidden volumes), reopen and stock full-primary readback passed\n')
 print('Dual native filesystem and stock readback checks passed', flush=True)

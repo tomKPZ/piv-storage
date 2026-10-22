@@ -5,7 +5,7 @@ import shutil
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-FILES = ('Makefile', 'dm-piv.c', 'piv-control.h', 'piv-control.inc', 'piv-native.inc')
+FILES = ('Makefile', 'dm-piv.c', 'piv-control.h', 'piv-control.inc', 'piv-native.inc', 'piv-rs.inc')
 
 
 def main():
