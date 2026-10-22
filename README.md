@@ -2,17 +2,23 @@
 
 Research prototype exposing two writable Linux device-mapper devices: a decoy
 volume and an independently encrypted hidden volume carried in the decoy's
-persistent random IVs. The primary volume is an ordinary LUKS2 volume with the
-original AEGIS-128 AEAD (`aegis128-random`, 16-byte random IVs); the hidden
+persistent random IVs. The primary volume is an ordinary LUKS2 volume with
+16-byte random IVs: original AEGIS-128 (`aegis128-random`, the default) or an
+XTS + HMAC authenc profile (`aes-`, `serpent-` or `twofish-xts-random` with
+`--integrity hmac-sha1|hmac-sha256|hmac-sha512`); the hidden
 volume uses the fragment-local [format v4](docs/format-v4.md). Both devices
 expose plaintext block I/O and support their own filesystem. Setup exits; the
 kernel owns subsequent I/O.
 
-Since 2026-10-21 AEGIS-128 with format v4 is the only supported profile. The
-earlier format v3 and the AES-GCM / ChaCha20-Poly1305 profiles (12-byte IVs)
-were removed: v4 needs 16-byte IVs to keep enough per-sector randomness while
-carrying hidden fragments (see [format-v4.md](docs/format-v4.md)). Their code and
-evidence remain in Git history before that date.
+Format v4 needs stock profiles that store a fresh random 16-byte IV per sector
+(10 random + 6 hidden bytes each; see [format-v4.md](docs/format-v4.md)). The
+earlier format v3 and the 12-byte-IV AES-GCM / ChaCha20-Poly1305 profiles were
+removed on 2026-10-21; the XTS + HMAC profiles were added on 2026-10-22. Under
+XTS + HMAC a repeated IV only reveals equal plaintext at that sector (HMAC still
+prevents forgery), whereas under AEGIS-128 it is a key compromise; see
+[security-review.md](docs/security-review.md). Serpent/Twofish images are
+authenticated but not decrypted by the host diagnostics (no maintained Python
+implementation); stock dm-crypt checks their plaintext in the guests.
 
 The current architecture has **no external persistent metadata, nonce ledger or
 recovery file**. It retains the ordinary LUKS2/dm-integrity layout and journal.

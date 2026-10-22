@@ -7,8 +7,9 @@ and limits are in README.md and docs/.
 ## Current state (2026-10-22)
 
 - One coordinated native owner (`kernel/dm-piv.c`, standalone, no dm-crypt fork)
-  exposes paired writable decoy/hidden block devices over a stock LUKS2
-  AEGIS-128 + dm-integrity volume. Hidden format v4 is the only format.
+  exposes paired writable decoy/hidden block devices over a stock LUKS2 +
+  dm-integrity volume with 16-byte random IVs (AEGIS-128 default, or XTS + HMAC
+  authenc). Hidden format v4 is the only format.
 - Setup is the static Rust `pivsetup` (open/close, keyslots, migrate, keygen);
   Python keeps only independent read-only diagnostics and guest test
   instrumentation.
@@ -20,8 +21,8 @@ and limits are in README.md and docs/.
 ## Remaining work
 
 1. **External cryptographic review** of the whole stored encoding (format v4:
-   LRW-AES fragments, SIV records, keyslots/directory, KDFs) and of AEGIS-128
-   usage and the nonce-budget guidance in docs/security-review.md. Needs an
+   LRW-AES fragments, SIV records, keyslots/directory, KDFs) and of the
+   AEGIS-128 and XTS + HMAC primary profiles' usage and the nonce-budget guidance in docs/security-review.md. Needs an
    outside reviewer; findings override everything below.
 2. **Sanitizer build of the 7.2 port kernel** (optional; the KASAN image is
    6.12 only). docs/kernel-port.md.
@@ -35,7 +36,9 @@ and limits are in README.md and docs/.
 
 ## Standing decisions (binding for autonomous sessions)
 
-- AEGIS-128 with format v4 only; v3 and 12-byte-IV profiles stay removed.
+- Format v4 only. Primary profiles: AEGIS-128 (default) and aes-/serpent-/
+  twofish-xts-random with hmac-sha1/256/512 (2026-10-22); v3 and the 12-byte-IV
+  profiles stay removed.
 - Setup scans only the keyslot area; `--verify` is the full audit. A decoy write
   covering a whole sector that fails authentication replaces it; raw IVs of such
   sectors feed only SIV-checked decoding (keyslots, directory, hidden reads).

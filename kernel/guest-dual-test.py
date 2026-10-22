@@ -45,7 +45,8 @@ def setup(initialize=False, rejected=False):
     value = json.loads(result.stdout)
     primary_bytes = int(subprocess.check_output(['blockdev', '--getsize64', DECOY]))
     segment = json.loads(crypt('luksDump', '--dump-json-metadata', '/dev/vdb').stdout)['segments']['0']
-    assert segment['encryption'] == 'aegis128-random'
+    assert segment['encryption'] in ('aegis128-random', 'aes-xts-random', 'serpent-xts-random',
+                                     'twofish-xts-random'), segment
     sectors = primary_bytes // segment['sector_size']
     expected = ((sectors - V4_KEYSLOT_AREA) // V4_GROUP - 2) * 512
     assert value['hidden_bytes'] == expected, (value, expected)

@@ -65,7 +65,10 @@ static int piv_release(struct inode *inode, struct file *file)
 }
 
 /* Internal prepare/apply tuple (no longer a userspace ABI since 2026-10-22). */
-#define PIV_TUPLE_BYTES 4128
+#define PIV_MAX_TAG 64
+#define PIV_TUPLE_BYTES (4096 + PIV_MAX_TAG + 16)
+/* Offset of the IV within an internal tuple or a sector's original copy. */
+#define PIV_IV_AT(cc) (4096 + (cc)->integrity_tag_size)
 #define PIV_APPLY_DEFER_FLUSH 1
 struct piv_update {
 	u32 version;
@@ -74,7 +77,7 @@ struct piv_update {
 	u64 sector;
 	u8 expected_iv[16];
 	u32 flags;
-	u8 tuple[PIV_TUPLE_BYTES]; /* sector ciphertext, zero-pad to 4096 || tag16 || IV16 */
+	u8 tuple[PIV_TUPLE_BYTES]; /* sector ciphertext, zero-pad to 4096 || tag || IV16 || zero */
 	u32 reserved;
 };
 
@@ -215,7 +218,7 @@ static int piv_read_range(struct piv_control *p, u64 index, u32 count,
  for (i = 0; data && i < pages; i++)
   memcpy(data + i * PAGE_SIZE, page_address(r->pages[i]), min_t(u32, PAGE_SIZE, bytes - i * PAGE_SIZE));
  for (i = 0; ivs && i < count; i++)
-  memcpy(ivs + i * cc->iv_size, r->io.integrity_metadata + i * cc->tuple_size + 16, cc->iv_size);
+  memcpy(ivs + i * cc->iv_size, r->io.integrity_metadata + i * cc->tuple_size + cc->integrity_tag_size, cc->iv_size);
 done:
  if (r->bio) bio_put(r->bio);
  for (i = 0; i < pages; i++) if (r->pages[i]) {
@@ -261,14 +264,14 @@ static int piv_update(struct piv_control *p, struct piv_update *u, bool prepare,
 		return ret;
 	/* Fixed-size control tuples pad unused data bytes in RAM only. */
 	if (memchr_inv(u->tuple + cc->sector_size, 0, 4096 - cc->sector_size) ||
-	    memchr_inv(u->tuple + 4112 + cc->iv_size, 0, 16 - cc->iv_size) ||
+	    memchr_inv(u->tuple + PIV_IV_AT(cc) + cc->iv_size, 0, PIV_TUPLE_BYTES - PIV_IV_AT(cc) - cc->iv_size) ||
 	    memchr_inv(u->expected_iv + cc->iv_size, 0, 16 - cc->iv_size))
 		return -EINVAL;
 	if (u->reserved || (u->flags && (prepare || u->flags != PIV_APPLY_DEFER_FLUSH)))
 		return -EINVAL;
 	if (p->failed)
 		return -EIO;
-	if (prepare && memchr_inv(u->tuple + (primary ? 4096 : 0), 0, primary ? 16 : 4112))
+	if (prepare && memchr_inv(u->tuple + (primary ? 4096 : 0), 0, PIV_IV_AT(cc) - (primary ? 4096 : 0)))
 		return -EINVAL;
 	if (replace && !primary)
 		return -EINVAL;
@@ -280,11 +283,11 @@ static int piv_update(struct piv_control *p, struct piv_update *u, bool prepare,
 		ret = u->flags ? 0 : blkdev_issue_flush(cc->dev->bdev);
 		goto io_done;
 	}
-	if (memcmp(old->original + 4112, u->expected_iv, cc->iv_size)) {
+	if (memcmp(old->original + PIV_IV_AT(cc), u->expected_iv, cc->iv_size)) {
 		ret = -ESTALE;
 		goto done;
 	}
-	if (!memcmp(u->tuple + 4112, u->expected_iv, cc->iv_size)) {
+	if (!memcmp(u->tuple + PIV_IV_AT(cc), u->expected_iv, cc->iv_size)) {
 		ret = -EINVAL;
 		goto done;
 	}
@@ -299,7 +302,7 @@ static int piv_update(struct piv_control *p, struct piv_update *u, bool prepare,
 		p->encryptions++;
 		if (primary)
 			memcpy(page_address(old->page), u->tuple, cc->sector_size);
-		ret = piv_crypto(cc, old, u->tuple + 4112);
+		ret = piv_crypto(cc, old, u->tuple + PIV_IV_AT(cc));
 		if (!ret) {
 			memcpy(u->tuple, page_address(old->page), cc->sector_size);
 			memcpy(u->tuple + 4096, old->io.integrity_metadata, cc->tuple_size);
@@ -547,14 +550,13 @@ static int piv_register(struct piv_crypt *cc, struct dm_target *ti)
 	struct piv_control *p;
 	int ret;
 
-	/* Pin the tested crypto profile (AEGIS-128, format v4); this is not a
-	 * general API. The constructor already parsed it; re-check the invariants
-	 * this code relies on.
+	/* Pin the tested stock profiles (16-byte random IVs for format v4: AEGIS-128
+	 * or XTS + HMAC authenc); this is not a general API. The constructor already
+	 * parsed the profile; re-check the invariants this code relies on.
 	 */
-	if (strcmp(cc->cipher_string, "capi:aegis128-random") ||
-	    cc->key_size != 16 || (cc->sector_size != 512 && cc->sector_size != 4096) ||
+	if ((cc->sector_size != 512 && cc->sector_size != 4096) ||
 	    cc->iv_size != 16 || cc->integrity_iv_size != cc->iv_size ||
-	    cc->integrity_tag_size != 16 || cc->tuple_size != 16 + cc->iv_size ||
+	    cc->integrity_tag_size > PIV_MAX_TAG || cc->tuple_size != cc->integrity_tag_size + cc->iv_size ||
 	    cc->iv_offset || cc->start ||
 	    !(dm_table_get_mode(ti->table) & BLK_OPEN_WRITE)) {
 		ti->error = "piv_control requires the tested writable-owner AEAD profile";

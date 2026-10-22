@@ -6,15 +6,26 @@ use crate::bail;
 use crate::error::Result;
 use crate::json::Value;
 
-/// LUKS encryption name -> (LUKS integrity type, exact dm-crypt cipher spec).
-/// AEGIS-128 only: format v4 needs 16-byte IVs (AES-GCM and ChaCha20-Poly1305
-/// with 12-byte IVs were removed with format v3 on 2026-10-21).
-pub const PRIMARY_PROFILES: [(&str, &str, &str); 1] = [
-    ("aegis128-random", "aead", "capi:aegis128-random"),
+/// (LUKS encryption, LUKS integrity type, exact dm-crypt cipher spec, tag bytes).
+/// Stock profiles whose random 16-byte IVs live in dm-integrity metadata, as
+/// format v4 requires: AEGIS-128 (default) and XTS + HMAC authenc (user decision
+/// 2026-10-22). 12-byte-IV AES-GCM/ChaCha20-Poly1305 cannot carry format v4.
+pub const PRIMARY_PROFILES: [(&str, &str, &str, u64); 10] = [
+    ("aegis128-random", "aead", "capi:aegis128-random", 16),
+    ("aes-xts-random", "hmac(sha1)", "capi:authenc(hmac(sha1),xts(aes))-random", 20),
+    ("aes-xts-random", "hmac(sha256)", "capi:authenc(hmac(sha256),xts(aes))-random", 32),
+    ("aes-xts-random", "hmac(sha512)", "capi:authenc(hmac(sha512),xts(aes))-random", 64),
+    ("serpent-xts-random", "hmac(sha1)", "capi:authenc(hmac(sha1),xts(serpent))-random", 20),
+    ("serpent-xts-random", "hmac(sha256)", "capi:authenc(hmac(sha256),xts(serpent))-random", 32),
+    ("serpent-xts-random", "hmac(sha512)", "capi:authenc(hmac(sha512),xts(serpent))-random", 64),
+    ("twofish-xts-random", "hmac(sha1)", "capi:authenc(hmac(sha1),xts(twofish))-random", 20),
+    ("twofish-xts-random", "hmac(sha256)", "capi:authenc(hmac(sha256),xts(twofish))-random", 32),
+    ("twofish-xts-random", "hmac(sha512)", "capi:authenc(hmac(sha512),xts(twofish))-random", 64),
 ];
 
-pub fn profile(encryption: &str) -> Option<(&'static str, &'static str)> {
-    PRIMARY_PROFILES.iter().find(|p| p.0 == encryption).map(|p| (p.1, p.2))
+/// (dm-crypt cipher spec, tag bytes) of a supported (encryption, integrity) pair.
+pub fn profile(encryption: &str, integrity: &str) -> Option<(&'static str, u64)> {
+    PRIMARY_PROFILES.iter().find(|p| p.0 == encryption && p.1 == integrity).map(|p| (p.2, p.3))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,7 +83,7 @@ pub fn parse_superblock(header: &[u8], offset: u64, file_size: u64) -> Result<La
     let flags = le_u32(header, 24);
     let block = header[28];
     if magic != b"integrt\0" || version != 4 || interleave != 15 || flags != 8
-        || tuple_size != 32 || !(block == 0 || block == 3) {
+        || !matches!(tuple_size, 32 | 36 | 48 | 80) || !(block == 0 || block == 3) {
         bail!("Unsupported integrity superblock profile");
     }
     if offset < 32768 || offset % 4096 != 0 || offset.checked_add(4096).map_or(true, |e| e > file_size) {
@@ -82,7 +93,7 @@ pub fn parse_superblock(header: &[u8], offset: u64, file_size: u64) -> Result<La
     if !(1..=4096).contains(&sections) || provided == 0 || provided % factor != 0 {
         bail!("Invalid integrity dimensions");
     }
-    // Pinned Linux: header address8 + saved data-sector tails8*factor + tuple[28|32].
+    // Pinned Linux: header address8 + saved data-sector tails8*factor + tuple.
     let entry_bytes = (8 + 8 * factor + tuple_size).div_ceil(8) * 8;
     let section_sectors = (504 / entry_bytes) * 8 * factor + 8;
     let initial = 8 + section_sectors * sections;
@@ -92,7 +103,7 @@ pub fn parse_superblock(header: &[u8], offset: u64, file_size: u64) -> Result<La
         integrity_offset: offset, primary_bytes, journal_sections: sections,
         journal_section_sectors: section_sectors, initial_sectors: initial,
         metadata_run_sectors: metadata_run, interleave_sectors: 32768,
-        sector_size: 512 * factor, tag_bytes: 16, iv_bytes: tuple_size - 16,
+        sector_size: 512 * factor, tag_bytes: tuple_size - 16, iv_bytes: 16,
     };
     if layout.sectors() == 0 {
         bail!("Invalid integrity dimensions");
@@ -122,8 +133,11 @@ pub fn validate_segment(metadata: &Value) -> Result<u64> {
     let Some(fields) = segment.as_object().filter(|f| f.keys().map(String::as_str).eq(expected)) else {
         bail!("Unsupported segment fields")
     };
-    let encryption = fields["encryption"].as_str();
-    let Some((integrity, _)) = encryption.and_then(profile) else { bail!("Unsupported primary encryption profile") };
+    let encryption = fields["encryption"].as_str().unwrap_or_default();
+    let integrity = fields["integrity"].get("type").and_then(Value::as_str).unwrap_or_default();
+    if profile(encryption, integrity).is_none() {
+        bail!("Unsupported primary encryption profile");
+    }
     if fields["type"].as_str() != Some("crypt") || fields["size"].as_str() != Some("dynamic")
         || fields["iv_tweak"].as_str() != Some("0")
         || !matches!(fields["sector_size"].as_u64(), Some(512 | 4096)) {
@@ -162,7 +176,7 @@ pub fn no_journal(metadata: &Value) -> Result<bool> {
 pub fn validate_integrity_table(table: &str, sectors: u64, raw_major: u32, raw_minor: u32, offset: u64,
                                 sector_size: u64, journal_sectors: u64, tuple_size: u64,
                                 no_journal: bool) -> Result<()> {
-    if tuple_size != 32 {
+    if !matches!(tuple_size, 32 | 36 | 48 | 80) {
         bail!("Unsupported lower tuple size");
     }
     let words: Vec<&str> = table.split_whitespace().collect();
@@ -175,8 +189,7 @@ pub fn validate_integrity_table(table: &str, sectors: u64, raw_major: u32, raw_m
         bail!("Unsupported lower integrity mapping");
     }
     let options = &words[8..];
-    let buffer = "buffer_sectors:128";
-    let mut required = vec!["interleave_sectors:32768", buffer, "fix_padding"];
+    let mut required = vec!["interleave_sectors:32768", "fix_padding"];
     if !no_journal {
         required.extend(["journal_watermark:50", "commit_time:10000"]);
     }
@@ -188,15 +201,18 @@ pub fn validate_integrity_table(table: &str, sectors: u64, raw_major: u32, raw_m
     let mut unique: Vec<&str> = options.to_vec();
     unique.sort_unstable();
     unique.dedup();
-    if options.len() != required.len() + 1 || unique.len() != options.len()
+    if options.len() != required.len() + 2 || unique.len() != options.len()
         || !required.iter().all(|r| options.contains(r)) {
         bail!("Unsupported lower integrity options");
     }
-    let extra: Vec<&&str> = options.iter().filter(|o| !required.contains(o)).collect();
-    let journal = match extra.as_slice() {
-        [one] if one.starts_with("journal_sectors:") => one["journal_sectors:".len()..].parse::<u64>().ok(),
-        _ => bail!("Unsupported lower integrity journal"),
-    };
+    // dm-integrity picks buffer_sectors itself (a power of two, at most the
+    // default 128, smaller when the journal would not fit); it is in-memory only.
+    let value = |prefix: &str| options.iter().filter_map(|o| o.strip_prefix(prefix)).next()
+        .and_then(|v| v.parse::<u64>().ok());
+    if !matches!(value("buffer_sectors:"), Some(8 | 16 | 32 | 64 | 128)) {
+        bail!("Unsupported lower integrity buffer");
+    }
+    let journal = value("journal_sectors:");
     if journal != Some(journal_sectors) {
         bail!("Unsupported lower integrity journal size");
     }
@@ -290,6 +306,21 @@ mod tests {
         assert!(no_journal(&flags(r#"["allow-discards"]"#)).is_err());
         assert!(no_journal(&flags(r#"["no-journal","allow-discards"]"#)).is_err());
         assert!(validate_integrity_table(&table.replace("fix_padding", "fix_hmac"), 28_932, 254, 16, 16_777_216, 4096, 1848, 32, false).is_err());
+    }
+
+    #[test]
+    fn xts_hmac_profiles_and_tables() {
+        assert_eq!(profile("aes-xts-random", "hmac(sha256)"), Some(("capi:authenc(hmac(sha256),xts(aes))-random", 32)));
+        assert_eq!(profile("twofish-xts-random", "hmac(sha1)").map(|p| p.1), Some(20));
+        assert!(profile("aes-xts-random", "aead").is_none());
+        assert!(profile("aegis128-random", "hmac(sha256)").is_none());
+        // Observed stock table (artifacts/profile-probe-001): 36-byte tuples, buffer 32.
+        let table = "0 96640 integrity 7:0 32768 36 J 7 block_size:4096 journal_sectors:792 \
+                     interleave_sectors:32768 buffer_sectors:32 journal_watermark:50 commit_time:10000 fix_padding";
+        validate_integrity_table(table, 12_080, 7, 0, 16_777_216, 4096, 792, 36, false).unwrap();
+        assert!(validate_integrity_table(&table.replace("buffer_sectors:32", "buffer_sectors:33"),
+                                         12_080, 7, 0, 16_777_216, 4096, 792, 36, false).is_err());
+        assert!(validate_integrity_table(table, 12_080, 7, 0, 16_777_216, 4096, 792, 28, false).is_err());
     }
 
     #[test]

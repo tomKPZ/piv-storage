@@ -56,7 +56,8 @@ resolved from context/evidence, not for routine implementation decisions.
   directory, Argon2id (default) or scrypt passphrase KEKs and optional A/B
   slots. Never add a persistent encryption counter. Format v3, its invalid
   markers and the 12-byte-IV AES-GCM/ChaCha20-Poly1305 profiles were removed
-  by user decision (2026-10-21, "option A"); do not reintroduce them. Stock
+  by user decision (2026-10-21, "option A"); do not reintroduce them (they cannot
+  carry v4). The "AEGIS-128 only" part of option A was reversed on 2026-10-22. Stock
   `--integrity-no-journal` (persisted LUKS2 flag "no-journal", direct-mode
   lower table) is accepted only with pivsetup's explicit --allow-no-journal,
   because a crash during a hidden write can tear decoy sectors of that record
@@ -114,8 +115,11 @@ resolved from context/evidence, not for routine implementation decisions.
   only in disposable guests with exact header/config/symbol matches. Never
   install host modules or touch real disks. scripts/fetch_kernel.py (or
   kernel/prepare.py) stages the complete module source.
-- Supported profile: LUKS2 original aegis128-random (integrity aead; not
-  AEGIS-128L), 512/4096-byte sectors, 16-byte keys, IVs and tags.
+- Supported profiles (stock, 16-byte random IVs): LUKS2 original
+  aegis128-random (integrity aead; not AEGIS-128L; default) and, since
+  2026-10-22 (user decision), aes-/serpent-/twofish-xts-random with integrity
+  hmac-sha1/256/512 (dm-crypt authenc; 32- or 64-byte XTS keys plus the HMAC
+  key; 20/32/64-byte tags), 512/4096-byte sectors.
   Integrity v4 fixed padding and the ordinary journal are required (or the
   opted-in stock no-journal direct mode). Validate geometry,
   AAD, extents and arithmetic. Offline diagnostics reject dirty journals; native

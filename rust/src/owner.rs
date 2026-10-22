@@ -131,6 +131,8 @@ pub struct GuestOwner {
     offset: u64,
     /// The volume persists stock "no-journal": lower table in direct mode.
     pub no_journal: bool,
+    /// Integrity tag bytes of the LUKS profile (16 AEGIS, 20/32/64 HMAC).
+    profile_tag: u64,
     mapping_cipher: &'static str,
     raw_major: u32,
     raw_minor: u32,
@@ -151,7 +153,9 @@ impl GuestOwner {
         let segment = metadata.get("segments").and_then(|s| s.get("0")).expect("validated segment");
         let encryption = segment.get("encryption").and_then(json::Value::as_str).expect("validated").to_string();
         let luks_sector = segment.get("sector_size").and_then(json::Value::as_u64).expect("validated");
-        let (_, mapping_cipher) = profile::profile(&encryption).expect("validated profile");
+        let integrity = segment.get("integrity").and_then(|i| i.get("type")).and_then(json::Value::as_str)
+            .expect("validated").to_string();
+        let (mapping_cipher, profile_tag) = profile::profile(&encryption, &integrity).expect("validated profile");
         let uuid = canonical_uuid(crypt(&["luksUUID", source_text])?.trim())?;
         let rdev = fs::metadata(source)?.rdev();
         let mut owner = GuestOwner {
@@ -160,7 +164,7 @@ impl GuestOwner {
             layout: Layout { integrity_offset: 0, primary_bytes: 0, journal_sections: 0, journal_section_sectors: 0,
                              initial_sectors: 0, metadata_run_sectors: 0, interleave_sectors: 0, sector_size: 512,
                              tag_bytes: 16, iv_bytes: 12 },
-            offset, no_journal, mapping_cipher, raw_major: libc::major(rdev), raw_minor: libc::minor(rdev),
+            offset, no_journal, mapping_cipher, profile_tag, raw_major: libc::major(rdev), raw_minor: libc::minor(rdev),
             lower_table: String::new(),
         };
         match owner.establish(&encryption, luks_sector, raw_bytes, passphrase_file) {
@@ -206,8 +210,8 @@ impl GuestOwner {
         read_exact_at(&raw, &mut header, self.offset)?;
         drop(raw);
         self.layout = profile::parse_superblock(&header, self.offset, raw_bytes)?;
-        if encryption != "aegis128-random" || self.layout.iv_bytes != 16 {
-            bail!("LUKS and integrity IV sizes disagree");
+        if self.layout.iv_bytes != 16 || self.layout.tag_bytes != self.profile_tag {
+            bail!("LUKS profile ({encryption}) and integrity tuple size disagree");
         }
         if self.layout.sector_size != luks_sector {
             bail!("LUKS and integrity sector sizes disagree");

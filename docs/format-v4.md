@@ -5,7 +5,8 @@ directory, A/B slots) in the kernel and the independent Python decoder; phase 4
 (`--integrity-no-journal`) is supported as an explicit opt-in since 2026-10-21
 (docs/journal-atomicity.md). v4 is the only hidden format: format v3
 and the 12-byte-IV profiles were removed on 2026-10-21 (user decision), so
-AEGIS-128 is the only primary profile. Nothing here is an independent
+Primary profiles: AEGIS-128 (default) or XTS + HMAC authenc, all with stored
+16-byte random IVs. Nothing here is an independent
 cryptographic review; tested behaviour is recorded in commit messages.
 
 ## Goals

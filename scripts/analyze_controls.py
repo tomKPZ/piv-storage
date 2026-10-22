@@ -31,7 +31,7 @@ def analyze(root, primary_key, hidden_key):
             assert hashlib.sha256(after.read(layout.integrity_offset, 0)).hexdigest() == prefix
             if common_layout is None: common_layout, header = layout, prefix
             assert common_layout == layout and prefix == header
-            codec = SectorCodec(primary_key, layout.sector_size, before.encryption)
+            codec = SectorCodec(primary_key, layout.sector_size, before.encryption, before.integrity)
             digest_before, digest_after = hashlib.sha256(), hashlib.sha256()
             changed_iv, changed_plain, same_plain_reencrypted = [], [], []
             requested = set()

@@ -21,19 +21,22 @@ def main():
                         help='Accepted for compatibility; format v4 is the only format')
     args = parser.parse_args()
     with args.volume_key_file.open('rb') as stream:
-        primary_key = stream.read(33)
+        primary_key = stream.read(129)
     with args.hidden_key_file.open('rb') as stream:
         hidden_key = stream.read(33)
     with Image(args.image) as image:
         primary = image.verify(primary_key)
-        assert primary == args.expected_primary.read_text().strip(), 'Primary mismatch'
+        # None: Serpent/Twofish-XTS sectors were authenticated (HMAC) but not
+        # decrypted on the host; their plaintext is checked by stock dm-crypt in guests.
+        assert primary in (None, args.expected_primary.read_text().strip()), 'Primary mismatch'
         # --hidden-key-file is a keyslot KEK; the layout comes from the keyslot.
         hidden = decode_image(image, hidden_key)
         assert hidden == args.expected_hidden.read_bytes(), 'Hidden mismatch'
         ivs = list(image.iv_slots())
         assert len(set(ivs)) == image.layout.sectors, 'Duplicate CURRENT primary IV'
         image.check_unchanged()
-        print(json.dumps(dict(primary_sha256=primary, authenticated_primary_sectors=len(ivs),
+        print(json.dumps(dict(primary_sha256=primary, primary_decrypted_on_host=primary is not None,
+            authenticated_primary_sectors=len(ivs),
             hidden_bytes=len(hidden), hidden_sha256=hashlib.sha256(hidden).hexdigest(),
             current_ivs_unique=True, historical_nonce_usage_known=False), indent=2))
 

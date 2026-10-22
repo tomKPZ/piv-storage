@@ -30,7 +30,7 @@ pivsetup keygen --output F
 ```
 
 `migrate` (src/migrate.rs) is the offline rekey/resize/sector-size-change path:
-it opens the source as `piv-src`, initializes a freshly luksFormatted AEGIS-128
+it opens the source as `piv-src`, initializes a freshly luksFormatted supported
 target as `piv-dst` (destroying any target hidden contents), refuses a target
 view smaller than the source's, copies both views in 1 MiB O_DIRECT chunks
 through an mlocked, zeroized buffer, flushes, re-reads both devices and compares
@@ -42,7 +42,7 @@ migrate suite) are explicit opt-ins beyond `/dev/vdb`.
 
 Behaviour is a port of pivstore/blocks.py and kernel_owner.py at commit
 6e4e099: guest guard, LUKS/integrity validation, exclusive /run lock,
-cryptsetup open and reload as piv-crypt, SETUP ABI 4 (AEGIS-128/format v4 only)/STATUS/KEYSLOT, wrong-key
+cryptsetup open and reload as piv-crypt, SETUP ABI 4 (format v4)/STATUS/KEYSLOT, wrong-key
 guard note, failed-attempt cleanup limited to its own identity-checked mappings,
 and close validation of both views. Differences: keys live in mlocked,
 zeroized buffers; the process is non-dumpable; SIGTERM is cooperative like

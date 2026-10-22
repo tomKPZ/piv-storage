@@ -36,7 +36,8 @@ usage: pivsetup open-blocks --key-file F (--hidden-key-file F | --hidden-passphr
                         [--source /dev/vdb] [--source-kdf K] [--target-kdf K] [--ab]
        pivsetup keygen --output F
 
-LUKS2 AEGIS-128 (aegis128-random, integrity aead) volumes with hidden format v4 only.
+LUKS2 volumes with 16-byte random IVs (aegis128-random + aead, or aes-, serpent- or
+twofish-xts-random + hmac-sha1/256/512) and hidden format v4.
 --initialize destroys all existing hidden contents. Keys are read from files only.
 Setup authenticates only the keyslot area; --verify first authenticates every
 primary sector and refuses on any failure (a full audit, O(volume) time).

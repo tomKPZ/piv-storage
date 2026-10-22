@@ -76,7 +76,7 @@ def parse_superblock(header, offset, file_size):
     magic, version, interleave, tuple_size, sections, provided, flags, block = (
         struct.unpack_from('<8sBBHIQIB', header))
     if (magic, version, interleave, flags) != (
-            b'integrt\0', 4, 15, 8) or tuple_size != 32 or block not in (0, 3):
+            b'integrt\0', 4, 15, 8) or tuple_size not in (32, 36, 48, 80) or block not in (0, 3):
         raise UnsupportedImage('Unsupported integrity superblock profile')
     if offset < 32768 or offset % 4096 or offset + 4096 > file_size:
         raise UnsupportedImage('Invalid integrity offset')
@@ -89,7 +89,7 @@ def parse_superblock(header, offset, file_size):
     initial = 8 + section_sectors * sections
     metadata_run = ((tuple_size * (32768 // factor) + 4095) // 4096) * 8
     layout = Layout(offset, provided * 512, sections, section_sectors,
-                    initial, metadata_run, sector_size=512 * factor, iv_bytes=tuple_size - 16)
+                    initial, metadata_run, sector_size=512 * factor, tag_bytes=tuple_size - 16, iv_bytes=16)
     data, tag = layout.offsets(layout.sectors - 1)
     if data + layout.sector_size > file_size or tag + tuple_size > file_size:
         raise UnsupportedImage('Primary extents exceed image size')
@@ -109,13 +109,14 @@ def validate_segment(metadata):
                 'sector_size', 'integrity'}
     if not isinstance(segment, dict) or set(segment) != expected:
         raise UnsupportedImage('Unsupported segment fields')
-    encryption = segment['encryption']
-    if (not isinstance(encryption, str) or encryption not in PRIMARY_PROFILES or
+    encryption, integrity = segment['encryption'], segment['integrity']
+    kind = integrity.get('type') if isinstance(integrity, dict) else None
+    if (not isinstance(encryption, str) or not isinstance(kind, str) or
+            (encryption, kind) not in PRIMARY_PROFILES or
             (segment['type'], segment['size'], segment['iv_tweak']) !=
             ('crypt', 'dynamic', '0') or segment['sector_size'] not in (512, 4096)):
         raise UnsupportedImage('Unsupported primary encryption profile')
-    if segment['integrity'] != {'type': PRIMARY_PROFILES[encryption][0], 'journal_encryption': 'none',
-                                'journal_integrity': 'none'}:
+    if integrity != {'type': kind, 'journal_encryption': 'none', 'journal_integrity': 'none'}:
         raise UnsupportedImage('Unsupported integrity/journal algorithms')
     value = segment['offset']
     if not isinstance(value, str) or not value.isascii() or not value.isdecimal():
@@ -156,9 +157,11 @@ class Image(AbstractContextManager):
             except (json.JSONDecodeError, TypeError, KeyError) as exc:
                 raise UnsupportedImage('Invalid LUKS2 segment metadata') from exc
             self.encryption = metadata['segments']['0']['encryption']
+            self.integrity = metadata['segments']['0']['integrity']['type']
             self.layout = parse_superblock(self.read(4096, offset), offset, self.size)
-            if self.layout.iv_bytes != 16:
-                raise UnsupportedImage('LUKS and integrity IV sizes disagree')
+            if (self.layout.iv_bytes != 16 or
+                    self.layout.tag_bytes != PRIMARY_PROFILES[(self.encryption, self.integrity)][1]):
+                raise UnsupportedImage('LUKS profile and integrity tuple size disagree')
             if self.layout.sector_size != metadata['segments']['0']['sector_size']:
                 raise UnsupportedImage('LUKS and integrity sector sizes disagree')
             self.check_empty_journal()
@@ -198,19 +201,23 @@ class Image(AbstractContextManager):
         """Yield carrier bytes in logical-sector order; does not authenticate them."""
         for index in range(self.layout.sectors):
             _, tag_offset = self.layout.offsets(index)
-            yield self.read(self.layout.iv_bytes, tag_offset + 16)
+            yield self.read(self.layout.iv_bytes, tag_offset + self.layout.tag_bytes)
 
     def verify(self, key):
+        """Authenticate every primary sector; return the plaintext SHA-256, or
+        None for profiles authenticated but not decrypted on the host."""
         from .sector import SectorCodec
-        codec = SectorCodec(key, self.layout.sector_size, self.encryption)
+        codec = SectorCodec(key, self.layout.sector_size, self.encryption, self.integrity)
         digest = hashlib.sha256()
         for index in range(self.layout.sectors):
             data_offset, tag_offset = self.layout.offsets(index)
             ciphertext = self.read(self.layout.sector_size, data_offset)
             metadata = self.read(self.layout.tuple_bytes, tag_offset)
-            plaintext = codec.decrypt(index, ciphertext, metadata)
-            digest.update(plaintext)
-        return digest.hexdigest()
+            if codec.decrypts:
+                digest.update(codec.decrypt(index, ciphertext, metadata))
+            else:
+                codec.authenticate(index, ciphertext, metadata)
+        return digest.hexdigest() if codec.decrypts else None
 
     def check_unchanged(self):
         current = os.fstat(self.fd)

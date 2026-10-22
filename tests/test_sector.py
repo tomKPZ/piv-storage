@@ -27,3 +27,42 @@ class SectorTests(unittest.TestCase):
             with self.assertRaises(UnsupportedImage):
                 SectorCodec(bytes(16), size, 'aegis128-random').decrypt(17, ct, metadata)
         with self.assertRaises(ValueError): SectorCodec(bytes(32), 512, 'aegis128-random')
+
+
+class XtsHmacTests(unittest.TestCase):
+    def test_authenc_layout_round_trip_and_rejections(self):
+        import hashlib, hmac, struct
+        for integrity, tag in (('hmac(sha1)', 20), ('hmac(sha256)', 32), ('hmac(sha512)', 64)):
+            for enc in (32, 64):
+                for size in (512, 4096):
+                    key = bytes(range(enc + tag))
+                    codec = SectorCodec(key, size, 'aes-xts-random', integrity)
+                    iv, plain = bytes(range(16, 32)), bytes(range(256)) * (size // 256)
+                    ct, metadata = codec.encrypt(9, plain, iv)
+                    # dm-crypt authenc: HMAC(mac key, LE64(sector512) || IV || ciphertext).
+                    mac = hmac.new(key[enc:], struct.pack('<Q', 9 * (size // 512)) + iv + ct,
+                                   integrity[5:-1]).digest()
+                    self.assertEqual(metadata, mac[:tag] + iv)
+                    self.assertEqual(codec.decrypt(9, ct, metadata), plain)
+                    for index, c, m in ((10, ct, metadata), (9, bytes([ct[0] ^ 1]) + ct[1:], metadata),
+                                        (9, ct, bytes([metadata[0] ^ 1]) + metadata[1:]),
+                                        (9, ct, metadata[:-1] + bytes([metadata[-1] ^ 1]))):
+                        with self.subTest(integrity=integrity, enc=enc, size=size, index=index), \
+                                self.assertRaises(UnsupportedImage):
+                            codec.decrypt(index, c, m)
+
+    def test_serpent_twofish_authenticate_without_decrypting(self):
+        import hmac, struct
+        key = bytes(64 + 32)
+        for cipher in ('serpent-xts-random', 'twofish-xts-random'):
+            codec = SectorCodec(key, 512, cipher, 'hmac(sha256)')
+            self.assertFalse(codec.decrypts)
+            ct, iv = bytes(range(256)) * 2, bytes(16)
+            tag = hmac.new(key[64:], struct.pack('<Q', 3) + iv + ct, 'sha256').digest()
+            self.assertEqual(codec.authenticate(3, ct, tag + iv), iv)
+            with self.assertRaises(UnsupportedImage):
+                codec.authenticate(4, ct, tag + iv)
+        with self.assertRaises(ValueError):
+            SectorCodec(bytes(70), 512, 'aes-xts-random', 'hmac(sha256)')
+        with self.assertRaises(ValueError):
+            SectorCodec(bytes(96), 512, 'aes-xts-random', 'aead')

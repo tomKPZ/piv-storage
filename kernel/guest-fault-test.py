@@ -23,7 +23,7 @@ NAMES = ('piv-native-hidden', 'piv-native-decoy', 'piv-native', 'piv-native_dif'
 results = []
 
 # Format v4 geometry (docs/format-v4.md): 112 keyslot sectors, two directory
-# groups, then 90-sector records (AEGIS-128 is the only supported profile).
+# groups, then 90-sector records (every supported profile has 16-byte IVs).
 def record_span(device, block):
     """First and last primary sector carrying hidden block @block."""
     first = 112 + 90 * (2 + block)
@@ -390,14 +390,14 @@ close_views(); absent()
 results.append('late corruption: --verify refuses, default setup opens with local EIO, reopen passed')
 
 # IV damage: corrupt the first IV byte of a record-10 carrier sector whose tuple
-# starts a 512-byte metadata sector (tuple = tag16 || IV16). The primary sector
+# starts a 512-byte metadata sector (tuple = tag || IV16). The primary sector
 # fails and its raw fragment is wrong, so the record's SIV tag rejects block 10.
 # Applied before opening so no cached metadata masks it.
 iv_sector = next(sector for sector in range(record_span(None, 10)[0], record_span(None, 10)[1] + 1)
                  if layout.offsets(sector)[1] % 512 == 0)
 tag_physical = layout.offsets(iv_sector)[1]
-iv_byte = direct('/dev/vdb', offset=tag_physical, size=512)[16] ^ 1
-corrupt_read(tag_physical // 512, iv_byte, nth=17)
+iv_byte = direct('/dev/vdb', offset=tag_physical, size=512)[layout.tag_bytes] ^ 1
+corrupt_read(tag_physical // 512, iv_byte, nth=layout.tag_bytes + 1)
 try:
     v = open_views()
     assert rejected(lambda: direct(v['hidden'], offset=10 * 512)).errno == errno.EIO

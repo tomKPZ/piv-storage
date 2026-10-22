@@ -28,6 +28,8 @@
 #include <linux/hex.h>	/* hex2bin moved out of kernel.h in newer kernels */
 #endif
 #include <crypto/aead.h>
+#include <crypto/authenc.h>
+#include <linux/rtnetlink.h>
 #include <crypto/aes.h>
 #include <crypto/skcipher.h>
 #include <crypto/utils.h>
@@ -65,9 +67,9 @@ struct piv_crypt {
 	sector_t start;
 	u64 iv_offset;
 	unsigned int sector_size, sector_shift, iv_size, integrity_iv_size;
-	unsigned int integrity_tag_size, tuple_size, key_size;
-	char cipher_string[48];
-	u8 key[32];
+	unsigned int integrity_tag_size, tuple_size, key_size, mac_key_size;
+	char cipher_string[64];
+	u8 key[128];	/* volume key: encryption key || MAC key (authenc) */
 };
 
 /* Mirrors the dm-crypt fields this code uses for one integrity-backed request. */
@@ -77,13 +79,59 @@ struct piv_io {
 	u8 *integrity_metadata;		/* tuple_size bytes per encryption sector */
 };
 
+/*
+ * Stock LUKS2 profiles whose random 16-byte IVs live in dm-integrity metadata,
+ * as format v4 requires (12-byte-IV GCM/ChaCha profiles cannot carry it).
+ * enc_a/enc_b: accepted encryption key sizes in bytes; mac: HMAC key size (the
+ * dm-crypt default, the digest size); tag: integrity tag bytes.
+ */
 static const struct piv_profile {
 	const char *cipher_string, *algorithm;
-	unsigned int key_size, iv_size;
+	unsigned int enc_a, enc_b, mac_size, tag_size, iv_size;
 } piv_profiles[] = {
-	/* AEGIS-128 only: format v4 needs 16-byte IVs (AES-GCM/ChaCha removed 2026-10-21). */
-	{ "capi:aegis128-random", "aegis128", 16, 16 },
+	{ "capi:aegis128-random", "aegis128", 16, 16, 0, 16, 16 },
+#define PIV_AUTHENC(hash, digest, cipher) \
+	{ "capi:authenc(hmac(" hash "),xts(" cipher "))-random", \
+	  "authenc(hmac(" hash "),xts(" cipher "))", 32, 64, digest, digest, 16 }
+	PIV_AUTHENC("sha1", 20, "aes"), PIV_AUTHENC("sha256", 32, "aes"), PIV_AUTHENC("sha512", 64, "aes"),
+	PIV_AUTHENC("sha1", 20, "serpent"), PIV_AUTHENC("sha256", 32, "serpent"),
+	PIV_AUTHENC("sha512", 64, "serpent"),
+	PIV_AUTHENC("sha1", 20, "twofish"), PIV_AUTHENC("sha256", 32, "twofish"),
+	PIV_AUTHENC("sha512", 64, "twofish"),
+#undef PIV_AUTHENC
 };
+
+/*
+ * Key the transform exactly as dm-crypt does: AEAD keys directly; authenc
+ * from the volume key (encryption key || MAC key) re-encoded as rtattr param
+ * (big-endian encryption key length) || MAC key || encryption key.
+ */
+static int piv_setkey(struct piv_crypt *cc, const u8 *key)
+{
+	struct crypto_authenc_key_param *param;
+
+	struct rtattr *rta;
+	unsigned int enc = cc->key_size - cc->mac_key_size, size;
+	u8 *blob;
+	int r;
+
+	if (!cc->mac_key_size)
+		return crypto_aead_setkey(cc->tfm, key, cc->key_size);
+	size = RTA_SPACE(sizeof(*param)) + cc->key_size;
+	blob = kzalloc(size, GFP_KERNEL);
+	if (!blob)
+		return -ENOMEM;
+	rta = (struct rtattr *)blob;
+	param = RTA_DATA(rta);
+	param->enckeylen = cpu_to_be32(enc);
+	rta->rta_len = RTA_LENGTH(sizeof(*param));
+	rta->rta_type = CRYPTO_AUTHENC_KEYA_PARAM;
+	memcpy(blob + RTA_SPACE(sizeof(*param)), key + enc, cc->mac_key_size);
+	memcpy(blob + RTA_SPACE(sizeof(*param)) + cc->mac_key_size, key, enc);
+	r = crypto_aead_setkey(cc->tfm, blob, size);
+	kfree_sensitive(blob);
+	return r;
+}
 
 static struct workqueue_struct *piv_io_wq;
 
@@ -281,12 +329,15 @@ static int piv_crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		return -ENOMEM;
 	ti->private = cc;
 	strscpy(cc->cipher_string, profile->cipher_string, sizeof(cc->cipher_string));
-	cc->key_size = profile->key_size;
+	cc->mac_key_size = profile->mac_size;
 	cc->iv_size = cc->integrity_iv_size = profile->iv_size;
-	cc->integrity_tag_size = 16;
+	cc->integrity_tag_size = profile->tag_size;
 	cc->sector_size = 512;
 	r = -EINVAL;
-	if (strlen(argv[1]) != 2 * cc->key_size || hex2bin(cc->key, argv[1], cc->key_size)) {
+	cc->key_size = strlen(argv[1]) / 2;
+	if ((cc->key_size != profile->enc_a + profile->mac_size &&
+	     cc->key_size != profile->enc_b + profile->mac_size) ||
+	    strlen(argv[1]) != 2 * cc->key_size || hex2bin(cc->key, argv[1], cc->key_size)) {
 		ti->error = "Invalid key (hex keys only)";
 		goto bad;
 	}
@@ -318,7 +369,7 @@ static int piv_crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		}
 	}
 	if (!control || tag != cc->integrity_tag_size + cc->iv_size) {
-		ti->error = "piv_control and integrity:<16+iv>:aead are required";
+		ti->error = "piv_control and integrity:<tag+iv>:aead are required";
 		goto bad;
 	}
 	cc->sector_shift = __ffs(cc->sector_size) - SECTOR_SHIFT;
@@ -345,7 +396,7 @@ static int piv_crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		ti->error = "Cannot allocate AEAD transform";
 		goto bad;
 	}
-	r = crypto_aead_setkey(cc->tfm, cc->key, cc->key_size);
+	r = piv_setkey(cc, cc->key);
 	/* The transform holds the key schedule; keep no other copy. */
 	memzero_explicit(cc->key, sizeof(cc->key));
 	if (!r)
@@ -429,7 +480,7 @@ static int piv_crypt_message(struct dm_target *ti, unsigned int argc, char **arg
 	} else {
 		clear_bit(PIV_KEY_VALID, &cc->flags);
 		get_random_bytes(cc->key, cc->key_size);
-		r = crypto_aead_setkey(cc->tfm, cc->key, cc->key_size);
+		r = piv_setkey(cc, cc->key);
 		memzero_explicit(cc->key, sizeof(cc->key));
 	}
 	mutex_unlock(&p->lock);

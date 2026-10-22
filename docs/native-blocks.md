@@ -90,12 +90,14 @@ always 0 since v3 invalid markers were removed), active/views/failed/version
 (u32). Counters are volatile, not durable lifetime history.
 No user paths or file descriptors enter the native persistence path.
 
-The primary cipher whitelist is capi:aegis128-random only (16-byte key, 16-byte
-IV, 16-byte tag). dm-piv.c's piv_aead reproduces dm-crypt's AEAD layout:
-AAD LE64(address_in_512_byte_units) || IV. Setup checks the actual owner table
-against the validated LUKS cipher on creation and reuse. The independent
-verifier uses the pinned diagnostic AEGIS-128 reference from the same validated
-public metadata. Setup needs no userspace crypto beyond pivsetup's passphrase
+The primary cipher whitelist is capi:aegis128-random (16-byte key, IV and tag)
+and capi:authenc(hmac(sha1|sha256|sha512),xts(aes|serpent|twofish))-random
+(32- or 64-byte XTS key plus the HMAC key in dm-crypt's authenc key encoding;
+16-byte IV; 20/32/64-byte tag). dm-piv.c's piv_aead reproduces dm-crypt's AEAD
+layout: AAD LE64(address_in_512_byte_units) || IV, tuple = tag || IV. Setup
+checks the actual owner table against the validated LUKS cipher on creation and
+reuse. The independent verifier uses the pinned diagnostic AEGIS-128 reference,
+or HMAC plus cryptography's AES-XTS (Serpent/Twofish: HMAC only). Setup needs no userspace crypto beyond pivsetup's passphrase
 KDFs. No persistent format is added outside the IVs.
 
 QUERY reports the primary sector size and encryption-sector count. Primary

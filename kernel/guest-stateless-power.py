@@ -34,17 +34,17 @@ carrier_bytes = ((skip + group * tuple_size + 511) // 512) * 512
 buffer = mmap.mmap(-1, carrier_bytes)
 def carrier():
     assert os.preadv(raw, [buffer], base) == carrier_bytes
-    return [buffer[skip + i * tuple_size + 16:skip + (i + 1) * tuple_size] for i in range(group)]
+    return [buffer[skip + i * tuple_size + layout.tag_bytes:skip + (i + 1) * tuple_size] for i in range(group)]
 before = carrier()
 journal_base = layout.integrity_offset + 8 * 512
 journal_bytes = layout.journal_sections * layout.journal_section_sectors * 512
 journal = mmap.mmap(-1, journal_bytes)
 known_ids = {0x1111111111111111, 0x2222222222222222, 0x3333333333333333, 0x4444444444444444}
 def committed_new_ivs():
-    # Pinned no-MAC journal: address8, saved tails8 per 512-byte data unit, tuple28/32.
+    # Pinned no-MAC journal: address8, saved tails8 per 512-byte data unit, tuple (tag || IV).
     factor = layout.sector_size // 512
     stride = layout.journal_entry_bytes
-    iv_at = 8 + factor * 8 + 16
+    iv_at = 8 + factor * 8 + layout.tag_bytes
     assert os.preadv(raw, [journal], journal_base) == journal_bytes
     changed = set()
     for section in range(layout.journal_sections):

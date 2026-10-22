@@ -2,8 +2,8 @@
 
 > [!NOTE]
 > 2026-10-21: format v3 and the AES-GCM / ChaCha20-Poly1305 profiles were
-> removed (AEGIS-128 with [format v4](format-v4.md) is the only supported
-> configuration). Results below that mention them are historical evidence for
+> removed; 2026-10-22: XTS + HMAC authenc profiles were added beside the default
+> AEGIS-128 ([format v4](format-v4.md) needs 16-byte random IVs). Results below that mention them are historical evidence for
 > the code at that time; current runs are recorded in commit messages.
 
 Internal source-led review, 2026-10-19, of runtime/format revision 1f4c94f.
@@ -103,6 +103,15 @@ one per written primary sector), hidden writes (90 per 512-byte hidden block,
 one record; A/B writes one slot), keyslot/directory updates and initialization
 (28 + 90 + 90 × records). Failed preparations that reached encryption count;
 exact replays do not.
+
+**Profile matters.** Under original AEGIS-128 a repeated (key, IV) pair leaks
+plaintext relations and allows state recovery and forgery. Under the XTS + HMAC
+profiles the IV is the XTS tweak and authentication is HMAC over sector, IV and
+ciphertext: a repeated IV at the same sector only reveals which 16-byte blocks of
+the two plaintexts are equal, and forgery still requires the HMAC key. The same
+collision terms apply, but their consequence is much milder for XTS + HMAC.
+Serpent/Twofish images are authenticated but not decrypted by the host
+diagnostics.
 
 **Two collision terms.**
 

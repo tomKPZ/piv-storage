@@ -387,7 +387,7 @@ static int pn_range_ivs(struct piv_control *p, u64 index, u32 count, u8 *ivs, bo
  for (j = 0; j < count; j++) {
   struct piv_sector *s = NULL;
   r = piv_load_mode(p->cc, index + j, &s, true); if (r) return r;
-  memcpy(ivs + j * iv, s->original + 4112, iv);
+  memcpy(ivs + j * iv, s->original + PIV_IV_AT(p->cc), iv);
   piv_sector_free(p->cc, s);
  }
  return 0;
@@ -470,7 +470,7 @@ static int pn_commit(struct piv_control *p, bool hidden, u64 offset, const u8 *d
   u64 sector = le64_to_cpu(entries[i].sector), start = sector * unit;
   bool primary = !hidden && start < offset + bytes && start + unit > offset;
   memset(u->tuple, 0, sizeof(u->tuple)); u->sector = sector;
-  memcpy(u->expected_iv, entries[i].old, iv); memcpy(u->tuple + 4112, ivs + i * iv, iv);
+  memcpy(u->expected_iv, entries[i].old, iv); memcpy(u->tuple + PIV_IV_AT(p->cc), ivs + i * iv, iv);
   if (primary) {
    struct piv_sector *s = NULL;
    u64 lo = max(start, offset), hi = min(start + unit, offset + bytes);
@@ -628,7 +628,7 @@ static int pn_write_v4(struct piv_control *p, bool hidden, u64 offset, const u8 
   r = piv_load_mode(p->cc, index, &s, full); if (r) goto done;
   entries[count].sector = cpu_to_le64(index);
   entries[count].replace = s->bad;
-  memcpy(entries[count++].old, s->original + 4112, 16); piv_sector_free(p->cc, s);
+  memcpy(entries[count++].old, s->original + PIV_IV_AT(p->cc), 16); piv_sector_free(p->cc, s);
  }
  if (!count || count > (1ULL << 32) - p->encryptions) { r = -EDQUOT; goto done; }
  /* Local checks are NOT a historical nonce-uniqueness guarantee. */

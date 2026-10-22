@@ -2,8 +2,8 @@
 
 > [!NOTE]
 > 2026-10-21: format v3 and the AES-GCM / ChaCha20-Poly1305 profiles were
-> removed (AEGIS-128 with [format v4](format-v4.md) is the only supported
-> configuration). Results below that mention them are historical evidence for
+> removed; 2026-10-22: XTS + HMAC authenc profiles were added beside the default
+> AEGIS-128 ([format v4](format-v4.md) needs 16-byte random IVs). Results below that mention them are historical evidence for
 > the code at that time; current runs are recorded in commit messages.
 
 The bounded profile separates uninstrumented elapsed time from kernel call counts.

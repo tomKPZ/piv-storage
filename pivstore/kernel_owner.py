@@ -71,7 +71,8 @@ class GuestOwner:
         self.offset = validate_segment(metadata)
         self.no_journal = no_journal(metadata)
         self.encryption = metadata['segments']['0']['encryption']
-        self.mapping_cipher = PRIMARY_PROFILES[self.encryption][1]
+        self.integrity = metadata['segments']['0']['integrity']['type']
+        self.mapping_cipher, self.profile_tag = PRIMARY_PROFILES[(self.encryption, self.integrity)]
         self.uuid = str(uuid.UUID(crypt('luksUUID', self.source).stdout.strip()))
         self.raw_device = self.source.stat().st_rdev
         directory = Path('/run/pivstore')
@@ -93,8 +94,8 @@ class GuestOwner:
                                                self.offset, self.raw_bytes)
             finally:
                 os.close(raw)
-            if self.encryption != 'aegis128-random' or self.layout.iv_bytes != 16:
-                raise ValueError('LUKS and integrity IV sizes disagree')
+            if self.layout.iv_bytes != 16 or self.layout.tag_bytes != self.profile_tag:
+                raise ValueError('LUKS profile and integrity tuple size disagree')
             if self.layout.sector_size != metadata['segments']['0']['sector_size']:
                 raise ValueError('LUKS and integrity sector sizes disagree')
             existing = dm('info', name, check=False).returncode == 0

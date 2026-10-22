@@ -5,7 +5,7 @@ Run from the repository root as an ordinary host user:
 ```sh
 python3 scripts/fetch_sources.py
 python3 scripts/vm.py prepare
-python3 scripts/vm.py run --script scripts/guest-control-aegis.sh --share-file scripts/guest-control.sh --run-dir artifacts/control-001
+python3 scripts/suite.py --prefix artifacts/control-001 --profile aegis-4096 --scaffold <staged scaffold.tar>
 ```
 
 Choose a new run directory each time; the runner refuses to overwrite one.
@@ -35,19 +35,18 @@ Do not silently test a different version. The base image checksum was obtained
 from Debian's HTTPS checksum list; detached-signature verification has not been
 implemented. Package downloads use the guest's normal APT signature verification.
 
-The test formats /dev/vdb as LUKS2 original AEGIS-128/random (`--cipher
-aegis128-random --integrity aead --key-size 128`), the only supported profile,
-with 4096-byte encryption sectors by default. scripts/guest-control-aegis.sh and
-guest-control-aegis-512.sh select 4096- or 512-byte sectors; share
-scripts/guest-control.sh with them:
+scripts/guest-control.sh formats /dev/vdb with stock cryptsetup. Its environment
+selects the profile: `PIV_PRIMARY_CIPHER` (default `aegis128-random`, or
+`aes-`/`serpent-`/`twofish-xts-random` with `PIV_INTEGRITY=hmac-sha1|hmac-sha256|hmac-sha512`),
+`PIV_SECTOR_SIZE` (4096 default, or 512) and `PIV_NO_JOURNAL=1`. suite.py writes
+a one-line task per profile (`--profile aegis-4096`, `aes-sha256-512`, ...):
 
 ```sh
-python3 scripts/vm.py run --script scripts/guest-control-aegis-512.sh \
-  --share-file scripts/guest-control.sh --run-dir artifacts/control-512-next --timeout 1800
+python3 scripts/suite.py --prefix artifacts/suite-next --profile aes-sha256-4096 \
+  --scaffold artifacts/stage-next/scaffold.tar
 ```
 
-The AES-GCM and ChaCha20-Poly1305 control wrappers were removed with format v3
-on 2026-10-21. All control generation and stock readback checks share the same
+All control generation and stock readback checks share the same
 body.
 
 Each profile writes distinct deterministic synthetic plaintext
@@ -91,8 +90,9 @@ and fuzz, meant for changes in their own areas; migrate attaches a second 512 Mi
 disk, /dev/vdc, via `vm.py --second-blank-mib`; fuzz runs
 kernel/guest-table-fuzz.py (table/constructor fuzzing) and
 kernel/guest-ioctl-fuzz.py, seeded control-ioctl fuzzing with
-`PIV_FUZZ_STEPS`/`PIV_FUZZ_SEED` overrides, best on the sanitizer image). Profiles are aegis-4096 and aegis-512, plus aegis-4096-nojournal and
-aegis-512-nojournal (fixtures persisting stock --integrity-no-journal; guest_code
+`PIV_FUZZ_STEPS`/`PIV_FUZZ_SEED` overrides, best on the sanitizer image). Profiles are aegis-4096 and aegis-512, the XTS + HMAC profiles
+`<aes|serpent|twofish>-<sha1|sha256|sha512>-<4096|512>`, plus aegis-4096-nojournal
+and aegis-512-nojournal (fixtures persisting stock --integrity-no-journal; guest_code
 then exports PIV_ALLOW_NO_JOURNAL=1 so the test client passes --allow-no-journal). `--suites-for PROFILE=LIST` narrows the suites of matching profiles.
 `--reuse-native PREFIX` skips the native step and starts the suites from a
 previous matrix's passed, host-verified native run when the module input
@@ -167,8 +167,7 @@ Failed run artifacts remain ignored and must not be used as golden fixtures.
 
 ## Original AEGIS-128 diagnostics
 
-Use scripts/guest-control-aegis.sh or guest-control-aegis-512.sh, sharing the
-same guest-control.sh body. They select --cipher aegis128-random --integrity aead
+The aegis-* profiles select --cipher aegis128-random --integrity aead
 --key-size 128. This is Linux's original AEGIS-128, not AEGIS-128L. Native
 activation needs no additional userspace cryptography library.
 

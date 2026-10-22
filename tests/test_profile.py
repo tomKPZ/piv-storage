@@ -179,3 +179,35 @@ class NoJournalTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class XtsHmacProfileTests(unittest.TestCase):
+    def test_stock_tables_and_segments(self):
+        # Observed stock tables (artifacts/profile-probe-001/002, 64 MiB images).
+        cases = (('0 96640 integrity 7:0 32768 36 J 7 block_size:4096 journal_sectors:792 interleave_sectors:32768 '
+                  'buffer_sectors:32 journal_watermark:50 commit_time:10000 fix_padding', 12080, 4096, 792, 36),
+                 ('0 88056 integrity 7:0 32768 48 J 6 journal_sectors:1024 interleave_sectors:32768 '
+                  'buffer_sectors:128 journal_watermark:50 commit_time:10000 fix_padding', 88056, 512, 1024, 48),
+                 ('0 95376 integrity 7:0 32768 80 J 7 block_size:4096 journal_sectors:1000 interleave_sectors:32768 '
+                  'buffer_sectors:128 journal_watermark:50 commit_time:10000 fix_padding', 11922, 4096, 1000, 80))
+        for table, count, size, journal, tup in cases:
+            validate_integrity_table(table, count, os.makedev(7, 0), 16777216, size, journal, tup)
+            for bad in (table.replace('buffer_sectors:', 'buffer_sectors:3'),
+                        table.replace(f' {tup} J', ' 28 J')):
+                with self.subTest(table=bad), self.assertRaises(ValueError):
+                    validate_integrity_table(bad, count, os.makedev(7, 0), 16777216, size, journal, tup)
+        for cipher in ('aes', 'serpent', 'twofish'):
+            for mac in ('sha1', 'sha256', 'sha512'):
+                metadata = {'config': {}, 'segments': {'0': {
+                    'type': 'crypt', 'offset': '16777216', 'size': 'dynamic', 'iv_tweak': '0',
+                    'encryption': f'{cipher}-xts-random', 'sector_size': 4096,
+                    'integrity': {'type': f'hmac({mac})', 'journal_encryption': 'none', 'journal_integrity': 'none'}}}}
+                self.assertEqual(validate_segment(metadata), 16777216)
+                metadata['segments']['0']['integrity']['type'] = 'aead'
+                with self.assertRaises(UnsupportedImage):
+                    validate_segment(metadata)
+
+    def test_superblock_tuple_sizes(self):
+        for tup in (32, 36, 48, 80):
+            layout = parse_superblock(header(tuple_size=tup, provided=200000), 16777216, 134217728)
+            self.assertEqual((layout.iv_bytes, layout.tag_bytes, layout.tuple_bytes), (16, tup - 16, tup))

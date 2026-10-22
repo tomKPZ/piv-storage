@@ -108,7 +108,8 @@ impl KernelDevice {
         let (version, size) = (u32_at(&q, 0), u32_at(&q, 4));
         let (sector, iv, tag, tuple, flags, reserved) =
             (u32_at(&q, 24), u32_at(&q, 28), u32_at(&q, 32), u32_at(&q, 36), u32_at(&q, 40), u32_at(&q, 44));
-        if (version, size, tag, reserved) != (2, 48, 16, 0) || iv != 16 || tuple != 16 + iv
+        if (version, size, reserved) != (2, 48, 0) || !matches!(tag, 16 | 20 | 32 | 64) || iv != 16
+            || tuple != tag + iv
             || !(sector == 512 || sector == 4096) || flags != 0 {
             bail!("Unsupported kernel control/profile");
         }

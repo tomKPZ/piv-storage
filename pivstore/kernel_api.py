@@ -65,7 +65,7 @@ def no_journal(metadata):
 def validate_integrity_table(table, sectors, raw_device, offset, sector_size=4096, journal_sectors=1848, tuple_size=32,
                              no_journal=False):
     """The stock lower table: journaled ("J"), or direct ("D") for no-journal."""
-    if tuple_size != 32:
+    if tuple_size not in (32, 36, 48, 80):
         raise ValueError('Unsupported lower tuple size')
     words = table.split()
     if (len(words) < 8 or words[:3] != ['0', str(sectors * (sector_size // 512)), 'integrity'] or
@@ -74,19 +74,22 @@ def validate_integrity_table(table, sectors, raw_device, offset, sector_size=409
             int(words[7]) != len(words) - 8):
         raise ValueError('Unsupported lower integrity mapping')
     options = words[8:]
-    required = {'interleave_sectors:32768', 'buffer_sectors:128', 'fix_padding'}
+    required = {'interleave_sectors:32768', 'fix_padding'}
     if not no_journal:
         required |= {'journal_watermark:50', 'commit_time:10000'}
     if sector_size == 4096:
         required.add('block_size:4096')
     elif sector_size != 512:
         raise ValueError('Unsupported lower sector size')
-    if len(options) != len(required) + 1 or not required.issubset(options):
+    if len(options) != len(required) + 2 or len(set(options)) != len(options) or not required.issubset(options):
         raise ValueError('Unsupported lower integrity options')
-    extra = set(options) - required
-    if len(extra) != 1 or not next(iter(extra)).startswith('journal_sectors:'):
-        raise ValueError('Unsupported lower integrity journal')
-    journal = int(next(iter(extra)).split(':')[1])
+    extra = {o.split(':', 1)[0]: o.split(':', 1)[1] for o in set(options) - required if ':' in o}
+    # dm-integrity picks buffer_sectors itself (a power of two, at most the
+    # default 128, smaller when the journal would not fit); it is in-memory only.
+    if set(extra) != {'journal_sectors', 'buffer_sectors'} or extra['buffer_sectors'] not in (
+            '8', '16', '32', '64', '128') or not extra['journal_sectors'].isdecimal():
+        raise ValueError('Unsupported lower integrity journal/buffer')
+    journal = int(extra['journal_sectors'])
     if journal != journal_sectors:
         raise ValueError('Unsupported lower integrity journal size')
 
@@ -106,7 +109,7 @@ class KernelDevice:
             data = bytearray(QUERY.size)
             fcntl.ioctl(self.fd, command(0, QUERY.size, 2), data, True)
             v, size, self.generation, self.sectors, sector, iv, tag, tup, flags, reserved = QUERY.unpack(data)
-            if (v, size, tag, reserved) != (2, 48, 16, 0) or iv != 16 or tup != 16 + iv or sector not in (512, 4096) or flags != 0:
+            if (v, size, tag, reserved) != (2, 48, tag, 0) or tag not in (16, 20, 32, 64) or iv != 16 or tup != tag + iv or sector not in (512, 4096) or flags != 0:
                 raise ValueError('Unsupported kernel control/profile')
             devices = bytearray(16)
             fcntl.ioctl(self.fd, command(7, 16, 2), devices, True)

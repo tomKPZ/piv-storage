@@ -44,6 +44,12 @@ manual_add_modules chacha
 manual_add_modules hmac
 manual_add_modules sha256_generic
 manual_add_modules sha256
+# XTS + HMAC authenc profiles (generic and x86-optimized implementations).
+for module in authenc xts serpent_generic serpent-sse2-x86_64 serpent-avx-x86_64 serpent-avx2 \
+    twofish_generic twofish_common twofish-x86_64 twofish-x86_64-3way twofish-avx-x86_64 \
+    sha1_generic sha1 sha1-ssse3 sha512_generic sha512 sha512-ssse3 sha256-ssse3 aesni_intel; do
+    manual_add_modules "$module"
+done
 HOOK
 chmod 700 /etc/initramfs-tools/hooks/piv-test
 mkinitramfs -o /var/tmp/piv-base.initrd "$(uname -r)"

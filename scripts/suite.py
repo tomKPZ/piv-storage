@@ -26,14 +26,21 @@ import threading
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-# AEGIS-128 is the only supported profile (format v4 needs 16-byte IVs).
-CONTROL_SCRIPTS = {
-    'aegis-4096': ['scripts/guest-control-aegis.sh', 'scripts/guest-control.sh'],
-    'aegis-512': ['scripts/guest-control-aegis-512.sh', 'scripts/guest-control.sh'],
+
+# Fixture profiles: environment for scripts/guest-control.sh (stock luksFormat).
+PROFILES = {
+    'aegis-4096': dict(PIV_PRIMARY_CIPHER='aegis128-random', PIV_SECTOR_SIZE='4096'),
+    'aegis-512': dict(PIV_PRIMARY_CIPHER='aegis128-random', PIV_SECTOR_SIZE='512'),
     # Stock --integrity-no-journal persisted in the LUKS2 header (direct-mode lower table).
-    'aegis-4096-nojournal': ['scripts/guest-control-aegis-nojournal.sh', 'scripts/guest-control.sh'],
-    'aegis-512-nojournal': ['scripts/guest-control-aegis-512-nojournal.sh', 'scripts/guest-control.sh'],
+    'aegis-4096-nojournal': dict(PIV_PRIMARY_CIPHER='aegis128-random', PIV_SECTOR_SIZE='4096', PIV_NO_JOURNAL='1'),
+    'aegis-512-nojournal': dict(PIV_PRIMARY_CIPHER='aegis128-random', PIV_SECTOR_SIZE='512', PIV_NO_JOURNAL='1'),
 }
+# XTS + HMAC authenc profiles (user decision 2026-10-22), e.g. aes-sha256-4096.
+for _cipher in ('aes', 'serpent', 'twofish'):
+    for _mac in ('sha1', 'sha256', 'sha512'):
+        for _size in ('4096', '512'):
+            PROFILES[f'{_cipher}-{_mac}-{_size}'] = dict(
+                PIV_PRIMARY_CIPHER=f'{_cipher}-xts-random', PIV_INTEGRITY=f'hmac-{_mac}', PIV_SECTOR_SIZE=_size)
 SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early', 'power', 'controls', 'v4', 'migrate', 'fuzz')
 # Routine tier: run after kernel or pivsetup changes. The opt-in remainder is for
 # changes in its own area: controls (descriptive write-pattern statistics),
@@ -129,9 +136,11 @@ class Matrix:
 
     def control(self, profile):
         run_dir = self.args.prefix / f'{profile}-control'
-        scripts = [ROOT / s for s in CONTROL_SCRIPTS[profile]]
-        if not self.vm(f'{profile}/control', scripts[0], run_dir, shares=scripts[1:], timeout=1800,
-                       extra=['--blank-mib', '128']):
+        task = self.args.prefix / f'{profile}-control-task.sh'
+        env = ' '.join(f'{k}={v}' for k, v in PROFILES[profile].items())
+        task.write_text(f'#!/bin/bash\nset -euo pipefail\n{env} bash /mnt/piv-work/guest-control.sh\n')
+        if not self.vm(f'{profile}/control', task, run_dir, shares=[ROOT / 'scripts/guest-control.sh'],
+                       timeout=1800, extra=['--blank-mib', '128']):
             return None
         subprocess.run([str(self.args.pivsetup), 'keygen', '--output', str(run_dir / 'hidden.key')],
                        cwd=ROOT, check=True, capture_output=True)
@@ -269,7 +278,7 @@ class Matrix:
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--prefix', type=Path, required=True, help='New directory for all runs, e.g. artifacts/suite-001')
-    parser.add_argument('--profile', action='append', default=[], choices=sorted(CONTROL_SCRIPTS),
+    parser.add_argument('--profile', action='append', default=[], choices=sorted(PROFILES),
                         help='Create a fresh stock fixture for this profile (repeatable)')
     parser.add_argument('--control', action='append', default=[], type=Path,
                         help='Existing control run directory (with share/ and hidden.key); repeatable')

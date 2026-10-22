@@ -4,10 +4,10 @@ dm-piv.ko is a standalone module (dm-piv.c plus piv-control.inc and
 piv-native.inc) registering piv-crypt and paired piv-view targets. It no longer
 vendors or patches dm-crypt: dm-piv.c implements only the per-sector AEAD path
 over stock dm-integrity, reproducing the Linux LUKS2 layout (AAD =
-LE64(512-byte sector) || IV, tuple = tag || IV) for the pinned AEGIS-128 profile. It coexists with unmodified dm-crypt/crypt and does not require
+LE64(512-byte sector) || IV, tuple = tag || IV) for the supported stock profiles. It coexists with unmodified dm-crypt/crypt and does not require
 unloading stock crypt, including when an ordinary encrypted filesystem is busy.
 The hidden views share one owner, hidden-record crypto and stateless authentication.
-Primary encryption is original AEGIS-128 with stored 16-byte random IVs (format v4 only; AES-GCM/ChaCha20-Poly1305 and v3 were removed 2026-10-21).
+Primary encryption is original AEGIS-128 (default) or XTS + HMAC authenc, always with stored 16-byte random IVs (format v4 only; AES-GCM/ChaCha20-Poly1305 and v3 were removed 2026-10-21).
 See [native interface and end-to-end tests](../docs/native-blocks.md).
 The userspace FUSE/NBD adapters have been removed; their historical test results
 remain in Git history. Both 512- and 4096-byte primary encryption
