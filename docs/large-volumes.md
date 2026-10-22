@@ -87,13 +87,18 @@ key and run kernel/guest-large-test.py:
 - End-of-device reads return EOF without changing the buffer; past-end writes
   fail without marking the owner failed or wrapping to low addresses.
 - A high-address lower read error (dm-flakey) and a witnessed ciphertext
-  corruption in the last record: the caller buffer stays unchanged, the failure
-  is local (same owner continues) and complete oracles match after reopening.
+  corruption of the last record's last carrier sector: the decoy read of that
+  16 KiB work item leaves the caller buffer unchanged, the failure is local
+  (same owner continues) and complete oracles match after reopening; with only
+  data corrupted, the last hidden block still reads correctly (raw IV, SIV
+  tag).
 - Timed initialization and reopen, custom unload and stock full-primary
   authentication. `large-results.json` records geometry and timings.
 
-Last recorded timings (2026-10-21, KVM): reopen 0.34 s (4096) / 0.22 s (512);
-initialization 27.8 s / 168.5 s, proportional to capacity.
+Last recorded timings (2026-10-22, KVM, batched writes, large-4096-007 and
+large-512-007, run beside a sanitizer matrix): reopen 0.33 s (4096) / 0.26 s
+(512); initialization 2.6 s / 3.4 s (format v4 with the per-sector write path,
+2026-10-21: 27.8 s / 168.5 s).
 
 Host tests (tests/test_profile.py) check integrity layout arithmetic above
 32-bit byte offsets with synthetic 8 GiB metadata for both sector sizes,

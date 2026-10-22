@@ -59,7 +59,7 @@ KERNEL_REPORT = re.compile(r'BUG: KASAN|UBSAN:|possible circular locking|possibl
 
 def kernel_reports(run_dir):
     found = []
-    for path in (run_dir / 'console.log', run_dir / 'share/dmesg.txt', run_dir / 'share/reboot-dmesg.txt'):
+    for path in (run_dir / 'console.log', run_dir / 'shutdown-console.log', run_dir / 'share/dmesg.txt', run_dir / 'share/reboot-dmesg.txt'):
         if path.exists():
             for line in path.read_text(errors='replace').splitlines():
                 if KERNEL_REPORT.search(line):

@@ -49,5 +49,6 @@ added after the port; on 7.2.9 only aes-sha256-4096 has run (the routine
 suites, passing); aes-sha256-512 has not run there. Format v5 (2026-10-22) ran
 the routine suites on the port image for aegis-4096 and aes-sha256-4096, all
 passing; the 512-byte profiles and the opt-in suites have not run v5 on 7.2.
+The batched write path (suite-085) passed the same routine suites there.
 Not covered: sanitizer builds of
 7.2, other distributions, and kernels between 6.12 and 7.2.

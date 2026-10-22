@@ -54,7 +54,11 @@ WARNING or a kmemleak suspect. guest_record forces a final kmemleak scan and
 saves the report; vm.py keeps logging for 10 seconds after a kernel fault so the
 trace is preserved. After the task reports completion, vm.py allows QEMU 600 s
 to power off on a sanitizer image (120 s otherwise) before treating the guest as
-hung; a long KASAN run once needed more than the former 60 s.
+hung, and keeps reading the console into `shutdown-console.log` (also scanned
+for kernel reports). Two sanitizer runs completed their task but QEMU never
+exited (suite-078 v5 within 60 s, suite-084 cancel within 600 s); the cause is
+not known (the reruns powered off in seconds). The shutdown log now records
+where a future hang stops.
 
 ## Findings and known noise
 

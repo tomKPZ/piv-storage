@@ -177,7 +177,13 @@ for fault in ('reads', 'corruption'):
                f'{sector512} 1 flakey /dev/vdb {sector512} 0 3600 5 corrupt_bio_byte 1 r {replacement} 0\n'
                f'{sector512 + 1} {raw_sectors - sector512 - 1} linear /dev/vdb {sector512 + 1}\n')
         assert direct(SOURCE, physical) == bytes([replacement]) + original[1:]
-        role, offset, count = 'hidden', capacity - BLOCK, BLOCK
+        # Format v5: hidden reads take the raw stored IV of a carrier sector
+        # failing authentication; corrupt data alone leaves the block
+        # readable (the record's SIV tag decides), while the decoy work item
+        # holding that sector is withheld.
+        assert direct(v['hidden'], capacity - BLOCK) == expected[capacity - BLOCK:]
+        offset = (last * unit // 16384) * 16384
+        role, count = 'decoy', min(16384, size - offset)
     with mmap.mmap(-1, count) as buf:
         sentinel = b'\xa5' * count
         buf[:] = sentinel

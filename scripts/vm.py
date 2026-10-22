@@ -135,6 +135,23 @@ class Console:
     def close(self):
         self.selector.close()
 
+    def wait_exit(self, seconds):
+        """Wait for QEMU to exit while still reading (and logging) the serial
+        console, so shutdown output is kept for diagnosis and an unread stdio
+        pipe can never block QEMU's serial writes."""
+        stop = time.monotonic() + seconds
+        while self.process.poll() is None:
+            if time.monotonic() >= stop:
+                raise subprocess.TimeoutExpired(self.process.args, seconds)
+            if self.selector.select(timeout=0.5):
+                chunk = os.read(self.process.stdout.fileno(), 65536)
+                if self.log and chunk:
+                    self.log.write(chunk)
+                    self.log.flush()
+                if not chunk:
+                    self.process.wait(timeout=max(0.0, stop - time.monotonic()))
+        return self.process.returncode
+
 
 def qemu_command(args, overlay, data, share, extra=()):
     smp, memory = getattr(args, 'smp', 2), getattr(args, 'memory_mib', 1024)
@@ -367,8 +384,12 @@ def run(args):
         code = int(match.group(1))
         # After PIV_TASK_DONE the guest only syncs and powers off. Sanitizer
         # kernels (KASAN, kmemleak) can need minutes for that after long runs;
-        # a guest still running after the grace is treated as hung.
-        process.wait(timeout=shutdown_grace(args))
+        # a guest still running after the grace is treated as hung. Shutdown
+        # output goes to shutdown-console.log.
+        with (run_dir / 'shutdown-console.log').open('wb') as log:
+            console.log = log
+            console.wait_exit(shutdown_grace(args))
+            console.log = None
         if args.power_cut_script and not (run_dir / 'power-cut.json').exists() and code == 0:
             raise RuntimeError('Expected power cut was not requested')
         if process.returncode != 0 or code != 0:
