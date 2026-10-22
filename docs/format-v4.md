@@ -10,19 +10,20 @@ recorded in commit messages.
 ## Primary profiles
 
 Format v4 stores everything in the 16-byte random IVs that stock LUKS2 +
-dm-integrity already keep per primary encryption sector. It works with every
-supported stock profile (stored random 16-byte IVs, 512- or 4096-byte sectors):
+dm-integrity already keep per primary encryption sector. It works with both
+supported stock profiles (stored random 16-byte IVs, 512- or 4096-byte sectors):
 
 | LUKS2 encryption | Integrity | Volume key | Tag | Tuple (tag ‖ IV) |
 | --- | --- | --- | ---: | ---: |
 | `aegis128-random` (original AEGIS-128, default) | `aead` | 16 bytes | 16 | 32 |
-| `aes-`/`serpent-`/`twofish-xts-random` | `hmac-sha1` / `hmac-sha256` / `hmac-sha512` | XTS key (32 or 64) ‖ HMAC key (digest size) | 20 / 32 / 64 | 36 / 48 / 80 |
+| `aes-xts-random` | `hmac-sha256` | XTS key (32 or 64) ‖ HMAC key (32) | 32 | 48 |
 
 Primary authentication is unchanged Linux: AEGIS-128 uses AAD
-`LE64(sector × S/512) ‖ IV`; XTS + HMAC uses the IV as XTS tweak and the tag
-`HMAC(LE64(sector × S/512) ‖ IV ‖ ciphertext)` truncated to the digest size. The hidden format does not
+`LE64(sector × S/512) ‖ IV`; AES-XTS + HMAC-SHA256 uses the IV as XTS tweak and
+the tag `HMAC-SHA256(LE64(sector × S/512) ‖ IV ‖ ciphertext)`. The hidden format does not
 depend on the profile except through the number of primary sectors. Profiles
-with 12-byte IVs cannot carry v4 and are not supported.
+with 12-byte IVs cannot carry v4; other XTS ciphers and HMAC digests are
+refused.
 
 ## Why 10 random + 6 payload bytes
 
@@ -76,10 +77,8 @@ All keys are 32 bytes: `HKDF-SHA256(ikm, salt, info = "pivstore/v4/" ‖ label)`
 
 Because the A/B suffix is in the record context, every record key differs
 between layouts. The KEK is a 32-byte random key file or a passphrase KDF
-computed by pivsetup: Argon2id (default; v1.3, m = 64 MiB, t = 3, p = 4, salt =
-`base ‖ "/kek/argon2id"`) or scrypt (`--kdf scrypt`; N = 2^17, r = 8, p = 1,
-salt = `base ‖ "/kek"`). The KDF and its parameters are not recorded; opening
-with the wrong KDF fails the key check.
+computed by pivsetup with Argon2id (v1.3, m = 64 MiB, t = 3, p = 4, salt =
+`base ‖ "/kek/argon2id"`). The KDF parameters are fixed and not recorded.
 
 ## Fragment encoding
 
@@ -205,8 +204,8 @@ their previous contents. The keyslot areas 1–3 keep their existing IVs.
   repeat event. Tail and unlisted keyslot areas are uniform random. SIV payload,
   padding and keyslot contents are inside the PRP input and never directly
   visible. Local collision rejection slightly conditions the distribution.
-- **No public magic.** Nothing identifies a v4 volume without a key; the KDF
-  choice and A/B flag are only inside encrypted keyslots.
+- **No public magic.** Nothing identifies a v4 volume without a key; the A/B
+  flag is only inside encrypted keyslots.
 - **Offline guessing.** Keyslots are a fast key-check oracle; passphrases are
   only as strong as the KDF cost. Prefer 32-byte key files.
 - **Context binding.** The context binds UUID, primary size, sector size and
@@ -215,7 +214,7 @@ their previous contents. The keyslot areas 1–3 keep their existing IVs.
 - **Hidden-write signature.** A hidden write re-encrypts 90 sectors with
   unchanged primary plaintext. A decoy-key holder who sees journal history or
   two snapshots can detect it; decoy writes have the stock footprint
-  ([detectability.md](detectability.md)). Stock `--integrity-no-journal`
-  (pivsetup `--allow-no-journal`) avoids on-disk journal history at the cost of
-  torn decoy sectors after a crash ([journal-atomicity.md](journal-atomicity.md)).
+  ([detectability.md](detectability.md)). Stock `--integrity-no-journal` would
+  avoid on-disk journal history but is refused, because a crash could then tear
+  decoy sectors ([journal-atomicity.md](journal-atomicity.md)).
 - Nonce budgets, observers and limits: [security-review.md](security-review.md).

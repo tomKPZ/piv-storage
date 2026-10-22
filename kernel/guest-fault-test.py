@@ -34,10 +34,6 @@ def blocks_touched(device, first, last):
     low, high = (first - 112) // 90 - 2, (last - 112) // 90 - 2
     return range(max(0, low), high + 1) if last >= 112 + 180 else range(0)
 
-# Fixture persists stock --integrity-no-journal (guest_code sets this).
-NO_JOURNAL = os.environ.get('PIV_ALLOW_NO_JOURNAL') == '1'
-
-
 def unreadable(path, unit, sectors, chunk=65536):
     """Primary sectors whose decoy reads fail (O_DIRECT, per-sector on error)."""
     bad, fd = [], os.open(path, os.O_RDONLY | os.O_DIRECT)
@@ -190,13 +186,6 @@ with blocks.spawn_open(SOURCE, KEY, HKEY, allow_test_stack=True,
 assert json.loads(Path(gate + '-setup.json').read_text())['errno'] == errno.EIO
 absent()
 results.append('kernel-auth cleanup')
-if NO_JOURNAL:
-    # The no-journal hazard needs pivsetup's explicit opt-in; refusal cleans up.
-    refusal = rejected(lambda: blocks.open_blocks(SOURCE, KEY, HKEY, allow_test_stack=True,
-                                                  allow_no_journal=False), ValueError)
-    assert 'allow-no-journal' in str(refusal), refusal
-    absent()
-    results.append('no-journal volume refused without --allow-no-journal')
 print('Setup phase failures and unrelated-name protection passed', flush=True)
 
 # Existing bare owners are not silently adopted or destroyed by a failed open.
@@ -232,11 +221,6 @@ for role in ('decoy', 'hidden'):
         affected = (range(10, 11) if role == 'hidden' else
                     blocks_touched(handle.device, offset // unit, (offset + size - 1) // unit))
         old = direct(v[role], offset=offset, size=size)
-        # Primary sectors this request may rewrite: the decoy range, or the
-        # hidden record's whole carrier (hidden-only tuples).
-        span = (range(offset // unit, (offset + size - 1) // unit + 1) if role == 'decoy'
-                else range(record_span(handle.device, 10)[0], record_span(handle.device, 10)[1] + 1))
-        saved = {sector: direct(v['decoy'], offset=sector * unit, size=unit) for sector in span}
         sectors = handle.device.sectors
         before_count = blocks.native_status(handle.device)['encryptions']
         print(f'Injecting lower {mode} through {role}, {size} bytes at offset {offset}', flush=True)
@@ -261,17 +245,8 @@ for role in ('decoy', 'hidden'):
             handle = owner()
             assert handle.device.generation != generation and not blocks.native_status(handle.device)['failed']
             handle.close()
-            torn = []
-            if NO_JOURNAL:
-                # Without the journal a failed lower write may leave sectors
-                # torn (EIO). They must lie within the request's primary
-                # sectors, and full-sector decoy writes of the saved plaintext
-                # replace them (the failing-sector replacement path).
-                torn = unreadable(v['decoy'], unit, sectors)
-                assert set(torn) <= set(span), (torn, span)
-                for sector in torn:
-                    direct(v['decoy'], write=saved[sector], offset=sector * unit)
-                assert not unreadable(v['decoy'], unit, sectors)
+            # The journal keeps every primary sector whole across the failed write.
+            assert not unreadable(v['decoy'], unit, sectors)
             repaired = verify(v, unavailable=affected)
         else:
             # Nothing was mutated: only the request fails. A write needing the
@@ -294,7 +269,6 @@ for role in ('decoy', 'hidden'):
         results.append(dict(view=role, fault=mode, bytes=size, offset=offset,
                             failed_both_views=mode == 'writes', recreated=mode == 'writes',
                             same_owner_continued=mode == 'reads', repaired=repaired,
-                            torn_primary_sectors=torn if mode == 'writes' else [],
                             prepared_encryptions=spent))
         print(f'{role} lower {mode}: ' + ('fail-stop, teardown, replay and recreation passed' if mode == 'writes'
               else 'local EIO, no encryption, same-owner continuation passed'), flush=True)

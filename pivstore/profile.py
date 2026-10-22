@@ -1,8 +1,8 @@
 """Read-only LUKS2/dm-integrity profile, cross-checked with stock Linux fixtures.
 
 LUKS2 header checksums and redundant-header selection are delegated to cryptsetup.
-Only no-journal-crypto, fixed-padding, 512/4096-byte profiles with 16-byte random IVs
-(original AEGIS-128, or aes/serpent/twofish-xts-random with hmac-sha1/256/512) are accepted.
+Only journaled (no journal crypto), fixed-padding, 512/4096-byte profiles with 16-byte
+random IVs (original AEGIS-128, or aes-xts-random with hmac-sha256) are accepted.
 """
 
 from contextlib import AbstractContextManager
@@ -77,7 +77,7 @@ def parse_superblock(header, offset, file_size):
     magic, version, interleave, tuple_size, sections, provided, flags, block = (
         struct.unpack_from('<8sBBHIQIB', header))
     if (magic, version, interleave, flags) != (
-            b'integrt\0', 4, 15, 8) or tuple_size not in (32, 36, 48, 80) or block not in (0, 3):
+            b'integrt\0', 4, 15, 8) or tuple_size not in (32, 48) or block not in (0, 3):
         raise UnsupportedImage('Unsupported integrity superblock profile')
     if offset < 32768 or offset % 4096 or offset + 4096 > file_size:
         raise UnsupportedImage('Invalid integrity offset')
@@ -205,8 +205,7 @@ class Image(AbstractContextManager):
             yield self.read(self.layout.iv_bytes, tag_offset + self.layout.tag_bytes)
 
     def verify(self, key):
-        """Authenticate every primary sector; return the plaintext SHA-256, or
-        None for profiles authenticated but not decrypted on the host."""
+        """Authenticate and decrypt every primary sector; return the plaintext SHA-256."""
         from .sector import SectorCodec
         codec = SectorCodec(key, self.layout.sector_size, self.encryption, self.integrity)
         digest = hashlib.sha256()
@@ -214,11 +213,8 @@ class Image(AbstractContextManager):
             data_offset, tag_offset = self.layout.offsets(index)
             ciphertext = self.read(self.layout.sector_size, data_offset)
             metadata = self.read(self.layout.tuple_bytes, tag_offset)
-            if codec.decrypts:
-                digest.update(codec.decrypt(index, ciphertext, metadata))
-            else:
-                codec.authenticate(index, ciphertext, metadata)
-        return digest.hexdigest() if codec.decrypts else None
+            digest.update(codec.decrypt(index, ciphertext, metadata))
+        return digest.hexdigest()
 
     def check_unchanged(self):
         current = os.fstat(self.fd)

@@ -12,8 +12,8 @@ are not committed; reproduce fixtures with docs/development.md
   6.12.113+deb13-amd64, cryptsetup/libcryptsetup 2:2.7.5-2, run under QEMU.
 - Fixtures: 128 MiB `/dev/vdb`, `cryptsetup luksFormat --type luks2 --cipher C
   --integrity I --sector-size S` with a cheap test PBKDF; AEGIS fixtures use a
-  16-byte volume key, XTS fixtures a 64-byte XTS key (cryptsetup appends the
-  HMAC key).
+  16-byte volume key, AES-XTS fixtures a 64-byte XTS key (cryptsetup appends
+  the 32-byte HMAC-SHA256 key).
 - Upstream functions checked in the source subset pinned by
   environment/sources.json: `crypt_convert_block_aead`, `iv_tag_from_dmreq`,
   `calculate_journal_section_size`, `calculate_device_limits`,
@@ -24,9 +24,8 @@ are not committed; reproduce fixtures with docs/development.md
 
 Every native/suite output image is verified on the host by
 `scripts/check_stateless.py`: full primary authentication (AEGIS-128 via the
-pinned SUPERCOP reference, AES-XTS decrypted with cryptography, Serpent/Twofish
-HMAC-authenticated only, their plaintext checked by stock dm-crypt in the
-guest), hidden decoding and current-IV uniqueness. This is evidence for the
+pinned SUPERCOP reference, AES-XTS + HMAC-SHA256 with cryptography), hidden
+decoding and current-IV uniqueness. This is evidence for the
 tested profiles and geometry; it does not establish arbitrary configurations,
 hardware crash durability or deniability.
 
@@ -44,14 +43,12 @@ Each primary sector's metadata tuple is `tag ‖ IV16`:
 | Profile | Active transform | Tag | Tuple | Primary authentication |
 | --- | --- | ---: | ---: | --- |
 | `aegis128-random` / `aead` | `capi:aegis128-random` (original AEGIS-128, not AEGIS-128L) | 16 | 32 | AEAD, AAD = `LE64(i·f) ‖ IV` |
-| `{aes,serpent,twofish}-xts-random` / `hmac-sha1` | dm-crypt `authenc(hmac(sha1),xts(…))` | 20 | 36 | tag = `HMAC(LE64(i·f) ‖ IV ‖ ciphertext)`, IV = XTS tweak |
-| … / `hmac-sha256` | `authenc(hmac(sha256),xts(…))` | 32 | 48 | as above |
-| … / `hmac-sha512` | `authenc(hmac(sha512),xts(…))` | 64 | 80 | as above |
+| `aes-xts-random` / `hmac-sha256` | dm-crypt `authenc(hmac(sha256),xts(aes))` | 32 | 48 | tag = `HMAC-SHA256(LE64(i·f) ‖ IV ‖ ciphertext)`, IV = XTS tweak |
 
 Here i is the primary encryption-sector index and f = S/512: the address is in
 512-byte units even for 4096-byte sectors (using i directly fails
-authentication for nonzero i). The authenc volume key is XTS key ‖ HMAC key
-(digest size).
+authentication for nonzero i). The authenc volume key is XTS key (32 or 64
+bytes) ‖ 32-byte HMAC key. Other XTS ciphers and HMAC digests are refused.
 
 ## Geometry formulas
 
@@ -74,29 +71,23 @@ not establish arbitrary-profile support.
 
 ## Observed 128 MiB fixtures
 
-Read from the stock fixtures with `python3 -m pivstore inspect`. Serpent and
-Twofish fixtures have the same geometry as AES with the same HMAC (identical
-primary sector counts in every suite run). Hidden bytes are format v4 without
+Read from the stock fixtures with `python3 -m pivstore inspect`. Hidden bytes are format v4 without
 A/B ([format-v4.md](format-v4.md)); A/B halves them.
 
 | Profile | S | Tuple | Journal sections × sectors (entries/section) | Initial | Metadata run | Primary sectors | Hidden bytes |
 | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: |
 | AEGIS | 4096 | 32 | 7 × 264 (32) | 1,856 | 256 | 28,216 | 158,720 |
-| XTS + HMAC-SHA1 | 4096 | 36 | 7 × 264 (32) | 1,856 | 288 | 28,188 | 158,208 |
 | XTS + HMAC-SHA256 | 4096 | 48 | 7 × 264 (32) | 1,856 | 384 | 28,104 | 158,208 |
-| XTS + HMAC-SHA512 | 4096 | 80 | 10 × 200 (24) | 2,008 | 640 | 27,861 | 156,672 |
 | AEGIS | 512 | 32 | 23 × 88 (80) | 2,032 | 2,048 | 213,008 | 1,209,856 |
-| XTS + HMAC-SHA1 | 512 | 36 | 25 × 80 (72) | 2,008 | 2,304 | 211,240 | 1,199,616 |
 | XTS + HMAC-SHA256 | 512 | 48 | 32 × 64 (56) | 2,056 | 3,072 | 205,816 | 1,168,896 |
-| XTS + HMAC-SHA512 | 512 | 80 | 42 × 48 (40) | 2,024 | 5,120 | 196,608 | 1,116,672 |
 
 The lower dm-integrity table has `interleave_sectors:32768`, `fix_padding`,
 `block_size:4096` (4096-byte profiles only), `journal_sectors` equal to the
 journal size above (for example 1,848 and 2,024 for AEGIS),
-`journal_watermark:50` and `commit_time:10000` (journaled mode) and a
+`journal_watermark:50` and `commit_time:10000` (journaled mode `J`) and a
 `buffer_sectors` value dm-integrity chooses itself (a power of two up to 128);
-pivsetup accepts exactly these options. With stock `--integrity-no-journal`
-persisted, the table is direct mode (`D`) without watermark/commit time
+pivsetup accepts exactly these options. A stock `--integrity-no-journal`
+volume (direct mode `D`) is refused
 ([journal-atomicity.md](journal-atomicity.md)).
 
 ## Conservative journal handling

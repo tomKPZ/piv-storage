@@ -15,7 +15,8 @@ python3 scripts/build_debug_kernel.py --prefix artifacts/debug-image-next
    reduced by `localmodconfig` to the modules the suites load. The list must
    include every module a suite needs, e.g. the AF_ALG modules (without them
    in-guest `cryptsetup luksFormat` reports aegis128-random unavailable) and the
-   authenc/xts/serpent/twofish/sha1/sha512 modules for the XTS + HMAC profiles.
+   authenc/xts modules (plus `hmac`, `sha256` and `aesni_intel`) for the AES-XTS +
+   HMAC-SHA256 profiles.
    Then KASAN (generic, inline, vmalloc), UBSAN (bounds, shift, bool, enum),
    PROVE_LOCKING, DEBUG_ATOMIC_SLEEP, DEBUG_LIST, DEBUG_SG and kmemleak; no
    debug info. `make bindeb-pkg` with `LOCALVERSION=+deb13-amd64-pivdbg`.

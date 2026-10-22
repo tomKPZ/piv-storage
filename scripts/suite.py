@@ -31,16 +31,10 @@ ROOT = Path(__file__).resolve().parents[1]
 PROFILES = {
     'aegis-4096': dict(PIV_PRIMARY_CIPHER='aegis128-random', PIV_SECTOR_SIZE='4096'),
     'aegis-512': dict(PIV_PRIMARY_CIPHER='aegis128-random', PIV_SECTOR_SIZE='512'),
-    # Stock --integrity-no-journal persisted in the LUKS2 header (direct-mode lower table).
-    'aegis-4096-nojournal': dict(PIV_PRIMARY_CIPHER='aegis128-random', PIV_SECTOR_SIZE='4096', PIV_NO_JOURNAL='1'),
-    'aegis-512-nojournal': dict(PIV_PRIMARY_CIPHER='aegis128-random', PIV_SECTOR_SIZE='512', PIV_NO_JOURNAL='1'),
+    # AES-XTS + HMAC-SHA256 authenc (user decision 2026-10-22).
+    'aes-sha256-4096': dict(PIV_PRIMARY_CIPHER='aes-xts-random', PIV_INTEGRITY='hmac-sha256', PIV_SECTOR_SIZE='4096'),
+    'aes-sha256-512': dict(PIV_PRIMARY_CIPHER='aes-xts-random', PIV_INTEGRITY='hmac-sha256', PIV_SECTOR_SIZE='512'),
 }
-# XTS + HMAC authenc profiles (user decision 2026-10-22), e.g. aes-sha256-4096.
-for _cipher in ('aes', 'serpent', 'twofish'):
-    for _mac in ('sha1', 'sha256', 'sha512'):
-        for _size in ('4096', '512'):
-            PROFILES[f'{_cipher}-{_mac}-{_size}'] = dict(
-                PIV_PRIMARY_CIPHER=f'{_cipher}-xts-random', PIV_INTEGRITY=f'hmac-{_mac}', PIV_SECTOR_SIZE=_size)
 SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early', 'power', 'controls', 'v4', 'migrate', 'fuzz',
           'bench')
 # Routine tier: run after kernel or pivsetup changes. The opt-in remainder is for

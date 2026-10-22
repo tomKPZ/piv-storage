@@ -39,25 +39,25 @@ guest and synthetic 128 or 512 MiB disks (`/dev/vdb`), not real hosts or disks.
 | Cipher | Integrity | Tag | Metadata tuple |
 | --- | --- | ---: | ---: |
 | `aegis128-random` (default; original AEGIS-128, **not AEGIS-128L**) | `aead` | 16 | 32 |
-| `aes-`, `serpent-` or `twofish-xts-random` | `hmac-sha1` / `hmac-sha256` / `hmac-sha512` | 20 / 32 / 64 | 36 / 48 / 80 |
+| `aes-xts-random` | `hmac-sha256` | 32 | 48 |
 
 512- or 4096-byte encryption sectors, integrity v4 fixed padding and the stock
-dm-integrity journal (default). XTS profiles use dm-crypt's authenc key
-encoding: a 32- or 64-byte XTS key followed by the HMAC key. Under XTS + HMAC a
+journaled dm-integrity mode. AES-XTS uses dm-crypt's authenc key encoding: a
+32- or 64-byte XTS key followed by the 32-byte HMAC key. Under XTS + HMAC a
 repeated IV reveals only equal plaintext at that sector (HMAC still prevents
 forgery); under AEGIS-128 it is a key compromise (see the
 [security review](docs/security-review.md)). The cipher is visible in LUKS
 metadata; compare detectability against a matched ordinary volume of the same
 profile.
 
-Stock `--integrity-no-journal` volumes (persistent LUKS2 flag) open only with
-`--allow-no-journal`: a crash during a hidden write can then tear decoy sectors
-of that record, not only the sectors being written
+Stock `--integrity-no-journal` volumes (persistent LUKS2 `no-journal` flag)
+are refused: without the journal a crash during a hidden write can tear decoy
+sectors of that record, and the measured write gain for dm-piv was small
 ([journal-atomicity.md](docs/journal-atomicity.md)).
 
 ## Usage
 
-Choose the primary cipher, sector size, journal and A/B with
+Choose the primary cipher, sector size and A/B with
 [configuration.md](docs/configuration.md) (trade-offs, defaults and measured
 performance). Build on the host with `python3 scripts/build_pivsetup.py`; see
 [development.md](docs/development.md) for the VM harness and
@@ -80,13 +80,11 @@ pivsetup close-blocks --device /dev/vdb --key-file /mnt/piv-work/passphrase.key
   be initialized before hidden use (stock cryptsetup still opens the decoy).
 - `--ab` (with `--initialize`): two record slots per block, so an interrupted
   hidden write leaves the previous version readable, at half capacity.
-- `--hidden-passphrase-file F` instead of `--hidden-key-file`, with
-  `--kdf argon2id` (default; 64 MiB, t=3, p=4) or `--kdf scrypt`. Nothing
-  records the KDF, so use the same one on every open.
+- `--hidden-passphrase-file F` instead of `--hidden-key-file`; the passphrase
+  KEK is always Argon2id (64 MiB, t=3, p=4).
 - `--verify`: authenticate every primary sector first and refuse the volume on
   any failure (an O(volume) audit). By default setup scans only the 112-sector
   keyslot area, in constant time.
-- `--allow-no-journal`: accept a no-journal volume (above).
 - `--name` (default `piv-native`), `--device` (default `/dev/vdb`).
 
 Other commands: `pivsetup keyslot add|remove --slot 0-3` manages up to four
@@ -97,8 +95,8 @@ primary rekey, resize or sector-size change, since live resize/rekey is
 unsupported (stock cryptsetup refuses reencrypt and resize on integrity
 volumes). See [rust/README.md](rust/README.md).
 
-Capacity on the 128 MiB fixtures (AEGIS-128; XTS + HMAC tuples are larger, so
-slightly fewer sectors):
+Capacity on the 128 MiB fixtures (AEGIS-128; XTS + HMAC-SHA256 tuples are
+larger, so slightly fewer sectors):
 
 | Sector bytes | Decoy bytes | Hidden bytes | Hidden bytes with `--ab` |
 | ---: | ---: | ---: | ---: |
@@ -202,9 +200,9 @@ python3 -m pivstore unpack PREFIX/aegis-4096-native/share/dual-final.img \
 
 `verify` authenticates the complete primary image and prints its plaintext hash;
 AEGIS-128 needs the pinned [SUPERCOP diagnostic
-reference](docs/development.md#original-aegis-128-diagnostics), AES-XTS + HMAC
-uses `cryptography`, and Serpent/Twofish images are HMAC-authenticated only
-(guests check their plaintext with stock dm-crypt). `unpack` opens a keyslot,
+reference](docs/development.md#original-aegis-128-diagnostics) and AES-XTS +
+HMAC-SHA256 uses `cryptography`; both profiles are fully decrypted on the host.
+`unpack` opens a keyslot,
 authenticates every hidden block and publishes a private output file only on
 success. `extract-ivs` performs no primary verification. Offline diagnostics
 reject a dirty journal; native activation lets Linux replay it. Keys belong in

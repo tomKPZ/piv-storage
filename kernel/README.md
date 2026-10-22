@@ -5,7 +5,7 @@ and piv-native.inc; no dm-crypt fork or patch) registering `piv-crypt` and the
 paired `piv-view` targets. dm-piv.c implements only the per-sector AEAD path
 over stock dm-integrity, reproducing the Linux LUKS2 layout (AAD =
 LE64(512-byte sector) ‖ IV, tuple = tag ‖ IV) for the supported stock profiles:
-original AEGIS-128 (default) or XTS + HMAC authenc, always with stored random
+original AEGIS-128 (default) or AES-XTS + HMAC-SHA256 authenc, always with stored random
 16-byte IVs, 512- or 4096-byte sectors, hidden format v4. It coexists with
 unmodified dm-crypt and never requires unloading it, even while an ordinary
 encrypted filesystem is busy. Interfaces and tests:

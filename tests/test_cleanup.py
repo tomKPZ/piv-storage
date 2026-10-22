@@ -89,12 +89,10 @@ class ClientTests(unittest.TestCase):
     def test_passphrase_kek_cross_check_vectors(self):
         # Same vectors as rust/tests/*.hex (Rust/Python KDF parity).
         vectors = Path(__file__).resolve().parents[1] / 'rust/tests'
-        self.assertEqual(blocks.passphrase_kek(b'pw', b'ctx', 'scrypt').hex(),
-                         (vectors / 'scrypt-pw-ctx.hex').read_text().strip())
         self.assertEqual(blocks.passphrase_kek(b'pw', b'ctx').hex(),
                          (vectors / 'argon2id-pw-ctx.hex').read_text().strip())
         with self.assertRaises(ValueError):
-            blocks.passphrase_kek(b'pw', b'ctx', 'pbkdf2')
+            blocks.passphrase_kek(b'', b'ctx')
 
 
 if __name__ == '__main__':

@@ -66,14 +66,6 @@ new = b'partial-record power cut'.ljust(512, b'!')
 (w / 'power-new-block').write_bytes(new)
 (w / 'power-old-hidden').write_bytes(old)
 (w / 'power-primary.sha256').write_text(subprocess.check_output(['sha256sum', views['decoy']], text=True).split()[0] + '\n')
-# Decoy plaintext of the record's carrier: without the integrity journal an
-# interrupted hidden write can tear these primary sectors (recovery checks that
-# only these fail and restores them from this copy).
-with open(views['decoy'], 'rb') as stream:
-    stream.seek(first * layout.sector_size)
-    (w / 'power-carrier-plaintext').write_bytes(stream.read(group * layout.sector_size))
-(w / 'power-carrier.json').write_text(json.dumps(dict(first=first, group=group, unit=layout.sector_size,
-                                                      sectors=layout.sectors)) + '\n')
 os.sync()
 errors = []
 def writer():

@@ -80,8 +80,9 @@ struct piv_io {
 };
 
 /*
- * Stock LUKS2 profiles whose random 16-byte IVs live in dm-integrity metadata,
- * as format v4 requires (12-byte-IV GCM/ChaCha profiles cannot carry it).
+ * The two supported stock LUKS2 profiles (aegis128-random + aead, aes-xts-random
+ * + hmac-sha256) whose random 16-byte IVs live in dm-integrity metadata, as
+ * format v4 requires.
  * enc_a/enc_b: accepted encryption key sizes in bytes; mac: HMAC key size (the
  * dm-crypt default, the digest size); tag: integrity tag bytes.
  */
@@ -90,15 +91,7 @@ static const struct piv_profile {
 	unsigned int enc_a, enc_b, mac_size, tag_size, iv_size;
 } piv_profiles[] = {
 	{ "capi:aegis128-random", "aegis128", 16, 16, 0, 16, 16 },
-#define PIV_AUTHENC(hash, digest, cipher) \
-	{ "capi:authenc(hmac(" hash "),xts(" cipher "))-random", \
-	  "authenc(hmac(" hash "),xts(" cipher "))", 32, 64, digest, digest, 16 }
-	PIV_AUTHENC("sha1", 20, "aes"), PIV_AUTHENC("sha256", 32, "aes"), PIV_AUTHENC("sha512", 64, "aes"),
-	PIV_AUTHENC("sha1", 20, "serpent"), PIV_AUTHENC("sha256", 32, "serpent"),
-	PIV_AUTHENC("sha512", 64, "serpent"),
-	PIV_AUTHENC("sha1", 20, "twofish"), PIV_AUTHENC("sha256", 32, "twofish"),
-	PIV_AUTHENC("sha512", 64, "twofish"),
-#undef PIV_AUTHENC
+	{ "capi:authenc(hmac(sha256),xts(aes))-random", "authenc(hmac(sha256),xts(aes))", 32, 64, 32, 32, 16 },
 };
 
 /*

@@ -1,9 +1,9 @@
-# Journal atomicity and the no-journal option
+# Journal atomicity
 
 Question: can the stock dm-integrity journal make one hidden record (90 primary
 sectors) atomic across power loss? Answer: no. The journal gives per-sector
 primary atomicity only; per-block hidden atomicity comes from the optional A/B
-record slots ([format-v4.md](format-v4.md)), which work with or without a journal.
+record slots ([format-v4.md](format-v4.md)).
 
 ## Evidence
 
@@ -19,7 +19,7 @@ review only):
   space (`free_sectors`). Under journal pressure one bio is copied in several
   reservations, which can land in different commits.
 - A journal section holds at most 80 entries in every supported profile (32 for
-  AEGIS at 4096-byte sectors, 80 at 512; 24–72 for XTS + HMAC; see
+  AEGIS at 4096-byte sectors, 80 at 512; 32 and 56 for XTS + HMAC-SHA256; see
   [observed-layout.md](observed-layout.md)), so a 90-sector record always spans
   more than one section even if it were submitted as one bio.
 - The native owner applies one tuple per lower write and flushes every 32
@@ -43,7 +43,8 @@ the device: it does not model a torn device write or hardware power loss.
    cross-block ordering.
 2. The journal does provide per-sector primary atomicity (data, tag and IV
    together). Without it, a crash can tear a primary sector, which then fails
-   authentication (EIO), as for any stock `--integrity-no-journal` user.
+   authentication (EIO). This is why no-journal volumes are unsupported
+   ([below](#no-journal-mode-is-unsupported)).
 3. The design tolerates failing sectors: setup scans only the keyslot area by
    default (`--verify` keeps the strict full audit), keyslot, directory and
    hidden decoding take raw IVs of failing carrier sectors (only the SIV tag can
@@ -51,37 +52,15 @@ the device: it does not model a torn device write or hardware power loss.
    A torn sector therefore does not block activation; it returns EIO until
    overwritten.
 
-## No-journal support
+## No-journal mode is unsupported
 
-Stock `--integrity-no-journal` is persisted by cryptsetup as the LUKS2 config
-flag `"no-journal"` (`cryptsetup open --integrity-no-journal --persistent`); the
-superblock is unchanged and every later open builds a direct-mode (`D`) lower
-table without `journal_watermark`/`commit_time`. pivsetup and the Python
-instrumentation accept exactly that flag (any other persistent flag is refused)
-and validate the D table; the offline diagnostics read such images unchanged.
-
-**Hazard (measured, accepted by the user).** Without the journal a hidden write
-is non-atomic not only for its record but also for the primary sectors it
-rewrites: it re-encrypts all 90 carrier sectors with unchanged plaintext, and a
-crash can leave a sector with mismatched data and tag/IV. In the same power
-test on the `aegis-4096-nojournal` and `aegis-512-nojournal` profiles, primary
-sector 303 (inside the interrupted record's carrier) was left failing
-authentication (4096 in every run; 512 in some runs, while others tore none);
-12 of 90 carrier IVs had changed. Its decoy plaintext is lost unless the user
-has a copy (the test restores it from a pre-cut copy to show the damage is
-confined to that carrier). Stock no-journal users lose only sectors they were
-writing; here a crash can also damage decoy sectors the user never wrote, which
-is also an observable anomaly. Decoy writes have only the stock exposure.
-
-**Policy.** pivsetup refuses a no-journal volume unless `--allow-no-journal` is
-given (the error explains the hazard). The journal stays the default. With
-no-journal, A/B records are recommended; a decoy-write tear leaves the hidden
-block readable (both IVs carry the same fragment, and hidden reads use the raw
-IV), while an interrupted hidden write mixes old and new fragments and fails its
-SIV tag (A/B keeps the previous version). Torn sectors return EIO until a
-full-sector decoy write replaces them.
-
-The no-journal profiles run the routine guest suites (faults including the
-opt-in refusal and torn-sector confinement, profile, cancel, lifecycle, batch,
-early, power, v4) plus fuzz and migrate; executed runs are recorded in commit
-messages.
+pivsetup refuses a LUKS2 header persisting the stock `"no-journal"` flag
+(`cryptsetup open --integrity-no-journal --persistent`) and any non-journal
+(direct-mode `D`) lower table. Earlier opt-in support showed the hazard: in the
+same power test on 4096- and 512-byte AEGIS no-journal volumes, an interrupted
+hidden write left a carrier sector it re-encrypted with unchanged plaintext
+failing authentication (every 4096 run, some 512 runs), so a crash could
+destroy decoy sectors the user never wrote, an observable anomaly that stock
+no-journal users do not have. The measured dm-piv write gain was at most about
+17%, and none at 512-byte sectors ([configuration.md](configuration.md#integrity-journal)),
+so support was removed.

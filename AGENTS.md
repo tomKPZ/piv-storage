@@ -54,15 +54,15 @@ resolved from context/evidence, not for routine implementation decisions.
 - Format v4 (docs/format-v4.md, user-approved 2026-10-20) is the only hidden
   format: LRW-randomized fragments (10 random + 6 payload bytes per 16-byte
   IV), 90-fragment SIV records, encrypted keyslots (no public magic) with a
-  directory, Argon2id (default) or scrypt passphrase KEKs and optional A/B
-  slots. Never add a persistent encryption counter. Format v3, its invalid
+  directory, Argon2id passphrase KEKs and optional A/B slots. Never add a persistent encryption counter. Format v3, its invalid
   markers and the 12-byte-IV AES-GCM/ChaCha20-Poly1305 profiles were removed
   by user decision (2026-10-21, "option A"); do not reintroduce them (they cannot
-  carry v4). The "AEGIS-128 only" part of option A was reversed on 2026-10-22. Stock
-  `--integrity-no-journal` (persisted LUKS2 flag "no-journal", direct-mode
-  lower table) is accepted only with pivsetup's explicit --allow-no-journal,
-  because a crash during a hidden write can tear decoy sectors of that record
-  (docs/journal-atomicity.md); the journal stays the default.
+  carry v4). The "AEGIS-128 only" part of option A was reversed on 2026-10-22.
+  To reduce maintenance (user decision 2026-10-22, after the suite-072 bench)
+  stock no-journal volumes (refused: little dm-piv gain, torn decoy sectors on
+  a crash; docs/journal-atomicity.md), the scrypt KDF and the Serpent/Twofish
+  and HMAC-SHA1/SHA512 profiles were removed; do not reintroduce them without
+  a user decision.
   Multi-snapshot observers, rollback resistance and alternative hidden openings
   under coercion are out of scope. Never put host-specific (e.g. corporate
   kernel) identifiers in the repository.
@@ -126,12 +126,10 @@ resolved from context/evidence, not for routine implementation decisions.
   install host modules or touch real disks. scripts/fetch_kernel.py (or
   kernel/prepare.py) stages the complete module source.
 - Supported profiles (stock, 16-byte random IVs): LUKS2 original
-  aegis128-random (integrity aead; not AEGIS-128L; default) and, since
-  2026-10-22 (user decision), aes-/serpent-/twofish-xts-random with integrity
-  hmac-sha1/256/512 (dm-crypt authenc; 32- or 64-byte XTS keys plus the HMAC
-  key; 20/32/64-byte tags), 512/4096-byte sectors.
-  Integrity v4 fixed padding and the ordinary journal are required (or the
-  opted-in stock no-journal direct mode). Validate geometry,
+  aegis128-random (integrity aead; not AEGIS-128L; default) and aes-xts-random
+  with integrity hmac-sha256 (dm-crypt authenc; 32- or 64-byte XTS key plus
+  the 32-byte HMAC key; 32-byte tags), 512/4096-byte sectors. Integrity v4
+  fixed padding and the ordinary journal are required. Validate geometry,
   AAD, extents and arithmetic. Offline diagnostics reject dirty journals; native
   setup delegates replay to Linux before authenticated access.
 - Use maintained crypto primitives. Setup is the static Rust `pivsetup` binary
@@ -141,7 +139,6 @@ resolved from context/evidence, not for routine implementation decisions.
   and guest test instrumentation. Test hooks are explicit PIVSETUP_TEST_*
   variables, never monkeypatching. Diagnostics use cryptography (AES-XTS, HMAC) plus the
   optional pinned SUPERCOP AES-NI reference for original AEGIS-128 (not 128L);
-  Serpent/Twofish images are HMAC-authenticated but not decrypted on the host;
   actual crypto/I/O runs in the experimental kernel module. Retain the independent
   codec and complete primary verifier as cross-checks. Only synthetic test keys.
 

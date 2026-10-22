@@ -11,42 +11,18 @@ use crate::profile::context_v4;
 use crate::secret::Secret;
 use crate::{hooks, signals};
 
-/// scrypt parameters for v4 passphrase KEKs (32 bytes); nothing is stored in
-/// clear, so they must be identical on every open (pivstore.blocks.SCRYPT).
-const SCRYPT_LOG_N: u8 = 17;
-const SCRYPT_R: u32 = 8;
-const SCRYPT_P: u32 = 1;
 /// Argon2id parameters (RFC 9106 second recommendation, user decision
-/// 2026-10-21): 64 MiB, 3 passes, 4 lanes. Fixed for the same reason.
+/// 2026-10-21): 64 MiB, 3 passes, 4 lanes. Nothing is stored in clear, so
+/// they must be identical on every open (pivstore.blocks.ARGON2ID).
 const ARGON2_M_KIB: u32 = 64 * 1024;
 const ARGON2_T: u32 = 3;
 const ARGON2_P: u32 = 4;
-
-/// Passphrase KDF for a v4 keyslot KEK. Nothing records which one a keyslot
-/// used, so callers must choose the same KDF when opening.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kdf {
-    Argon2id,
-    Scrypt,
-}
-
-impl Kdf {
-    pub fn parse(text: &str) -> Result<Kdf> {
-        match text {
-            "argon2id" => Ok(Kdf::Argon2id),
-            "scrypt" => Ok(Kdf::Scrypt),
-            other => bail!("Unsupported --kdf {other} (argon2id or scrypt)"),
-        }
-    }
-}
 
 pub struct OpenOptions<'a> {
     pub name: &'a str,
     pub initialize: bool,
     pub ab: bool,
     pub verify: bool,
-    /// Accept a volume that persists stock "no-journal" (see docs/journal-atomicity.md).
-    pub allow_no_journal: bool,
     pub allow: Allow,
 }
 
@@ -59,7 +35,7 @@ pub struct Views {
 
 pub enum HiddenSecret {
     Key(Secret),
-    Passphrase(Secret, Kdf),
+    Passphrase(Secret),
 }
 
 pub fn base_identity(owner: &GuestOwner) -> Vec<u8> {
@@ -68,31 +44,22 @@ pub fn base_identity(owner: &GuestOwner) -> Vec<u8> {
     context_v4(&owner.uuid, primary_bytes, device.sector_size)
 }
 
-/// KEK for a v4 keyslot from a passphrase. Salts are domain-separated by KDF:
-/// scrypt uses v4 base context || "/kek" (as the Python reference), Argon2id
-/// uses v4 base context || "/kek/argon2id".
-pub fn passphrase_kek(passphrase: &[u8], base_context: &[u8], kdf: Kdf) -> Result<Secret> {
+/// KEK for a v4 keyslot from a passphrase: Argon2id with salt v4 base
+/// context || "/kek/argon2id" (the only passphrase KDF since scrypt was
+/// removed by user decision 2026-10-22).
+pub fn passphrase_kek(passphrase: &[u8], base_context: &[u8]) -> Result<Secret> {
     if passphrase.is_empty() {
         bail!("Empty passphrase");
     }
     let mut salt = base_context.to_vec();
+    salt.extend_from_slice(b"/kek/argon2id");
     let mut kek = Secret::with_capacity(32);
     kek.push(&[0u8; 32])?;
-    match kdf {
-        Kdf::Scrypt => {
-            salt.extend_from_slice(b"/kek");
-            let params = scrypt::Params::new(SCRYPT_LOG_N, SCRYPT_R, SCRYPT_P, 32).map_err(|e| Error::new(e.to_string()))?;
-            scrypt::scrypt(passphrase, &salt, &params, &mut kek).map_err(|e| Error::new(e.to_string()))?;
-        }
-        Kdf::Argon2id => {
-            salt.extend_from_slice(b"/kek/argon2id");
-            let params = argon2::Params::new(ARGON2_M_KIB, ARGON2_T, ARGON2_P, Some(32))
-                .map_err(|e| Error::new(e.to_string()))?;
-            argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
-                .hash_password_into(passphrase, &salt, &mut kek)
-                .map_err(|e| Error::new(e.to_string()))?;
-        }
-    }
+    let params = argon2::Params::new(ARGON2_M_KIB, ARGON2_T, ARGON2_P, Some(32))
+        .map_err(|e| Error::new(e.to_string()))?;
+    argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
+        .hash_password_into(passphrase, &salt, &mut kek)
+        .map_err(|e| Error::new(e.to_string()))?;
     Ok(kek)
 }
 
@@ -172,17 +139,11 @@ fn open_inner(owner: &mut GuestOwner, secret: HiddenSecret, options: &OpenOption
             return Err(Error::os(libc::EEXIST, "Public view name is already in use"));
         }
     }
-    if owner.no_journal && !options.allow_no_journal {
-        let mut error = Error::new("Volume uses stock --integrity-no-journal; pass --allow-no-journal to accept");
-        error.note("Without the journal, a crash during a hidden write can destroy decoy sectors of that record \
-                    (they return EIO), not only sectors being written; see docs/journal-atomicity.md");
-        return Err(error);
-    }
     let flags = setup_flags(options.initialize, options.ab, options.verify)?;
     let identity = base_identity(owner);
     let key = match secret {
         HiddenSecret::Key(key) => key,
-        HiddenSecret::Passphrase(passphrase, kdf) => passphrase_kek(&passphrase, &identity, kdf)?,
+        HiddenSecret::Passphrase(passphrase) => passphrase_kek(&passphrase, &identity)?,
     };
     owner.validate()?;
     signals::check()?;
@@ -191,7 +152,7 @@ fn open_inner(owner: &mut GuestOwner, secret: HiddenSecret, options: &OpenOption
     device.begin()?;
     if let Err(mut error) = native_setup(device, &key, &identity, flags) {
         if error.errno == Some(libc::EKEYREJECTED) {
-            error.note("No keyslot authenticated: wrong hidden key or KDF, or a carrier never \
+            error.note("No keyslot authenticated: wrong hidden key or passphrase, or a carrier never \
                         initialized (use --initialize)");
         }
         return Err(error);
@@ -304,16 +265,11 @@ mod tests {
 
     #[test]
     fn passphrase_kek_matches_python_reference() {
-        // hashlib.scrypt(b'pw', salt=b'ctx/kek', n=2**17, r=8, p=1, dklen=32)
         let hex = |s: &Secret| s.iter().map(|b| format!("{b:02x}")).collect::<String>();
-        let kek = passphrase_kek(b"pw", b"ctx", Kdf::Scrypt).unwrap();
-        assert_eq!(hex(&kek), include_str!("../tests/scrypt-pw-ctx.hex").trim());
         // cryptography Argon2id(salt=b'ctx/kek/argon2id', length=32, iterations=3,
         // lanes=4, memory_cost=65536).derive(b'pw')
-        let kek = passphrase_kek(b"pw", b"ctx", Kdf::Argon2id).unwrap();
+        let kek = passphrase_kek(b"pw", b"ctx").unwrap();
         assert_eq!(hex(&kek), include_str!("../tests/argon2id-pw-ctx.hex").trim());
-        assert!(passphrase_kek(b"", b"ctx", Kdf::Argon2id).is_err());
-        assert_eq!(Kdf::parse("scrypt").unwrap(), Kdf::Scrypt);
-        assert!(Kdf::parse("pbkdf2").is_err());
+        assert!(passphrase_kek(b"", b"ctx").is_err());
     }
 }

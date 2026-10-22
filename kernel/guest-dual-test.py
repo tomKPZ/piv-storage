@@ -33,7 +33,6 @@ def setup(initialize=False, rejected=False):
             '--key-file', str(W / 'passphrase.key'), '--hidden-key-file', str(W / 'hidden.key'),
             ]
     if initialize: args.append('--initialize')
-    if os.environ.get('PIV_ALLOW_NO_JOURNAL') == '1': args.append('--allow-no-journal')
     result = subprocess.run(args, capture_output=True, text=True)
     if rejected:
         # Wrong-key guard: no keyslot authenticates, so setup must refuse and
@@ -45,8 +44,7 @@ def setup(initialize=False, rejected=False):
     value = json.loads(result.stdout)
     primary_bytes = int(subprocess.check_output(['blockdev', '--getsize64', DECOY]))
     segment = json.loads(crypt('luksDump', '--dump-json-metadata', '/dev/vdb').stdout)['segments']['0']
-    assert segment['encryption'] in ('aegis128-random', 'aes-xts-random', 'serpent-xts-random',
-                                     'twofish-xts-random'), segment
+    assert segment['encryption'] in ('aegis128-random', 'aes-xts-random'), segment
     sectors = primary_bytes // segment['sector_size']
     expected = ((sectors - V4_KEYSLOT_AREA) // V4_GROUP - 2) * 512
     assert value['hidden_bytes'] == expected, (value, expected)

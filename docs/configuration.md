@@ -15,11 +15,11 @@ resize are not supported.
 
 | Option | Chosen at | Default | Alternatives | Main trade-off |
 | --- | --- | --- | --- | --- |
-| [Primary cipher](#primary-cipher-profile) | `luksFormat` | `aegis128-random` + `aead` | `aes-`/`serpent-`/`twofish-xts-random` + `hmac-sha1`/`hmac-sha256`/`hmac-sha512` | AEGIS is fastest; XTS + HMAC tolerates an IV repeat far better |
+| [Primary cipher](#primary-cipher-profile) | `luksFormat` | `aegis128-random` + `aead` | `aes-xts-random` + `hmac-sha256` | AEGIS is fastest; XTS + HMAC tolerates an IV repeat far better |
 | [Sector size](#sector-size) | `luksFormat` | none from pivsetup; the test fixtures use 4096 | 512 | 512 gives 7.6× hidden capacity and faster hidden reads; 4096 gives faster decoy writes and 5–7% more decoy space |
-| [Integrity journal](#integrity-journal) | first `cryptsetup open` | journal on | `--integrity-no-journal --persistent` plus pivsetup `--allow-no-journal` | Turning it off barely speeds up dm-piv but risks torn decoy sectors after a crash |
+| [Integrity journal](#integrity-journal) | first `cryptsetup open` | journal on (required) | none | No-journal volumes are refused |
 | [A/B record slots](#ab-record-slots) | `--initialize` | off | `--ab` | A/B keeps the previous hidden block after an interrupted write, at half capacity and half hidden-read speed |
-| [Hidden key type](#hidden-key-file-or-passphrase) | `--initialize` and keyslot add | key file | `--hidden-passphrase-file` with `--kdf argon2id` (default) or `scrypt` | A key file cannot be guessed; a passphrase relies on the KDF cost |
+| [Hidden key type](#hidden-key-file-or-passphrase) | `--initialize` and keyslot add | key file | `--hidden-passphrase-file` (Argon2id) | A key file cannot be guessed; a passphrase relies on the KDF cost |
 | [Full audit](#full-audit---verify) | every open | off | `--verify` | Authenticates every sector; time grows with volume size |
 
 ## Primary cipher profile
@@ -31,12 +31,12 @@ recorded in plaintext in the LUKS2 header.
 | Profile | luksFormat options | Tag bytes per sector |
 | --- | --- | ---: |
 | AEGIS-128 (default) | `--cipher aegis128-random --key-size 128 --integrity aead` | 16 |
-| AES-XTS + HMAC | `--cipher aes-xts-random --key-size 512 --integrity hmac-sha256` (or `hmac-sha1`, `hmac-sha512`) | 32 (20, 64) |
-| Serpent-/Twofish-XTS + HMAC | `--cipher serpent-xts-random` or `twofish-xts-random`, otherwise as AES | as AES |
+| AES-XTS + HMAC-SHA256 | `--cipher aes-xts-random --key-size 512 --integrity hmac-sha256` | 32 |
 
 `aegis128-random` is the original AEGIS-128, not AEGIS-128L. For XTS,
 `--key-size` is the XTS key only (512 bits = AES-256-XTS; 256 is also
-accepted); cryptsetup adds the HMAC key.
+accepted); cryptsetup adds the 32-byte HMAC key. Other ciphers (Serpent,
+Twofish) and HMAC digests (SHA-1, SHA-512) are refused.
 
 **Security.** The kernel draws a fresh random IV for every write, so two writes
 to one sector repeat an IV with small but nonzero probability. A decoy rewrite
@@ -56,11 +56,9 @@ HMAC fails much more gracefully there. See the
 [security review](security-review.md) for the full nonce budget.
 
 **Performance (4096-byte sectors).** AEGIS-128 is the fastest. AES-XTS + HMAC
-costs about 0.07 s more per open, 15–30% lower hidden-read speed and similar
+costs about 0.07 s more per open, about 15% lower hidden-read speed and similar
 write speed (writes are limited by the serialized write path, not the cipher).
-Serpent and Twofish are the slowest: 33–43% lower decoy read speed and 37–44%
-lower hidden read speed than AEGIS. The HMAC size matters little for speed;
-SHA-512 mainly costs space (see [Storage overhead](#storage-overhead)).
+Its larger tag also costs some space (see [Storage overhead](#storage-overhead)).
 
 **Detectability.** The cipher name is visible to anyone who reads the LUKS2
 header. Compare a dm-piv volume only against ordinary volumes of the same
@@ -70,7 +68,6 @@ both are uncommon compared with unauthenticated `aes-xts-plain64`.
 **Recommendation.** `aes-xts-random` + `hmac-sha256` is the conservative choice
 if you worry about RNG state being duplicated (VMs, cloned images). AEGIS-128
 is fine on a physical machine with a healthy RNG and is the faster default.
-Choose Serpent or Twofish only if you specifically want a non-AES cipher.
 
 ## Sector size
 
@@ -103,27 +100,16 @@ initialize (see [Large volumes](#large-volumes-and-initialization-time)).
 
 ## Integrity journal
 
-dm-integrity's journal makes each primary sector update atomic. With
-`--integrity-no-journal` (made persistent with `cryptsetup open
---integrity-no-journal --persistent`), pivsetup refuses the volume unless
-given `--allow-no-journal`. Without the journal, a crash during a hidden write
-can tear decoy sectors of that hidden record, not just the sectors being
-written ([journal-atomicity.md](journal-atomicity.md)).
-
-| AEGIS-128, 4096-byte sectors | Journal (default) | No journal |
-| --- | ---: | ---: |
-| Stock dm-crypt sequential write (reference) | 69 MiB/s | 162 MiB/s |
-| dm-piv decoy sequential write | 5.8 MiB/s | 6.8 MiB/s |
-| dm-piv decoy random 4 KiB writes | 534 IOPS | 822 IOPS |
-| dm-piv hidden sequential write | 24 KiB/s | 20 KiB/s |
-| Torn decoy sectors after a crash during a hidden write | no | possible |
-
-At 512-byte sectors, no-journal was not faster in any dm-piv write test.
-
-**Recommendation.** Keep the journal (the default). Turning it off more than
-doubles stock dm-crypt write speed, but dm-piv's own write path is the
-bottleneck, so the gain for dm-piv is small and comes with a data-loss hazard
-for the decoy.
+dm-integrity's journal makes each primary sector update atomic, and pivsetup
+requires it: a volume whose LUKS2 header persists the `no-journal` flag
+(`cryptsetup open --integrity-no-journal --persistent`), or any non-journal
+lower table, is refused. Without the journal, a crash during a hidden write can
+tear decoy sectors of that hidden record, not just the sectors being written
+([journal-atomicity.md](journal-atomicity.md)). No-journal support was removed
+because it barely helped dm-piv: in suite-072 (AEGIS-128, 4096-byte sectors) it
+raised decoy writes by at most about 17% (5.8 → 6.8 MiB/s), and at 512-byte
+sectors no dm-piv write test was faster. dm-piv's own write path, not the
+journal, is the bottleneck.
 
 ## A/B record slots
 
@@ -156,14 +142,12 @@ The hidden master key is wrapped in up to four encrypted keyslots. Each is
 unlocked by a 32-byte key file (`--hidden-key-file`, generated by `pivsetup
 keygen`) or a passphrase (`--hidden-passphrase-file`). Keyslots allow offline
 guessing by anyone with a copy of the disk, so a passphrase is only as strong
-as its entropy times the KDF cost. Nothing records which KDF a keyslot used;
-pass the same `--kdf` on every open.
+as its entropy times the KDF cost. Passphrases always use Argon2id.
 
 | Hidden key type | Added open time (measured) | Parameters |
 | --- | ---: | --- |
 | Key file | none | 256-bit random key |
-| `--kdf argon2id` (default) | about 0.13 s | 64 MiB, t = 3, p = 4 |
-| `--kdf scrypt` | about 0.30 s | N = 2^17, r = 8, p = 1 (128 MiB) |
+| Passphrase (Argon2id) | about 0.13 s | 64 MiB, t = 3, p = 4 |
 
 These costs are much lower than cryptsetup's own LUKS2 keyslots, which
 calibrate Argon2id to about 2 seconds and up to 1 GiB of memory. The hidden
@@ -184,7 +168,6 @@ refuses the volume on any failure.
 | AEGIS-128 4096 | 0.14 s | 0.65 s |
 | AEGIS-128 512 | 0.14 s | 0.75 s |
 | AES-XTS + HMAC-SHA256 4096 | 0.21 s | 0.85 s |
-| Serpent/Twofish-XTS + HMAC-SHA256 4096 | 0.19–0.22 s | 1.1–1.3 s |
 
 That is roughly 100–200 MiB/s of audit speed here; expect hours on multi-TB
 volumes. Use it after a suspected corruption or before trusting a copied
@@ -212,22 +195,18 @@ the IVs.
 | Profile | Decoy bytes (share of raw) | Hidden bytes | Hidden with `--ab` |
 | --- | ---: | ---: | ---: |
 | AEGIS-128 4096 | 115,572,736 (86.1%) | 158,720 | 79,360 |
-| AES-XTS + HMAC-SHA1 4096 | 115,458,048 (86.0%) | 158,208 | 78,848 |
 | AES-XTS + HMAC-SHA256 4096 | 115,113,984 (85.8%) | 158,208 | 78,848 |
-| AES-XTS + HMAC-SHA512 4096 | 114,118,656 (85.0%) | 156,672 | 78,336 |
 | AEGIS-128 512 | 109,060,096 (81.3%) | 1,209,856 | 604,672 |
 | AES-XTS + HMAC-SHA256 512 | 105,377,792 (78.5%) | 1,168,896 | 584,192 |
 
-Serpent and Twofish match AES with the same HMAC. On a 128 MiB disk, 16 MiB
-goes to the LUKS2 header. Beyond that, the per-sector integrity metadata takes
-T/(S + T) of the remaining space, where T is the tag plus the 16-byte IV
-(32 bytes for AEGIS, 36/48/80 for HMAC-SHA1/256/512):
+On a 128 MiB disk, 16 MiB goes to the LUKS2 header. Beyond that, the
+per-sector integrity metadata takes T/(S + T) of the remaining space, where T
+is the tag plus the 16-byte IV (32 bytes for AEGIS, 48 for HMAC-SHA256):
 
 | Integrity metadata share | S = 4096 | S = 512 |
 | --- | ---: | ---: |
 | AEGIS-128 (T = 32) | 0.8% | 5.9% |
 | HMAC-SHA256 (T = 48) | 1.2% | 8.6% |
-| HMAC-SHA512 (T = 80) | 1.9% | 13.5% |
 
 For a 1 TiB disk this gives roughly 1.4 GiB of hidden capacity at 4096-byte
 sectors and 10.7 GiB at 512 (AEGIS-128; half with A/B). These are
@@ -244,9 +223,7 @@ for a hidden passphrase, the KDF time from the table above.
 | Profile | Stock open | dm-piv open | dm-piv close |
 | --- | ---: | ---: | ---: |
 | AEGIS-128 4096 / 512 | 0.04 s | 0.14 s | 0.21 s |
-| AEGIS-128 no-journal | 0.03 s | 0.12–0.14 s | 0.21–0.23 s |
 | AES-XTS + HMAC 4096 / 512 | 0.04 s | 0.21 s | 0.22 s |
-| Serpent/Twofish-XTS + HMAC 4096 | 0.05 s | 0.19–0.22 s | 0.20–0.22 s |
 
 Opening does not depend on volume size unless `--verify` is used. The same
 `pivsetup open-blocks` runs unchanged from an initramfs (the early-boot suite
@@ -264,17 +241,12 @@ ordinary dm-crypt on the same fixture before dm-piv is activated.
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | AEGIS-128 4096 | 69 MiB/s | 5.8 MiB/s | 664 MiB/s | 150 MiB/s | 12,299 / 534 IOPS | 24 KiB/s | 280 KiB/s |
 | AEGIS-128 512 | 67 MiB/s | 1.35 MiB/s | 506 MiB/s | 141 MiB/s | 10,935 / 258 IOPS | 28 KiB/s | 1.5 MiB/s |
-| AEGIS-128 4096 no-journal | 162 MiB/s | 6.8 MiB/s | 684 MiB/s | 166 MiB/s | 7,376 / 822 IOPS | 20 KiB/s | 305 KiB/s |
-| AEGIS-128 512 no-journal | 150 MiB/s | 1.22 MiB/s | 628 MiB/s | 151 MiB/s | 6,558 / 251 IOPS | 21 KiB/s | 1.5 MiB/s |
-| AES-XTS + HMAC-SHA1 4096 | 70 MiB/s | 5.3 MiB/s | 448 MiB/s | 133 MiB/s | 10,406 / 519 IOPS | 21 KiB/s | 227 KiB/s |
 | AES-XTS + HMAC-SHA256 4096 | 71 MiB/s | 5.9 MiB/s | 533 MiB/s | 152 MiB/s | 11,598 / 563 IOPS | 23 KiB/s | 239 KiB/s |
 | AES-XTS + HMAC-SHA256 512 | 71 MiB/s | 1.46 MiB/s | 331 MiB/s | 115 MiB/s | 10,131 / 268 IOPS | 28 KiB/s | 1.4 MiB/s |
-| AES-XTS + HMAC-SHA512 4096 | 69 MiB/s | 5.5 MiB/s | 304 MiB/s | 116 MiB/s | 14,814 / 551 IOPS | 20 KiB/s | 195 KiB/s |
-| Serpent-XTS + HMAC-SHA256 4096 | 67 MiB/s | 5.0 MiB/s | 273 MiB/s | 101 MiB/s | 10,432 / 493 IOPS | 18 KiB/s | 177 KiB/s |
-| Twofish-XTS + HMAC-SHA256 4096 | 73 MiB/s | 5.1 MiB/s | 272 MiB/s | 85 MiB/s | 11,078 / 497 IOPS | 17 KiB/s | 156 KiB/s |
 
 Random 4 KiB decoy reads ran at stock speed in every profile (7,000–9,300
-IOPS for both).
+IOPS for both). The suite-072 run also measured profiles that are no longer
+supported; those rows are omitted.
 
 What to expect:
 
@@ -286,17 +258,17 @@ What to expect:
   request (a current implementation limit, not a format property). Throughput is
   bound by per-request latency, not by the cipher. This difference is visible
   to anyone timing writes on the running system.
-- **Hidden writes** run at about 17–28 KiB/s (33–57 blocks per second). Each
+- **Hidden writes** run at about 23–28 KiB/s (46–57 blocks per second). Each
   512-byte hidden write authenticates and rewrites a whole 90-sector record.
   Use the hidden volume for small, rarely changed data.
 - **Hidden reads** authenticate 90 sectors per 512 bytes regardless of request
-  size: about 280 KiB/s at 4096-byte sectors and 1.5 MiB/s at 512.
+  size: about 240–280 KiB/s at 4096-byte sectors and 1.4–1.5 MiB/s at 512.
 
 ## Large volumes and initialization time
 
 `--initialize` writes every hidden record. It ran at about 47 blocks/s
 (24 KiB/s of hidden capacity) at 4096-byte sectors and 54 blocks/s (28 KiB/s)
-at 512. Extrapolated to a 1 TiB disk (AEGIS-128, journal, no A/B), that is
+at 512. Extrapolated to a 1 TiB disk (AEGIS-128, no A/B), that is
 about **17 hours** at 4096-byte sectors and **4–5 days** at 512. A/B halves
 it. Initialization can be cancelled with SIGINT/SIGTERM; blocks not yet written
 stay unavailable until a later `--initialize` completes

@@ -12,7 +12,7 @@ python3 scripts/build_pivsetup.py        # rootless; prints path and SHA-256
 The build uses the system rustc/cargo, a project-local `CARGO_HOME` under the
 ignored `downloads/cargo`, the committed `Cargo.lock` (`--locked`, offline after
 the first fetch) and static glibc (`-C target-feature=+crt-static`). Crates:
-`libc`, `zeroize` and RustCrypto `scrypt` and `argon2` only (no clap/serde; a
+`libc`, `zeroize` and RustCrypto `argon2` only (no clap/serde; a
 minimal strict JSON reader parses `cryptsetup luksDump`).
 
 ## Commands
@@ -22,23 +22,23 @@ Run only inside the pinned disposable guest:
 ```
 pivsetup open-blocks --key-file F (--hidden-key-file F | --hidden-passphrase-file F)
                      [--device /dev/vdb] [--name piv-native] [--initialize]
-                     [--ab] [--verify] [--allow-no-journal] [--kdf argon2id|scrypt]
+                     [--ab] [--verify]
 pivsetup close-blocks --key-file F [--device /dev/vdb] [--name piv-native]
 pivsetup keyslot add|remove --key-file F --slot 0-3
-                     [--new-key-file F | --new-passphrase-file F [--kdf argon2id|scrypt]]
+                     [--new-key-file F | --new-passphrase-file F]
                      [--device /dev/vdb] [--name piv-native]
 pivsetup migrate --source-key-file F (--source-hidden-key-file F | --source-hidden-passphrase-file F)
                  --target D --target-key-file F
                  (--target-hidden-key-file F | --target-hidden-passphrase-file F)
-                 [--source /dev/vdb] [--source-kdf K] [--target-kdf K] [--ab]
-                 [--allow-no-journal]
+                 [--source /dev/vdb] [--ab]
 pivsetup keygen --output F
 ```
 
 `--key-file` is the stock LUKS passphrase file; hidden key files hold 32 bytes
 (`keygen` writes one). Option semantics are in the [README](../README.md#usage).
-Passphrase KEKs use Argon2id by default (m = 64 MiB, t = 3, p = 4) or
-`--kdf scrypt`; nothing records the KDF, so open with the same one.
+Passphrase KEKs always use Argon2id (m = 64 MiB, t = 3, p = 4). Only the two
+supported primary profiles and journaled dm-integrity volumes are accepted
+([configuration.md](../docs/configuration.md)).
 
 `open-blocks` performs the guest guard, LUKS/integrity validation, exclusive
 /run lock, cryptsetup open and reload as `piv-crypt`, NATIVE_SETUP (ABI 4) and
@@ -76,5 +76,5 @@ Explicit environment variables, inert unless set:
 See src/hooks.rs.
 
 `cargo test` runs unit tests, including cross-check vectors shared with the
-Python code (scrypt and Argon2id KEKs, profile/segment validation, superblock
+Python code (Argon2id KEKs, profile/segment validation, superblock
 geometry, ioctl numbers).

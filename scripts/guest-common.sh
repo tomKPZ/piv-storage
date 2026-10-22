@@ -36,11 +36,6 @@ guest_code() {
     mkdir -p /opt/piv-code/pivstore
     mount -t 9p -o trans=virtio,version=9p2000.L,ro pivcode /opt/piv-code/pivstore
     export PYTHONPATH=/opt/piv-code
-    # Fixtures persisting stock --integrity-no-journal need pivsetup's explicit
-    # --allow-no-journal; the Python test client adds it from this variable.
-    if cryptsetup luksDump --dump-json-metadata /dev/vdb 2>/dev/null | grep -q '"no-journal"'; then
-        export PIV_ALLOW_NO_JOURNAL=1
-    fi
     # The Rust setup frontend (scripts/build_pivsetup.py), shared per run.
     if test -e /mnt/piv-work/pivsetup; then
         install -m 0755 /mnt/piv-work/pivsetup /usr/local/sbin/pivsetup

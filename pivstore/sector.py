@@ -1,12 +1,9 @@
 """The supported Linux primary-sector codecs, retained for independent kernel verification.
 
-AEGIS-128 (via the pinned reference) and dm-crypt's XTS + HMAC authenc
-profiles: tag = HMAC(mac_key, LE64(sector512) || IV || ciphertext) truncated to
-the digest size, ciphertext = XTS(enc_key, tweak = IV). The LUKS volume key is
+AEGIS-128 (via the pinned reference) and dm-crypt's AES-XTS + HMAC-SHA256
+authenc profile: tag = HMAC-SHA256(mac_key, LE64(sector512) || IV ||
+ciphertext), ciphertext = AES-XTS(enc_key, tweak = IV). The LUKS volume key is
 enc_key || mac_key (dm-crypt's default MAC key size is the digest size).
-AES-XTS decrypts through cryptography; Serpent/Twofish-XTS have no maintained
-Python implementation here, so those profiles are authenticated (HMAC) but not
-decrypted on the host; their plaintext is checked by stock dm-crypt in guests.
 """
 
 import hashlib
@@ -15,8 +12,8 @@ import struct
 
 from cryptography.exceptions import InvalidTag
 
-HASHES = {'hmac(sha1)': ('sha1', 20), 'hmac(sha256)': ('sha256', 32), 'hmac(sha512)': ('sha512', 64)}
-XTS_CIPHERS = ('aes-xts-random', 'serpent-xts-random', 'twofish-xts-random')
+HASHES = {'hmac(sha256)': ('sha256', 32)}
+XTS_CIPHERS = ('aes-xts-random',)
 
 
 def _failed(index):
@@ -46,18 +43,11 @@ class SectorCodec:
         else:
             raise ValueError('Unsupported primary cipher')
 
-    @property
-    def decrypts(self):
-        """False for profiles authenticated but not decrypted on the host."""
-        return self.encryption in ('aegis128-random', 'aes-xts-random')
-
     def _aad(self, index, iv):
         return struct.pack('<Q', index * (self.sector_size // 512)) + iv
 
     def _xts(self, iv, data, encrypt):
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-        if self.encryption != 'aes-xts-random':
-            raise NotImplementedError(f'{self.encryption} has no host implementation')
         cipher = Cipher(algorithms.AES(self.enc_key), modes.XTS(iv))
         op = cipher.encryptor() if encrypt else cipher.decryptor()
         return op.update(data) + op.finalize()

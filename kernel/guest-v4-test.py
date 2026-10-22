@@ -134,33 +134,33 @@ assert direct(v['hidden'], 512, 512) == bytes(512)
 # rewrite the whole keyslot/directory area through the decoy (fragment refresh
 # must preserve every listed keyslot), then retire the original key.
 second_key, passphrase = os.urandom(32), b'synthetic test passphrase'
-scrypt_passphrase = b'synthetic scrypt passphrase'
+third_passphrase = b'another synthetic test passphrase'
 keyslot('/dev/vdb', KEY, 1, second_key)
-keyslot('/dev/vdb', KEY, 2, passphrase=passphrase)   # pivsetup derives the KEK (default Argon2id)
-keyslot('/dev/vdb', KEY, 3, passphrase=scrypt_passphrase, kdf='scrypt')
-# Independent Python KEKs (cryptography Argon2id, hashlib scrypt) must open the
-# same slots: Rust/Python KDF parity on the real volume context.
+keyslot('/dev/vdb', KEY, 2, passphrase=passphrase)   # pivsetup derives the Argon2id KEK
+keyslot('/dev/vdb', KEY, 3, passphrase=third_passphrase)
+# Independent Python Argon2id KEKs must open the same slots: Rust/Python KDF
+# parity on the real volume context.
 from pivstore.blocks import base_identity, passphrase_kek
 from pivstore.kernel_owner import GuestOwner as _Owner
 owner = _Owner('/dev/vdb', KEY)
 identity = base_identity(owner)
 owner.close()
 pass_kek = passphrase_kek(passphrase, identity)
-scrypt_kek = passphrase_kek(scrypt_passphrase, identity, 'scrypt')
+third_kek = passphrase_kek(third_passphrase, identity)
 area = direct(v['decoy'], 0, RESERVED * unit)
 direct(v['decoy'], 0, RESERVED * unit, area)
 close_blocks('/dev/vdb', KEY)
 for kw in (dict(), dict(key=second_key), dict(key=None, hidden_passphrase=passphrase), dict(key=pass_kek),
-           dict(key=None, hidden_passphrase=scrypt_passphrase, kdf='scrypt'), dict(key=scrypt_kek)):
+           dict(key=None, hidden_passphrase=third_passphrase), dict(key=third_kek)):
     v = opened(**kw)
     assert direct(v['hidden'], 0, 512) == second
     close_blocks('/dev/vdb', KEY)
-# Nothing records the KDF: the wrong one derives an unrelated KEK.
-assert rejected(lambda: opened(key=None, hidden_passphrase=scrypt_passphrase)).errno == errno.EKEYREJECTED
+# A wrong passphrase derives an unrelated KEK.
+assert rejected(lambda: opened(key=None, hidden_passphrase=b'wrong synthetic passphrase')).errno == errno.EKEYREJECTED
 v = opened(key=second_key)
 keyslot('/dev/vdb', KEY, 3)
 close_blocks('/dev/vdb', KEY)
-assert rejected(lambda: opened(key=None, hidden_passphrase=scrypt_passphrase, kdf='scrypt')).errno == errno.EKEYREJECTED
+assert rejected(lambda: opened(key=None, hidden_passphrase=third_passphrase)).errno == errno.EKEYREJECTED
 v = opened(key=second_key)
 keyslot('/dev/vdb', KEY, 0)            # remove the original key file's slot
 assert rejected(lambda: keyslot('/dev/vdb', KEY, 0)).errno == errno.ENOENT
@@ -172,8 +172,8 @@ assert rejected(lambda: keyslot('/dev/vdb', KEY, 1)).errno == errno.EBUSY   # la
 close_blocks('/dev/vdb', KEY)
 assert rejected(lambda: opened(key=None, hidden_passphrase=passphrase)).errno == errno.EKEYREJECTED
 results['keyslots'] = dict(added=[1, 2, 3], removed=[3, 0, 2], last_slot_protected=True,
-                           kdfs=dict(slot2='argon2id', slot3='scrypt'), python_kdf_cross_check=True,
-                           wrong_kdf_rejected=True, decoy_rewrite_of_keyslot_area_preserved=True)
+                           passphrase_slots=[2, 3], python_kdf_cross_check=True,
+                           wrong_passphrase_rejected=True, decoy_rewrite_of_keyslot_area_preserved=True)
 results['ab'] = dict(fallback_after_damaged_newest_slot=True, rewrite_encryptions=GROUP)
 
 v = opened(initialize=True)

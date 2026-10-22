@@ -617,7 +617,7 @@ static int pn_write_v4(struct piv_control *p, bool hidden, u64 offset, const u8 
  if (!entries || !ivs) goto done;
  for (index = offset / unit; index <= (offset + bytes - 1) / unit; index++) {
   struct piv_sector *s = NULL;
-  /* A sector failing authentication (e.g. torn without the journal) may be
+  /* A sector failing authentication (e.g. media damage) may be
    * replaced only by a write covering all of it. Its raw stored fragment is
    * refreshed like any other: the record's SIV tag decides whether it is
    * still valid, so damage stays damage and is never made authentic.

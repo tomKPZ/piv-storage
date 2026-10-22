@@ -49,9 +49,8 @@ The exact bytes are specified in [format-v4.md](format-v4.md). All hidden keys
 come from HKDF-SHA256 ([RFC 5869](https://www.rfc-editor.org/rfc/rfc5869.html))
 over the master key (or a keyslot KEK) with the public v4 context as salt and
 `"pivstore/v4/" ‖ label` as info (`pn_hkdf`, cross-checked against the Python
-decoder). A KEK is a 32-byte key file or a passphrase through Argon2id (default;
-m = 64 MiB, t = 3, p = 4) or scrypt (N = 2^17, r = 8, p = 1); the KDF is not
-recorded, which adds no secrecy.
+decoder). A KEK is a 32-byte key file or a passphrase through Argon2id
+(m = 64 MiB, t = 3, p = 4, fixed and not recorded).
 
 Each hidden block is a deterministic SIV record: a 16-byte HMAC-SHA256 tag over
 context, group, generation and data, and ChaCha20 under `tag[0:12]`. Identical
@@ -65,10 +64,10 @@ for chosen and repeated hidden data, valid and damaged records and the public
 context, to be indistinguishable from stock random IVs without the hidden key.
 It rests on LRW/AES tweakable-PRP security plus the SIV layer; local collision
 rejection slightly conditions the distribution. There is no public magic: the
-keyslots, directory, KDF choice and A/B flag are all inside the PRP input. This
+keyslots, directory and A/B flag are all inside the PRP input. This
 is a design argument without external review. Statistical summaries in
 [detectability.md](detectability.md) cannot prove it. The cipher choice itself
-(AEGIS-128 or XTS + HMAC) is visible in LUKS metadata; compare against ordinary
+(AEGIS-128 or AES-XTS + HMAC-SHA256) is visible in LUKS metadata; compare against ordinary
 volumes of the same profile.
 
 The context binds the UUID, primary capacity, sector size, the A/B layout and the
@@ -104,7 +103,7 @@ preparation and exact replays do not.
 - *Original AEGIS-128* (not AEGIS-128L, whose analyses must not be transplanted):
   a repeated (key, IV) pair leaks plaintext relations and enables state recovery
   and forgery. Treat it as a key compromise.
-- *XTS + HMAC* (AES, Serpent or Twofish): the IV is the XTS tweak and the only
+- *AES-XTS + HMAC-SHA256*: the IV is the XTS tweak and the only
   per-sector input to encryption, so a repeated IV under the same XTS key, at
   the same or another sector, reveals which 16-byte blocks at the same offsets
   of the two plaintexts are equal. Authentication is HMAC over sector, IV and
@@ -142,9 +141,8 @@ under the current scope.
 
 The module reimplements the stock dm-crypt AEAD/authenc sector layout (Linux
 AAD/IV/tag offsets), cross-checked by host decoding of kernel-written images:
-AEGIS-128 via the pinned SUPERCOP reference and AES-XTS + HMAC via
-cryptography; Serpent/Twofish images are HMAC-authenticated on the host and
-their plaintext checked by stock dm-crypt in guests. It does not inherit
+AEGIS-128 via the pinned SUPERCOP reference and AES-XTS + HMAC-SHA256 via
+cryptography. It does not inherit
 dm-crypt fixes, so its own crypto/integrity path needs equivalent review; exact
 header compatibility does not establish that a pinned kernel is free of
 vulnerabilities.
@@ -203,9 +201,9 @@ multi-snapshot observers are out of scope.
 Decoy writes change only the IVs of the sectors written, like stock writes, so
 this signature comes from hidden writes (and initialization/keyslot updates).
 It indicates hidden-volume activity to a decoy-key holder with journal access.
-Mitigations: stock `--integrity-no-journal`, supported only with pivsetup's
-`--allow-no-journal`, removes on-disk journal history, but a crash during a
-hidden write can then tear decoy sectors of that record's carrier
+No supported mitigation removes it: stock `--integrity-no-journal` would remove
+on-disk journal history, but pivsetup refuses it because a crash during a
+hidden write could then tear decoy sectors of that record's carrier
 ([journal-atomicity.md](journal-atomicity.md)). Journal encryption is untested
 and unverified for LUKS2 integrity profiles in cryptsetup, and would hide sector
 numbers only from keyless observers.

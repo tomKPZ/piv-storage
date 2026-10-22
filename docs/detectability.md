@@ -69,8 +69,9 @@ cannot establish pseudorandomness against arbitrary steganalysis.
 ## Executed results (format v4, original AEGIS-128)
 
 Measured on the 128 MiB `aegis-4096` and `aegis-512` fixtures (pinned Debian
-6.12.113 guest, run `artifacts/suite-061` on 2026-10-22, before the XTS + HMAC
-profiles were added; artifacts are not committed). The XTS + HMAC profiles have not been measured with
+6.12.113 guest, run `artifacts/suite-061` on 2026-10-22, before the AES-XTS +
+HMAC-SHA256 profiles were added; artifacts are not committed). The AES-XTS +
+HMAC-SHA256 profiles have not been measured with
 this experiment; the decoy-write rule is profile-independent, but no result is
 claimed for them.
 

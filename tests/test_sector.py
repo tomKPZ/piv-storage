@@ -32,7 +32,7 @@ class SectorTests(unittest.TestCase):
 class XtsHmacTests(unittest.TestCase):
     def test_authenc_layout_round_trip_and_rejections(self):
         import hashlib, hmac, struct
-        for integrity, tag in (('hmac(sha1)', 20), ('hmac(sha256)', 32), ('hmac(sha512)', 64)):
+        for integrity, tag in (('hmac(sha256)', 32),):
             for enc in (32, 64):
                 for size in (512, 4096):
                     key = bytes(range(enc + tag))
@@ -51,17 +51,11 @@ class XtsHmacTests(unittest.TestCase):
                                 self.assertRaises(UnsupportedImage):
                             codec.decrypt(index, c, m)
 
-    def test_serpent_twofish_authenticate_without_decrypting(self):
-        import hmac, struct
-        key = bytes(64 + 32)
-        for cipher in ('serpent-xts-random', 'twofish-xts-random'):
-            codec = SectorCodec(key, 512, cipher, 'hmac(sha256)')
-            self.assertFalse(codec.decrypts)
-            ct, iv = bytes(range(256)) * 2, bytes(16)
-            tag = hmac.new(key[64:], struct.pack('<Q', 3) + iv + ct, 'sha256').digest()
-            self.assertEqual(codec.authenticate(3, ct, tag + iv), iv)
-            with self.assertRaises(UnsupportedImage):
-                codec.authenticate(4, ct, tag + iv)
+    def test_dropped_profiles_and_bad_keys_rejected(self):
+        for cipher, integrity in (('serpent-xts-random', 'hmac(sha256)'), ('twofish-xts-random', 'hmac(sha256)'),
+                                  ('aes-xts-random', 'hmac(sha1)'), ('aes-xts-random', 'hmac(sha512)')):
+            with self.subTest(cipher=cipher, integrity=integrity), self.assertRaises(ValueError):
+                SectorCodec(bytes(96), 512, cipher, integrity)
         with self.assertRaises(ValueError):
             SectorCodec(bytes(70), 512, 'aes-xts-random', 'hmac(sha256)')
         with self.assertRaises(ValueError):

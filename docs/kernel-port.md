@@ -44,7 +44,7 @@ because the old and new APIs are type-incompatible.
 
 The full suite set (`--suites all`) passed on the port image for the AEGIS-128
 4096 and 512 profiles, including the early-boot suite, with no kernel reports;
-runs are recorded in commit messages. The XTS + HMAC profiles were added after
-the port; on 7.2.9 only aes-sha256-4096 and twofish-sha512-512 have run
-(the routine suites, passing). Not covered: sanitizer builds of
+runs are recorded in commit messages. The AES-XTS + HMAC-SHA256 profiles were
+added after the port; on 7.2.9 only aes-sha256-4096 has run (the routine
+suites, passing); aes-sha256-512 has not run there. Not covered: sanitizer builds of
 7.2, other distributions, and kernels between 6.12 and 7.2.

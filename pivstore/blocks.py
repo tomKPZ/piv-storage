@@ -28,9 +28,8 @@ SETUP_VERSION = 4
 SETUP_INITIALIZE, SETUP_AB, SETUP_VERIFY = 1, 8, 16
 STATUS = struct.Struct('=QQQIIII')  # STATUS version 4
 KEYSLOT = struct.Struct('=IIQII32s2I')
-# Passphrase KEK parameters; must equal rust/src/blocks.rs. Argon2id (default):
-# RFC 9106 second recommendation; scrypt kept as an explicit alternative.
-SCRYPT = dict(n=2 ** 17, r=8, p=1, maxmem=256 * 1024 * 1024, dklen=32)
+# Passphrase KEK parameters; must equal rust/src/blocks.rs. Argon2id (the only
+# passphrase KDF): RFC 9106 second recommendation.
 ARGON2ID = dict(length=32, iterations=3, lanes=4, memory_cost=64 * 1024)
 ERROR = re.compile(r'^pivsetup: (?:\[Errno (\d+)\] )?(.*)$')
 
@@ -80,21 +79,14 @@ def run(args, env=None):
 
 
 def open_args(source, key_file, secret_path, *, passphrase=False, name='piv-native', initialize=False,
-              ab=False, verify=False, allow_no_journal=None, allow_test_stack=False, allow_second_disk=False,
-              kdf=None):
-    # Guest instrumentation: guest_code exports PIV_ALLOW_NO_JOURNAL=1 when the
-    # fixture persists stock no-journal, so every suite opens it unchanged.
-    if allow_no_journal is None:
-        allow_no_journal = os.environ.get('PIV_ALLOW_NO_JOURNAL') == '1'
+              ab=False, verify=False, allow_test_stack=False, allow_second_disk=False):
     args = ['open-blocks', '--device', source, '--key-file', key_file, '--name', name,
             '--hidden-passphrase-file' if passphrase else '--hidden-key-file', secret_path]
     if initialize: args.append('--initialize')
     if ab: args.append('--ab')
     if verify: args.append('--verify')
-    if allow_no_journal: args.append('--allow-no-journal')
     if allow_test_stack: args.append('--allow-test-stack')
     if allow_second_disk: args.append('--allow-second-disk')
-    if kdf is not None: args += ['--kdf', kdf]
     return [str(a) for a in args]
 
 
@@ -141,13 +133,11 @@ def migrate(source, source_key_file, source_hidden_key, target, target_key_file,
                 '--source-hidden-key-file', source_path, '--target', target,
                 '--target-key-file', target_key_file, '--target-hidden-key-file', target_path]
         if ab: args.append('--ab')
-        if os.environ.get('PIV_ALLOW_NO_JOURNAL') == '1': args.append('--allow-no-journal')
         if allow_second_disk: args.append('--allow-second-disk')
         return json.loads(run(args))
 
 
-def keyslot(source, key_file, slot, kek=None, *, name='piv-native', allow_test_stack=False, passphrase=None,
-            kdf=None):
+def keyslot(source, key_file, slot, kek=None, *, name='piv-native', allow_test_stack=False, passphrase=None):
     """Add (kek or passphrase given) or remove keyslot @slot on active v4 views."""
     adding = kek is not None or passphrase is not None
     args = ['keyslot', 'add' if adding else 'remove', '--device', source, '--key-file', key_file,
@@ -156,7 +146,6 @@ def keyslot(source, key_file, slot, kek=None, *, name='piv-native', allow_test_s
         run(args)
         return
     option = '--new-key-file' if kek is not None else '--new-passphrase-file'
-    if kdf is not None: args += ['--kdf', kdf]
     with secret_file(kek if kek is not None else passphrase) as path:
         run(args + [option, path])
 
@@ -177,19 +166,11 @@ def base_identity(owner):
     return context_v4(owner.uuid, owner.device.sectors * owner.device.sector_size, owner.device.sector_size)
 
 
-def passphrase_kek(passphrase, base_context, kdf='argon2id'):
-    """Independent cross-check of pivsetup's v4 passphrase KEK.
-
-    argon2id: salt = context || "/kek/argon2id" (Python cryptography);
-    scrypt: salt = context || "/kek" (hashlib).
-    """
+def passphrase_kek(passphrase, base_context):
+    """Independent cross-check of pivsetup's v4 passphrase KEK: Argon2id with
+    salt = context || "/kek/argon2id"."""
     if not passphrase:
         raise ValueError('Empty passphrase')
-    if kdf == 'scrypt':
-        import hashlib
-        return hashlib.scrypt(passphrase, salt=base_context + b'/kek', **SCRYPT)
-    if kdf != 'argon2id':
-        raise ValueError('Unsupported KDF')
     salt = base_context + b'/kek/argon2id'
     try:  # cryptography >= 44 (OpenSSL Argon2)
         from cryptography.hazmat.primitives.kdf.argon2 import Argon2id

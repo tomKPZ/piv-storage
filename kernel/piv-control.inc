@@ -126,7 +126,7 @@ static int piv_crypto(struct piv_crypt *cc, struct piv_sector *s,
 
 /* Caller holds lifecycle lock. Plaintext lives only in a private wiped page.
  * With @allow_bad, a sector whose stored tuple fails authentication (-EBADMSG,
- * e.g. torn by a crash without the integrity journal) is returned with ->bad set
+ * e.g. media damage or an uncoordinated write) is returned with ->bad set
  * and its raw stored ciphertext/tuple in ->original; its page is not plaintext.
  * Only internal full-sector replacement and SIV-protected fragment collection
  * may use that; nothing unauthenticated is ever published.

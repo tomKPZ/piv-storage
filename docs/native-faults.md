@@ -1,9 +1,8 @@
 # Stateless failure semantics and fault tests
 
 The design keeps no private recovery plan, WAL or history. Primary
-ciphertext/tag/IV updates go through the ordinary dm-integrity journal (or, with
-the opted-in `--allow-no-journal`, stock direct mode; see
-[journal-atomicity.md](journal-atomicity.md)). An interrupted hidden write may
+ciphertext/tag/IV updates go through the ordinary dm-integrity journal (the
+only supported mode; see [journal-atomicity.md](journal-atomicity.md)). An interrupted hidden write may
 leave that one 512-byte hidden block unreadable. A record's whole plaintext must
 authenticate (SIV tag over all 90 fragments) before it is returned, so old and
 new carrier fragments are never mixed into a valid block. Independently valid
@@ -58,9 +57,7 @@ the journal and requires block 0 to be complete-old, complete-new or EIO, every
 other hidden block unchanged and the full primary hash unchanged. A decoy write
 must not silently repair an EIO block; a full hidden write then repairs it.
 Stock full-primary readback and a stock dm-crypt coexistence check follow (this
-suite produces no host-verified output image). On `*-nojournal` profiles torn primary sectors are allowed only inside
-that record's carrier and are restored by full-sector decoy writes (the measured
-hazard in journal-atomicity.md).
+suite produces no host-verified output image).
 
 ## Lower-device errors and setup cleanup (`faults` suite)
 
@@ -78,8 +75,7 @@ block. A direct raw read witnesses each injected fault first.
   injected during the kernel SETUP ioctl via `PIVSETUP_TEST_GATE`. Every
   attempt must remove exactly what it created. Conflicting lower/public names,
   existing owners and an unrelated replacement at close are preserved; both view
-  names are validated before either is removed. On `*-nojournal` fixtures,
-  opening without `--allow-no-journal` is refused and cleaned up.
+  names are validated before either is removed.
 - **error_reads** (both views): the read and an overlapping write fail with EIO,
   spend no encryption and leave the owner healthy; after restoration the same
   owner generation reads and rewrites the range and passes the complete

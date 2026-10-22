@@ -131,9 +131,9 @@ No user paths or file descriptors enter the persistence path.
 ## Primary crypto
 
 The owner accepts `capi:aegis128-random` (16-byte key, IV and tag) and
-`capi:authenc(hmac(sha1|sha256|sha512),xts(aes|serpent|twofish))-random`
-(dm-crypt authenc key encoding: 32- or 64-byte XTS key plus the HMAC key;
-16-byte IV; 20/32/64-byte tag), hex keys only. `piv_aead` reproduces dm-crypt's
+`capi:authenc(hmac(sha256),xts(aes))-random` (dm-crypt authenc key encoding:
+32- or 64-byte XTS key plus the 32-byte HMAC key; 16-byte IV; 32-byte tag), hex
+keys only. `piv_aead` reproduces dm-crypt's
 layout: AAD = LE64(address in 512-byte units) ‖ IV, tuple = tag ‖ IV. Primary
 tuples are prepared in RAM with zero padding up to 4096 bytes (rejected if
 nonzero), never on disk. Fresh preparation spends an encryption even if

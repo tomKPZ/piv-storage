@@ -56,9 +56,8 @@ Per profile, suite.py creates a stock fixture with scripts/guest-control.sh
 (or uses `--control DIR`), runs the native dual-view and early-build test, then
 runs the selected suites concurrently, one fresh VM per suite.
 
-- Profiles: `aegis-4096`, `aegis-512`, `aegis-4096-nojournal`,
-  `aegis-512-nojournal` (stock `--integrity-no-journal`; the client then passes
-  `--allow-no-journal`) and `<aes|serpent|twofish>-<sha1|sha256|sha512>-<4096|512>`.
+- Profiles: `aegis-4096`, `aegis-512`, `aes-sha256-4096` and `aes-sha256-512`
+  (AES-XTS + HMAC-SHA256).
 - `--suites routine` (default): faults, profile, cancel, lifecycle, batch,
   early, power, v4. `--suites all` adds controls, migrate (second 512 MiB disk)
   and fuzz (seeded control-ioctl fuzzing with `PIV_FUZZ_STEPS`/`PIV_FUZZ_SEED`,
@@ -98,9 +97,9 @@ Guards accept the derived images only with their marker files.
 ## Stock fixtures
 
 scripts/guest-control.sh formats /dev/vdb with stock cryptsetup, selected by
-`PIV_PRIMARY_CIPHER` (default `aegis128-random`, or `aes-`/`serpent-`/
-`twofish-xts-random` with `PIV_INTEGRITY=hmac-sha1|hmac-sha256|hmac-sha512`),
-`PIV_SECTOR_SIZE` (4096 default, or 512) and `PIV_NO_JOURNAL=1`. It writes
+`PIV_PRIMARY_CIPHER` (default `aegis128-random`, or `aes-xts-random` with
+`PIV_INTEGRITY=hmac-sha256`) and `PIV_SECTOR_SIZE` (4096 default, or 512), always
+with the default journaled integrity mode. It writes
 distinct deterministic synthetic plaintext to every primary sector, reopens
 read-only with stock cryptsetup and hashes every primary byte. Keyslot PBKDF2
 uses a very low iteration count solely to speed up disposable tests.
@@ -146,8 +145,8 @@ PIV_FIXTURE=artifacts/suite-next/aegis-4096-control \
 ```
 
 The library path is a trusted diagnostic input; never point it at untrusted
-code. AES-XTS + HMAC images are verified with `cryptography`; Serpent/Twofish
-images are HMAC-authenticated only on the host.
+code. AES-XTS + HMAC-SHA256 images are decrypted and verified with
+`cryptography`.
 
 See [native-blocks.md](native-blocks.md) for the module and paired devices and
 [kernel/README.md](../kernel/README.md) for module build rules.

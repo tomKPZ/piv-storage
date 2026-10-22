@@ -2,7 +2,7 @@
 """Pinned disposable guest: configuration benchmark on a pristine stock fixture.
 
 Times stock and native activation, decoy and hidden throughput, A/B and the
-passphrase KDFs, checking every byte read back. Destroys the fixture's decoy
+Argon2id passphrase keyslot, checking every byte read back. Destroys the fixture's decoy
 contents (guest-owned copy only). Results: bench-results.json.
 """
 import hashlib
@@ -185,13 +185,12 @@ views = native_open('ab', 'open')
 assert hashlib.sha256(transfer(views['hidden'], 0, ab_len, HIDDEN_CHUNK)[0]).hexdigest() == ab_hash
 native_close('ab')
 
-# Passphrase KEKs: initialization and open time per KDF (synthetic random passphrase).
-for kdf in ('argon2id', 'scrypt'):
-    passphrase = os.urandom(16).hex().encode()
-    native_open(kdf, 'initialize', key=None, hidden_passphrase=passphrase, kdf=kdf, initialize=True)
-    native_close(kdf)
-    native_open(kdf, 'open', key=None, hidden_passphrase=passphrase, kdf=kdf)
-    native_close(kdf)
+# Argon2id passphrase KEK: initialization and open time (synthetic random passphrase).
+passphrase = os.urandom(16).hex().encode()
+native_open('argon2id', 'initialize', key=None, hidden_passphrase=passphrase, initialize=True)
+native_close('argon2id')
+native_open('argon2id', 'open', key=None, hidden_passphrase=passphrase)
+native_close('argon2id')
 
 # Stock Linux still authenticates every primary sector and sees both decoy regions.
 subprocess.run(['rmmod', 'dm_piv'], check=True)
@@ -203,7 +202,6 @@ crypt('close', 'piv-stock-bench')
 
 results.update(primary_sector=unit, raw_bytes=size('/dev/vdb'), stock_bytes=stock_bytes,
                decoy_bytes=decoy_bytes, hidden_bytes=hidden_bytes, ab_hidden_bytes=ab_bytes,
-               no_journal=os.environ.get('PIV_ALLOW_NO_JOURNAL') == '1',
                cpu=next(line.split(':', 1)[1].strip() for line in Path('/proc/cpuinfo').read_text().splitlines()
                         if line.startswith('model name')),
                vcpus=os.cpu_count(), kernel=os.uname().release,

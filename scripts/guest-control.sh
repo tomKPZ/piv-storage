@@ -18,14 +18,14 @@ apt-get -y --no-install-recommends install \
 test "$(uname -r)" = 6.12.113+deb13-amd64
 PIV_SECTOR_SIZE=${PIV_SECTOR_SIZE:-4096}
 case "$PIV_SECTOR_SIZE" in 512|4096) ;; *) exit 1;; esac
-# Stock profiles with random 16-byte IVs (format v4): AEGIS-128 (default) or
-# XTS + HMAC authenc (PIV_INTEGRITY=hmac-sha1|hmac-sha256|hmac-sha512).
+# The two supported stock profiles with random 16-byte IVs (format v4):
+# AEGIS-128 (default) or AES-XTS + HMAC-SHA256 (PIV_INTEGRITY=hmac-sha256).
 PIV_PRIMARY_CIPHER=${PIV_PRIMARY_CIPHER:-aegis128-random}
 case "$PIV_PRIMARY_CIPHER" in
     aegis128-random) primary_integrity=aead; primary_key_bytes=16 ;;
-    aes-xts-random|serpent-xts-random|twofish-xts-random)
+    aes-xts-random)
         primary_integrity=${PIV_INTEGRITY:?XTS profiles need PIV_INTEGRITY}
-        case "$primary_integrity" in hmac-sha1|hmac-sha256|hmac-sha512) ;; *) exit 1 ;; esac
+        test "$primary_integrity" = hmac-sha256 || exit 1
         primary_key_bytes=64 ;;  # XTS encryption key; cryptsetup appends the HMAC key
     *) exit 1 ;;
 esac
@@ -51,13 +51,7 @@ if [ "$primary_integrity" != aead ]; then
     cryptsetup luksDump --batch-mode --dump-volume-key --volume-key-file volume.key \
         --key-file passphrase.key "$device" > /dev/null
 fi
-# PIV_NO_JOURNAL=1: persist stock --integrity-no-journal in the LUKS2 header
-# (config flag "no-journal"); every later open then uses a direct-mode table.
-if test "${PIV_NO_JOURNAL:-0}" = 1; then
-    cryptsetup open --integrity-no-journal --persistent --key-file passphrase.key "$device" piv-control
-else
-    cryptsetup open --key-file passphrase.key "$device" piv-control
-fi
+cryptsetup open --key-file passphrase.key "$device" piv-control
 size=$(blockdev --getsize64 /dev/mapper/piv-control)
 python3 - "$size" "$PIV_SECTOR_SIZE" <<'PY'
 import hashlib
