@@ -46,5 +46,8 @@ The full suite set (`--suites all`) passed on the port image for the AEGIS-128
 4096 and 512 profiles, including the early-boot suite, with no kernel reports;
 runs are recorded in commit messages. The AES-XTS + HMAC-SHA256 profiles were
 added after the port; on 7.2.9 only aes-sha256-4096 has run (the routine
-suites, passing); aes-sha256-512 has not run there. Not covered: sanitizer builds of
+suites, passing); aes-sha256-512 has not run there. Format v5 (2026-10-22) ran
+the routine suites on the port image for aegis-4096 and aes-sha256-4096, all
+passing; the 512-byte profiles and the opt-in suites have not run v5 on 7.2.
+Not covered: sanitizer builds of
 7.2, other distributions, and kernels between 6.12 and 7.2.
