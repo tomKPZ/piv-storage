@@ -1823,4 +1823,12 @@ pre-2026-10-20 fail-stop; now they assert scoped isolation. large-4096-004 and
 large-512-004 (512 MiB) passed; reopen 0.34 s / 0.22 s. suite-057: final-tree
 journaled routine 18/18.
 
-Open: sanitizer run on no-journal profiles (optional), external review.
+suite-058-nojournal-sanitizer (KASAN/UBSAN/lockdep image, no-journal fixtures;
+4096 routine, 512 faults and power): 12/12, no kernel reports.
+
+Possible improvement (not done): hidden reads could use raw IVs of carrier
+sectors that fail primary authentication (SIV-checked, like keyslots), so a
+torn primary sector whose IV survived would not make its hidden block EIO.
+It changes the faults-suite expectations and is a modest availability gain.
+
+Open: external review; optional sanitizer build of 7.2.
