@@ -2,7 +2,7 @@
 
 This guide is for users setting up a volume. It lists each option, its
 default, its trade-offs and measured numbers. The numbers come from the `bench`
-suite (suite-083, format v5 with batched writes), so read [How the numbers were measured](#how-the-numbers-were-measured)
+suite (suite-094, format v5 with concurrent requests), so read [How the numbers were measured](#how-the-numbers-were-measured)
 before comparing them with other systems.
 
 Some options are fixed when the stock volume is created (`cryptsetup
@@ -16,9 +16,9 @@ resize are not supported.
 | Option | Chosen at | Default | Alternatives | Main trade-off |
 | --- | --- | --- | --- | --- |
 | [Primary cipher](#primary-cipher-profile) | `luksFormat` | `aegis128-random` + `aead` | `aes-xts-random` + `hmac-sha256` | AEGIS is fastest; XTS + HMAC tolerates an IV repeat far better |
-| [Sector size](#sector-size) | `luksFormat` | none from pivsetup; the test fixtures use 4096 | 512 | 512 gives 8× hidden capacity and 4× faster hidden reads and writes; 4096 gives 5–7% more decoy space |
+| [Sector size](#sector-size) | `luksFormat` | none from pivsetup; the test fixtures use 4096 | 512 | 512 gives 8× hidden capacity, about 3× faster hidden reads and 8× faster hidden writes; 4096 gives 5–7% more decoy space |
 | [Integrity journal](#integrity-journal) | first `cryptsetup open` | journal on (required) | none | No-journal volumes are refused |
-| [A/B record slots](#ab-record-slots) | `--initialize` | off | `--ab` | A/B keeps the previous hidden block after an interrupted write, at half capacity and half hidden-read speed |
+| [A/B record slots](#ab-record-slots) | `--initialize` | off | `--ab` | A/B keeps the previous hidden block after an interrupted write, at half capacity and up to half hidden-read speed |
 | [Reed–Solomon parity](#reedsolomon-parity) | `--initialize` | off | `--parity 4`, `8`, `16` | Survives up to p unreadable or damaged carrier sectors per lane, for 1.7–7% of hidden capacity |
 | [Hidden key type](#hidden-key-file-or-passphrase) | `--initialize` and keyslot add | key file | `--hidden-passphrase-file` (Argon2id) | A key file cannot be guessed; a passphrase relies on the KDF cost |
 | [Passphrase cost](#hidden-key-file-or-passphrase) | every passphrase open and keyslot add | `--kdf-cost 3` (1 GiB) | 1, 2, 4 | Higher tiers slow guessing and every open, and need more RAM; the tier is not recorded |
@@ -58,9 +58,9 @@ HMAC fails much more gracefully there. See the
 [security review](security-review.md) for the full nonce budget.
 
 **Performance (4096-byte sectors).** AEGIS-128 is the fastest. AES-XTS + HMAC
-costs about 0.08 s more per open, about 10–20% lower hidden-read and
-hidden-write speed and similar decoy write speed (decoy writes are limited by
-the serialized write path, not the cipher).
+costs about 0.08 s more per open, about half the hidden-read speed (each hidden
+block read authenticates 687 sectors, so the cipher dominates) and similar
+decoy and hidden write speed (writes are limited by the integrity journal).
 Its larger tag also costs some space (see [Storage overhead](#storage-overhead)).
 
 **Detectability.** The cipher name is visible to anyone who reads the LUKS2
@@ -83,11 +83,11 @@ explicitly rather than relying on cryptsetup's device-dependent default.
 | Hidden capacity (A/B) | 1,257,472 B (626,688 B) | 155,648 B (77,824 B) |
 | Hidden share of decoy capacity | 1.15% | 0.135% |
 | Raw bytes rewritten per 4 KiB hidden write | 344 KiB | 2.7 MiB |
-| Decoy sequential write | 14 MiB/s | 10 MiB/s |
-| Decoy random 4 KiB writes | 879 IOPS | 664 IOPS |
-| Hidden sequential read | 1.6 MiB/s | 290 KiB/s |
-| Hidden sequential write | 820 KiB/s | 200 KiB/s |
-| `--initialize` | 1.25 s | 0.95 s |
+| Decoy sequential write | 100 MiB/s | 115 MiB/s |
+| Decoy random 4 KiB writes | 6,050 IOPS | 6,180 IOPS |
+| Hidden sequential read | 8.5 MiB/s | 3.2 MiB/s |
+| Hidden sequential write | 1.3 MiB/s | 160 KiB/s |
+| `--initialize` | 1.09 s | 0.94 s |
 
 Each 4096-byte hidden block needs 687 primary sectors (without parity), so
 hidden capacity is about 4096/(687·S) of the decoy for sector size S, minus
@@ -95,9 +95,8 @@ the keyslots and the two directory records (112 + 2·687 sectors). Smaller
 sectors therefore give 8× the hidden share. On a 128 MiB 4096-byte-sector
 disk the 38 hidden blocks are too few for mke2fs (it needs about 55 blocks of
 4 KiB). They also cost a larger share of space for tags and 8× as many sectors
-to authenticate and journal per decoy byte, though decoy writes measured
-faster at 512 (each request flushes the journal, and 4096-byte journal sections
-are larger).
+to authenticate and journal per decoy byte (decoy writes measured about 10%
+slower at 512).
 
 **Recommendation.** Use **512** if hidden capacity matters, which is usually
 the point of this tool: 4096-byte sectors leave only about 0.14% of the volume
@@ -131,14 +130,16 @@ blocks.
 | AEGIS-128 | 4096 single | 4096 A/B | 512 single | 512 A/B |
 | --- | ---: | ---: | ---: | ---: |
 | Hidden capacity | 155,648 B | 77,824 B | 1,257,472 B | 626,688 B |
-| Hidden sequential read | 290 KiB/s | 150 KiB/s | 1.6 MiB/s | 800 KiB/s |
-| Hidden random 4 KiB reads | 77 IOPS | 34 IOPS | 372 IOPS | 192 IOPS |
-| Hidden sequential write | 200 KiB/s | 80 KiB/s | 820 KiB/s | 400 KiB/s |
-| `--initialize` | 0.95 s | 0.56 s | 1.25 s | 0.64 s |
+| Hidden sequential read | 3.2 MiB/s | 2.2 MiB/s | 8.5 MiB/s | 5.1 MiB/s |
+| Hidden random 4 KiB reads | 540 IOPS | 262 IOPS | 1,206 IOPS | 401 IOPS |
+| Hidden sequential write | 160 KiB/s | 170 KiB/s | 1.3 MiB/s | 1.2 MiB/s |
+| `--initialize` | 0.94 s | 0.60 s | 1.09 s | 0.59 s |
 
-A/B reads both slots, so hidden reads take about twice as long. A write
-rewrites the same 687 sectors but first reads both slots to find the older
-one, so A/B writes run at 40–50% of single-slot speed. One 4 KiB hidden block is one record, so with A/B a
+A/B reads both slots, so hidden reads take up to about twice as long. A write
+rewrites the same 687 sectors but first reads both slots to find the older one
+and flushes the journal (so the newest slot is durable before the other is
+overwritten); with concurrent requests A/B writes now run at about the
+single-slot speed (90–105%; 40–50% before suite-094). One 4 KiB hidden block is one record, so with A/B a
 block is either all old or all new after an interruption. Initialization is faster because it writes only one
 slot per block (without reading either).
 
@@ -161,9 +162,9 @@ Parity is recorded in the keyslot; later opens need no option.
 | AEGIS-128, 128 MiB | 4096 no parity | 4096 `--parity 8` | 512 no parity | 512 `--parity 8` |
 | --- | ---: | ---: | ---: | ---: |
 | Hidden capacity | 155,648 B | 151,552 B | 1,257,472 B | 1,216,512 B |
-| Hidden sequential read | 290 KiB/s | 250 KiB/s | 1.6 MiB/s | 1.5 MiB/s |
-| Hidden sequential write | 200 KiB/s | 180 KiB/s | 820 KiB/s | 770 KiB/s |
-| `--initialize` | 0.95 s | 0.96 s | 1.25 s | 1.19 s |
+| Hidden sequential read | 3.2 MiB/s | 3.5 MiB/s | 8.5 MiB/s | 6.4 MiB/s |
+| Hidden sequential write | 160 KiB/s | 170 KiB/s | 1.3 MiB/s | 1.3 MiB/s |
+| `--initialize` | 0.94 s | 1.04 s | 1.09 s | 1.05 s |
 
 Capacity cost on large volumes: 1.7% (P = 4), 3.5% (P = 8), 7.0% (P = 16);
 each hidden write rewrites 3P more sectors. Hidden writes still require every
@@ -214,12 +215,14 @@ refuses the volume on any failure.
 
 | 128 MiB disk | Open (default) | Open with `--verify` |
 | --- | ---: | ---: |
-| AEGIS-128 4096 | 0.13 s | 0.67 s |
-| AEGIS-128 512 | 0.12 s | 0.78 s |
-| AES-XTS + HMAC-SHA256 4096 | 0.21 s | 0.84 s |
-| AES-XTS + HMAC-SHA256 512 | 0.20 s | 0.97 s |
+| AEGIS-128 4096 | 0.14 s | 0.18 s |
+| AEGIS-128 512 | 0.12 s | 0.27 s |
+| AES-XTS + HMAC-SHA256 4096 | 0.21 s | 0.36 s |
+| AES-XTS + HMAC-SHA256 512 | 0.19 s | 0.44 s |
 
-That is roughly 100–200 MiB/s of audit speed here; expect hours on multi-TB
+That is roughly 0.5–3 GiB/s of audit speed on this cached test disk
+(it reads 1024 sectors per batch; before suite-094, 16 KiB at a time gave
+100–200 MiB/s); on real storage it is bounded by the disk; expect hours on multi-TB
 volumes. Use it after a suspected corruption or before trusting a copied
 image, not on every boot.
 
@@ -272,8 +275,8 @@ for a hidden passphrase, the KDF time from the table above.
 
 | Profile | Stock open | dm-piv open | dm-piv close |
 | --- | ---: | ---: | ---: |
-| AEGIS-128 4096 / 512 | 0.03 s | 0.12–0.13 s | 0.21–0.22 s |
-| AES-XTS + HMAC 4096 / 512 | 0.04–0.05 s | 0.20–0.21 s | 0.20–0.22 s |
+| AEGIS-128 4096 / 512 | 0.03 s | 0.12–0.14 s | 0.21–0.23 s |
+| AES-XTS + HMAC 4096 / 512 | 0.04 s | 0.18–0.22 s | 0.20–0.23 s |
 
 Opening does not depend on volume size unless `--verify` is used. The same
 `pivsetup open-blocks` runs unchanged from an initramfs (the early-boot suite
@@ -289,69 +292,75 @@ ordinary dm-crypt on the same fixture before dm-piv is activated.
 
 | Profile | Stock seq write | Decoy seq write | Stock seq read | Decoy seq read | Stock / decoy random 4 KiB write | Hidden seq write | Hidden seq read |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| AEGIS-128 4096 | 74 MiB/s | 10 MiB/s | 793 MiB/s | 174 MiB/s | 12,156 / 664 IOPS | 200 KiB/s | 290 KiB/s |
-| AEGIS-128 512 | 69 MiB/s | 14 MiB/s | 571 MiB/s | 147 MiB/s | 13,705 / 879 IOPS | 820 KiB/s | 1.6 MiB/s |
-| AES-XTS + HMAC-SHA256 4096 | 68 MiB/s | 9.9 MiB/s | 498 MiB/s | 142 MiB/s | 13,074 / 654 IOPS | 160 KiB/s | 260 KiB/s |
-| AES-XTS + HMAC-SHA256 512 | 66 MiB/s | 14 MiB/s | 412 MiB/s | 117 MiB/s | 12,303 / 899 IOPS | 720 KiB/s | 1.4 MiB/s |
+| AEGIS-128 4096 | 71 MiB/s | 115 MiB/s | 724 MiB/s | 604 MiB/s | 12,435 / 6,181 IOPS | 160 KiB/s | 3.2 MiB/s |
+| AEGIS-128 512 | 68 MiB/s | 100 MiB/s | 606 MiB/s | 489 MiB/s | 12,904 / 6,053 IOPS | 1.3 MiB/s | 8.5 MiB/s |
+| AES-XTS + HMAC-SHA256 4096 | 74 MiB/s | 116 MiB/s | 445 MiB/s | 434 MiB/s | 11,103 / 6,446 IOPS | 180 KiB/s | 1.7 MiB/s |
+| AES-XTS + HMAC-SHA256 512 | 69 MiB/s | 102 MiB/s | 409 MiB/s | 375 MiB/s | 12,379 / 5,260 IOPS | 1.3 MiB/s | 6.0 MiB/s |
 
-Random 4 KiB decoy reads ran at stock speed in every profile (6,500–9,000
-IOPS for both). Compared with suite-077 (the previous per-sector write path),
-batched writes raised decoy sequential writes 1.7× at 4096-byte sectors and
-9× at 512, decoy random writes 1.2–3×, hidden writes 8× (4096) and 25× (512)
-and initialization 6× and 30×. Reads did not change (differences within
-noise).
+Random 4 KiB decoy reads ran at stock speed in every profile (7,900–9,700
+IOPS for both). Compared with suite-083 (batched writes on one ordered worker
+that flushed after every write), concurrent requests, stock flush semantics
+and batched 1024-sector reads raised decoy sequential writes 7–12×, decoy
+random writes 6–10×, decoy sequential reads 3–3.5×, hidden reads 3–14×
+(sequential and random), hidden writes 1.5–1.8× at 512-byte sectors (unchanged
+within noise at 4096) and A/B hidden writes 2–3×. Initialization of the
+128 MiB disk did not change beyond noise; on 512 MiB disks it was 1.5–1.7×
+faster than the previous module in the same session (see below).
 
 What to expect:
 
-- **Decoy reads** are close to stock for random access and 3–5× slower for
-  large sequential reads.
-- **Decoy writes** are 5–7× slower than stock dm-crypt for sequential writes
-  and 14–18× slower for random 4 KiB writes. dm-piv handles one write request
-  (at most 16 KiB) at a time on an ordered worker: it reads and authenticates
-  the old sectors, re-encrypts, writes through the journal and flushes before
-  starting the next request (a current implementation limit, not a format
-  property; stock dm-crypt does not flush plain writes). Throughput is bound
-  by per-request latency, not by the cipher. This difference is visible to
-  anyone timing writes on the running system.
-- **Hidden writes** run at about 160–200 KiB/s at 4096-byte sectors (40–50
-  blocks of 4 KiB per second) and 720–820 KiB/s at 512 (180–200 blocks/s).
-  Each hidden block write authenticates and rewrites a whole 687-sector record
-  (2.7 MiB of primary data at 4096-byte sectors, 344 KiB at 512), so the
-  hidden volume suits small, rarely changed data.
+- **Decoy reads** are close to stock: random reads at stock speed, large
+  sequential reads at 80–100% of stock.
+- **Decoy writes** are about 2× slower than stock dm-crypt for random 4 KiB
+  writes at queue depth 1 (each request reads and authenticates the old
+  sectors before re-encrypting them), and measured faster than stock for
+  large sequential writes here (dm-piv submits each 128 KiB request as a few
+  large concurrent bios). Like stock dm-crypt, a plain write is not flushed;
+  durability comes from fsync/FUA. Either difference is visible to anyone
+  timing writes on the running system.
+- **Hidden writes** run at about 160–180 KiB/s at 4096-byte sectors (about 45
+  blocks of 4 KiB per second, limited by the integrity journal: each block
+  rewrites 2.7 MiB of primary data) and 1.3 MiB/s at 512 (344 KiB per block).
+  The hidden volume suits small, rarely changed data.
 - **Hidden reads** authenticate 687 sectors per 4 KiB block regardless of
-  request size: about 230–310 KiB/s at 4096-byte sectors and 1.4–1.9 MiB/s at
-  512 (suite-077 and suite-083).
+  request size; concurrent requests overlap: about 1.7–3.2 MiB/s at 4096-byte
+  sectors and 6–8.5 MiB/s at 512 for 64 KiB requests (suite-094).
 
 ## Large volumes and initialization time
 
 `--initialize` writes every hidden record, which rewrites essentially every
 primary sector: about 29,000 sectors/s (113 MiB/s) at 4096-byte sectors
-(0.95 s for 128 MiB, open included) and 170,000 sectors/s (83 MiB/s) at 512
-(1.25 s). Extrapolated to a 1 TiB disk (AEGIS-128, no A/B), that is about
-**2.5–3 hours** at 4096-byte sectors and **3.5 hours** at 512 (suite-077,
-before batched writes: 16 hours and 4–5 days). A/B halves it. The test disk
+(0.94 s for 128 MiB, open included) and 190,000 sectors/s (95 MiB/s) at 512
+(1.09 s). Extrapolated to a 1 TiB disk (AEGIS-128, no A/B), that is about
+**2.5–3 hours** at 4096-byte sectors and **3 hours** at 512 (suite-077,
+before batched writes: 16 hours and 4–5 days). A/B halves it. Initialization
+writes 8 records concurrently; on the 128 MiB test disk this was within noise
+of the serial version, and on 512 MiB disks (large-*-009 against the previous
+module in the same, slower host session) it took 6.9 s instead of 10.1 s at
+4096-byte sectors and 15.7 s instead of 27.1 s at 512. The test disk
 is cached by the host; on real storage initialization approaches the disk's
 bandwidth limit (every carrier sector is read once and written twice through
 the journal). Initialization can be cancelled with SIGINT/SIGTERM; blocks not yet written
 stay unavailable until a later `--initialize` completes
 ([cancellation.md](cancellation.md)).
 
-The per-owner limit of 2^32 primary encryptions also bounds one
+The per-owner limit of 2^40 primary encryptions (raised from 2^32, which a
+512-byte-sector initialization reached around 2 TiB) also bounds one
 initialization (G encryptions per hidden block, about one per primary sector):
-at 512-byte sectors it is reached around 2 TiB. These figures are extrapolated; the test guard admits
+at 512-byte sectors it is reached around 512 TiB. These figures are extrapolated; the test guard admits
 only 128 and 512 MiB disks ([large-volumes.md](large-volumes.md)).
 
 ## How the numbers were measured
 
 - `bench` suite (scripts/guest-bench.sh, kernel/guest-bench-test.py) run
-  sequentially (`--jobs 1`) in suite-083 (format v5, batched writes,
-  2026-10-22; KDF tier rows from suite-077, matched within 0.2 s) on the pinned
+  sequentially (`--jobs 1`) in suite-094 (format v5, concurrent requests,
+  2026-10-22; KDF tier rows from suite-077, matched within 0.6 s) on the pinned
   Debian 6.12.113 guest: 2 vCPUs, `-cpu max` under KVM on an Intel Xeon @
   2.60 GHz host, 3.5 GiB guest RAM (for the 2 GiB Argon2id tier), 128 MiB raw
   virtio disk image.
 - The disk image sits in the host page cache, and O_DIRECT bypasses only the
   guest page cache. Absolute numbers therefore reflect a fast cached virtual
-  disk. Real storage adds latency, which hurts dm-piv's serialized writes
+  disk. Real storage adds latency, which hurts dm-piv's read-before-write
   more than stock dm-crypt. Compare rows with each other, not with other
   systems.
 - Sequential numbers are single passes and activation numbers medians of
@@ -366,7 +375,7 @@ Reproduce (results land in `PREFIX/*-bench/share/bench-results.json`):
 ```sh
 python3 scripts/suite.py --prefix artifacts/bench-next \
   --control artifacts/suite-016/aegis-4096-control \
-  --scaffold artifacts/batch-input-001/scaffold.tar --suites bench --jobs 1
+  --scaffold artifacts/conc-input-002/scaffold.tar --suites bench --jobs 1
 ```
 
 ## Example

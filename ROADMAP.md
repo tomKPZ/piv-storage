@@ -10,7 +10,9 @@ and limits are in README.md and docs/.
   exposes paired writable decoy/hidden block devices over a stock LUKS2 +
   dm-integrity volume with 16-byte random IVs (AEGIS-128 default, or AES-XTS + HMAC-SHA256
   authenc). Hidden format v5 (4 KiB records, keyslot parameters, Argon2id
-  cost tiers, optional Reed–Solomon parity) is the only format.
+  cost tiers, optional Reed–Solomon parity) is the only format. View bios run
+  concurrently (range locks per sector range/record, stock flush semantics,
+  batched 1024-sector authenticated reads).
 - Setup is the static Rust `pivsetup` (open/close, keyslots, migrate, keygen);
   Python keeps only independent read-only diagnostics and guest test
   instrumentation.
@@ -21,28 +23,7 @@ and limits are in README.md and docs/.
 
 ## Remaining work
 
-1. **Concurrent bios and larger reads** (core module). Record writes are
-   batched (one authenticated read, a few multi-sector write bios and one flush
-   per request; docs/native-blocks.md#write-path), but the single ordered
-   `piv-native` worker still handles one bio at a time and flushes the lower
-   journal after every write request, so decoy writes run 5–7× (sequential)
-   and 14–18× (random 4 KiB) slower than stock dm-crypt and sequential decoy
-   reads 3–5× slower (docs/configuration.md, suite-083). Process independent
-   bios and initialization records concurrently and/or batch across bios while
-   serializing updates that touch the same hidden record (a per-record lock),
-   keeping stock PREFLUSH/FUA/flush semantics, per-sector authentication
-   before publishing and the failure-scope rules (a failure after writing
-   begins still stops the owner). Decide whether plain (non-FUA) writes still
-   need their own completion flush (stock does not flush them). Revisit the
-   16 KiB range-read and DM split bounds (hidden and decoy reads still use
-   16 KiB synchronous ranges; A/B hidden writes read both slots that way
-   before the batched rewrite, so they run at 40–50% of single-slot speed) and
-   the 2^32 per-owner cap. Exit: bench shows the gain; faults, power, cancel,
-   batch and lifecycle suites updated and passing on the stock and sanitizer
-   images, with the lifecycle expected ordering updated for the new design;
-   docs updated. Initialization's floor is then disk bandwidth: it reads every
-   carrier sector once and writes it about twice (journal).
-2. **Quick and resumable initialization** (pivsetup + module, no format change).
+1. **Quick and resumable initialization** (pivsetup + module, no format change).
    `--initialize --quick` (non-default, user decision 2026-10-22) writes only
    keyslot 0 and the directory; never-written hidden blocks return EIO until
    first written (each hidden write replaces a whole record), which breaks
@@ -54,7 +35,7 @@ and limits are in README.md and docs/.
    explicit, documented destructive command, never automatic. Exit: v5/cancel
    suites cover quick init, EIO on unwritten blocks, fill after cancellation
    and skipping of written blocks; host decoder verifies the result.
-3. **Lift the activation guards and deploy beyond test guests** (user
+2. **Lift the activation guards and deploy beyond test guests** (user
    approval 2026-10-22). Remove pivsetup's restriction to the pinned QEMU guest
    and 128/512 MiB `/dev/vdb` (and the test-only `--allow-test-stack` /
    `--allow-second-disk` escape hatches once unneeded), keeping the safety

@@ -97,10 +97,13 @@ key and run kernel/guest-large-test.py:
 - Timed initialization and reopen, custom unload and stock full-primary
   authentication. `large-results.json` records geometry and timings.
 
-Last recorded timings (2026-10-22, KVM, batched writes, large-4096-007 and
-large-512-007, run beside a sanitizer matrix): reopen 0.33 s (4096) / 0.26 s
-(512); initialization 2.6 s / 3.4 s (format v4 with the per-sector write path,
-2026-10-21: 27.8 s / 168.5 s).
+Last recorded timings (2026-10-22, KVM, concurrent requests, large-4096-009
+and large-512-009): reopen 1.6 s (4096) / 1.6 s (512); initialization 6.9 s /
+15.7 s. The host was about 3× slower in that session than for large-*-007
+(batched writes, 2.6 s / 3.4 s, reopen 0.33 s / 0.26 s): the previous module
+rerun in the same session (large-*-010-oldmodule) took 10.1 s / 27.1 s to
+initialize and 2.2 s / 1.7 s to reopen. Format v4 with the per-sector write
+path (2026-10-21) took 27.8 s / 168.5 s.
 
 Host tests (tests/test_profile.py) check integrity layout arithmetic above
 32-bit byte offsets with synthetic 8 GiB metadata for both sector sizes,

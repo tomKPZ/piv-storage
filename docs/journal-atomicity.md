@@ -45,8 +45,12 @@ IVs were changed in committed journal or current state when the VM was cut,
 the block
 returned EIO after replay, no primary sector was torn, other hidden blocks and
 all primary plaintext were unchanged, a decoy write did not make the damaged
-block valid, and a later full hidden write repaired it. This kills the VM, not
-the device: it does not model a torn device write or hardware power loss.
+block valid, and a later full hidden write repaired it. The same test passed on all
+four profiles with concurrent requests and no completion flush (suite-090: 96,
+256, 96 and 160 changed carrier IVs at the cut, first attempt each; the
+hidden writer's fsync and the prefill's fsyncs provide the commits). This kills
+the VM, not the device: it does not model a torn device write or hardware
+power loss.
 
 ## Conclusions
 
