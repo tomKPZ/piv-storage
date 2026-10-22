@@ -77,15 +77,15 @@ def stock_rewrite(source, key, sector, unit):
 
 
 def open_views(**options):
-    value = blocks.open_blocks(SOURCE, KEY, HKEY, allow_test_stack=True, **options)
+    value = blocks.open_blocks(SOURCE, KEY, HKEY, **options)
     subprocess.run(['udevadm', 'settle'], check=True)
     return value
 
 def close_views():
-    blocks.close_blocks(SOURCE, KEY, allow_test_stack=True)
+    blocks.close_blocks(SOURCE, KEY)
 
 def owner():
-    return owners.GuestOwner(SOURCE, KEY, allow_test_stack=True)
+    return owners.GuestOwner(SOURCE, KEY)
 
 def absent():
     assert all(mapping_identity(name) is None for name in NAMES)
@@ -165,7 +165,7 @@ results.append('foreign setup names preserved')
 # Inject failures at each setup phase through pivsetup's explicit test hook
 # (PIVSETUP_TEST_FAIL); every attempt must remove exactly what it created.
 for phase in ('after-cryptsetup-open', 'before-setup', 'after-setup', 'first-view', 'second-view'):
-    rejected(lambda: blocks.open_blocks(SOURCE, KEY, HKEY, allow_test_stack=True,
+    rejected(lambda: blocks.open_blocks(SOURCE, KEY, HKEY,
                                         env=dict(PIVSETUP_TEST_FAIL=phase)))
     absent()
     results.append(phase + ' cleanup')
@@ -173,7 +173,7 @@ for phase in ('after-cryptsetup-open', 'before-setup', 'after-setup', 'first-vie
 # Lower read failure during the kernel authentication scan: hold pivsetup at its
 # gate, inject the fault for exactly the SETUP ioctl, then let it unwind.
 gate = '/run/piv-fault-kernel-auth'
-with blocks.spawn_open(SOURCE, KEY, HKEY, allow_test_stack=True,
+with blocks.spawn_open(SOURCE, KEY, HKEY,
                        env=dict(PIVSETUP_TEST_GATE=gate, PIVSETUP_TEST_HOLD='1')) as process:
     while not Path(gate + '-ready.json').exists():
         assert process.poll() is None, process.communicate()

@@ -5,6 +5,11 @@ umask 077
 test "$(id -u)" = 0
 test "$(findmnt -n -o FSTYPE /mnt/piv-work)" = 9p
 cd /mnt/piv-work
+# PIV_CONTROL_DEVICE (default /dev/vdb) selects another disposable vm.py disk,
+# e.g. the arbitrary-size /dev/vdc of large-volume runs.
+device=${PIV_CONTROL_DEVICE:-/dev/vdb}
+case "$device" in /dev/vdb|/dev/vdc) ;; *) echo "Unsupported disposable guest disk" >&2; exit 1 ;; esac
+test -b "$device"
 test -b /dev/vdb
 case "$(blockdev --getsize64 /dev/vdb)" in
     134217728|536870912) ;;
@@ -35,7 +40,6 @@ modprobe dm_crypt
 # Synthetic keys are runtime-only files in the ignored, private run directory.
 head -c "$primary_key_bytes" /dev/urandom > volume.key
 head -c 32 /dev/urandom > passphrase.key
-device=/dev/vdb
 cleanup() {
     cryptsetup close piv-control 2>/dev/null || true
 }
@@ -78,10 +82,11 @@ cryptsetup close piv-control
 cryptsetup luksDump --dump-json-metadata "$device" > luks.json
 # integritysetup dump has no offset argument. Give it a standalone copy of
 # the superblock; inspection requires neither activation nor a loop device.
-python3 - <<'PY'
+PIV_DEVICE=$device python3 - <<'PY'
 import json
+import os
 offset = int(json.load(open('luks.json'))['segments']['0']['offset'])
-with open('/dev/vdb', 'rb', buffering=0) as source:
+with open(os.environ['PIV_DEVICE'], 'rb', buffering=0) as source:
     source.seek(offset)
     header = source.read(4096)
     if len(header) != 4096:

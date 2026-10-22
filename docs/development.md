@@ -24,11 +24,20 @@ booting 6.12.113+deb13-amd64. `vm.py run` creates a disposable qcow2 OS overlay
 and a sparse raw data disk exposed as /dev/vdb: 128 MiB by default,
 `--blank-mib 512` for the other approved size ([large-volumes.md](large-volumes.md)),
 or `--data-image` to attach a private copy of an existing 128/512 MiB image.
-`--second-blank-mib` adds /dev/vdc (migration tests), `--power-cut-script`
-reboots the same disks after a simulated power cut, and `--code` exports the
-package source read-only. vm.py freezes scripts/guest-common.sh (guards,
-package setup, module build/load, provenance) into every run; reuse it rather
-than duplicating guards.
+`--second-blank-mib N` (16–16384) adds a sparse /dev/vdc of any size
+(migration, arbitrary-device and large-volume tests), `--power-cut-script`
+reboots the same disks after a simulated power cut (also used for the deploy
+suite's boot test), and `--code` exports the package source read-only. vm.py
+freezes scripts/guest-common.sh (harness guards, package setup, module
+build/load, provenance) into every run; reuse it rather than duplicating
+guards.
+
+pivsetup itself no longer confines activation to this guest (the activation
+guards were removed 2026-10-22; [packaging/README.md](../packaging/README.md)
+covers real installations). The harness guards in guest-common.sh and
+guest-control.sh (pinned guest kernels, a 9p work share, a 128/512 MiB
+/dev/vdb) remain: they protect the host and keep agent testing confined to
+disposable guests and synthetic disks.
 
 Networking is QEMU user mode without forwarded ports; host entropy is supplied
 through virtio-rng. Only the private run/share directory is exported via 9p;
@@ -59,7 +68,12 @@ runs the selected suites concurrently, one fresh VM per suite.
 - Profiles: `aegis-4096`, `aegis-512`, `aes-sha256-4096` and `aes-sha256-512`
   (AES-XTS + HMAC-SHA256).
 - `--suites routine` (default): faults, profile, cancel, lifecycle, batch,
-  stress (concurrent I/O oracles and a fault under load), early, power, v5. `--suites all` adds controls, migrate (second 512 MiB disk)
+  stress (concurrent I/O oracles and a fault under load), early, power, v5. `--suites all` adds controls, migrate (second 512 MiB disk),
+  devices (activation on a 300 MiB second disk, a loop device, a dm-linear
+  offset and a GPT partition, plus the remaining safety refusals; the loop and
+  partition images are host-verified), deploy (packaging/install.sh: DKMS
+  build and signature check, installed activation, initramfs-tools hook
+  validation and a reboot whose initramfs opens the views)
   and fuzz (seeded control-ioctl fuzzing with `PIV_FUZZ_STEPS`/`PIV_FUZZ_SEED`,
   plus dm table/constructor fuzzing; best on the sanitizer image). `bench`
   (the [configuration.md](configuration.md) measurements, on the pristine
@@ -98,11 +112,13 @@ kernel C changes. Executed runs are recorded in commit messages.
 - Port: Debian trixie-backports 7.2.9 image from scripts/build_port_image.py;
   see [kernel-port.md](kernel-port.md).
 
-Guards accept the derived images only with their marker files.
+The harness guard (guest-common.sh) accepts the derived images only with
+their marker files.
 
 ## Stock fixtures
 
-scripts/guest-control.sh formats /dev/vdb with stock cryptsetup, selected by
+scripts/guest-control.sh formats /dev/vdb (or `PIV_CONTROL_DEVICE=/dev/vdc`)
+with stock cryptsetup, selected by
 `PIV_PRIMARY_CIPHER` (default `aegis128-random`, or `aes-xts-random` with
 `PIV_INTEGRITY=hmac-sha256`) and `PIV_SECTOR_SIZE` (4096 default, or 512), always
 with the default journaled integrity mode. It writes

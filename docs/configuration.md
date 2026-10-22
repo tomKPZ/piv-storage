@@ -264,8 +264,8 @@ is the tag plus the 16-byte IV (32 bytes for AEGIS, 48 for HMAC-SHA256):
 
 For a 1 TiB disk this gives roughly 1.5 GiB of hidden capacity at 4096-byte
 sectors and 11.2 GiB at 512 (AEGIS-128, no parity; half with A/B). These are
-extrapolations, not measurements: the test guard only admits 128 and 512 MiB
-disks.
+extrapolations, not measurements: the largest tested volumes are 3 GiB
+(4096-byte sectors) and 2 GiB (512) ([large-volumes.md](large-volumes.md)).
 
 ## Activation and boot time
 
@@ -371,8 +371,8 @@ plus one authenticated read per block.
 The per-owner limit of 2^40 primary encryptions (raised from 2^32, which a
 512-byte-sector initialization reached around 2 TiB) also bounds one
 initialization (G encryptions per hidden block, about one per primary sector):
-at 512-byte sectors it is reached around 512 TiB. These figures are extrapolated; the test guard admits
-only 128 and 512 MiB disks ([large-volumes.md](large-volumes.md)).
+at 512-byte sectors it is reached around 512 TiB. These figures are extrapolated beyond the largest tested
+volumes (3 GiB and 2 GiB; [large-volumes.md](large-volumes.md)).
 
 ## How the numbers were measured
 
@@ -409,9 +409,9 @@ layer and a hidden key file:
 
 ```sh
 cryptsetup luksFormat --type luks2 --cipher aes-xts-random --key-size 512 \
-  --integrity hmac-sha256 --sector-size 512 --key-file passphrase.key /dev/vdb
+  --integrity hmac-sha256 --sector-size 512 --key-file passphrase.key /dev/sdX2
 pivsetup keygen --output hidden.key
-pivsetup open-blocks --device /dev/vdb --key-file passphrase.key \
+pivsetup open-blocks --device /dev/sdX2 --key-file passphrase.key \
   --hidden-key-file hidden.key --initialize
 ```
 

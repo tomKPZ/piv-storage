@@ -70,12 +70,13 @@ class ClientTests(unittest.TestCase):
 
     def test_open_arguments_never_contain_key_material(self):
         args = blocks.open_args('/dev/vdb', '/w/passphrase.key', '/run/secret', initialize=True,
-                                ab=True, allow_test_stack=True)
+                                ab=True)
         self.assertEqual(args, ['open-blocks', '--device', '/dev/vdb', '--key-file', '/w/passphrase.key',
                                 '--name', 'piv-native', '--hidden-key-file', '/run/secret', '--initialize',
-                                '--ab', '--allow-test-stack'])
+                                '--ab'])
         self.assertIn('--hidden-passphrase-file', blocks.open_args('/dev/vdb', 'k', 's', passphrase=True))
-        self.assertEqual(blocks.open_args('/dev/vdc', 'k', 's', allow_second_disk=True)[-1], '--allow-second-disk')
+        # The removed test-confinement escape hatches are never emitted.
+        self.assertFalse([a for a in blocks.open_args('/dev/sdz1', 'k', 's') if a.startswith('--allow')])
 
     def test_secret_file_is_private_and_removed(self):
         real = tempfile.mkstemp

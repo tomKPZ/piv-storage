@@ -1,4 +1,7 @@
-"""Strict setup/lifecycle policy for the disposable pinned QEMU guest only."""
+"""Python mirror of pivsetup's owner lifecycle (owner.rs), kept as guest test
+instrumentation: device checks, LUKS/integrity validation, exclusive /run lock,
+ordinary cryptsetup open, reload as piv-crypt, control binding, identity checks."""
+import errno
 import fcntl
 import glob
 import json
@@ -14,39 +17,42 @@ from .kernel_api import KernelDevice, dm, check_activation_flags, mapping_identi
 from .profile import parse_superblock, validate_segment
 
 
-PINNED_KERNEL = '6.12.113+deb13-amd64'
-# Sanitizer (KASAN/UBSAN/lockdep) build of the same source, accepted only on a
-# guest image explicitly marked by scripts/build_debug_kernel.py.
-DEBUG_KERNEL = PINNED_KERNEL + '-pivdbg'
-# Newer-kernel port target (Debian trixie-backports), accepted only on a guest
-# image explicitly marked by scripts/build_port_image.py.
-PORT_KERNEL = '7.2.9+deb13-amd64'
+def has_partitions(rdev):
+    """A whole disk whose kernel partition table lists partitions (they can be
+    in use without appearing as holders of the disk itself)."""
+    base = Path(f'/sys/dev/block/{os.major(rdev)}:{os.minor(rdev)}')
+    if (base / 'partition').exists():
+        return False
+    return any((entry / 'partition').exists() for entry in base.iterdir())
 
 
-def pinned_release():
-    release = os.uname().release
-    return (release == PINNED_KERNEL or
-            (release == DEBUG_KERNEL and Path('/etc/piv-debug-kernel').exists()) or
-            (release == PORT_KERNEL and Path('/etc/piv-port-kernel').exists()))
-
-
-def guest_guard(source, allow_test_stack=False, allow_second_disk=False):
-    if (os.geteuid() != 0 or not pinned_release() or
-            Path('/sys/class/dmi/id/sys_vendor').read_text().strip() != 'QEMU'):
-        raise ValueError('Kernel setup is restricted to the pinned disposable QEMU guest')
-    allowed = ['/dev/vdb']
-    if allow_test_stack:
-        allowed += ['/dev/mapper/piv-test-delay', '/dev/mapper/piv-test-fault']
-    if allow_second_disk:
-        # Explicit opt-in for migration tests: the pinned guest's second disposable disk.
-        allowed += ['/dev/vdc']
-    if str(source) not in allowed or not stat.S_ISBLK(Path(source).stat().st_mode):
-        raise ValueError('Unsupported disposable test device')
-    size = subprocess.check_output(['blockdev', '--getsize64', str(source)], text=True)
-    size = int(size)
-    if size not in (128 * 1024 * 1024, 512 * 1024 * 1024):
-        raise ValueError('Expected an explicitly supported 128 or 512 MiB disposable guest disk')
+def check_device(source):
+    """Activation preconditions that protect the caller (no test confinement):
+    root, an existing block device (symlinks followed) of a nonzero whole
+    number of 512-byte sectors that is not a partitioned whole disk. Mirrors
+    pivsetup's owner::check_device."""
+    if os.geteuid() != 0:
+        raise PermissionError('Kernel setup requires root')
+    info = Path(source).stat()
+    if not stat.S_ISBLK(info.st_mode):
+        raise ValueError(f'{source} is not a block device')
+    size = int(subprocess.check_output(['blockdev', '--getsize64', str(source)], text=True))
+    if size <= 0 or size % 512:
+        raise ValueError(f'Unsupported block device size {size}')
+    if has_partitions(info.st_rdev):
+        raise ValueError(f'{source} has a partition table in use; give the partition that holds the LUKS volume')
     return size
+
+
+def check_unclaimed(source):
+    """Exclusive-open probe of an unowned device (EBUSY while mounted, mapped
+    or otherwise opened exclusively)."""
+    try:
+        os.close(os.open(source, os.O_RDONLY | os.O_EXCL | os.O_CLOEXEC))
+    except OSError as error:
+        if error.errno == errno.EBUSY:
+            raise OSError(errno.EBUSY, f'{source} is in use (mounted, mapped or open exclusively)') from None
+        raise
 
 
 def crypt(*args):
@@ -55,8 +61,7 @@ def crypt(*args):
 
 
 class GuestOwner:
-    def __init__(self, source, passphrase_file, name='piv-native', *, allow_test_stack=False,
-                 allow_second_disk=False):
+    def __init__(self, source, passphrase_file, name='piv-native'):
         self.lock_fd = None
         self.device = None
         self.created = False
@@ -66,7 +71,7 @@ class GuestOwner:
         self.source = Path(source)
         if not re.fullmatch(r'piv-[a-zA-Z0-9_-]{1,40}', name):
             raise ValueError('Invalid experimental mapping name')
-        self.raw_bytes = guest_guard(self.source, allow_test_stack, allow_second_disk)
+        self.raw_bytes = check_device(self.source)
         metadata = json.loads(crypt('luksDump', '--dump-json-metadata', self.source).stdout)
         self.offset = validate_segment(metadata)
         check_activation_flags(metadata)
@@ -87,6 +92,15 @@ class GuestOwner:
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 raise ValueError('Invalid global owner lock')
             fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            existing = dm('info', name, check=False).returncode == 0
+            if not existing:
+                # Busy-device protection before reading anything from the device.
+                if mapping_identity(self.lower_name) is not None:
+                    raise FileExistsError('Lower mapping name is already in use')
+                holders = Path(f'/sys/dev/block/{os.major(self.raw_device)}:{os.minor(self.raw_device)}/holders')
+                if list(holders.iterdir()):
+                    raise OSError(errno.EBUSY, 'Device already has an independent mapping')
+                check_unclaimed(self.source)
             # Only static format fields: live journal recovery belongs to Linux.
             raw = os.open(self.source, os.O_RDONLY)
             try:
@@ -98,13 +112,7 @@ class GuestOwner:
                 raise ValueError('LUKS profile and integrity tuple size disagree')
             if self.layout.sector_size != metadata['segments']['0']['sector_size']:
                 raise ValueError('LUKS and integrity sector sizes disagree')
-            existing = dm('info', name, check=False).returncode == 0
             if not existing:
-                if mapping_identity(self.lower_name) is not None:
-                    raise FileExistsError('Lower mapping name is already in use')
-                holders = Path(f'/sys/dev/block/{os.major(self.raw_device)}:{os.minor(self.raw_device)}/holders')
-                if list(holders.iterdir()):
-                    raise ValueError('Disposable device already has an independent mapping')
                 self.created = True
                 try:
                     crypt('open', '--disable-keyring', '--key-file', passphrase_file, self.source, name)
@@ -131,7 +139,7 @@ class GuestOwner:
                 del fields
             expected_uuid = 'CRYPT-LUKS2-' + self.uuid.replace('-', '') + '-' + name
             if dm('info', '-c', '--noheadings', '-o', 'uuid', name).stdout.strip() != expected_uuid:
-                raise ValueError('Mapping does not belong to this disposable LUKS volume')
+                raise ValueError('Mapping does not belong to this LUKS volume')
             if not self.mappings:
                 self.mappings = {mapping: mapping_identity(mapping)
                                  for mapping in (self.name, self.lower_name)}

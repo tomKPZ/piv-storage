@@ -23,21 +23,23 @@ use error::{Error, Result};
 use secret::Secret;
 
 const USAGE: &str = "\
-usage: pivsetup open-blocks --key-file F (--hidden-key-file F | --hidden-passphrase-file F)
-                            [--device /dev/vdb] [--name piv-native]
+usage: pivsetup open-blocks --device D --key-file F (--hidden-key-file F | --hidden-passphrase-file F)
+                            [--name piv-native]
                             [--initialize [--quick] [--ab] [--parity 4|8|16] | --fill]
                             [--verify] [--kdf-cost 1-4]
-       pivsetup close-blocks --key-file F [--device /dev/vdb] [--name piv-native]
-       pivsetup keyslot add|remove --key-file F --slot 0-3
+       pivsetup close-blocks --device D --key-file F [--name piv-native]
+       pivsetup keyslot add|remove --device D --key-file F --slot 0-3
                             [--new-key-file F | --new-passphrase-file F [--kdf-cost 1-4]]
-                            [--device /dev/vdb] [--name piv-native]
-       pivsetup migrate --source-key-file F (--source-hidden-key-file F | --source-hidden-passphrase-file F)
+                            [--name piv-native]
+       pivsetup migrate --source D --source-key-file F (--source-hidden-key-file F | --source-hidden-passphrase-file F)
                         --target D --target-key-file F
                         (--target-hidden-key-file F | --target-hidden-passphrase-file F)
-                        [--source /dev/vdb] [--ab] [--parity 4|8|16]
+                        [--ab] [--parity 4|8|16]
                         [--source-kdf-cost 1-4] [--target-kdf-cost 1-4]
        pivsetup keygen --output F
 
+D is the block device (or partition) holding the LUKS2 volume; there is no
+default. Research prototype without external cryptographic review.
 LUKS2 volumes with 16-byte random IVs (aegis128-random + aead, or aes-xts-random
 + hmac-sha256), the journaled integrity layer, and hidden format v5 (4096-byte
 hidden blocks). --initialize destroys all existing hidden contents and writes
@@ -75,8 +77,7 @@ impl Args {
                       "--source-hidden-passphrase-file", "--target", "--target-key-file",
                       "--target-hidden-key-file", "--target-hidden-passphrase-file", "--parity",
                       "--kdf-cost", "--source-kdf-cost", "--target-kdf-cost"];
-        let switches = ["--initialize", "--quick", "--fill", "--ab", "--verify", "--allow-test-stack",
-                        "--allow-second-disk"];
+        let switches = ["--initialize", "--quick", "--fill", "--ab", "--verify"];
         while let Some(word) = argv.next() {
             let (key, inline) = match word.split_once('=') {
                 Some((k, v)) if k.starts_with("--") => (k.to_string(), Some(v.to_string())),
@@ -185,23 +186,21 @@ fn fill_random(buffer: &mut [u8]) -> Result<()> {
 }
 
 fn run(args: Args) -> Result<()> {
-    let device = args.path("--device").unwrap_or_else(|| PathBuf::from("/dev/vdb"));
     let name = args.value("--name").unwrap_or("piv-native").to_string();
-    let allow = owner::Allow {
-        test_stack: args.flag("--allow-test-stack"),
-        second_disk: args.flag("--allow-second-disk"),
-    };
+    if matches!(args.action.as_str(), "open-blocks" | "close-blocks" | "keyslot" | "migrate") {
+        owner::require_root()?;
+    }
     match args.action.as_str() {
         "open-blocks" => {
             args.only(&["--device", "--key-file", "--name", "--hidden-key-file", "--hidden-passphrase-file",
-                        "--initialize", "--quick", "--fill", "--ab", "--parity", "--verify", "--kdf-cost",
-                        "--allow-test-stack", "--allow-second-disk"])?;
+                        "--initialize", "--quick", "--fill", "--ab", "--parity", "--verify", "--kdf-cost"])?;
+            let device = args.required("--device")?;
             let secret = hidden_secret(&args, "--hidden")?;
             let options = OpenOptions {
                 name: &name, initialize: args.flag("--initialize"), quick: args.flag("--quick"),
                 fill: args.flag("--fill"), ab: args.flag("--ab"),
                 verify: args.flag("--verify"), parity: blocks::parity(args.value("--parity"))?,
-                kdf_cost: kdf_cost_for(&args, "--kdf-cost", "--hidden-passphrase-file")?, allow,
+                kdf_cost: kdf_cost_for(&args, "--kdf-cost", "--hidden-passphrase-file")?,
             };
             let views = blocks::open_blocks(&device, &args.required("--key-file")?, secret, &options)?;
             // --fill adds the block counts: already valid (skipped), written
@@ -217,16 +216,15 @@ fn run(args: Args) -> Result<()> {
             Ok(())
         }
         "close-blocks" => {
-            args.only(&["--device", "--key-file", "--name", "--allow-test-stack", "--allow-second-disk"])?;
-            blocks::close_blocks(&device, &args.required("--key-file")?, &name, allow)
+            args.only(&["--device", "--key-file", "--name"])?;
+            blocks::close_blocks(&args.required("--device")?, &args.required("--key-file")?, &name)
         }
         "migrate" => {
             args.only(&["--source", "--source-key-file", "--source-hidden-key-file",
                         "--source-hidden-passphrase-file", "--target", "--target-key-file",
                         "--target-hidden-key-file", "--target-hidden-passphrase-file", "--ab", "--parity",
-                        "--source-kdf-cost", "--target-kdf-cost", "--allow-test-stack",
-                        "--allow-second-disk"])?;
-            let source = args.path("--source").unwrap_or_else(|| PathBuf::from("/dev/vdb"));
+                        "--source-kdf-cost", "--target-kdf-cost"])?;
+            let source = args.required("--source")?;
             let source_secret = hidden_secret(&args, "--source-hidden")?;
             let target_secret = hidden_secret(&args, "--target-hidden")?;
             let layout = migrate::MigrateOptions {
@@ -237,7 +235,7 @@ fn run(args: Args) -> Result<()> {
             };
             let report = migrate::migrate(&source, &args.required("--source-key-file")?, source_secret,
                                           &args.required("--target")?, &args.required("--target-key-file")?,
-                                          target_secret, &layout, allow)?;
+                                          target_secret, &layout)?;
             println!("{{\n  \"decoy\": {{\"bytes\": {}, \"target_bytes\": {}}},\n  \
                       \"hidden\": {{\"bytes\": {}, \"target_bytes\": {}}},\n  \"verified\": true\n}}",
                      report.decoy_bytes, report.decoy_target_bytes, report.hidden_bytes, report.hidden_target_bytes);
@@ -245,7 +243,8 @@ fn run(args: Args) -> Result<()> {
         }
         "keyslot" => {
             args.only(&["--device", "--key-file", "--name", "--slot", "--new-key-file", "--new-passphrase-file",
-                        "--kdf-cost", "--allow-test-stack", "--allow-second-disk"])?;
+                        "--kdf-cost"])?;
+            let device = args.required("--device")?;
             let tier = kdf_cost_for(&args, "--kdf-cost", "--new-passphrase-file")?;
             let slot: u32 = args.value("--slot").and_then(|s| s.parse().ok()).filter(|&s| s < 4)
                 .ok_or_else(|| Error::new("--slot must be 0, 1, 2 or 3"))?;
@@ -261,7 +260,7 @@ fn run(args: Args) -> Result<()> {
                 }
                 (Some("add"), None, Some(passphrase)) => {
                     let identity = {
-                        let owner = owner::GuestOwner::open(&device, &key_file, &name, allow)?;
+                        let owner = owner::Owner::open(&device, &key_file, &name)?;
                         blocks::base_identity(&owner)
                     };
                     Some(blocks::passphrase_kek(&read_passphrase(&passphrase)?, &identity, tier)?)
@@ -271,7 +270,7 @@ fn run(args: Args) -> Result<()> {
                 }
                 _ => return Err(Error::new(format!("Usage error\n{USAGE}"))),
             };
-            blocks::keyslot(&device, &key_file, slot, kek.as_deref(), &name, allow)
+            blocks::keyslot(&device, &key_file, slot, kek.as_deref(), &name)
         }
         "keygen" => {
             args.only(&["--output"])?;

@@ -18,23 +18,25 @@ and limits are in README.md and docs/.
   Python keeps only independent read-only diagnostics and guest test
   instrumentation.
 - Tested on the pinned Debian 6.12.113 guest kernel, its KASAN/UBSAN/lockdep
-  build and the Debian backports 7.2.9 kernel; journaled
-  volumes; 128 and 512 MiB fixtures. Test tiers and rerun policy:
+  build and the Debian backports 7.2.9 kernel; journaled volumes; 128 and
+  512 MiB fixtures plus arbitrary devices (300 MiB disk, loop, dm-linear
+  offset, GPT partition) and 2–3 GiB volumes. Test tiers and rerun policy:
   docs/development.md.
+- Activation is no longer confined to the test guest (user approval
+  2026-10-22): `--device` is required and any block device or partition is
+  accepted, with the user-protecting checks kept. packaging/ provides DKMS,
+  install.sh and an initramfs-tools hook, verified by the `deploy` suite
+  (packaging/README.md).
 
 ## Remaining work
 
-1. **Lift the activation guards and deploy beyond test guests** (user
-   approval 2026-10-22). Remove pivsetup's restriction to the pinned QEMU guest
-   and 128/512 MiB `/dev/vdb` (and the test-only `--allow-test-stack` /
-   `--allow-second-disk` escape hatches once unneeded), keeping the safety
-   checks that are not about test confinement: exclusive /run locks, identity
-   checks on mappings, busy-device protection and refusal of foreign stacks.
-   Then packaging and module signing and boot integration beyond the test
-   initramfs. Agent testing still uses only disposable guests and synthetic
-   disks. Exit: activation works on an arbitrary block device inside a guest
-   (e.g. a non-vdb disk of another size), guard tests replaced by tests of the
-   remaining safety checks, docs updated.
+No implementation items remain. Open, unverified deployment areas (pick up
+only with a concrete need; each needs a disposable-guest test first):
+
+- Boot-time `ask` prompts (initramfs askpass), a root filesystem on a view,
+  Secure Boot enrollment/enforcement of the DKMS-signed module, dracut and
+  non-Debian distributions (packaging/README.md lists what was verified).
+- External cryptographic review of the format and profiles (not an agent task).
 
 ## Standing decisions (binding for autonomous sessions)
 

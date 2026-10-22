@@ -439,15 +439,15 @@ def restack(errors=()):
 
 
 def rs_open(**kw):
-    return opened(STACK, allow_test_stack=True, **kw)
+    return opened(STACK, **kw)
 
 
 def rs_close():
-    close_blocks(STACK, KEY, allow_test_stack=True)
+    close_blocks(STACK, KEY)
 
 
 def rs_status():
-    return status(STACK, allow_test_stack=True)[0]
+    return status(STACK)[0]
 
 
 def raw_tuple_patch(sector, data, metadata):
@@ -478,7 +478,7 @@ dm('create', 'piv-test-fault', input='0 %d linear /dev/vdb 0\n' % disk)
 # Quick initialization with parity, then fill: the four written blocks are
 # skipped, the rest receive zero records with parity.
 v = rs_open(initialize=True, quick=True, parity=P)
-handle = GuestOwner(STACK, KEY, allow_test_stack=True)
+handle = GuestOwner(STACK, KEY)
 layout, unit, sectors = handle.layout, handle.device.sector_size, handle.device.sectors
 handle.close()
 rs_records = (sectors - KEYSLOT_AREA) // G - 2

@@ -1,0 +1,89 @@
+#!/bin/sh
+# initramfs-tools local-top script: open the dm-piv views listed in the
+# initramfs copy of /etc/pivtab (written by the pivsetup hook) before the root
+# filesystem is mounted. Failures are logged and boot continues; a root
+# filesystem on a view that did not open then fails as usual.
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "$1" in prereqs) prereqs; exit 0 ;; esac
+. /scripts/functions
+
+CONF=/etc/pivtab
+[ -r "$CONF" ] || exit 0
+umask 077
+mkdir -p /run/pivsetup
+LOG=/run/pivsetup/initramfs.log
+
+note() { echo "$*" >> "$LOG"; }
+
+# Overwrite and delete a prompted secret on the initramfs tmpfs.
+discard() {
+    [ -f "$1" ] || return 0
+    size=$(wc -c < "$1")
+    dd if=/dev/zero of="$1" bs=1 count="$size" conv=notrunc 2>/dev/null
+    rm -f "$1"
+}
+
+prompt() {  # prompt TEXT FILE
+    /lib/cryptsetup/askpass "$1" < /dev/console > "$2"
+}
+
+modprobe -q dm_integrity
+modprobe -q dm_crypt
+if ! modprobe -q dm-piv; then
+    log_failure_msg "pivsetup: the dm-piv module could not be loaded"
+    note "module: failed"
+    exit 0
+fi
+
+while read -r name device luks hidden options; do
+    case "$name" in ''|'#'*) continue ;; esac
+    # Wait for the device like local-top/cryptroot does (ROOTDELAY, default 30 s).
+    slumber=${ROOTDELAY:-30}
+    while [ ! -b "$device" ] && [ "$slumber" -gt 0 ]; do
+        sleep 1
+        slumber=$((slumber - 1))
+    done
+    if [ ! -b "$device" ]; then
+        log_failure_msg "pivsetup: $name: device $device did not appear"
+        note "$name: missing device"
+        continue
+    fi
+    hidden_option=--hidden-key-file
+    cost=
+    old_ifs=$IFS; IFS=,
+    for option in $options; do
+        case "$option" in
+            hidden-passphrase) hidden_option=--hidden-passphrase-file ;;
+            kdf-cost=*) cost=${option#kdf-cost=} ;;
+        esac
+    done
+    IFS=$old_ifs
+    luks_file=$luks hidden_file=$hidden
+    if [ "$luks" = ask ]; then
+        luks_file=/run/pivsetup/$name.luks-secret
+        prompt "Please unlock $name (LUKS passphrase): " "$luks_file"
+    fi
+    if [ "$hidden" = ask ]; then
+        hidden_file=/run/pivsetup/$name.hidden-secret
+        prompt "Hidden passphrase for $name: " "$hidden_file"
+    fi
+    log_begin_msg "pivsetup: opening $name"
+    if [ -n "$cost" ]; then
+        set -- --kdf-cost "$cost"
+    else
+        set --
+    fi
+    if pivsetup open-blocks --device "$device" --name "$name" --key-file "$luks_file" \
+            "$hidden_option" "$hidden_file" "$@" > "/run/pivsetup/$name.json" 2>> "$LOG"; then
+        note "$name: opened"
+        log_end_msg 0
+    else
+        note "$name: failed"
+        log_end_msg 1
+        log_failure_msg "pivsetup: $name: activation failed (see $LOG)"
+    fi
+    [ "$luks" = ask ] && discard "$luks_file"
+    [ "$hidden" = ask ] && discard "$hidden_file"
+done < "$CONF"
+exit 0

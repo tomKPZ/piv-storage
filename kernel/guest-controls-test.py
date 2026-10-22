@@ -13,13 +13,13 @@ import time
 from control_metrics import workload, payload
 from pivstore.blocks import open_blocks, close_blocks
 from pivstore.kernel_api import dm
-from pivstore.kernel_owner import guest_guard, crypt
+from pivstore.kernel_owner import check_device, crypt
 from pivstore.profile import validate_segment, parse_superblock
 
 W = Path('/mnt/piv-work')
 T = Path('/sys/kernel/tracing')
 KEY = W / 'passphrase.key'
-guest_guard('/dev/vdb')
+check_device('/dev/vdb')
 metadata = json.loads(crypt('luksDump', '--dump-json-metadata', '/dev/vdb').stdout)
 offset = validate_segment(metadata)
 raw = os.open('/dev/vdb', os.O_RDONLY)

@@ -56,17 +56,17 @@ def fault(mode='linear'):
 
 
 def open_views():
-    value = blocks.open_blocks(SOURCE, KEY, HKEY, allow_test_stack=True)
+    value = blocks.open_blocks(SOURCE, KEY, HKEY)
     subprocess.run(['udevadm', 'settle'], check=True)
     return value
 
 
 def close_views():
-    blocks.close_blocks(SOURCE, KEY, allow_test_stack=True)
+    blocks.close_blocks(SOURCE, KEY)
 
 
 def status():
-    handle = owners.GuestOwner(SOURCE, KEY, allow_test_stack=True)
+    handle = owners.GuestOwner(SOURCE, KEY)
     try:
         return blocks.native_status(handle.device), handle.device.sector_size, handle.device.sectors
     finally:

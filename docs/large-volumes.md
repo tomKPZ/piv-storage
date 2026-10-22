@@ -5,14 +5,15 @@ above `MAX_LFS_FILESIZE / primary_sector_size`, so the pinned 64-bit kernel's
 signed file-offset domain bounds all primary byte arithmetic; the public map
 path also checks a sector offset before shifting it into bytes. This is an
 arithmetic boundary, not a claim that every size below it is tested or
-practical. Activation stays restricted to the pinned QEMU guest's /dev/vdb with
-128 or 512 MiB raw disks, plus the explicitly opted-in test wrappers with
-identity/table validation. No generic host-device deployment is enabled.
+practical. pivsetup accepts block devices of any size (the 128/512 MiB
+activation guard was removed on 2026-10-22); the largest tested volumes are
+3 GiB at 4096-byte and 2 GiB at 512-byte sectors (below).
 
 The frontend passes the actual validated raw byte size to the integrity
-parser. `vm.py run --blank-mib 512` creates a fresh 512 MiB blank disk; copied
-`--data-image` inputs must be regular 128 or 512 MiB files (the two options are
-mutually exclusive) and are copied before attaching.
+parser. In the harness, `vm.py run --blank-mib 512` creates a fresh 512 MiB
+/dev/vdb and `--second-blank-mib N` a sparse /dev/vdc of N MiB (16–16384);
+copied `--data-image` inputs must be regular 128 or 512 MiB files (the
+harness guard's /dev/vdb sizes) and are copied before attaching.
 
 ## Bounds and properties
 
@@ -77,7 +78,8 @@ volumes; any live variant would have to be implemented here.
 ## Large-geometry guest test
 
 scripts/guest-large.sh (default AEGIS-128/4096) and scripts/guest-large-512.sh
-(AEGIS-128/512) format a fresh guest-owned 512 MiB blank disk with stock
+(AEGIS-128/512) format a fresh guest-owned 512 MiB blank disk (or, with
+`PIV_LARGE_DEVICE=/dev/vdc`, vm.py's arbitrary-size second disk) with stock
 cryptsetup, write deterministic primary plaintext, generate a synthetic hidden
 key and run kernel/guest-large-test.py:
 
@@ -113,11 +115,32 @@ path (2026-10-21) took 27.8 s / 168.5 s.
 Host tests (tests/test_profile.py) check integrity layout arithmetic above
 32-bit byte offsets with synthetic 8 GiB metadata for both sector sizes,
 including truncated-extent rejection; this does not mean the module has run on
-an 8 GiB disk. Guard tests reject other sizes, non-block paths, other
-devices/guests/kernels and unprivileged activation.
+an 8 GiB disk. Device-check tests (tests/test_device_checks.py, the Rust unit
+tests and the `devices` suite) accept any size and path but reject non-block
+paths, partitioned whole disks, busy devices and unprivileged activation.
+
+Beyond 512 MiB (2026-10-22, KVM, AEGIS-128, `--second-blank-mib`, the
+3 GiB and 2 GiB disks on /dev/vdc, all cases above including both high-address
+faults; host check_stateless.py on vm.py's `second.img` authenticated every
+primary sector and decoded every hidden block):
+
+| Run | Raw | Sector | Primary sectors | Hidden | Quick init | Fill all | Full init | Reopen | Fill none | Host check |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| large-3g-012 | 3 GiB | 4096 | 770,149 | 4.4 MiB | 0.20 s | 5.9 s | 5.3 s | 0.21 s | 1.3 s | 19 s, 141 MB RSS |
+| large-2g-512-012 | 2 GiB | 512 | 3,885,080 | 22.1 MiB | 0.20 s | 11.6 s | 8.8 s | 0.22 s | 2.6 s | 80 s |
+| large-3g-013 | 3 GiB | 4096 | 770,149 | 4.4 MiB | 0.21 s | 6.9 s | 8.2 s | 0.28 s | 1.8 s | passed |
+
+The -012 runs used pivsetup 32d49336 (before the busy-device checks moved
+ahead of the superblock read); large-3g-013 repeated the 3 GiB run with the
+final pivsetup 4f5ace03 while a 16-VM suite matrix shared the host (hence the
+slower times).
 
 This test is not part of suite.py; run it directly (fresh run directories;
-generated disks and keys stay in ignored artifacts/):
+generated disks and keys stay in ignored artifacts/). For a larger disk, add
+`--blank-mib 128 --second-blank-mib 3072` and run a task that exports
+`PIV_LARGE_DEVICE=/dev/vdc` before `bash /mnt/piv-work/guest-large.sh`
+(sharing guest-large.sh), then host-check the run's `second.img` instead of
+`share/large-final.img`:
 
 ```sh
 python3 scripts/build_pivsetup.py

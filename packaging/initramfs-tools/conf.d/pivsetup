@@ -1,0 +1,3 @@
+# initramfs-tools: create initramfs images readable only by root. The pivsetup
+# hook can embed key files (pivtab option embed-keys).
+UMASK=0077

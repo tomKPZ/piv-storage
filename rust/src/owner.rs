@@ -1,4 +1,4 @@
-//! Private owner lifecycle (pivstore/kernel_owner.py GuestOwner): guest guard,
+//! Private owner lifecycle (pivstore/kernel_owner.py GuestOwner): device checks,
 //! LUKS/integrity validation, exclusive /run lock, ordinary cryptsetup open,
 //! reload as piv-crypt with piv_control, control binding and identity checks.
 
@@ -14,21 +14,6 @@ use crate::error::{Error, Result};
 use crate::ioctl::{valid_piv_name, KernelDevice};
 use crate::json;
 use crate::profile::{self, Layout};
-
-pub const PINNED_KERNEL: &str = "6.12.113+deb13-amd64";
-/// Sanitizer build of the same source; accepted only on a guest image that
-/// scripts/build_debug_kernel.py explicitly marked with /etc/piv-debug-kernel.
-pub const DEBUG_KERNEL: &str = "6.12.113+deb13-amd64-pivdbg";
-/// Newer-kernel port target (Debian trixie-backports); accepted only on a guest
-/// image that scripts/build_port_image.py explicitly marked with /etc/piv-port-kernel.
-pub const PORT_KERNEL: &str = "7.2.9+deb13-amd64";
-const MIB: u64 = 1024 * 1024;
-
-fn pinned_release(release: &str) -> bool {
-    release == PINNED_KERNEL
-        || (release == DEBUG_KERNEL && Path::new("/etc/piv-debug-kernel").exists())
-        || (release == PORT_KERNEL && Path::new("/etc/piv-port-kernel").exists())
-}
 
 /// (major, minor, DM UUID) of a mapping, without reading any key-containing table.
 pub type Identity = (String, String, String);
@@ -59,51 +44,69 @@ pub fn remove_mapping(name: &str, identity: &Identity, discard: bool) -> Result<
     dm_ok(&["remove", "--retry", name]).map(|_| ())
 }
 
-fn uname_release() -> String {
-    // SAFETY: uname into a zeroed struct.
-    let mut info: libc::utsname = unsafe { std::mem::zeroed() };
-    if unsafe { libc::uname(&mut info) } != 0 {
-        return String::new();
-    }
-    let bytes: Vec<u8> = info.release.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
-    String::from_utf8_lossy(&bytes).into_owned()
-}
-
-/// Explicit test-guest device opt-ins beyond the default /dev/vdb.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Allow {
-    /// The dm-delay/dm-flakey test stack over /dev/vdb.
-    pub test_stack: bool,
-    /// The pinned guest's second disposable disk (/dev/vdc), for migration tests.
-    pub second_disk: bool,
-}
-
-/// Restrict privileged setup to the pinned disposable QEMU guest and its
-/// explicitly supported 128/512 MiB /dev/vdb (or the opted-in test devices).
-pub fn guest_guard(source: &Path, allow: Allow) -> Result<u64> {
+/// Device-mapper setup needs root; checked before any key file is read.
+pub fn require_root() -> Result<()> {
     // SAFETY: geteuid has no preconditions.
-    let euid = unsafe { libc::geteuid() };
-    let vendor = fs::read_to_string("/sys/class/dmi/id/sys_vendor").unwrap_or_default();
-    if euid != 0 || !pinned_release(&uname_release()) || vendor.trim() != "QEMU" {
-        bail!("Kernel setup is restricted to the pinned disposable QEMU guest");
+    if unsafe { libc::geteuid() } != 0 {
+        return Err(Error::os(libc::EPERM, "Kernel setup requires root"));
     }
-    let mut allowed = vec!["/dev/vdb"];
-    if allow.test_stack {
-        allowed.extend(["/dev/mapper/piv-test-delay", "/dev/mapper/piv-test-fault"]);
-    }
-    if allow.second_disk {
-        allowed.push("/dev/vdc");
-    }
-    let is_block = fs::metadata(source).map(|m| m.file_type().is_block_device()).unwrap_or(false);
-    if !allowed.iter().any(|a| source.as_os_str().as_bytes() == a.as_bytes()) || !is_block {
-        bail!("Unsupported disposable test device");
+    Ok(())
+}
+
+/// Activation preconditions that protect the caller (they do not confine the
+/// prototype to test machines): root, an existing block device (symlinks such
+/// as /dev/disk/by-* are followed) of a nonzero whole number of 512-byte
+/// sectors that is not a partitioned whole disk. LUKS2/integrity profile,
+/// geometry bounds, holders and exclusive use are checked afterwards.
+pub fn check_device(source: &Path) -> Result<u64> {
+    require_root()?;
+    let info = fs::metadata(source)
+        .map_err(|e| Error::new(format!("Cannot access {}: {e}", source.display())))?;
+    if !info.file_type().is_block_device() {
+        bail!("{} is not a block device", source.display());
     }
     let size: u64 = cmd::run("blockdev", &["--getsize64", path_str(source)?])?.trim().parse()
         .map_err(|_| Error::new("Invalid device size"))?;
-    if size != 128 * MIB && size != 512 * MIB {
-        bail!("Expected an explicitly supported 128 or 512 MiB disposable guest disk");
+    if size == 0 || size % 512 != 0 {
+        bail!("Unsupported block device size {size}");
+    }
+    let (major, minor) = (libc::major(info.rdev()), libc::minor(info.rdev()));
+    if has_partitions(major, minor)? {
+        bail!("{} has a partition table in use; give the partition that holds the LUKS volume", source.display());
     }
     Ok(size)
+}
+
+/// A whole disk whose kernel partition table lists partitions: its partitions
+/// can be in use without appearing as holders of the disk itself.
+fn has_partitions(major: u32, minor: u32) -> Result<bool> {
+    partitions_listed(Path::new(&format!("/sys/dev/block/{major}:{minor}")))
+}
+
+/// `base` is a sysfs block-device directory: a partition has a `partition`
+/// attribute; a whole disk lists its partitions as subdirectories with one.
+fn partitions_listed(base: &Path) -> Result<bool> {
+    if base.join("partition").exists() {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(base)? {
+        if entry?.path().join("partition").exists() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Exclusive-open probe of an unowned device: fails with EBUSY while a
+/// filesystem, swap, another mapping or any other exclusive opener holds it.
+fn check_unclaimed(source: &Path) -> Result<()> {
+    match fs::OpenOptions::new().read(true).custom_flags(libc::O_EXCL | libc::O_CLOEXEC).open(source) {
+        Ok(_) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
+            Err(Error::os(libc::EBUSY, format!("{} is in use (mounted, mapped or open exclusively)", source.display())))
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 pub fn path_str(path: &Path) -> Result<&str> {
@@ -118,7 +121,7 @@ fn holders(major: u32, minor: u32) -> Result<Vec<String>> {
     Ok(names)
 }
 
-pub struct GuestOwner {
+pub struct Owner {
     lock: Option<fs::File>,
     pub device: Option<KernelDevice>,
     pub created: bool,
@@ -137,12 +140,12 @@ pub struct GuestOwner {
     lower_table: String,
 }
 
-impl GuestOwner {
-    pub fn open(source: &Path, passphrase_file: &Path, name: &str, allow: Allow) -> Result<Self> {
+impl Owner {
+    pub fn open(source: &Path, passphrase_file: &Path, name: &str) -> Result<Self> {
         if !valid_piv_name(name, 40) {
             bail!("Invalid experimental mapping name");
         }
-        let raw_bytes = guest_guard(source, allow)?;
+        let raw_bytes = check_device(source)?;
         let source_text = path_str(source)?;
         let metadata = json::parse(&crypt(&["luksDump", "--dump-json-metadata", source_text])?)
             .map_err(|e| Error::new(format!("Invalid LUKS2 metadata: {e}")))?;
@@ -156,7 +159,7 @@ impl GuestOwner {
         let (mapping_cipher, profile_tag) = profile::profile(&encryption, &integrity).expect("validated profile");
         let uuid = canonical_uuid(crypt(&["luksUUID", source_text])?.trim())?;
         let rdev = fs::metadata(source)?.rdev();
-        let mut owner = GuestOwner {
+        let mut owner = Owner {
             lock: None, device: None, created: false, mappings: Vec::new(), name: name.to_string(),
             lower_name: format!("{name}_dif"), source: source.to_path_buf(), uuid,
             layout: Layout { integrity_offset: 0, primary_bytes: 0, journal_sections: 0, journal_section_sectors: 0,
@@ -202,6 +205,18 @@ impl GuestOwner {
             return Err(Error::last_os("Owner lock"));
         }
         self.lock = Some(lock);
+        let name = self.name.clone();
+        let existing = dm(&["info", &name], None, false)?.status == 0;
+        if !existing {
+            // Busy-device protection before reading anything from the device.
+            if mapping_identity(&self.lower_name)?.is_some() {
+                return Err(Error::os(libc::EEXIST, "Lower mapping name is already in use"));
+            }
+            if !holders(self.raw_major, self.raw_minor)?.is_empty() {
+                return Err(Error::os(libc::EBUSY, "Device already has an independent mapping"));
+            }
+            check_unclaimed(&self.source)?;
+        }
         // Only static format fields: live journal recovery belongs to Linux.
         let raw = fs::File::open(&self.source)?;
         let mut header = vec![0u8; 4096];
@@ -214,15 +229,7 @@ impl GuestOwner {
         if self.layout.sector_size != luks_sector {
             bail!("LUKS and integrity sector sizes disagree");
         }
-        let name = self.name.clone();
-        let existing = dm(&["info", &name], None, false)?.status == 0;
         if !existing {
-            if mapping_identity(&self.lower_name)?.is_some() {
-                return Err(Error::os(libc::EEXIST, "Lower mapping name is already in use"));
-            }
-            if !holders(self.raw_major, self.raw_minor)?.is_empty() {
-                bail!("Disposable device already has an independent mapping");
-            }
             self.created = true;
             let opened = crypt(&["open", "--disable-keyring", "--key-file", path_str(passphrase_file)?,
                                  path_str(&self.source)?, &name]);
@@ -242,7 +249,7 @@ impl GuestOwner {
         }
         let expected_uuid = format!("CRYPT-LUKS2-{}-{}", self.uuid.replace('-', ""), name);
         if dm_ok(&["info", "-c", "--noheadings", "-o", "uuid", &name])?.trim() != expected_uuid {
-            bail!("Mapping does not belong to this disposable LUKS volume");
+            bail!("Mapping does not belong to this LUKS volume");
         }
         if self.mappings.is_empty() {
             for mapping in [name.clone(), self.lower_name.clone()] {
@@ -383,7 +390,7 @@ impl GuestOwner {
     }
 }
 
-impl Drop for GuestOwner {
+impl Drop for Owner {
     fn drop(&mut self) {
         self.close();
     }
@@ -408,6 +415,21 @@ pub fn canonical_uuid(text: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partitioned_whole_disks_are_detected() {
+        let base = std::env::temp_dir().join(format!("pivsetup-sysfs-{}", std::process::id()));
+        let disk = base.join("disk");
+        fs::create_dir_all(disk.join("queue")).unwrap();
+        fs::create_dir_all(disk.join("sda1")).unwrap();
+        assert!(!partitions_listed(&disk).unwrap());
+        fs::write(disk.join("sda1/partition"), "1\n").unwrap();
+        assert!(partitions_listed(&disk).unwrap());
+        // The partition itself (its own `partition` attribute) is accepted.
+        assert!(!partitions_listed(&disk.join("sda1")).unwrap());
+        assert!(partitions_listed(&base.join("missing")).is_err());
+        fs::remove_dir_all(&base).unwrap();
+    }
 
     #[test]
     fn uuid_canonical_form() {

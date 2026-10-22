@@ -20,7 +20,7 @@ def main():
     run.mkdir(mode=0o700, parents=True, exist_ok=False)
     data = run / 'control.img'
     shutil.copyfile(args.data_image, data)
-    # Keep the test device named vdb, as required by the strict guest guard.
+    # Keep the test device named vdb (guest-early-test.sh opens /dev/vdb).
     dummy = run / 'empty-boot-disk.img'
     with dummy.open('wb') as stream:
         stream.truncate(1024 * 1024)

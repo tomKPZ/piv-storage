@@ -19,8 +19,8 @@ headers (scripts/guest-port-install.sh), test-compiles the module against them
 `/etc/piv-port-kernel`, freezes the overlay as the read-only
 `downloads/port-kernel-<hash>.qcow2` (provenance in the matching .json; apt
 repositories were live) and verifies the boot (scripts/guest-port-verify.sh).
-The guards (shell, Python, Rust) accept `7.2.9+deb13-amd64` only with that
-marker. Module builds on it use the normal boot/header config comparison;
+The test harness guard (guest-common.sh) accepts `7.2.9+deb13-amd64` only
+with that marker. Module builds on it use the normal boot/header config comparison;
 kernel/check-config.py takes the release for the `CONFIG_BUILD_SALT` entry.
 
 Run suites with

@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Disposable 512 MiB fixture: high-offset geometry, tails and read faults."""
+"""Disposable large fixture: high-offset geometry, tails and read faults.
+
+PIV_LARGE_DEVICE (default /dev/vdb, 512 MiB) selects the formatted disk, e.g.
+an arbitrary-size /dev/vdc; the raw size is read from the device. For a disk
+other than /dev/vdb the final image is not copied over 9p: the host checks
+vm.py's second.img directly."""
 import errno
 import hashlib
 import json
@@ -21,7 +26,9 @@ HKEY = secrets.token_bytes(32)
 PRIMARY = (W / 'expected.sha256').read_text().strip()
 (W / 'expected-primary.sha256').write_text(PRIMARY + '\n')
 SOURCE = '/dev/mapper/piv-test-fault'
-RAW = 512 * 1024 * 1024
+DEVICE = os.environ.get('PIV_LARGE_DEVICE', '/dev/vdb')
+assert DEVICE in ('/dev/vdb', '/dev/vdc')
+RAW = int(subprocess.check_output(['blockdev', '--getsize64', DEVICE]))
 OLD_CAP = 256 * 1024 * 1024
 results = dict(cases=[], faults=[])
 
@@ -41,14 +48,14 @@ def direct(path, offset, count=4096, write=None):   # 4096: hidden logical block
             os.close(fd)
 
 
-def open_views(source='/dev/vdb', **options):
-    value = open_blocks(source, KEY, HKEY, allow_test_stack=source == SOURCE, **options)
+def open_views(source=DEVICE, **options):
+    value = open_blocks(source, KEY, HKEY, **options)
     subprocess.run(['udevadm', 'settle'], check=True)
     return value
 
 
-def close_views(source='/dev/vdb'):
-    close_blocks(source, KEY, allow_test_stack=source == SOURCE)
+def close_views(source=DEVICE):
+    close_blocks(source, KEY)
 
 
 def verify(views):
@@ -80,7 +87,7 @@ close_views()
 start = time.monotonic()
 v = open_views(initialize=True)
 results['initialize_seconds'] = time.monotonic() - start
-owner = GuestOwner('/dev/vdb', KEY)
+owner = GuestOwner(DEVICE, KEY)
 unit, sectors, iv = owner.device.sector_size, owner.device.sectors, owner.device.iv_size
 # Format v5 geometry: 112 keyslot sectors, two directory groups, 687-sector
 # records (no parity) of 4096-byte hidden blocks.
@@ -167,7 +174,7 @@ verify(v)
 close_views()
 
 raw_sectors = RAW // 512
-healthy = f'0 {raw_sectors} linear /dev/vdb 0\n'
+healthy = f'0 {raw_sectors} linear {DEVICE} 0\n'
 dm('create', 'piv-test-fault', input=healthy)
 
 
@@ -179,22 +186,22 @@ def reload(table):
 
 for fault in ('reads', 'corruption'):
     v = open_views(SOURCE)
-    handle = GuestOwner(SOURCE, KEY, allow_test_stack=True)
+    handle = GuestOwner(SOURCE, KEY)
     # Last sector of the last record, beyond the old limit and away from checkpoint0.
     last = first_sector(records) - 1
     assert last * unit > OLD_CAP
     physical = layout.offsets(last)[0]
     if fault == 'reads':
-        reload(f'0 {raw_sectors} flakey /dev/vdb 0 0 3600 1 error_reads\n')
+        reload(f'0 {raw_sectors} flakey {DEVICE} 0 0 3600 1 error_reads\n')
         rejected(lambda: direct(SOURCE, physical))
         offset = (last * unit // 16384) * 16384
         role, count = 'decoy', min(16384, size - offset)
     else:
-        original = direct('/dev/vdb', physical)
+        original = direct(DEVICE, physical)
         sector512, replacement = physical // 512, original[0] ^ 1
-        reload(f'0 {sector512} linear /dev/vdb 0\n'
-               f'{sector512} 1 flakey /dev/vdb {sector512} 0 3600 5 corrupt_bio_byte 1 r {replacement} 0\n'
-               f'{sector512 + 1} {raw_sectors - sector512 - 1} linear /dev/vdb {sector512 + 1}\n')
+        reload(f'0 {sector512} linear {DEVICE} 0\n'
+               f'{sector512} 1 flakey {DEVICE} {sector512} 0 3600 5 corrupt_bio_byte 1 r {replacement} 0\n'
+               f'{sector512 + 1} {raw_sectors - sector512 - 1} linear {DEVICE} {sector512 + 1}\n')
         assert direct(SOURCE, physical) == bytes([replacement]) + original[1:]
         # Format v5: hidden reads take the raw stored IV of a carrier sector
         # failing authentication; corrupt data alone leaves the block
@@ -229,12 +236,13 @@ for fault in ('reads', 'corruption'):
     print(f'High-address {fault}: withholding, local EIO, continuation and reopen passed', flush=True)
 dm('remove', '--retry', 'piv-test-fault')
 subprocess.run(['rmmod', 'dm_piv'], check=True)
-subprocess.run(['cryptsetup', 'open', '--readonly', '--key-file', str(KEY), '/dev/vdb', 'piv-stock'], check=True)
+subprocess.run(['cryptsetup', 'open', '--readonly', '--key-file', str(KEY), DEVICE, 'piv-stock'], check=True)
 assert subprocess.check_output(['sha256sum', '/dev/mapper/piv-stock'], text=True).split()[0] == PRIMARY
 subprocess.run(['cryptsetup', 'close', 'piv-stock'], check=True)
 (W / 'expected-hidden-volume').write_bytes(expected)
-subprocess.run(['dd', 'if=/dev/vdb', 'of=' + str(W / 'large-final.img'), 'bs=1M', 'status=none'], check=True)
-results.update(raw_bytes=RAW, primary_bytes=size, hidden_bytes=capacity,
+if DEVICE == '/dev/vdb':
+    subprocess.run(['dd', 'if=/dev/vdb', 'of=' + str(W / 'large-final.img'), 'bs=1M', 'status=none'], check=True)
+results.update(device=DEVICE, raw_bytes=RAW, primary_bytes=size, hidden_bytes=capacity,
                primary_sectors=sectors, sector_size=unit, iv_bytes=iv,
                format=5, unused_tail_sectors=sectors - first_sector(records))
 (W / 'large-results.json').write_text(json.dumps(results, indent=2) + '\n')

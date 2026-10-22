@@ -1,6 +1,8 @@
 //! Explicit test-only hooks, replacing the Python guest tests' monkeypatching
-//! of pivstore.blocks.native_setup. Inactive unless PIVSETUP_TEST_GATE is set;
-//! setup itself is already restricted to the pinned disposable guest.
+//! of pivstore.blocks.native_setup. Inactive unless a PIVSETUP_TEST_* variable
+//! is set. They ship in the deployed binary (the tested binary is the deployed
+//! one): only whoever controls root's environment can set them, and they can
+//! only fail setup, pause it, or write public context (no keys) to PREFIX files.
 //!
 //! With PIVSETUP_TEST_GATE=PREFIX:
 //! - before the native SETUP ioctl, write PREFIX-ready.json (control path,

@@ -147,9 +147,10 @@ fault first.
   full hidden write repairs it.
 
 The test finishes with stock full-primary readback, a closed image for host
-verification, and custom-module unload while stock crypt stays busy. Fixture
-guards stay limited to QEMU /dev/vdb (128 or 512 MiB) plus the named test
-wrappers. Cleanup is best effort, not hidden recovery, rollback, atomic
+verification, and custom-module unload while stock crypt stays busy. The
+test harness keeps its fixtures on the guest's disposable /dev/vdb (128 or 512
+MiB; scripts/guest-common.sh); pivsetup itself accepts the dm-delay/dm-flakey
+wrappers like any other block device. Cleanup is best effort, not hidden recovery, rollback, atomic
 initialization or protection against hardware that acknowledges writes without
 persisting them. These synthetic faults test authenticated-read withholding and
 scoped failure, not adversarial journal replay or physical durability.

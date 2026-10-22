@@ -17,8 +17,8 @@ initial = open_blocks('/dev/vdb', w / 'passphrase.key', (w / 'hidden.key').read_
 close_blocks('/dev/vdb', w / 'passphrase.key')
 dm('create', 'piv-test-delay', input='0 262144 delay /dev/vdb 0 0 /dev/vdb 0 1000\n')
 views = open_blocks('/dev/mapper/piv-test-delay', w / 'passphrase.key',
-                    (w / 'hidden.key').read_bytes(), allow_test_stack=True)
-owner = GuestOwner('/dev/mapper/piv-test-delay', w / 'passphrase.key', allow_test_stack=True)
+                    (w / 'hidden.key').read_bytes())
+owner = GuestOwner('/dev/mapper/piv-test-delay', w / 'passphrase.key')
 layout = owner.layout
 owner.close()
 # Hidden block 0's record: after 112 keyslot sectors and two 687-sector
@@ -104,9 +104,9 @@ def prefill_journal():
 
 for attempt in range(6 if prefill else 1):
     if attempt:
-        close_blocks('/dev/mapper/piv-test-delay', w / 'passphrase.key', allow_test_stack=True)
+        close_blocks('/dev/mapper/piv-test-delay', w / 'passphrase.key')
         views = open_blocks('/dev/mapper/piv-test-delay', w / 'passphrase.key',
-                            (w / 'hidden.key').read_bytes(), allow_test_stack=True)
+                            (w / 'hidden.key').read_bytes())
     new = contents[attempt % 2]
     (w / 'power-new-block').write_bytes(new)
     (w / 'power-old-hidden').write_bytes(old)

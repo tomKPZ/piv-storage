@@ -155,7 +155,7 @@ def spawn(phase):
     # the keyslot area, too briefly to witness cancellation reliably.
     # The fill phase cancels a fill of a quick-initialized volume.
     args = blocks.open_args(SOURCE, KEY, W / 'hidden.key', initialize=phase == 'initialize',
-                            verify=phase == 'scan', fill=phase == 'fill', allow_test_stack=True)
+                            verify=phase == 'scan', fill=phase == 'fill')
     return subprocess.Popen([blocks.binary(), *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, env={**os.environ, 'PIVSETUP_TEST_GATE': str(W / phase)})
 
@@ -171,7 +171,7 @@ def finished(process, interrupted=False):
 
 
 def open_views(**options):
-    v = blocks.open_blocks(SOURCE, KEY, HKEY, allow_test_stack=True, **options)
+    v = blocks.open_blocks(SOURCE, KEY, HKEY, **options)
     subprocess.run(['udevadm', 'settle'], check=True)
     return v
 
@@ -221,7 +221,7 @@ try:
         if phase == 'fill':
             # Quick initialization: keyslot and directory only, every block unavailable.
             v = open_views(initialize=True, quick=True)
-            blocks.close_blocks(SOURCE, KEY, allow_test_stack=True)
+            blocks.close_blocks(SOURCE, KEY)
         # A short lower write delay slows initialization records (each a few
         # multi-sector writes through the journal) without exceeding the
         # signal-to-exit timeout.
@@ -268,7 +268,7 @@ try:
         absent()
         assert mapping_identity('piv-test-delay') == wrapper
         v = open_views()
-        handle = GuestOwner(SOURCE, KEY, allow_test_stack=True)
+        handle = GuestOwner(SOURCE, KEY)
         handle.close()
         unavailable_from, total = None, len(expected) // BLOCK
         if phase == 'scan':
@@ -282,7 +282,7 @@ try:
             expected[:completed * BLOCK] = bytes(completed * BLOCK)
             unavailable_from = completed
         verify(v, unavailable_from)
-        blocks.close_blocks(SOURCE, KEY, allow_test_stack=True)
+        blocks.close_blocks(SOURCE, KEY)
         fill = None
         if phase != 'scan':
             # Resume: fill skips the records completed before the cancellation
@@ -292,7 +292,7 @@ try:
             assert fill == dict(valid=completed, written=total - completed, failed=0), (fill, completed)
             expected[:] = bytes(len(expected))
             verify(v)
-            blocks.close_blocks(SOURCE, KEY, allow_test_stack=True)
+            blocks.close_blocks(SOURCE, KEY)
         results.append(dict(phase=phase, interrupted_seconds=elapsed,
                             encryptions=status['encryptions'], no_native_state=True,
                             cleanup=True, complete_oracles=True, resumed_by_fill=fill))
@@ -320,7 +320,7 @@ finally:
 v = open_views(initialize=True)
 expected[:] = bytes(len(expected))
 verify(v)
-blocks.close_blocks(SOURCE, KEY, allow_test_stack=True)
+blocks.close_blocks(SOURCE, KEY)
 results.append(dict(phase='normal-initialization', complete_oracles=True))
 absent()
 dm('remove', '--retry', 'piv-test-delay')

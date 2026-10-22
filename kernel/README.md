@@ -14,12 +14,17 @@ encrypted filesystem is busy. Interfaces and tests:
 
 ## Rules
 
-- Build and load ONLY inside the pinned disposable guest, never on the host or
-  real disks. Source, headers, config and symbol versions must match; never
-  force-load. Unsigned-module taint is expected. Supported guest kernels are
-  the pinned Debian 6.12.113, its sanitizer build
-  ([sanitizer.md](../docs/sanitizer.md)) and the 7.2.9 port
-  ([kernel-port.md](../docs/kernel-port.md)).
+- Development and agent testing build and load the module only inside
+  disposable guests, never on the development host or real disks. Source,
+  headers, config and symbol versions must match; never force-load.
+  Unsigned-module taint is expected there. Tested kernels are the pinned
+  Debian 6.12.113, its sanitizer build ([sanitizer.md](../docs/sanitizer.md))
+  and the 7.2.9 port ([kernel-port.md](../docs/kernel-port.md)).
+- Installation on a real system (research prototype, no external review):
+  DKMS (`packaging/dkms/dkms.conf`, `packaging/install.sh dkms`), module
+  signing for Secure Boot and the initramfs-tools hook are described in
+  [packaging/README.md](../packaging/README.md); the `deploy` suite builds,
+  signs, installs and boots with them in a disposable guest.
 - The module builds against the guest's headers package; no kernel source tree
   or full kernel build is needed. kernel/check-config.py allowlists four exact
   Debian build-salt/signing config additions. The pinned upstream dm-crypt

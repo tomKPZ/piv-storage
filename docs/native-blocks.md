@@ -15,12 +15,16 @@ file. Loading the module does not convert existing stock mappings.
 
 ## Setup (pivsetup open-blocks)
 
-Setup is privileged and restricted to QEMU, the pinned guest kernels and a
-disposable 128 or 512 MiB /dev/vdb ([rust/README.md](../rust/README.md)). It:
+Setup is privileged (root) and works on any block device or partition holding
+the LUKS2 volume ([rust/README.md](../rust/README.md);
+installation: [packaging/README.md](../packaging/README.md)). It:
 
-1. validates the LUKS2 segment and integrity geometry for a
-   [supported profile](../README.md#supported-primary-profiles) and takes an
-   exclusive /run lock;
+1. checks the device (a block device, not a whole disk with partitions),
+   validates the LUKS2 segment for a
+   [supported profile](../README.md#supported-primary-profiles), takes an
+   exclusive per-volume /run lock and, for a new owner, refuses a device with
+   any holder or exclusive opener (EBUSY) before parsing the integrity
+   superblock against the device's real size;
 2. opens the volume with cryptsetup (Linux replays the journal), suspends the
    crypt mapping, reloads its private table as `piv-crypt ... piv_control`,
    resumes, and checks the owner table against the validated LUKS cipher;
@@ -273,7 +277,25 @@ The initramfs contains synthetic test credentials and must stay private and
 ignored. It holds static pivsetup, cryptsetup/dmsetup, a few coreutils, kmod
 decompression libraries and the required crypto modules, and no Python; it
 mounts only RAM/pseudo filesystems. early_vm.py copies the data image and
-attaches a blank disk only to preserve the /dev/vdb guard.
+attaches a blank first disk so that the data disk stays /dev/vdb, the device
+the test script opens.
+
+The `deploy` suite (scripts/guest-deploy.sh, scripts/guest-deploy-boot.sh)
+covers the installable boot path instead: packaging/install.sh installs
+pivsetup, the DKMS-built and DKMS-signed module and the initramfs-tools hook;
+after a reboot of the same disks, the stock initramfs-tools boot must have
+loaded dm-piv before mounting root and opened both views from an
+`embed-keys` /etc/pivtab entry ([packaging/README.md](../packaging/README.md)).
+
+The `devices` suite (scripts/guest-devices.sh, kernel/guest-devices-test.py)
+activates volumes on a 300 MiB second disk, a loop device over a guest-root
+file (two owners at once), a dm-linear mapping at a 2 MiB offset and a GPT
+partition reached through /dev/disk/by-partlabel, reopens through symlinks and
+checks the remaining refusals: unprivileged callers, a missing `--device`,
+non-block paths, invalid names, a partitioned whole disk, an independent stock
+holder, an exclusive opener, a held /run owner lock, a second owner on an owned
+device and a stock mapping under the owner name. The loop and partition images
+are verified on the host.
 
 Before loading dm-piv, the shared guest loader creates a disposable
 stock-encrypted ext4 filesystem on a guest-root-backed loop image; it stays

@@ -22,7 +22,7 @@ security specification. Respect tool/sandbox approval requirements.
    notes (especially docs/development.md, docs/observed-layout.md and
    docs/format-v5.md, docs/native-blocks.md, docs/native-faults.md and
    docs/security-review.md, docs/journal-atomicity.md, docs/read-performance.md,
-   docs/large-volumes.md and docs/cancellation.md). Inspect
+   docs/large-volumes.md, docs/cancellation.md and packaging/README.md). Inspect
    git status and relevant code before changing anything.
 2. Determine what is actually implemented and tested. Recheck environmental
    assumptions as needed (the current host has KVM; see docs/development.md).
@@ -114,11 +114,18 @@ resolved from context/evidence, not for routine implementation decisions.
   identity-checked private owner to drain probes; never force public views or
   existing/foreign mappings. Normal close retains busy-device protection.
 - Larger geometry uses checked kernel file-offset bounds rather than a 256 MiB
-  primary cap. pivsetup currently admits only pinned QEMU /dev/vdb at 128 or
-  512 MiB plus opted-in test wrappers; the user approved removing this
-  activation guard (2026-10-22, ROADMAP). Agent testing must still use only
-  disposable guests and synthetic disks. The actual validated raw size must
-  reach extent parsing. Live resize, rekey and cipher
+  primary cap. pivsetup's activation guards (pinned QEMU guest, 128/512 MiB
+  /dev/vdb, --allow-test-stack/--allow-second-disk) were removed by user
+  approval (2026-10-22): `--device` is required and any block device or
+  partition is accepted. Keep the user-protecting checks: root, block devices
+  only, no partitioned whole disk, busy-device refusal (holders, exclusive
+  openers), the exclusive /run lock, mapping identity checks, refusal of
+  foreign/unexpected stacks and tables, profile validation and checked
+  geometry. Agent testing must still use only disposable guests and synthetic
+  disks (the harness guards in scripts/guest-common.sh stay; they protect the
+  host); never touch real disks. packaging/ (DKMS, initramfs-tools hook,
+  install.sh) is verified by the `deploy` suite. The actual validated raw size
+  must reach extent parsing. Live resize, rekey and cipher
   change are out of scope (stock cryptsetup refuses them on integrity volumes;
   user decision 2026-10-22); `pivsetup migrate` is the offline path.
 - Read sizes for setup, decoy reads and carrier collection are implementation

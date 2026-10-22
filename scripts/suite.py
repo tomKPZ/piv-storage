@@ -22,6 +22,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 
@@ -36,10 +37,13 @@ PROFILES = {
     'aes-sha256-512': dict(PIV_PRIMARY_CIPHER='aes-xts-random', PIV_INTEGRITY='hmac-sha256', PIV_SECTOR_SIZE='512'),
 }
 SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'stress', 'early', 'power', 'controls', 'v5', 'migrate',
-          'fuzz', 'bench')
+          'devices', 'deploy', 'fuzz', 'bench')
 # Routine tier: run after kernel or pivsetup changes. The opt-in remainder is for
 # changes in its own area: controls (descriptive write-pattern statistics),
-# migrate (pivsetup migrate) and
+# migrate (pivsetup migrate), devices (activation on arbitrary block devices
+# and the remaining safety checks; a 300 MiB second disk), deploy (packaging/:
+# DKMS build and signature, installed activation and an initramfs-tools boot
+# that opens the views) and
 # fuzz (control ioctls and table constructors; most useful on the sanitizer).
 # bench (docs/configuration.md numbers) is explicit only and should run with
 # --jobs 1; 'all' excludes it.
@@ -124,10 +128,11 @@ class Matrix:
         with lock:
             self.results.setdefault(name, {}).update(value)
 
-    def host_check(self, name, image, control, oracle_primary, oracle_hidden):
+    def host_check(self, name, image, control, oracle_primary, oracle_hidden, keys=None):
+        volume_key, hidden_key = keys or (control / 'share/volume.key', control / 'hidden.key')
         command = [sys.executable, str(ROOT / 'scripts/check_stateless.py'), str(image),
-                   '--volume-key-file', str(control / 'share/volume.key'),
-                   '--hidden-key-file', str(control / 'hidden.key'),
+                   '--volume-key-file', str(volume_key),
+                   '--hidden-key-file', str(hidden_key),
                    '--expected-primary', str(oracle_primary), '--expected-hidden', str(oracle_hidden)]
         result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
         ok = result.returncode == 0
@@ -192,6 +197,10 @@ class Matrix:
                       [ko, ROOT / 'kernel/guest-stateless-power.py', *keys], None),
             'migrate': (ROOT / 'scripts/guest-migrate.sh', final,
                         [ko, ROOT / 'kernel/guest-migrate-test.py', *keys, *oracles], None),
+            'devices': (ROOT / 'scripts/guest-devices.sh', final,
+                        [ko, ROOT / 'kernel/guest-devices-test.py', *keys, *oracles], None),
+            'deploy': (ROOT / 'scripts/guest-deploy.sh', final,
+                       [Path(self.args.scaffold), self.args.packaging, *keys, *oracles], 'deploy-final.img'),
             'fuzz': (ROOT / 'scripts/guest-fuzz.sh', final,
                      [ko, ROOT / 'kernel/guest-table-fuzz.py', ROOT / 'kernel/guest-ioctl-fuzz.py', *keys, *oracles], None),
             'v5': (ROOT / 'scripts/guest-v5.sh', control / 'control.img',
@@ -231,6 +240,10 @@ class Matrix:
                 extra += ['--power-cut-script', str(ROOT / 'scripts/guest-stateless-recover.sh')]
             if name == 'migrate':
                 extra += ['--second-blank-mib', '512']
+            if name == 'devices':
+                extra += ['--second-blank-mib', '300']
+            if name == 'deploy':
+                extra += ['--power-cut-script', str(ROOT / 'scripts/guest-deploy-boot.sh')]
             if not self.vm(key, script, run_dir, data=data, shares=files, extra=extra,
                            memory_mib=SUITE_MEMORY_MIB.get(name)):
                 return
@@ -244,6 +257,15 @@ class Matrix:
                                         cwd=ROOT, capture_output=True, text=True)
                 (run_dir / 'analysis.json').write_text(result.stdout)
                 self.record(key, dict(host_verified=result.returncode == 0))
+            elif name == 'devices':
+                for label in ('loop', 'partition'):
+                    self.host_check(f'{key}/{label}', out / f'devices-{label}.img', control,
+                                    out / f'{label}-expected-primary.sha256', out / f'{label}-expected-hidden-volume',
+                                    keys=(out / f'{label}-volume.key', out / f'{label}-hidden.key'))
+            elif name == 'deploy':
+                self.host_check(key, out / output, control, primary, hidden)
+                # The disk after systemd-shutdown detached the still-active views.
+                self.host_check(f'{key}/after-shutdown', run_dir / 'control.img', control, primary, hidden)
             elif name in ('v5', 'stress'):
                 self.host_check(key, out / output, control, out / 'expected-primary.sha256',
                                 out / 'expected-hidden-volume')
@@ -337,6 +359,10 @@ def main():
     sys.path.insert(0, str(ROOT / 'scripts'))
     from build_pivsetup import build
     args.pivsetup = build(quiet=True)
+    # packaging/ (install.sh, DKMS and initramfs-tools files) for the deploy suite.
+    args.packaging = args.prefix / 'packaging.tar'
+    with tarfile.open(args.packaging, 'x') as archive:
+        archive.add(ROOT / 'packaging', arcname='packaging')
     pivsetup_sha256 = hashlib.sha256(args.pivsetup.read_bytes()).hexdigest()
     log(f'pivsetup {pivsetup_sha256}')
     matrix = Matrix(args)
@@ -349,9 +375,12 @@ def main():
                    base_image=str(args.base_image) if args.base_image else None,
                    suites=args.suites, results=matrix.results)
     (args.prefix / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
-    failed = [k for k, v in matrix.results.items() if not v.get('passed') or v.get('host_verified') is False]
+    # Run entries need passed; extra host-check entries (e.g. devices/loop) need host_verified.
+    failed = [k for k, v in matrix.results.items()
+              if (k.count('/') == 1 and not v.get('passed')) or v.get('host_verified') is False]
     expected = sum(1 + len(matrix.suites_for(name)) for name, _ in work) + len(args.profile)
-    missing = expected - len(matrix.results)
+    # Extra host-check entries (e.g. devices/loop) are not separate runs.
+    missing = expected - len([k for k in matrix.results if k.count('/') == 1])
     log(f'{len(matrix.results) - len(failed)} passed, {len(failed)} failed, {missing} not run; '
         f'summary: {args.prefix / "summary.json"}')
     return 1 if failed or missing else 0

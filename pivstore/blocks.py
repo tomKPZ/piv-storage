@@ -84,8 +84,7 @@ def run(args, env=None):
 
 
 def open_args(source, key_file, secret_path, *, passphrase=False, name='piv-native', initialize=False,
-              quick=False, fill=False, ab=False, verify=False, allow_test_stack=False, allow_second_disk=False,
-              parity=0, kdf_cost=None):
+              quick=False, fill=False, ab=False, verify=False, parity=0, kdf_cost=None):
     args = ['open-blocks', '--device', source, '--key-file', key_file, '--name', name,
             '--hidden-passphrase-file' if passphrase else '--hidden-key-file', secret_path]
     if initialize: args.append('--initialize')
@@ -95,8 +94,6 @@ def open_args(source, key_file, secret_path, *, passphrase=False, name='piv-nati
     if parity: args += ['--parity', str(parity)]
     if kdf_cost is not None: args += ['--kdf-cost', str(kdf_cost)]
     if verify: args.append('--verify')
-    if allow_test_stack: args.append('--allow-test-stack')
-    if allow_second_disk: args.append('--allow-second-disk')
     return [str(a) for a in args]
 
 
@@ -128,14 +125,12 @@ def spawn_open(source, key_file, hidden_key, *, env, **options):
                 process.communicate()
 
 
-def close_blocks(source, key_file, *, name='piv-native', allow_test_stack=False, allow_second_disk=False):
-    run(['close-blocks', '--device', source, '--key-file', key_file, '--name', name]
-        + (['--allow-test-stack'] if allow_test_stack else [])
-        + (['--allow-second-disk'] if allow_second_disk else []))
+def close_blocks(source, key_file, *, name='piv-native'):
+    run(['close-blocks', '--device', source, '--key-file', key_file, '--name', name])
 
 
 def migrate(source, source_key_file, source_hidden_key, target, target_key_file, target_hidden_key, *,
-            ab=False, parity=0, allow_second_disk=False):
+            ab=False, parity=0):
     """pivsetup migrate: copy both views into a freshly formatted target that it
     initializes, then re-read and compare both (rekey/resize/sector-size change).
     Returns byte counts per view. Hidden keys are passed in private files."""
@@ -145,16 +140,15 @@ def migrate(source, source_key_file, source_hidden_key, target, target_key_file,
                 '--target-key-file', target_key_file, '--target-hidden-key-file', target_path]
         if ab: args.append('--ab')
         if parity: args += ['--parity', str(parity)]
-        if allow_second_disk: args.append('--allow-second-disk')
         return json.loads(run(args))
 
 
-def keyslot(source, key_file, slot, kek=None, *, name='piv-native', allow_test_stack=False, passphrase=None,
+def keyslot(source, key_file, slot, kek=None, *, name='piv-native', passphrase=None,
             kdf_cost=None):
     """Add (kek or passphrase given) or remove keyslot @slot on active v5 views."""
     adding = kek is not None or passphrase is not None
     args = ['keyslot', 'add' if adding else 'remove', '--device', source, '--key-file', key_file,
-            '--name', name, '--slot', slot] + (['--allow-test-stack'] if allow_test_stack else [])
+            '--name', name, '--slot', slot]
     if not adding:
         run(args)
         return

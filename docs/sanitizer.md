@@ -30,11 +30,11 @@ python3 scripts/build_debug_kernel.py --prefix artifacts/debug-image-next
 4. **verify** (scripts/guest-debug-verify.sh): boots it and requires the KASAN
    and lockdep initialization messages.
 
-Guards (guest-common.sh, pivstore.kernel_owner, pivsetup) accept the release
-`6.12.113+deb13-amd64-pivdbg` only when the marker exists. On that image the
+The test harness guard (guest-common.sh) accepts the release
+`6.12.113+deb13-amd64-pivdbg` only when the marker exists (pivsetup has no
+kernel check since the activation guards were removed, 2026-10-22). On that image the
 module build checks vermagic against the running kernel instead of the Debian
-header-config comparison (bindeb-pkg headers ship no .config). The early-boot
-initramfs copies the marker.
+header-config comparison (bindeb-pkg headers ship no .config).
 
 ## Running suites
 

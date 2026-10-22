@@ -316,7 +316,9 @@ def run(args):
     os.chmod(run_dir / "control.img", 0o600)
     args.second_disk = None
     if args.second_blank_mib:
-        # Migration tests only: a second disposable blank disk, /dev/vdc in the guest.
+        # A second disposable sparse blank disk, /dev/vdc in the guest. Any size in
+        # range: pivsetup no longer restricts devices; /dev/vdb stays 128/512 MiB
+        # for the harness guard in guest-common.sh.
         args.second_disk = run_dir / "second.img"
         with args.second_disk.open("xb") as disk:
             disk.truncate(args.second_blank_mib * 1024 * 1024)
@@ -408,6 +410,13 @@ def run(args):
         process.stdout.close()
 
 
+def second_disk_mib(text):
+    value = int(text)
+    if not 16 <= value <= 16384:
+        raise argparse.ArgumentTypeError("second disk size must be 16-16384 MiB")
+    return value
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
@@ -426,8 +435,9 @@ def main():
     disks.add_argument("--data-image", type=Path,
                       help="Copy this image into the guest data disk; never attach it directly")
     task.add_argument("--share-file", type=Path, action='append', default=[])
-    task.add_argument("--second-blank-mib", type=int, choices=(128, 512),
-                      help="Attach a second disposable blank disk (/dev/vdc) for migration tests")
+    task.add_argument("--second-blank-mib", type=second_disk_mib, metavar="16-16384",
+                      help="Attach a second disposable sparse blank disk (/dev/vdc) of this size "
+                           "(migration, arbitrary-device and large-volume tests)")
     task.add_argument("--code", action='store_true', help='Export package source read-only to the guest')
     task.add_argument("--accel", choices=("tcg", "kvm"), default="tcg")
     task.add_argument("--smp", type=int, default=2, choices=range(1, 65), metavar="1-64")

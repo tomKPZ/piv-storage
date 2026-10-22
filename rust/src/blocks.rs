@@ -6,7 +6,7 @@ use crate::bail;
 use crate::cmd::{dm, dm_ok};
 use crate::error::{Error, Result};
 use crate::ioctl::{FillCounts, KernelDevice, SETUP_AB, SETUP_FILL, SETUP_INITIALIZE, SETUP_QUICK, SETUP_VERIFY};
-use crate::owner::{mapping_identity, remove_mapping, Allow, GuestOwner};
+use crate::owner::{mapping_identity, remove_mapping, Owner};
 use crate::profile::base_context;
 use crate::secret::Secret;
 use crate::{hooks, signals};
@@ -34,7 +34,6 @@ pub struct OpenOptions<'a> {
     pub parity: u32,
     /// Argon2id cost tier for passphrases (1-4).
     pub kdf_cost: u8,
-    pub allow: Allow,
 }
 
 pub struct Views {
@@ -51,7 +50,7 @@ pub enum HiddenSecret {
     Passphrase(Secret),
 }
 
-pub fn base_identity(owner: &GuestOwner) -> Vec<u8> {
+pub fn base_identity(owner: &Owner) -> Vec<u8> {
     let device = owner.device();
     let primary_bytes = device.sectors * device.sector_size;
     base_context(&owner.uuid, primary_bytes, device.sector_size)
@@ -137,7 +136,7 @@ pub fn open_blocks(source: &Path, key_file: &Path, secret: HiddenSecret, options
             bail!("Hidden key must contain exactly 32 bytes");
         }
     }
-    let mut owner = GuestOwner::open(source, key_file, options.name, options.allow)?;
+    let mut owner = Owner::open(source, key_file, options.name)?;
     let mut created: Vec<(String, String)> = Vec::new();
     let result = open_inner(&mut owner, secret, options, &mut created);
     match result {
@@ -155,7 +154,7 @@ pub fn open_blocks(source: &Path, key_file: &Path, secret: HiddenSecret, options
     }
 }
 
-fn unwind(owner: &mut GuestOwner, created: &[(String, String)]) -> Result<()> {
+fn unwind(owner: &mut Owner, created: &[(String, String)]) -> Result<()> {
     for (mapping, token) in created.iter().rev() {
         if let Some(identity) = mapping_identity(mapping)? {
             if &identity.2 == token {
@@ -171,7 +170,7 @@ fn unwind(owner: &mut GuestOwner, created: &[(String, String)]) -> Result<()> {
     Ok(())
 }
 
-fn open_inner(owner: &mut GuestOwner, secret: HiddenSecret, options: &OpenOptions,
+fn open_inner(owner: &mut Owner, secret: HiddenSecret, options: &OpenOptions,
               created: &mut Vec<(String, String)>) -> Result<Views> {
     let name = options.name;
     if owner.device().status()?.active {
@@ -234,17 +233,17 @@ fn open_inner(owner: &mut GuestOwner, secret: HiddenSecret, options: &OpenOption
     })
 }
 
-pub fn close_blocks(source: &Path, key_file: &Path, name: &str, allow: Allow) -> Result<()> {
+pub fn close_blocks(source: &Path, key_file: &Path, name: &str) -> Result<()> {
     if dm(&["info", name], None, false)?.status != 0 {
         return Err(Error::os(libc::ENOENT, "Native owner is not active"));
     }
-    let mut owner = GuestOwner::open(source, key_file, name, allow)?;
+    let mut owner = Owner::open(source, key_file, name)?;
     let result = close_inner(&mut owner, name);
     owner.close();
     result
 }
 
-fn close_inner(owner: &mut GuestOwner, name: &str) -> Result<()> {
+fn close_inner(owner: &mut Owner, name: &str) -> Result<()> {
     let device = owner.device();
     let status = device.status()?;
     let rdev = std::os::unix::fs::MetadataExt::rdev(&std::fs::metadata(&device.owner)?);
@@ -274,8 +273,8 @@ fn close_inner(owner: &mut GuestOwner, name: &str) -> Result<()> {
     owner.remove(false)
 }
 
-pub fn keyslot(source: &Path, key_file: &Path, slot: u32, kek: Option<&[u8]>, name: &str, allow: Allow) -> Result<()> {
-    let mut owner = GuestOwner::open(source, key_file, name, allow)?;
+pub fn keyslot(source: &Path, key_file: &Path, slot: u32, kek: Option<&[u8]>, name: &str) -> Result<()> {
+    let mut owner = Owner::open(source, key_file, name)?;
     let result = (|| {
         if owner.created || !owner.device().status()?.active {
             return Err(Error::os(libc::ENOENT, "Native views must be active to manage keyslots"));

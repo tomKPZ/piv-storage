@@ -29,10 +29,6 @@ cp /root/piv-module/dm-piv.ko "${DESTDIR}/piv/dm-piv.ko"
 cp /mnt/piv-work/passphrase.key /mnt/piv-work/hidden.key /mnt/piv-work/guest-early-test.sh \
  /mnt/piv-work/expected-hidden-volume /mnt/piv-work/expected-primary.sha256 "${DESTDIR}/piv/"
 printf 'early-boot-test' | dd of="${DESTDIR}/piv/early-block" bs=4096 count=1 conv=sync status=none
-# Sanitizer and port-kernel images carry explicit markers that the guards require.
-for marker in /etc/piv-debug-kernel /etc/piv-port-kernel; do
-    if [ -e "$marker" ]; then mkdir -p "${DESTDIR}/etc"; cp "$marker" "${DESTDIR}/etc/"; fi
-done
 manual_add_modules virtio_blk
 manual_add_modules dm_crypt
 manual_add_modules dm_integrity

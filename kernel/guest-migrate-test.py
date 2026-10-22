@@ -59,14 +59,23 @@ subprocess.run(['cryptsetup', 'luksFormat', '--batch-mode', '--type', 'luks2', '
                 '--pbkdf', 'pbkdf2', '--pbkdf-force-iterations', '1000', '--key-file', str(TKEY), TARGET],
                check=True, stdout=subprocess.DEVNULL)
 
-# Refusals leave no mappings behind: same device, and /dev/vdc without the
-# explicit opt-in (the source opens first, so this also checks its cleanup).
-results['refusals'] = [
-    refused('different devices', SOURCE, KEY, HKEY, SOURCE, KEY, TKEK, allow_second_disk=True),
-    refused('Unsupported disposable test device', SOURCE, KEY, HKEY, TARGET, TKEY, TKEK),
-]
+# Refusals leave no mappings behind: the same device (also through a symlink,
+# caught by its device number) and a target held by an exclusive opener (the
+# source opens first, so this also checks its cleanup).
+link = Path('/run/piv-migrate-source-link')
+link.symlink_to(SOURCE)
+held = os.open(TARGET, os.O_RDONLY | os.O_EXCL)
+try:
+    results['refusals'] = [
+        refused('different devices', SOURCE, KEY, HKEY, SOURCE, KEY, TKEK),
+        refused('different devices', SOURCE, KEY, HKEY, link, KEY, TKEK),
+        refused('in use', SOURCE, KEY, HKEY, TARGET, TKEY, TKEK),
+    ]
+finally:
+    os.close(held)
+    link.unlink()
 
-result = migrate(SOURCE, KEY, HKEY, TARGET, TKEY, TKEK, ab=True, parity=4, allow_second_disk=True)
+result = migrate(SOURCE, KEY, HKEY, TARGET, TKEY, TKEK, ab=True, parity=4)
 assert result['verified'] is True, result
 assert result['decoy']['target_bytes'] > result['decoy']['bytes'], result
 assert result['hidden']['bytes'] == len(EXPECTED), result
@@ -84,17 +93,17 @@ close_blocks(SOURCE, KEY)
 # The target authenticates only with its own key (A/B layout and RS parity from
 # the keyslot).
 try:
-    open_blocks(TARGET, TKEY, HKEY, allow_second_disk=True)
+    open_blocks(TARGET, TKEY, HKEY)
     raise AssertionError('target opened with the source hidden key')
 except OSError as error:
     assert error.errno == errno.EKEYREJECTED, error
 assert mappings() == [], mappings()
-v = open_blocks(TARGET, TKEY, TKEK, allow_second_disk=True)
+v = open_blocks(TARGET, TKEY, TKEK)
 assert v['hidden_bytes'] == result['hidden']['target_bytes'], (v, result)
 assert sha256_prefix(v['decoy'], result['decoy']['bytes']) == PRIMARY
 hidden = Path(v['hidden']).read_bytes()
 assert hidden[:len(EXPECTED)] == EXPECTED and not any(hidden[len(EXPECTED):])
-close_blocks(TARGET, TKEY, allow_second_disk=True)
+close_blocks(TARGET, TKEY)
 
 # Unmodified Linux authenticates the migrated primary on its own.
 subprocess.run(['rmmod', 'dm_piv'], check=True)

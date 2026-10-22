@@ -9,11 +9,16 @@ hidden device 4096-byte logical blocks of plaintext; each can hold its own
 filesystem. Setup exits; the kernel
 owns all subsequent I/O.
 
-This is not a proven indistinguishability construction or reliable production
-storage. README and ROADMAP are provisional research notes; the internal
-[security and threat-model review](docs/security-review.md) defines observer
-boundaries and open assumptions. **No external cryptographic review has been
-conducted** (see [Nonces and limitations](#nonces-and-limitations)).
+> [!CAUTION]
+> Research prototype: not a proven indistinguishability construction and not
+> reliable production storage. **No external cryptographic review has been
+> conducted** (see [Nonces and limitations](#nonces-and-limitations)). It has
+> only been tested in disposable QEMU guests on synthetic disks. Use it only
+> on storage whose loss you can tolerate, keep backups of both views, and read
+> the internal [security and threat-model review](docs/security-review.md)
+> (observer boundaries and open assumptions) first.
+
+README and ROADMAP are provisional research notes.
 
 ## Components
 
@@ -32,9 +37,11 @@ conducted** (see [Nonces and limitations](#nonces-and-limitations)).
 There is **no external persistent metadata, nonce ledger, WAL or recovery
 file**: only ordinary LUKS2/dm-integrity structures and encrypted records inside
 IVs. Volatile ownership locks live in /run. Activation needs only `pivsetup`,
-cryptsetup/dmsetup, the keys and the matching module; it has been tested from a
-Python-free RAM-root initramfs. Use is restricted to the pinned disposable QEMU
-guest and synthetic 128 or 512 MiB disks (`/dev/vdb`), not real hosts or disks.
+cryptsetup/dmsetup, the keys and the matching module, on any block device or
+partition holding the LUKS2 volume; it has been tested from a Python-free
+RAM-root initramfs and from a stock initramfs-tools boot
+([packaging/README.md](packaging/README.md): DKMS, module signing, boot
+integration).
 
 ## Supported primary profiles
 
@@ -61,20 +68,30 @@ sectors of that record, and the measured write gain for dm-piv was small
 
 Choose the primary cipher, sector size and A/B with
 [configuration.md](docs/configuration.md) (trade-offs, defaults and measured
-performance). Build on the host with `python3 scripts/build_pivsetup.py`; see
-[development.md](docs/development.md) for the VM harness and
-[native-blocks.md](docs/native-blocks.md) for the module. Inside the guest:
+performance). Install `pivsetup` and the module (DKMS) as described in
+[packaging/README.md](packaging/README.md); [development.md](docs/development.md)
+covers the VM test harness and [native-blocks.md](docs/native-blocks.md) the
+module. Format the volume with stock cryptsetup, then, as root:
 
 ```sh
-pivsetup keygen --output /mnt/piv-work/hidden.key
-pivsetup open-blocks --device /dev/vdb \
-  --key-file /mnt/piv-work/passphrase.key \
-  --hidden-key-file /mnt/piv-work/hidden.key --initialize
+cryptsetup luksFormat --type luks2 --cipher aegis128-random --key-size 128 \
+  --integrity aead --sector-size 4096 --key-file /root/luks.key /dev/sdX2
+pivsetup keygen --output /root/hidden.key
+pivsetup open-blocks --device /dev/sdX2 --key-file /root/luks.key \
+  --hidden-key-file /root/hidden.key --initialize
 # ... use /dev/mapper/piv-native-decoy and /dev/mapper/piv-native-hidden ...
-pivsetup close-blocks --device /dev/vdb --key-file /mnt/piv-work/passphrase.key
+pivsetup close-blocks --device /dev/sdX2 --key-file /root/luks.key
 ```
 
-`--key-file` is the stock LUKS passphrase. Options of `open-blocks`:
+`--device` (required, no default) is the block device or partition holding
+the LUKS2 volume; symlinks such as `/dev/disk/by-partuuid/...` are followed.
+`--key-file` is the stock LUKS passphrase. Setup refuses non-block paths, a
+whole disk with a partition table (give the partition), a device that is
+mounted, mapped or opened exclusively, an owner name used by another mapping
+and a volume whose /run owner lock is held. **Never open the volume for
+writing with stock cryptsetup** (e.g. through `/etc/crypttab`): stock writes do
+not refresh the hidden records they overwrite and destroy hidden data.
+Options of `open-blocks`:
 
 - `--initialize` **destroys all existing hidden contents**: it writes a new
   random master key, keyslot 0, the directory and authenticated zero blocks,
@@ -105,7 +122,7 @@ pivsetup close-blocks --device /dev/vdb --key-file /mnt/piv-work/passphrase.key
 - `--verify`: authenticate every primary sector first and refuse the volume on
   any failure (an O(volume) audit). By default setup scans only the 112-sector
   keyslot area, in constant time.
-- `--name` (default `piv-native`), `--device` (default `/dev/vdb`).
+- `--name` (default `piv-native`; `piv-` plus up to 40 letters, digits, `_` or `-`).
 
 A/B and parity are recorded in the encrypted keyslot; later opens read them
 from there. Other commands: `pivsetup keyslot add|remove --slot 0-3` manages up
@@ -130,8 +147,8 @@ less with parity), minus a fixed 112 + 2G sectors for keyslots and the
 directory. The 38 hidden blocks of a 128 MiB 4096-byte-sector volume are too
 few for mke2fs (about 55 blocks of 4 KiB minimum). Setup never creates
 filesystems. Unmount both filesystems before `close-blocks`. Larger geometry
-uses checked kernel bounds ([large-volumes.md](docs/large-volumes.md)), but the
-fixture guard admits only 128 and 512 MiB disks.
+uses checked kernel bounds ([large-volumes.md](docs/large-volumes.md)); the
+largest tested volumes are 3 GiB (4096-byte sectors) and 2 GiB (512).
 
 ## Format v5 in brief
 
@@ -248,6 +265,7 @@ private files, never command arguments or commits.
 ## Further reading
 
 [configuration.md](docs/configuration.md) (choosing options, performance),
+[packaging/README.md](packaging/README.md) (installation, DKMS, signing, boot),
 [ROADMAP.md](ROADMAP.md) (remaining work), [development.md](docs/development.md)
 (harness and tests), [native-blocks.md](docs/native-blocks.md),
 [native-faults.md](docs/native-faults.md),

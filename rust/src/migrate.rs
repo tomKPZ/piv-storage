@@ -19,7 +19,7 @@ use zeroize::Zeroize;
 use crate::bail;
 use crate::blocks::{close_blocks, open_blocks, HiddenSecret, OpenOptions, Views};
 use crate::error::{Error, Result};
-use crate::owner::{path_str, Allow};
+use crate::owner::path_str;
 use crate::signals;
 
 const CHUNK: usize = 1 << 20;
@@ -173,20 +173,21 @@ fn copy_both(src: &Views, dst: &Views) -> Result<Report> {
 #[allow(clippy::too_many_arguments)]
 pub fn migrate(source: &Path, source_key_file: &Path, source_secret: HiddenSecret,
                target: &Path, target_key_file: &Path, target_secret: HiddenSecret,
-               layout: &MigrateOptions, allow: Allow) -> Result<Report> {
+               layout: &MigrateOptions) -> Result<Report> {
     let canonical = |p: &Path| std::fs::canonicalize(p).map_err(Error::from);
-    if canonical(source)? == canonical(target)? || path_str(source)? == path_str(target)? {
+    let rdev = |p: &Path| std::fs::metadata(p).map(|m| std::os::unix::fs::MetadataExt::rdev(&m)).map_err(Error::from);
+    if canonical(source)? == canonical(target)? || path_str(source)? == path_str(target)? || rdev(source)? == rdev(target)? {
         bail!("Source and target must be different devices");
     }
     let src = open_blocks(source, source_key_file, source_secret,
                           &OpenOptions { name: SOURCE_NAME, initialize: false, quick: false, fill: false, ab: false, verify: false, parity: 0,
-                                         kdf_cost: layout.source_kdf_cost, allow })?;
+                                         kdf_cost: layout.source_kdf_cost })?;
     let result = (|| {
         let dst = open_blocks(target, target_key_file, target_secret,
                               &OpenOptions { name: TARGET_NAME, initialize: true, quick: false, fill: false, ab: layout.ab, verify: false,
-                                             parity: layout.parity, kdf_cost: layout.target_kdf_cost, allow })?;
+                                             parity: layout.parity, kdf_cost: layout.target_kdf_cost })?;
         let copied = copy_both(&src, &dst);
-        let closed = close_blocks(target, target_key_file, TARGET_NAME, allow);
+        let closed = close_blocks(target, target_key_file, TARGET_NAME);
         match (copied, closed) {
             (Ok(report), Ok(())) => Ok(report),
             (Ok(_), Err(error)) => Err(error),
@@ -197,7 +198,7 @@ pub fn migrate(source: &Path, source_key_file: &Path, source_secret: HiddenSecre
             (Err(error), Ok(())) => Err(error),
         }
     })();
-    let closed = close_blocks(source, source_key_file, SOURCE_NAME, allow);
+    let closed = close_blocks(source, source_key_file, SOURCE_NAME);
     match (result, closed) {
         (Ok(report), Ok(())) => Ok(report),
         (Ok(_), Err(error)) => Err(error),
