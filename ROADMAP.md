@@ -1818,6 +1818,9 @@ faults and power tests verify that torn sectors stay within the request/carrier
 and repair by full-sector replacement. Evidence: suite-056-nojournal 22/22, 14/14
 host checks. The journal stays the default.
 
-Open: sanitizer run on no-journal profiles (optional), large-volume suite
-(guest-large-test asserts an owner fail-stop on a hidden-read corruption, which
-predates scoped isolation; recheck before relying on it), external review.
+Large-volume suite rechecked: guest-large-test's read-fault cases asserted the
+pre-2026-10-20 fail-stop; now they assert scoped isolation. large-4096-004 and
+large-512-004 (512 MiB) passed; reopen 0.34 s / 0.22 s. suite-057: final-tree
+journaled routine 18/18.
+
+Open: sanitizer run on no-journal profiles (optional), external review.

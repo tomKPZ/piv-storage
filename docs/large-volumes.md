@@ -5,6 +5,13 @@
 > removed (AEGIS-128 with [format v4](format-v4.md) is the only supported
 > configuration). Results below that mention them are historical evidence for
 > the code at that time; see ROADMAP.md for current runs.
+>
+> Rerun 2026-10-21 after the keyslot-area setup scan (large-4096-004,
+> large-512-004, 512 MiB, both passed): reopen took 0.34 s and 0.22 s under KVM
+> (setup no longer reads the whole primary; `--verify` does). Initialization
+> remains proportional to capacity (27.8 s and 168.5 s). The read-fault cases now
+> assert scoped isolation (local EIO, the same owner continues), matching the
+> faults suite; the old fail-stop assertion predated that change.
 
 The native module's former 256 MiB primary cap is removed. Setup instead rejects
 primary-sector counts exceeding MAX_LFS_FILESIZE / primary_sector_size. The

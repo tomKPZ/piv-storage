@@ -186,18 +186,21 @@ for fault in ('reads', 'corruption'):
             assert buf[:] == sentinel
         finally:
             os.close(fd)
-    assert native_status(handle.device)['failed']
+    # Scoped isolation (since 2026-10-20): a read or authentication failure
+    # mutates nothing, so only the request fails; the same owner keeps serving
+    # both views once the fault clears.
+    assert not native_status(handle.device)['failed']
     reload(healthy)
     for peer in ('decoy', 'hidden'):
-        rejected(lambda: direct(v[peer], 0))
+        direct(v[peer], 0)
     handle.close()
     close_views(SOURCE)
     v = open_views(SOURCE)
     verify(v)
     close_views(SOURCE)
     results['faults'].append(dict(fault=fault, primary_sector=last,
-                                 beyond_old_cap=True, no_output=True, sticky_failure=True))
-    print(f'High-address {fault}: withholding, shared fail-stop and recreation passed', flush=True)
+                                 beyond_old_cap=True, no_output=True, local_failure=True))
+    print(f'High-address {fault}: withholding, local EIO, continuation and reopen passed', flush=True)
 dm('remove', '--retry', 'piv-test-fault')
 subprocess.run(['rmmod', 'dm_piv'], check=True)
 subprocess.run(['cryptsetup', 'open', '--readonly', '--key-file', str(KEY), '/dev/vdb', 'piv-stock'], check=True)
