@@ -57,7 +57,9 @@ of that record, not only the sectors being written
 
 ## Usage
 
-Build on the host with `python3 scripts/build_pivsetup.py`; see
+Choose the primary cipher, sector size, journal and A/B with
+[configuration.md](docs/configuration.md) (trade-offs, defaults and measured
+performance). Build on the host with `python3 scripts/build_pivsetup.py`; see
 [development.md](docs/development.md) for the VM harness and
 [native-blocks.md](docs/native-blocks.md) for the module. Inside the guest:
 
@@ -210,6 +212,7 @@ private files, never command arguments or commits.
 
 ## Further reading
 
+[configuration.md](docs/configuration.md) (choosing options, performance),
 [ROADMAP.md](ROADMAP.md) (remaining work), [development.md](docs/development.md)
 (harness and tests), [native-blocks.md](docs/native-blocks.md),
 [native-faults.md](docs/native-faults.md),

@@ -62,8 +62,11 @@ runs the selected suites concurrently, one fresh VM per suite.
 - `--suites routine` (default): faults, profile, cancel, lifecycle, batch,
   early, power, v4. `--suites all` adds controls, migrate (second 512 MiB disk)
   and fuzz (seeded control-ioctl fuzzing with `PIV_FUZZ_STEPS`/`PIV_FUZZ_SEED`,
-  plus dm table/constructor fuzzing; best on the sanitizer image). An explicit
-  comma list also works; `--suites-for PROFILE=LIST` narrows per profile.
+  plus dm table/constructor fuzzing; best on the sanitizer image). `bench`
+  (the [configuration.md](configuration.md) measurements, on the pristine
+  fixture) is never in a set; request it explicitly and run it with
+  `--jobs 1`. An explicit comma list also works; `--suites-for PROFILE=LIST`
+  narrows per profile.
 - `--reuse-native PREFIX` skips the native step and starts from a previous
   passed, host-verified native run with the same module input and base image.
 - `--base-image` selects a derived guest image (sanitizer or port, below);

@@ -72,8 +72,9 @@ caches. Medians of three samples are not confidence intervals. There is no
 claim about cold start, physical media, production throughput or a controlled
 cipher comparison (profiles differ in cipher, tag size and geometry). Hidden
 reads cost 90 primary authentications per 512 bytes regardless of request size.
-Earlier recorded timings predate the keyslot-area setup scan and format v4 and
-no longer apply; current results live in each run's `profile-results.json`.
+Current results live in each run's `profile-results.json`; the sequential
+`bench` suite's user-facing write/read/activation numbers are in
+[configuration.md](configuration.md).
 
 ## Running
 

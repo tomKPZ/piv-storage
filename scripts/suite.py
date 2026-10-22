@@ -41,13 +41,16 @@ for _cipher in ('aes', 'serpent', 'twofish'):
         for _size in ('4096', '512'):
             PROFILES[f'{_cipher}-{_mac}-{_size}'] = dict(
                 PIV_PRIMARY_CIPHER=f'{_cipher}-xts-random', PIV_INTEGRITY=f'hmac-{_mac}', PIV_SECTOR_SIZE=_size)
-SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early', 'power', 'controls', 'v4', 'migrate', 'fuzz')
+SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early', 'power', 'controls', 'v4', 'migrate', 'fuzz',
+          'bench')
 # Routine tier: run after kernel or pivsetup changes. The opt-in remainder is for
 # changes in its own area: controls (descriptive write-pattern statistics),
 # migrate (pivsetup migrate) and
 # fuzz (control ioctls and table constructors; most useful on the sanitizer).
+# bench (docs/configuration.md numbers) is explicit only and should run with
+# --jobs 1; 'all' excludes it.
 DEFAULT_SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early', 'power', 'v4')
-SUITE_SETS = {'routine': DEFAULT_SUITES, 'all': SUITES}
+SUITE_SETS = {'routine': DEFAULT_SUITES, 'all': tuple(s for s in SUITES if s != 'bench')}
 lock = threading.Lock()
 
 
@@ -193,6 +196,8 @@ class Matrix:
                      [ko, ROOT / 'kernel/guest-table-fuzz.py', ROOT / 'kernel/guest-ioctl-fuzz.py', *keys, *oracles], None),
             'v4': (ROOT / 'scripts/guest-v4.sh', control / 'control.img',
                    [ko, ROOT / 'kernel/guest-v4-test.py', *keys], 'v4-final.img'),
+            'bench': (ROOT / 'scripts/guest-bench.sh', control / 'control.img',
+                      [ko, ROOT / 'kernel/guest-bench-test.py', *keys], None),
             'controls': (ROOT / 'scripts/guest-controls.sh', control / 'control.img',
                          [ko, ROOT / 'kernel/guest-controls-test.py', ROOT / 'scripts/control_metrics.py', *keys],
                          None),
