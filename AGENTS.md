@@ -46,7 +46,7 @@ resolved from context/evidence, not for routine implementation decisions.
   defects override feature ordering; standalone tooling/assessment comes later.
 - Maintain the paired native writable decoy/hidden block devices, one coordinated
   kernel owner and independent read-only image/record decoders. No FUSE/NBD,
-  offline writer, legacy decoding, external history/WAL, bootstrap or compaction.
+  offline writer or external history/WAL.
 - The user explicitly selected a stateless design. Persist only ordinary stock
   LUKS/dm-integrity structures and encrypted records inside IVs. No separate
   partition, root-ext4 file or hidden-volume metadata dependency. /run ownership
@@ -74,21 +74,23 @@ resolved from context/evidence, not for routine implementation decisions.
   re-randomizes only the written sectors' IVs and preserves their fragments
   (damage stays damage). Never turn corruption into authenticated zeros. Full hidden writes may repair a block after primary authentication.
 - Fresh seeded CRNG entropy is mandatory. Local proposed/replaced IV collision
-  rejection is only a small check, not lifetime nonce history. The 2^32 per-owner
-  encryption counter resets at recreation and does not enforce the per-key
-  lifetime budget. Document probabilistic collisions, amplification, retries,
-  rollback and clones. Do not resurrect an observable nonce ledger.
-- Preserve the kernel-internal authenticated PREPARE/exact-tuple APPLY and owner
-  lifetime gates. The control device exposes only QUERY, DEVICES, BEGIN/END,
+  rejection is only a small check, not lifetime nonce history. Any volatile
+  per-owner encryption cap (currently 2^32) is an implementation choice that
+  may be raised or removed; it does not enforce the per-key lifetime budget.
+  Document probabilistic collisions, amplification, retries, rollback and
+  clones. Do not resurrect an observable nonce ledger.
+- IVs and metadata tuples are generated, authenticated and written only inside
+  the kernel owner. The control device exposes only QUERY, DEVICES, BEGIN/END,
   SETUP, DETACH, STATUS and KEYSLOT; never re-add userspace IV or tuple access.
-  Apply through the ordinary lower dm-integrity journal; its per-sector atomicity
+  Write through the ordinary lower dm-integrity journal; its per-sector atomicity
   does not make a hidden record atomic. Failure scope follows mutation: errors
-  before the first APPLY (reads, authentication, allocation, preparation) fail
-  only that bio; APPLY-time and flush errors stop the shared owner. Local hidden
-  unavailability must not stop the decoy.
+  before the first lower write of a request (reads, authentication, allocation,
+  preparation) fail only that bio; errors once writing has begun, and flush
+  errors, stop the shared owner. Local hidden unavailability must not stop the
+  decoy.
 - Wrong-key guard: setup without initialize requires a keyslot to
   authenticate, using IVs from the keyslot-area scan, and refuses without the
-  keyslot directory. Never add extra I/O for it. There is no
+  keyslot directory. There is no
   uninitialized-carrier mode (removed with v3); stock carriers must be
   initialized.
 - Bio size bounds, preparation batch sizes, worker topology and cross-bio
@@ -98,9 +100,9 @@ resolved from context/evidence, not for routine implementation decisions.
   the same hidden record, keep stock PREFLUSH/FUA/flush semantics and the
   failure-scope rules above. Tail primary sectors have no hidden record.
 - Setup polls pending signals and yields between authenticated ranges and
-  complete initialization records. Keep cancellation outside pn_write: completed
-  records stay committed, the keyslot-area scan repeats on retry, and cancellation is
-  not rollback. Failed-attempt cleanup may errorize only its newly created,
+  complete initialization records, never inside a record write: completed
+  records stay committed, the keyslot-area scan repeats on retry, and
+  cancellation is not rollback. Failed-attempt cleanup may errorize only its newly created,
   identity-checked private owner to drain probes; never force public views or
   existing/foreign mappings. Normal close retains busy-device protection.
 - Larger geometry uses checked kernel file-offset bounds rather than a 256 MiB
@@ -110,10 +112,11 @@ resolved from context/evidence, not for routine implementation decisions.
   validated raw size must reach extent parsing. Live resize, rekey and cipher
   change are out of scope (stock cryptsetup refuses them on integrity volumes;
   user decision 2026-10-22); `pivsetup migrate` is the offline path.
-- Native setup, decoy reads and carrier collection use bounded 16 KiB range
-  reads. Authenticate every sector with unchanged Linux AAD/tag offsets before
-  publishing any range bytes or IVs. Keep per-sector crypto counts and late-sector
-  corruption/no-output regressions; fewer submissions must never skip checks.
+- Read sizes for setup, decoy reads and carrier collection are implementation
+  choices (bounded memory). Authenticate every sector with unchanged Linux
+  AAD/tag offsets before publishing any range bytes or IVs. Keep per-sector
+  crypto counts and late-sector corruption/no-output regressions; fewer
+  submissions must never skip checks.
 - Build dm-piv.ko as a standalone module (dm-piv.c, no dm-crypt fork)
   registering piv-crypt/piv-view. Keep stock dm-crypt/crypt loaded and
   independent; never unload it to activate ours. Keep workqueue names distinct
@@ -132,12 +135,11 @@ resolved from context/evidence, not for routine implementation decisions.
   AAD, extents and arithmetic. Offline diagnostics reject dirty journals; native
   setup delegates replay to Linux before authenticated access.
 - Use maintained crypto primitives. Setup is the static Rust `pivsetup` binary
-  (rust/; crates libc, zeroize, RustCrypto scrypt and argon2, pinned by Cargo.lock; no
-  clap/serde) plus cryptsetup, built rootlessly by scripts/build_pivsetup.py.
-  Keys stay in mlocked, zeroized buffers and never reach argv. Python keeps only
-  diagnostics and guest test instrumentation; pivstore.blocks is a thin client
-  of the binary. Test hooks are explicit PIVSETUP_TEST_* variables, never
-  monkeypatching. Diagnostics use cryptography (AES-XTS, HMAC) plus the
+  (rust/; keep dependencies few, maintained and pinned by Cargo.lock) plus
+  cryptsetup, built rootlessly by scripts/build_pivsetup.py. Keys stay in
+  mlocked, zeroized buffers and never reach argv. Python keeps only diagnostics
+  and guest test instrumentation. Test hooks are explicit PIVSETUP_TEST_*
+  variables, never monkeypatching. Diagnostics use cryptography (AES-XTS, HMAC) plus the
   optional pinned SUPERCOP AES-NI reference for original AEGIS-128 (not 128L);
   Serpent/Twofish images are HMAC-authenticated but not decrypted on the host;
   actual crypto/I/O runs in the experimental kernel module. Retain the independent
@@ -178,9 +180,10 @@ resolved from context/evidence, not for routine implementation decisions.
 Guest test scaffolding lives in scripts/guest-common.sh, automatically frozen by
 vm.py. Reuse it rather than duplicating guards, builds and package setup.
 kernel/piv-io-test.c is a separate guest-only exact-bio-flags test helper; never
-link it into dm-piv or load it on the host. Lifecycle traces must have complete
-worker/flush/completion ordering and zero missed/overrun events; absent evidence
-is a test failure. Private owner/lower administrative mutations while views are
+link it into dm-piv or load it on the host. Lifecycle traces must show the
+flush/completion ordering the design promises, with zero missed/overrun events;
+absent evidence is a test failure (update the expected ordering when the worker
+design changes). Private owner/lower administrative mutations while views are
 active are outside the supported public-view lifecycle.
 
 Use small reproducible fixtures and pure userspace checks first, then stock Linux

@@ -20,17 +20,28 @@ and limits are in README.md and docs/.
 
 ## Remaining work
 
-1. **External cryptographic review** of the whole stored encoding (format v4:
+1. **Concurrent decoy writes and larger reads** (core module). The single
+   ordered `piv-native` worker applies one bio at a time, so decoy writes run
+   12–50× slower than stock dm-crypt and sequential reads 2.5–4.5× slower
+   (docs/configuration.md, suite-072). Process independent bios concurrently
+   and/or batch across bios while serializing updates that touch the same
+   hidden record, keeping stock PREFLUSH/FUA/flush semantics, per-sector
+   authentication before publishing, and the failure-scope rules (a failure after
+   writing begins still stops the owner). Revisit the 16 KiB range-read and DM split
+   bounds and the 2^32 per-owner cap. Exit: lifecycle, batch, faults, power
+   and fuzz suites updated for the new ordering and passing on the stock and
+   sanitizer images; `bench` shows the gain; docs updated.
+2. **External cryptographic review** of the whole stored encoding (format v4:
    LRW-AES fragments, SIV records, keyslots/directory, KDFs), of the AEGIS-128
    and XTS + HMAC primary profiles' usage and of the nonce-budget guidance in
    docs/security-review.md. Needs an outside reviewer; findings override
-   everything below.
-2. **Sanitizer build of the 7.2 port kernel** (optional; the KASAN image is
+   everything else here.
+3. **Sanitizer build of the 7.2 port kernel** (optional; the KASAN image is
    6.12 only). docs/kernel-port.md.
-3. **Kernels between 6.12 and 7.2 and other distributions** (optional). The
+4. **Kernels between 6.12 and 7.2 and other distributions** (optional). The
    API shims in dm-piv.c use believed-but-unverified version thresholds; a wrong
    one fails the build rather than misbehaving.
-4. **Deployment beyond test guests** — packaging and module signing, boot
+5. **Deployment beyond test guests** — packaging and module signing, boot
    integration beyond the test initramfs, and real-device activation. The guards
    deliberately restrict activation to the pinned disposable QEMU guests; lifting
    that is a scope change that needs the user.
