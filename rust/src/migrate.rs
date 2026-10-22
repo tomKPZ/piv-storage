@@ -179,11 +179,11 @@ pub fn migrate(source: &Path, source_key_file: &Path, source_secret: HiddenSecre
         bail!("Source and target must be different devices");
     }
     let src = open_blocks(source, source_key_file, source_secret,
-                          &OpenOptions { name: SOURCE_NAME, initialize: false, ab: false, verify: false, parity: 0,
+                          &OpenOptions { name: SOURCE_NAME, initialize: false, quick: false, fill: false, ab: false, verify: false, parity: 0,
                                          kdf_cost: layout.source_kdf_cost, allow })?;
     let result = (|| {
         let dst = open_blocks(target, target_key_file, target_secret,
-                              &OpenOptions { name: TARGET_NAME, initialize: true, ab: layout.ab, verify: false,
+                              &OpenOptions { name: TARGET_NAME, initialize: true, quick: false, fill: false, ab: layout.ab, verify: false,
                                              parity: layout.parity, kdf_cost: layout.target_kdf_cost, allow })?;
         let copied = copy_both(&src, &dst);
         let closed = close_blocks(target, target_key_file, TARGET_NAME, allow);

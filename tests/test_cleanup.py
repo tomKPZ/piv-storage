@@ -90,8 +90,11 @@ class ClientTests(unittest.TestCase):
         args = blocks.open_args('/dev/vdb', 'k', 's', passphrase=True, initialize=True, parity=8, kdf_cost=1)
         self.assertEqual(args[-4:], ['--parity', '8', '--kdf-cost', '1'])
         self.assertNotIn('--parity', blocks.open_args('/dev/vdb', 'k', 's'))
-        self.assertEqual(blocks.SETUP.size, 192)
-        self.assertEqual(blocks.SETUP_VERSION, 5)
+        self.assertEqual(blocks.SETUP.size, 216)
+        self.assertEqual(blocks.SETUP_VERSION, 6)
+        self.assertEqual(blocks.open_args('/dev/vdb', 'k', 's', initialize=True, quick=True)[-2:],
+                         ['--initialize', '--quick'])
+        self.assertEqual(blocks.open_args('/dev/vdb', 'k', 's', fill=True)[-1], '--fill')
 
     def test_passphrase_kek_cross_check_vectors(self):
         # Same vectors as rust/tests/*.hex (Rust/Python KDF parity).

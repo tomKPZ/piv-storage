@@ -41,8 +41,8 @@ def direct(path, offset, count=4096, write=None):   # 4096: hidden logical block
             os.close(fd)
 
 
-def open_views(source='/dev/vdb', initialize=False):
-    value = open_blocks(source, KEY, HKEY, initialize=initialize, allow_test_stack=source == SOURCE)
+def open_views(source='/dev/vdb', **options):
+    value = open_blocks(source, KEY, HKEY, allow_test_stack=source == SOURCE, **options)
     subprocess.run(['udevadm', 'settle'], check=True)
     return value
 
@@ -65,6 +65,18 @@ def rejected(action):
         raise AssertionError('Expected EIO')
 
 
+# Timed quick initialization, then a fill writing every block (it completes
+# the quick initialization), before the full initialization used below.
+start = time.monotonic()
+v = open_views(initialize=True, quick=True)
+results['quick_initialize_seconds'] = time.monotonic() - start
+close_views()
+start = time.monotonic()
+v = open_views(fill=True)
+results['fill_all_seconds'] = time.monotonic() - start
+assert v['fill'] == dict(valid=0, written=v['hidden_bytes'] // 4096, failed=0), v
+assert Path(v['hidden']).read_bytes() == bytes(v['hidden_bytes'])
+close_views()
 start = time.monotonic()
 v = open_views(initialize=True)
 results['initialize_seconds'] = time.monotonic() - start
@@ -144,6 +156,13 @@ close_views()
 start = time.monotonic()
 v = open_views()
 results['reopen_seconds'] = time.monotonic() - start
+verify(v)
+close_views()
+# A fill of a complete volume only checks every record (nothing to write).
+start = time.monotonic()
+v = open_views(fill=True)
+results['fill_none_seconds'] = time.monotonic() - start
+assert v['fill'] == dict(valid=records, written=0, failed=0), v['fill']
 verify(v)
 close_views()
 

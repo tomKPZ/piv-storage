@@ -21,8 +21,9 @@ Run only inside the pinned disposable guest:
 
 ```
 pivsetup open-blocks --key-file F (--hidden-key-file F | --hidden-passphrase-file F)
-                     [--device /dev/vdb] [--name piv-native] [--initialize]
-                     [--ab] [--parity 4|8|16] [--verify] [--kdf-cost 1-4]
+                     [--device /dev/vdb] [--name piv-native]
+                     [--initialize [--quick] [--ab] [--parity 4|8|16] | --fill]
+                     [--verify] [--kdf-cost 1-4]
 pivsetup close-blocks --key-file F [--device /dev/vdb] [--name piv-native]
 pivsetup keyslot add|remove --key-file F --slot 0-3
                      [--new-key-file F | --new-passphrase-file F [--kdf-cost 1-4]]
@@ -46,8 +47,10 @@ supported primary profiles and journaled dm-integrity volumes are accepted
 ([configuration.md](../docs/configuration.md)).
 
 `open-blocks` performs the guest guard, LUKS/integrity validation, exclusive
-/run lock, cryptsetup open and reload as `piv-crypt`, NATIVE_SETUP (ABI 5, with
-the parity choice) and
+/run lock, cryptsetup open and reload as `piv-crypt`, NATIVE_SETUP (ABI 6, with
+the parity choice and the quick/fill flags; `--fill` prints the returned block
+counts as `"fill": {"valid": N, "written": N, "failed": N}` and notes failed
+blocks on stderr) and
 view creation ([native-blocks.md](../docs/native-blocks.md)). Failed-attempt
 cleanup is limited to its own identity-checked mappings; close validates both
 views. `keyslot` uses NATIVE_KEYSLOT on the active owner.

@@ -80,6 +80,18 @@ pivsetup close-blocks --device /dev/vdb --key-file /mnt/piv-work/passphrase.key
   random master key, keyslot 0, the directory and authenticated zero blocks,
   preserving every decoy plaintext byte. Reopen without it. Stock carriers must
   be initialized before hidden use (stock cryptsetup still opens the decoy).
+- `--quick` (with `--initialize`; not the default): write only the master key,
+  keyslot 0 and the directory, in constant time. Every hidden block then
+  **reads EIO until it is first written**, so tools that read blocks they never
+  wrote (filesystem probes, `mkfs` checks, `dd` or backups of the whole view)
+  fail; run `--fill` before using such tools.
+- `--fill` (without `--initialize`; **destructive**): write zeros into every
+  hidden block whose record does not authenticate and skip the valid ones. It
+  completes a quick or interrupted `--initialize` and resumes itself after
+  cancellation, but it also turns damaged blocks into zeros, so it never runs
+  implicitly. The JSON output adds `"fill": {"valid", "written", "failed"}`
+  block counts; failed blocks (carrier unreadable or failing authentication)
+  are left as they were.
 - `--ab` (with `--initialize`): two record slots per block, so an interrupted
   hidden write leaves the previous version readable, at half capacity.
 - `--parity 4|8|16` (with `--initialize`; off by default): Reed–Solomon parity
@@ -170,8 +182,9 @@ hidden write re-encodes its whole G-sector record with a fresh generation.
   ordering, rollback protection or hidden filesystem recovery is promised.
   Whole-record rollback is accepted.
 - SIGINT/SIGTERM [cancel setup](docs/cancellation.md) between authenticated
-  ranges and initialization records. Completed records stay; an interrupted
-  `--initialize` leaves later blocks unavailable. Cleanup removes only the
+  ranges and rounds of initialization or fill records. Completed records stay;
+  an interrupted `--initialize` leaves later blocks unavailable until `--fill`
+  completes it. Cleanup removes only the
   attempt's own identity-checked mappings and never rolls back disk writes.
 
 ## Nonces and limitations

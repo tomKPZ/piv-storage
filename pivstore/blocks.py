@@ -22,11 +22,13 @@ import tempfile
 from .format import base_context
 from .kernel_api import command
 
-SETUP = struct.Struct('=IIQII32s128sII')
-# SETUP ABI 5 (format v5 only): flags INITIALIZE, AB, VERIFY; then the RS
-# parity (0, 4, 8 or 16; non-zero only with INITIALIZE) and a reserved word.
-SETUP_VERSION = 5
-SETUP_INITIALIZE, SETUP_AB, SETUP_VERIFY = 1, 8, 16
+SETUP = struct.Struct('=IIQII32s128sIIQQQ')
+# SETUP ABI 6 (format v5 only, read/write ioctl): flags INITIALIZE, AB, VERIFY,
+# QUICK (with INITIALIZE) and FILL (without); then the RS parity (0, 4, 8 or
+# 16; non-zero only with INITIALIZE), a reserved word and the FILL output
+# counts (valid, written, failed; zero on input).
+SETUP_VERSION = 6
+SETUP_INITIALIZE, SETUP_AB, SETUP_VERIFY, SETUP_QUICK, SETUP_FILL = 1, 8, 16, 32, 64
 STATUS = struct.Struct('=QQQIIII')  # STATUS version 4
 KEYSLOT = struct.Struct('=IIQII32s2I')
 # Passphrase KEK cost tiers (--kdf-cost, docs/format-v5.md); must equal
@@ -82,10 +84,13 @@ def run(args, env=None):
 
 
 def open_args(source, key_file, secret_path, *, passphrase=False, name='piv-native', initialize=False,
-              ab=False, verify=False, allow_test_stack=False, allow_second_disk=False, parity=0, kdf_cost=None):
+              quick=False, fill=False, ab=False, verify=False, allow_test_stack=False, allow_second_disk=False,
+              parity=0, kdf_cost=None):
     args = ['open-blocks', '--device', source, '--key-file', key_file, '--name', name,
             '--hidden-passphrase-file' if passphrase else '--hidden-key-file', secret_path]
     if initialize: args.append('--initialize')
+    if quick: args.append('--quick')
+    if fill: args.append('--fill')
     if ab: args.append('--ab')
     if parity: args += ['--parity', str(parity)]
     if kdf_cost is not None: args += ['--kdf-cost', str(kdf_cost)]
@@ -96,7 +101,8 @@ def open_args(source, key_file, secret_path, *, passphrase=False, name='piv-nati
 
 
 def open_blocks(source, key_file, hidden_key=None, *, hidden_passphrase=None, env=None, **options):
-    """Open paired views through pivsetup; returns decoy/hidden paths and hidden_bytes."""
+    """Open paired views through pivsetup; returns decoy/hidden paths and
+    hidden_bytes (with fill=True also 'fill': valid/written/failed counts)."""
     passphrase = hidden_passphrase is not None
     with secret_file(hidden_passphrase if passphrase else hidden_key) as path:
         return json.loads(run(open_args(source, key_file, path, passphrase=passphrase, **options), env))

@@ -46,7 +46,7 @@ libc.ioctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_void_p]
 
 # number: (size, direction) from kernel/piv-control.h (1 = write, 2 = read).
 COMMANDS = {0: (48, 2), 1: (48, 3), 2: (48, 3), 3: (4176, 3), 4: (4176, 1), 5: (48, 1), 6: (48, 1),
-            7: (16, 2), 8: (48, 1), 9: (4176, 3), 10: (4176, 3), 11: (4176, 1), 12: (192, 1),
+            7: (16, 2), 8: (48, 1), 9: (4176, 3), 10: (4176, 3), 11: (4176, 1), 12: (216, 3),
             13: (48, 1), 14: (40, 2), 15: (64, 1)}
 REMOVED = {1, 2, 3, 4, 8, 9, 10, 11}  # former userspace IV/tuple controls: ENOTTY
 SETUP_SCANS = 16  # template-valid SETUPs scan the whole primary; keep them rare
@@ -79,16 +79,19 @@ def template(number, size, device, sectors, context):
     sector = rng.choice([0, 1, sectors - 1, sectors, sectors + 1, 2**63, 2**64 - 1,
                          rng.randrange(sectors)])
     generation = device.generation if rng.random() < 0.9 else rng.getrandbits(64)
-    version = {12: 5, 15: 1}.get(number, 2) if rng.random() < 0.9 else rng.getrandbits(32)
+    version = {12: 6, 15: 1}.get(number, 2) if rng.random() < 0.9 else rng.getrandbits(32)
     length = size if rng.random() < 0.9 else rng.choice([0, size - 1, size + 1, rng.getrandbits(32)])
     if number == 12:
-        flags = rng.choice([0, 0, 0, 8, 2, 4, 16, rng.getrandbits(32)]) & ~1  # never INITIALIZE
+        flags = rng.choice([0, 0, 0, 8, 2, 4, 16, 32, 64, rng.getrandbits(32)]) & ~1  # never INITIALIZE
         clen = len(context) if rng.random() < 0.8 else rng.choice([0, 127, 128, 129, rng.getrandbits(32)])
-        # SETUP ABI 5: parity (0/4/8/16, INITIALIZE only) then a reserved word.
+        # SETUP ABI 6: parity (0/4/8/16, INITIALIZE only), a reserved word and
+        # the FILL output counts (must be zero on input). FILL (64) is sent:
+        # with the random KEK no keyslot authenticates, so it never writes.
         parity = rng.choice([0, 0, 0, 4, 8, 16, 5, rng.getrandbits(32)])
         reserved = 0 if rng.random() < 0.9 else rng.getrandbits(32)
-        body = struct.pack('=IIQII32s128sII', version, length, generation, flags, clen,
-                           rng.randbytes(32), context.ljust(128, b'\0')[:128], parity, reserved)
+        counts = (0, 0, 0) if rng.random() < 0.9 else tuple(rng.getrandbits(64) for _ in range(3))
+        body = struct.pack('=IIQII32s128sIIQQQ', version, length, generation, flags, clen,
+                           rng.randbytes(32), context.ljust(128, b'\0')[:128], parity, reserved, *counts)
     elif number == 15:
         slot = rng.choice([1, 2, 3, 4, 5, 2**32 - 1])  # never slot 0
         op = rng.choice([1, 2, 0, 3, rng.getrandbits(32)])
@@ -116,7 +119,7 @@ def step(fd, device, sectors, context, stats, scans):
         number = rng.choice(list(COMMANDS))
         size, direction = COMMANDS[number]
         if rng.random() < 0.1:
-            size, direction = rng.choice([0, 8, 47, 49, 192, 4176, 16383]), rng.randrange(4)
+            size, direction = rng.choice([0, 8, 47, 49, 192, 216, 4176, 16383]), rng.randrange(4)
     else:
         number, size, direction = rng.randrange(64), rng.randrange(1 << 14), rng.randrange(4)
     if number == 12 and (size, direction) == COMMANDS[12]:

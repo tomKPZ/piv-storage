@@ -24,20 +24,22 @@ disposable 128 or 512 MiB /dev/vdb ([rust/README.md](../rust/README.md)). It:
 2. opens the volume with cryptsetup (Linux replays the journal), suspends the
    crypt mapping, reloads its private table as `piv-crypt ... piv_control`,
    resumes, and checks the owner table against the validated LUKS cipher;
-3. begins coordinated ownership and issues NATIVE_SETUP (ABI 5) with the
+3. begins coordinated ownership and issues NATIVE_SETUP (ABI 6) with the
    keyslot KEK, the v5 base context and (at initialization) the RS parity. The kernel waits for a seeded CRNG
    (without holding the owner lifecycle lock), then scans the 112-sector keyslot
    area (every primary sector with `--verify`, refusing on any failure);
 4. with `--initialize`, writes a new master key, keyslot 0, the directory and
-   authenticated zero blocks; otherwise a keyslot must authenticate under the
-   KEK using IVs from that scan (EKEYREJECTED otherwise) and the directory must
-   authenticate;
+   (unless `--quick`) authenticated zero blocks; otherwise a keyslot must
+   authenticate under the KEK using IVs from that scan (EKEYREJECTED otherwise)
+   and the directory must authenticate, and with `--fill` every block whose
+   record does not authenticate receives a zero record
+   ([format-v5.md](format-v5.md#setup-and-initialization));
 5. creates both views.
 
 There is no uninitialized-carrier mode. Hidden availability of individual
 records never gates the decoy. Runtime locks use /run, which may be tmpfs.
-Setup polls SIGINT/SIGTERM between authenticated ranges and initialization
-records ([cancellation.md](cancellation.md)).
+Setup polls SIGINT/SIGTERM between authenticated ranges and rounds of
+initialization or fill records ([cancellation.md](cancellation.md)).
 
 Setup tracks mappings created by its attempt, including commands that fail
 after kernel creation. Failed setup removes matching view UUIDs, then the newly
@@ -200,10 +202,14 @@ NATIVE_STATUS and NATIVE_KEYSLOT. There is no userspace IV, tuple or primary
 read/write access; all rewriting happens inside the kernel and other ioctl
 numbers return ENOTTY.
 
-- NATIVE_SETUP ABI 5 (192 bytes): version/size, generation, flags,
+- NATIVE_SETUP ABI 6 (216 bytes, read/write): version/size, generation, flags,
   context_length, key[32] (keyslot KEK), context[128] (v5 base context),
-  parity (0, 4, 8 or 16; non-zero only with initialize), reserved. Flags: 1
-  initialize, 8 A/B (with initialize), 16 verify; other bits are rejected.
+  parity (0, 4, 8 or 16; non-zero only with initialize), reserved, then the
+  fill output counts valid, written, failed (u64; zero on input). Flags: 1
+  initialize, 8 A/B (with initialize), 16 verify, 32 quick (with initialize),
+  64 fill (without initialize); other bits are rejected. After a successful
+  setup the kernel copies the structure back with the key zeroed. ABI 6
+  (2026-10-22) added quick, fill and the counts.
 - NATIVE_KEYSLOT (version 1, 64 bytes): version/size, generation, slot, op
   (1 add, 2 remove), kek[32], reserved[2]. The last keyslot cannot be removed;
   failures after a lower write fail-stop the owner.

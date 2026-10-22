@@ -27,16 +27,21 @@ pub fn command(number: u64, size: u64, direction: u64) -> u64 {
 
 pub const QUERY_SIZE: usize = 48; // '=IIQQIIIIII'
 pub const READ_SIZE: usize = 48; // '=IIQQ16sII'
-pub const SETUP_SIZE: usize = 192; // '=IIQII32s128sII'
+pub const SETUP_SIZE: usize = 216; // '=IIQII32s128sIIQQQ'
 pub const STATUS_SIZE: usize = 40; // '=QQQIIII' (STATUS version 4)
 pub const KEYSLOT_SIZE: usize = 64; // '=IIQII32s2I'
 
-/// SETUP ABI 5 (format v5 only): destructive initialization.
+/// SETUP ABI 6 (format v5 only): destructive initialization.
 pub const SETUP_INITIALIZE: u32 = 1;
 /// With SETUP_INITIALIZE: A/B record slots.
 pub const SETUP_AB: u32 = 8;
 /// Full audit: authenticate every primary sector at setup (else keyslot area only).
 pub const SETUP_VERIFY: u32 = 16;
+/// With SETUP_INITIALIZE: keyslot 0 and the directory only, no records.
+pub const SETUP_QUICK: u32 = 32;
+/// Without SETUP_INITIALIZE: zero records into every block whose record does
+/// not authenticate (destructive for damaged blocks).
+pub const SETUP_FILL: u32 = 64;
 pub const KEYSLOT_ADD: u32 = 1;
 pub const KEYSLOT_REMOVE: u32 = 2;
 
@@ -52,6 +57,15 @@ fn ioctl(fd: libc::c_int, request: u64, data: &mut [u8]) -> Result<()> {
         return Err(Error::os(errno, std::io::Error::from_raw_os_error(errno).to_string()));
     }
     Ok(())
+}
+
+/// SETUP_FILL output: blocks already authenticated (skipped), given a zero
+/// record, and left as they were (carrier unreadable or failing authentication).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FillCounts {
+    pub valid: u64,
+    pub written: u64,
+    pub failed: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,14 +189,15 @@ impl KernelDevice {
         Ok(status)
     }
 
-    /// ABI 5 SETUP (@parity: RS parity fragments per lane, initialization
-    /// only). The request (with the key) is wiped whatever happens.
-    pub fn setup(&self, hidden_key: &[u8], identity: &[u8], flags: u32, parity: u32) -> Result<()> {
+    /// ABI 6 SETUP (@parity: RS parity fragments per lane, initialization
+    /// only). The request (with the key) is wiped whatever happens. Returns
+    /// the fill counts the kernel copies back (zero without SETUP_FILL).
+    pub fn setup(&self, hidden_key: &[u8], identity: &[u8], flags: u32, parity: u32) -> Result<FillCounts> {
         if hidden_key.len() != 32 || identity.is_empty() || identity.len() > 120 {
             bail!("Invalid native key/context size");
         }
         let mut data = [0u8; SETUP_SIZE];
-        data[0..4].copy_from_slice(&5u32.to_le_bytes());
+        data[0..4].copy_from_slice(&6u32.to_le_bytes());
         data[4..8].copy_from_slice(&(SETUP_SIZE as u32).to_le_bytes());
         data[8..16].copy_from_slice(&self.generation.to_le_bytes());
         data[16..20].copy_from_slice(&flags.to_le_bytes());
@@ -192,7 +207,8 @@ impl KernelDevice {
         data[184..188].copy_from_slice(&parity.to_le_bytes());
         // SAFETY: lock the stack copy of the key for the ioctl's duration.
         let locked = unsafe { libc::mlock(data.as_ptr().cast(), data.len()) } == 0;
-        let result = ioctl(self.fd, command(12, SETUP_SIZE as u64, DIR_WRITE), &mut data);
+        let result = ioctl(self.fd, command(12, SETUP_SIZE as u64, DIR_READ | DIR_WRITE), &mut data)
+            .map(|()| FillCounts { valid: u64_at(&data, 192), written: u64_at(&data, 200), failed: u64_at(&data, 208) });
         data.zeroize();
         if locked {
             unsafe { libc::munlock(data.as_ptr().cast(), data.len()) };
@@ -249,7 +265,7 @@ mod tests {
     #[test]
     fn command_numbers_match_python() {
         // pivstore.kernel_api.command(number, size, direction)
-        assert_eq!(command(12, 192, 1), 0x40c0_500c);
+        assert_eq!(command(12, 216, 3), 0xc0d8_500c);
         assert_eq!(command(14, 48, 2), 0x8030_500e);
         assert_eq!(command(0, 48, 2), 0x8030_5000);
         assert_eq!(command(15, 64, 1), 0x4040_500f);

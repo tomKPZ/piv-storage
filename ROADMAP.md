@@ -13,7 +13,8 @@ and limits are in README.md and docs/.
   cost tiers, optional Reed–Solomon parity) is the only format. View bios run
   concurrently (range locks per sector range/record, stock flush semantics,
   batched 1024-sector authenticated reads).
-- Setup is the static Rust `pivsetup` (open/close, keyslots, migrate, keygen);
+- Setup is the static Rust `pivsetup` (open/close, keyslots, migrate, keygen;
+  full or `--quick` initialization and the explicit, destructive `--fill`);
   Python keeps only independent read-only diagnostics and guest test
   instrumentation.
 - Tested on the pinned Debian 6.12.113 guest kernel, its KASAN/UBSAN/lockdep
@@ -23,19 +24,7 @@ and limits are in README.md and docs/.
 
 ## Remaining work
 
-1. **Quick and resumable initialization** (pivsetup + module, no format change).
-   `--initialize --quick` (non-default, user decision 2026-10-22) writes only
-   keyslot 0 and the directory; never-written hidden blocks return EIO until
-   first written (each hidden write replaces a whole record), which breaks
-   tools that read unwritten blocks; document that. A separate fill operation
-   on an open volume writes zero records only into blocks whose record does not
-   authenticate under the current master key, skipping authenticated ones; it
-   completes a quick or cancelled initialization and resumes after
-   interruption. It also rewrites damaged blocks as zeros, so it must be an
-   explicit, documented destructive command, never automatic. Exit: v5/cancel
-   suites cover quick init, EIO on unwritten blocks, fill after cancellation
-   and skipping of written blocks; host decoder verifies the result.
-2. **Lift the activation guards and deploy beyond test guests** (user
+1. **Lift the activation guards and deploy beyond test guests** (user
    approval 2026-10-22). Remove pivsetup's restriction to the pinned QEMU guest
    and 128/512 MiB `/dev/vdb` (and the test-only `--allow-test-stack` /
    `--allow-second-disk` escape hatches once unneeded), keeping the safety

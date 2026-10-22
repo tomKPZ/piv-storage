@@ -627,7 +627,7 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	if (cmd == PIV_NATIVE_SETUP) {
 		setup = memdup_user((void __user *)arg, sizeof(*setup));
 		if (IS_ERR(setup)) return PTR_ERR(setup);
-		if (setup->version != 5 || setup->size != sizeof(*setup)) {
+		if (setup->version != 6 || setup->size != sizeof(*setup)) {
 			ret = -EINVAL; goto out;
 		}
 		/* Early boot: wait for seeded CRNG without holding owner lifecycle lock. */
@@ -718,6 +718,13 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			ret = copy_to_user((void __user *)arg, &p->devices, sizeof(p->devices)) ? -EFAULT : 0;
 		else if (cmd == PIV_QUERY)
 			ret = copy_to_user((void __user *)arg, &profile, sizeof(profile)) ? -EFAULT : 0;
+		else if (cmd == PIV_NATIVE_SETUP) {
+			/* Output counts; never copy the key back. A copy failure after a
+			 * successful setup leaves the owner active (as for STATUS).
+			 */
+			memzero_explicit(setup->key, sizeof(setup->key));
+			ret = copy_to_user((void __user *)arg, setup, sizeof(*setup)) ? -EFAULT : 0;
+		}
 	}
 out:
 	kfree_sensitive(setup);

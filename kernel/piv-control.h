@@ -38,7 +38,10 @@ struct piv_devices {
 	__u32 owner_major, owner_minor, lower_major, lower_minor;
 };
 #define PIV_DEVICES _IOR('P', 7, struct piv_devices)
-/* Native SETUP ABI version 5 (2026-10-22): format v5 only. */
+/* Native SETUP ABI version 6 (2026-10-22): format v5 only. Version 6 added
+ * QUICK and FILL and the FILL output counts (read/write ioctl; the kernel
+ * copies the request back with the key zeroed after a successful setup).
+ */
 struct piv_native_setup {
  __u32 version, size;
  __u64 generation;
@@ -46,6 +49,11 @@ struct piv_native_setup {
  __u8 key[32], context[128];   /* key: keyslot KEK */
  __u32 parity;                 /* RS parity fragments per lane: 0, 4, 8, 16; INITIALIZE only */
  __u32 reserved;
+ /* Output (zero on input), FILL only: blocks whose record already
+  * authenticated (skipped), blocks given a zero record, and blocks left as
+  * they were because their carrier could not be read or authenticated.
+  */
+ __u64 valid, written, failed;
 };
 /* STATUS version 4 (2026-10-22): the always-zero v3 invalidations field was removed. */
 struct piv_native_status {
@@ -54,7 +62,7 @@ struct piv_native_status {
 };
 /* Destructively initialize: new master key, keyslot 0 under the KEK (with
  * the A/B flag and the parity), the directory, then authenticated zeros in
- * every 4096-byte hidden block. Without it, a
+ * every 4096-byte hidden block (unless QUICK). Without it, a
  * keyslot must authenticate under the KEK or setup returns EKEYREJECTED.
  */
 #define PIV_SETUP_INITIALIZE 1U
@@ -65,7 +73,18 @@ struct piv_native_status {
  * still authenticate every sector they touch.
  */
 #define PIV_SETUP_VERIFY 16U
-#define PIV_NATIVE_SETUP _IOW('P', 12, struct piv_native_setup)
+/* With INITIALIZE: write only keyslot 0 and the directory. Never-written
+ * hidden blocks do not authenticate (reads return EIO) until written or filled.
+ */
+#define PIV_SETUP_QUICK 32U
+/* Without INITIALIZE, after the keyslot and directory authenticate: give every
+ * hidden block whose record does not authenticate under the master key a
+ * zero record (A/B: slot 0, generation 1); authenticated blocks are skipped.
+ * Completes a quick or interrupted initialization and resumes itself.
+ * Destructive: damaged blocks become zeros. Never implied by another flag.
+ */
+#define PIV_SETUP_FILL 64U
+#define PIV_NATIVE_SETUP _IOWR('P', 12, struct piv_native_setup)
 #define PIV_NATIVE_DETACH _IOW('P', 13, struct piv_read_iv)
 #define PIV_NATIVE_STATUS _IOR('P', 14, struct piv_native_status)
 /* v5 keyslot management on an active owner (version 1, 64 bytes). */

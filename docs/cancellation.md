@@ -1,12 +1,13 @@
-# Cancelling native activation and initialization
+# Cancelling native activation, initialization and fill
 
 Native SETUP yields to the scheduler and checks pending signals between
 authenticated primary read ranges (up to 1024 sectors each), between rounds of
-complete hidden-record initialization writes (8 records written concurrently
-per round), and around the final checkpoint before marking the native state
+complete hidden-record initialization or fill writes (8 blocks handled
+concurrently per round), and around the final checkpoint before marking the native state
 ready. Waiting for the setup lifecycle mutex is interruptible. The
 ioctl returns EINTR when cancellation wins at one of these boundaries. There is
-no abort ioctl, flag, on-disk marker or resume file.
+no abort ioctl, flag, on-disk marker or resume file; `--fill` resumes by
+checking which records already authenticate.
 
 The `pivsetup` frontend installs SIGINT and SIGTERM handlers without
 SA_RESTART that only set a flag, so the interruptible SETUP ioctl returns EINTR.
@@ -36,7 +37,13 @@ directory, which later opens refuse until `--initialize` is retried.
 This is destructive partial initialization, not rollback or persistent
 progress. Reopening without `--initialize` exposes the mixed content. Retrying
 `--initialize` starts from block zero with a fresh master key and random
-encodings; it is not resume and consumes additional primary encryptions.
+encodings and consumes additional primary encryptions. To resume instead,
+open with `--fill`: blocks completed before the cancellation authenticate and
+are skipped; every other block receives a zero record. A cancelled fill
+behaves the same way (whole rounds of up to 8 blocks completed, flushed before
+returning) and another `--fill` resumes it. A quick initialization
+(`--initialize --quick`) writes no records at all; its only uninterruptible
+writes are keyslot 0 and the directory.
 Storage errors and power loss keep the existing torn-record/EIO limitations;
 cancellation is not a crash transaction.
 
@@ -101,12 +108,20 @@ resample until the task is observed blocked.
   entries witnessed): the retained counter must equal 28 keyslot + 687
   directory + 687 per completed record, with at least two and fewer than 64
   records completed (whole rounds of 8, except a shorter last round).
+- **Fill** (after a quick initialization; same delay and witness): the counter
+  must equal 687 per completed record (a fill writes no keyslot or directory),
+  with the same bounds.
+
+After each initialize/fill cancellation the reopened views are checked as
+below, then `--fill` must report exactly the completed records as valid
+(skipped), every other block as written and none failed, and the whole hidden
+view must then read as zeros.
 
 Each cancellation must report EINTR with inactive status, no views, zero hidden
 capacity and no failure, exit 130 without cleanup notes, leave no mappings or
 control nodes, keep the wrapper identity, and have no missed probes or trace
 overruns. Reopened views must match the full primary hash and, for the
-initialization case, zeros up to the completed prefix and EIO beyond it. A
+initialization and fill cases, zeros up to the completed prefix and EIO beyond it. A
 normal full initialization then runs to completion, followed by close, custom
 unload, stock full-primary readback and host verification of `cancel-final.img`
 against `expected-cancel-hidden`.

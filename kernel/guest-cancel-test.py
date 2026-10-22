@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Witness setup/lock/init cancellation in the kernel, not merely before ioctl."""
+"""Witness setup/lock/init/fill cancellation in the kernel, not merely before
+ioctl, and fill completing a cancelled initialization or fill."""
 import errno
 import fcntl
 import hashlib
@@ -22,7 +23,7 @@ T = Path('/sys/kernel/tracing')
 SOURCE = '/dev/mapper/piv-test-delay'
 KEY = W / 'passphrase.key'
 HKEY = (W / 'hidden.key').read_bytes()
-SETUP_CMD = command(12, blocks.SETUP.size, 1)
+SETUP_CMD = command(12, blocks.SETUP.size, 3)
 BLOCK, GROUP = 4096, 687         # format v5 hidden block and record (no parity)
 
 
@@ -45,7 +46,7 @@ def child(phase):
         identity = bytes.fromhex(info['context'])
         fd = os.open(info['control'], os.O_RDWR)
         data = bytearray(blocks.SETUP.pack(blocks.SETUP_VERSION, blocks.SETUP.size, info['generation'], 0,
-                                         len(identity), HKEY, identity, 0, 0))
+                                         len(identity), HKEY, identity, 0, 0, 0, 0, 0))
         interrupted = False
         try:
             fcntl.ioctl(fd, SETUP_CMD, data, True)
@@ -152,8 +153,9 @@ def spawn(phase):
     # handling (cooperative cancellation), cleanup and exit status 130.
     # The scan phase cancels a --verify full audit: the default setup scans only
     # the keyslot area, too briefly to witness cancellation reliably.
+    # The fill phase cancels a fill of a quick-initialized volume.
     args = blocks.open_args(SOURCE, KEY, W / 'hidden.key', initialize=phase == 'initialize',
-                            verify=phase == 'scan', allow_test_stack=True)
+                            verify=phase == 'scan', fill=phase == 'fill', allow_test_stack=True)
     return subprocess.Popen([blocks.binary(), *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, env={**os.environ, 'PIVSETUP_TEST_GATE': str(W / phase)})
 
@@ -168,8 +170,8 @@ def finished(process, interrupted=False):
         assert process.returncode == 0, (process.returncode, out, err)
 
 
-def open_views(initialize=False):
-    v = blocks.open_blocks(SOURCE, KEY, HKEY, initialize=initialize, allow_test_stack=True)
+def open_views(**options):
+    v = blocks.open_blocks(SOURCE, KEY, HKEY, allow_test_stack=True, **options)
     subprocess.run(['udevadm', 'settle'], check=True)
     return v
 
@@ -215,12 +217,16 @@ try:
     for event, function in (('range', 'piv_read_range'), ('write', 'pn_write')):
         probe_command(f'p:piv_cancel/{event} {symbol(function)}')
         registered.append(event)
-    for phase, event in (('scan', 'range'), ('initialize', 'write')):
+    for phase, event in (('scan', 'range'), ('initialize', 'write'), ('fill', 'write')):
+        if phase == 'fill':
+            # Quick initialization: keyslot and directory only, every block unavailable.
+            v = open_views(initialize=True, quick=True)
+            blocks.close_blocks(SOURCE, KEY, allow_test_stack=True)
         # A short lower write delay slows initialization records (each a few
         # multi-sector writes through the journal) without exceeding the
         # signal-to-exit timeout.
         reload(read_ms=25 if phase == 'scan' else 0,
-               write_ms=2 if phase == 'initialize' else 0)
+               write_ms=2 if phase in ('initialize', 'fill') else 0)
         process = spawn(phase)
         wait_until(lambda: (W / (phase + '-ready.json')).exists())
         # Scan ranges run in the SETUP caller; initialization records run on
@@ -264,21 +270,32 @@ try:
         v = open_views()
         handle = GuestOwner(SOURCE, KEY, allow_test_stack=True)
         handle.close()
-        unavailable_from = None
+        unavailable_from, total = None, len(expected) // BLOCK
         if phase == 'scan':
             assert status['encryptions'] == 0
         else:
-            # Keyslot 0 (2 x 14 sectors) and the directory (687) precede the
-            # 687-sector zero records.
-            completed, remainder = divmod(status['encryptions'] - 2 * 14 - GROUP, GROUP)
-            assert not remainder and 2 <= completed < min(64, len(expected) // BLOCK), status
+            # Initialization: keyslot 0 (2 x 14 sectors) and the directory (687)
+            # precede the 687-sector zero records. Fill writes records only.
+            setup = 2 * 14 + GROUP if phase == 'initialize' else 0
+            completed, remainder = divmod(status['encryptions'] - setup, GROUP)
+            assert not remainder and 2 <= completed < min(64, total), status
             expected[:completed * BLOCK] = bytes(completed * BLOCK)
             unavailable_from = completed
         verify(v, unavailable_from)
         blocks.close_blocks(SOURCE, KEY, allow_test_stack=True)
+        fill = None
+        if phase != 'scan':
+            # Resume: fill skips the records completed before the cancellation
+            # (they authenticate) and writes zeros into every other block.
+            v = open_views(fill=True)
+            fill = v['fill']
+            assert fill == dict(valid=completed, written=total - completed, failed=0), (fill, completed)
+            expected[:] = bytes(len(expected))
+            verify(v)
+            blocks.close_blocks(SOURCE, KEY, allow_test_stack=True)
         results.append(dict(phase=phase, interrupted_seconds=elapsed,
                             encryptions=status['encryptions'], no_native_state=True,
-                            cleanup=True, complete_oracles=True))
+                            cleanup=True, complete_oracles=True, resumed_by_fill=fill))
         print(f'{phase}: interrupted in {elapsed:.3f}s; cleanup, full oracles and reopen passed', flush=True)
     profile = (T / 'kprobe_profile').read_text()
     (W / 'kprobe-profile.txt').write_text(profile)
@@ -299,8 +316,7 @@ finally:
 # Exercise normal initialization completion too, on the smaller fixture. Large
 # initialization was already verified in large-*; do not repeat an eight-minute run.
 # Always complete it: an interrupted initialization leaves later blocks
-# unavailable (the master key changed first), which no whole-volume oracle can
-# describe.
+# unavailable (the master key changed first) until a fill completes it.
 v = open_views(initialize=True)
 expected[:] = bytes(len(expected))
 verify(v)
@@ -315,4 +331,5 @@ subprocess.run(['cryptsetup', 'close', 'piv-stock'], check=True)
 (W / 'expected-cancel-hidden').write_bytes(expected)
 subprocess.run(['dd', 'if=/dev/vdb', 'of=' + str(W / 'cancel-final.img'), 'bs=1M', 'status=none'], check=True)
 write_json('cancel-results.json', results)
-(W / 'result.txt').write_text('Witnessed scan, contended setup lock and record-boundary initialization cancellation, cleanup, reopen and stock verification passed\n')
+(W / 'result.txt').write_text('Witnessed scan, contended setup lock and record-boundary initialization and fill '
+                              'cancellation, cleanup, fill resumption, reopen and stock verification passed\n')

@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::bail;
 use crate::cmd::{dm, dm_ok};
 use crate::error::{Error, Result};
-use crate::ioctl::{KernelDevice, SETUP_AB, SETUP_INITIALIZE, SETUP_VERIFY};
+use crate::ioctl::{FillCounts, KernelDevice, SETUP_AB, SETUP_FILL, SETUP_INITIALIZE, SETUP_QUICK, SETUP_VERIFY};
 use crate::owner::{mapping_identity, remove_mapping, Allow, GuestOwner};
 use crate::profile::base_context;
 use crate::secret::Secret;
@@ -24,6 +24,10 @@ pub const PARITIES: [u32; 3] = [4, 8, 16];
 pub struct OpenOptions<'a> {
     pub name: &'a str,
     pub initialize: bool,
+    /// With initialize: keyslot 0 and the directory only (unwritten blocks read EIO).
+    pub quick: bool,
+    /// Without initialize: zero records into blocks that do not authenticate.
+    pub fill: bool,
     pub ab: bool,
     pub verify: bool,
     /// Reed–Solomon parity fragments per lane (0 = off); only with initialize.
@@ -38,6 +42,8 @@ pub struct Views {
     pub hidden: String,
     pub decoy_bytes: u64,
     pub hidden_bytes: u64,
+    /// Fill counts (only with OpenOptions::fill).
+    pub fill: Option<FillCounts>,
 }
 
 pub enum HiddenSecret {
@@ -93,7 +99,13 @@ pub fn passphrase_kek(passphrase: &[u8], base_context: &[u8], tier: u8) -> Resul
     Ok(kek)
 }
 
-fn setup_flags(initialize: bool, ab: bool, verify: bool, parity: u32) -> Result<u32> {
+fn setup_flags(initialize: bool, quick: bool, fill: bool, ab: bool, verify: bool, parity: u32) -> Result<u32> {
+    if quick && !initialize {
+        bail!("--quick applies only with --initialize (use --fill to complete a quick initialization)");
+    }
+    if fill && initialize {
+        bail!("--fill applies only without --initialize (it completes an existing volume)");
+    }
     if ab && !initialize {
         bail!("--ab applies only with --initialize (the layout is read from the keyslot afterwards)");
     }
@@ -101,10 +113,11 @@ fn setup_flags(initialize: bool, ab: bool, verify: bool, parity: u32) -> Result<
         bail!("--parity 4, 8 or 16 applies only with --initialize (it is read from the keyslot afterwards)");
     }
     Ok((if initialize { SETUP_INITIALIZE } else { 0 }) | (if ab { SETUP_AB } else { 0 })
-        | (if verify { SETUP_VERIFY } else { 0 }))
+        | (if verify { SETUP_VERIFY } else { 0 }) | (if quick { SETUP_QUICK } else { 0 })
+        | (if fill { SETUP_FILL } else { 0 }))
 }
 
-fn native_setup(device: &KernelDevice, key: &[u8], identity: &[u8], flags: u32, parity: u32) -> Result<()> {
+fn native_setup(device: &KernelDevice, key: &[u8], identity: &[u8], flags: u32, parity: u32) -> Result<FillCounts> {
     hooks::fail("before-setup")?;
     hooks::before_setup(device, identity)?;
     let started = std::time::Instant::now();
@@ -114,7 +127,7 @@ fn native_setup(device: &KernelDevice, key: &[u8], identity: &[u8], flags: u32, 
     match result {
         Err(error) if interrupted => Err(Error { interrupted: true, ..error }),
         Err(error) => Err(error),
-        Ok(()) => hooks::fail("after-setup"),
+        Ok(counts) => hooks::fail("after-setup").map(|()| counts),
     }
 }
 
@@ -172,7 +185,7 @@ fn open_inner(owner: &mut GuestOwner, secret: HiddenSecret, options: &OpenOption
             return Err(Error::os(libc::EEXIST, "Public view name is already in use"));
         }
     }
-    let flags = setup_flags(options.initialize, options.ab, options.verify, options.parity)?;
+    let flags = setup_flags(options.initialize, options.quick, options.fill, options.ab, options.verify, options.parity)?;
     let identity = base_identity(owner);
     let passphrase = matches!(secret, HiddenSecret::Passphrase(_));
     let key = match secret {
@@ -184,18 +197,21 @@ fn open_inner(owner: &mut GuestOwner, secret: HiddenSecret, options: &OpenOption
     let device = owner.device();
     device.suspend()?;
     device.begin()?;
-    if let Err(mut error) = native_setup(device, &key, &identity, flags, options.parity) {
-        if error.errno == Some(libc::EKEYREJECTED) {
-            error.note("No keyslot authenticated: wrong hidden key or passphrase, or a carrier never \
-                        initialized (use --initialize)");
-            if passphrase {
-                error.note(format!("Passphrases also need the --kdf-cost tier used when the keyslot was \
-                                    written (this attempt: {}); a wrong tier looks like a wrong passphrase",
-                                   options.kdf_cost));
+    let counts = match native_setup(device, &key, &identity, flags, options.parity) {
+        Ok(counts) => counts,
+        Err(mut error) => {
+            if error.errno == Some(libc::EKEYREJECTED) {
+                error.note("No keyslot authenticated: wrong hidden key or passphrase, or a carrier never \
+                            initialized (use --initialize)");
+                if passphrase {
+                    error.note(format!("Passphrases also need the --kdf-cost tier used when the keyslot was \
+                                        written (this attempt: {}); a wrong tier looks like a wrong passphrase",
+                                       options.kdf_cost));
+                }
             }
+            return Err(error);
         }
-        return Err(error);
-    }
+    };
     drop(key);
     device.resume()?;
     let status = device.status()?;
@@ -214,6 +230,7 @@ fn open_inner(owner: &mut GuestOwner, secret: HiddenSecret, options: &OpenOption
         hidden: format!("/dev/mapper/{name}-hidden"),
         decoy_bytes: decoy_sectors * 512,
         hidden_bytes: status.hidden_bytes,
+        fill: options.fill.then_some(counts),
     })
 }
 
@@ -294,14 +311,20 @@ mod tests {
 
     #[test]
     fn setup_flags_match_kernel_abi() {
-        // kernel/piv-control.h: INITIALIZE = 1, AB = 8, VERIFY = 16 (SETUP ABI 5).
-        assert_eq!(setup_flags(false, false, false, 0).unwrap(), 0);
-        assert_eq!(setup_flags(true, false, false, 0).unwrap(), 1);
-        assert_eq!(setup_flags(true, true, false, 8).unwrap(), 9);
-        assert_eq!(setup_flags(false, false, true, 0).unwrap(), 16);
-        assert!(setup_flags(false, true, false, 0).is_err());
-        assert!(setup_flags(false, false, false, 4).is_err());
-        assert!(setup_flags(true, false, false, 5).is_err());
+        // kernel/piv-control.h: INITIALIZE = 1, AB = 8, VERIFY = 16, QUICK = 32,
+        // FILL = 64 (SETUP ABI 6).
+        assert_eq!(setup_flags(false, false, false, false, false, 0).unwrap(), 0);
+        assert_eq!(setup_flags(true, false, false, false, false, 0).unwrap(), 1);
+        assert_eq!(setup_flags(true, false, false, true, false, 8).unwrap(), 9);
+        assert_eq!(setup_flags(false, false, false, false, true, 0).unwrap(), 16);
+        assert_eq!(setup_flags(true, true, false, true, false, 4).unwrap(), 41);
+        assert_eq!(setup_flags(false, false, true, false, true, 0).unwrap(), 80);
+        assert!(setup_flags(false, false, false, true, false, 0).is_err());
+        assert!(setup_flags(false, false, false, false, false, 4).is_err());
+        assert!(setup_flags(true, false, false, false, false, 5).is_err());
+        assert!(setup_flags(false, true, false, false, false, 0).is_err());
+        assert!(setup_flags(true, false, true, false, false, 0).is_err());
+        assert!(setup_flags(true, true, true, false, false, 0).is_err());
     }
 
     #[test]

@@ -35,10 +35,11 @@ mutually exclusive) and are copied before attaching.
   persistent state.
 
 Kernel per-request memory is bounded independently of volume size. Default
-setup scans only the keyslot area, so reopening is constant time; `--verify`
-and `--initialize` do work proportional to volume size while holding the setup
-lifecycle lock. [Cooperative cancellation](cancellation.md) checks pending
-signals between read ranges and complete initialization records; it does not
+setup scans only the keyslot area, so reopening is constant time; `--verify`,
+`--initialize` and `--fill` do work proportional to volume size while holding
+the setup lifecycle lock (`--initialize --quick` is constant time).
+[Cooperative cancellation](cancellation.md) checks pending signals between
+read ranges and rounds of complete initialization or fill records; it does not
 interrupt stalled lower I/O or roll back records already written. Host
 diagnostic image decoding and IV scans use memory proportional to image
 geometry and are not a constant-memory large-storage interface.
@@ -94,12 +95,16 @@ key and run kernel/guest-large-test.py:
   (same owner continues) and complete oracles match after reopening; with only
   data corrupted, the last hidden block still reads correctly (raw IV, SIV
   tag).
-- Timed initialization and reopen, custom unload and stock full-primary
+- Timed quick initialization, a fill of every block (counts checked, all
+  zeros read back), full initialization, reopen and a fill with nothing to
+  write (every block valid), custom unload and stock full-primary
   authentication. `large-results.json` records geometry and timings.
 
-Last recorded timings (2026-10-22, KVM, concurrent requests, large-4096-009
-and large-512-009): reopen 1.6 s (4096) / 1.6 s (512); initialization 6.9 s /
-15.7 s. The host was about 3× slower in that session than for large-*-007
+Last recorded timings (2026-10-22, KVM, large-4096-011 and large-512-011):
+quick initialization 1.9 s (4096) / 1.6 s (512); fill of every block 8.5 s /
+22.3 s; full initialization 6.6 s / 15.2 s; reopen 1.7 s / 1.7 s; fill with
+nothing to write 4.1 s / 9.1 s. Earlier (large-4096-009 and large-512-009):
+reopen 1.6 s / 1.6 s; initialization 6.9 s / 15.7 s. The host was about 3× slower in that session than for large-*-007
 (batched writes, 2.6 s / 3.4 s, reopen 0.33 s / 0.26 s): the previous module
 rerun in the same session (large-*-010-oldmodule) took 10.1 s / 27.1 s to
 initialize and 2.2 s / 1.7 s to reopen. Format v4 with the per-sector write

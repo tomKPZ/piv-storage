@@ -46,6 +46,12 @@ transaction, hidden crash recovery or rollback resistance.
   state on journal/metadata write errors. Unmount, remove and recreate the
   stack after correcting the underlying problem; there is no error-clearing
   control. An EIO write may have partially changed the disk.
+- **Setup-time fill** (`--fill`) applies the same split per block: a block
+  whose carrier cannot be read or authenticated, before anything of it was
+  written, is left as it was and counted as failed while the fill continues;
+  a write error, a flush error or a non-local error (allocation, encryption
+  cap, nonce retries) fails the whole setup, which removes the attempt's
+  private owner like a failed `--initialize`. Records completed earlier stay.
 - **Concurrent requests at a fail-stop.** Requests run concurrently
   ([concurrency](native-blocks.md#concurrency)). One that has not yet started
   writing when the owner stops writes nothing and fails with EIO (it checks

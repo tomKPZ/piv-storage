@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Format v5 on a stock 16-byte-IV fixture: footprint, preservation, guard,
-damage, repair, KDF tiers and Reed–Solomon parity."""
+damage, repair, KDF tiers, quick initialization and fill, and Reed–Solomon
+parity."""
 import errno
 import hashlib
 import json
@@ -88,6 +89,20 @@ def stock_rewrite(source, sectors):
 
 def damage(sector):
     stock_rewrite('/dev/vdb', [sector])
+
+
+def readable(path, index):
+    """Block @index of a hidden view, or None if it reads EIO (exact O_DIRECT)."""
+    try:
+        return direct(path, index * BLOCK, BLOCK)
+    except OSError as exc:
+        assert exc.errno == errno.EIO, exc
+        return None
+
+
+def setup_writes():
+    """Primary encryptions of keyslot 0 (2 x 14 sectors) and one directory write."""
+    return 2 * 14 + GROUP
 
 
 def write_profile(count=48):
@@ -255,9 +270,78 @@ results['keyslots'] = dict(added=[1, 2, 3], removed=[3, 0, 2], last_slot_protect
                            decoy_rewrite_of_keyslot_area_preserved=True)
 results['ab'] = dict(fallback_after_damaged_newest_slot=True, rewrite_encryptions=GROUP)
 
-v = opened(initialize=True)
+# ---- Quick initialization and fill (no parity) ----
+# --quick writes only keyslot 0 and the directory: every hidden block reads EIO
+# until written. --fill skips authenticated blocks and writes zero records into
+# the rest; a block with a destroyed fragment (stock rewrite) is rewritten as
+# zeros (documented destructive behaviour). Encryption counts witness exactly
+# which records were written.
+v = opened(initialize=True, quick=True)
 st, unit, sectors = status()
 records = (sectors - KEYSLOT_AREA) // GROUP - 2
+assert v['hidden_bytes'] == st['hidden_bytes'] == records * BLOCK, (v, records)
+assert st['encryptions'] == setup_writes(), st
+for index in (0, 1, records // 2, records - 1):
+    assert readable(v['hidden'], index) is None, index
+quick = {i: hashlib.shake_256(b'quick-%d' % i).digest(BLOCK) for i in (1, 3, records // 2)}
+for index, value in quick.items():
+    before = status()[0]['encryptions']
+    direct(v['hidden'], index * BLOCK, BLOCK, value)
+    assert status()[0]['encryptions'] - before == GROUP
+for index, value in quick.items():
+    assert direct(v['hidden'], index * BLOCK, BLOCK) == value
+primary_quick = subprocess.check_output(['sha256sum', v['decoy']], text=True).split()[0]
+close_blocks('/dev/vdb', KEY)
+for kw in (dict(quick=True), dict(initialize=True, fill=True)):    # usage errors, nothing opened
+    try:
+        opened(**kw)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(kw)
+v = opened()
+assert readable(v['hidden'], 0) is None and readable(v['hidden'], records - 1) is None
+assert direct(v['hidden'], BLOCK, BLOCK) == quick[1]
+close_blocks('/dev/vdb', KEY)
+damage(RESERVED + 3 * GROUP + 100)                   # one fragment of block 3's record
+v = opened(fill=True)
+assert v['fill'] == dict(valid=2, written=records - 2, failed=0), v['fill']
+assert status()[0]['encryptions'] == (records - 2) * GROUP
+expected_quick = bytearray(records * BLOCK)
+for index in (1, records // 2):
+    expected_quick[index * BLOCK:(index + 1) * BLOCK] = quick[index]
+assert Path(v['hidden']).read_bytes() == expected_quick      # block 3 is now zeros
+assert subprocess.check_output(['sha256sum', v['decoy']], text=True).split()[0] == primary_quick
+close_blocks('/dev/vdb', KEY)
+v = opened(fill=True)                                        # idempotent: nothing left to write
+assert v['fill'] == dict(valid=records, written=0, failed=0), v['fill']
+assert status()[0]['encryptions'] == 0
+close_blocks('/dev/vdb', KEY)
+results['quick_fill'] = dict(records=records, quick_encryptions=setup_writes(), unwritten='EIO',
+                             fill_first=dict(valid=2, written=records - 2, failed=0),
+                             damaged_block_rewritten_as_zeros=True, fill_again=dict(valid=records, written=0),
+                             primary_preserved=True)
+
+# A/B quick: unwritten blocks have no valid slot; a write goes to slot 0
+# (generation 1) and fill completes the rest.
+v = opened(initialize=True, quick=True, ab=True)
+ab_records = ((sectors - KEYSLOT_AREA) // GROUP - 2) // 2
+assert v['hidden_bytes'] == ab_records * BLOCK and status()[0]['encryptions'] == setup_writes()
+assert readable(v['hidden'], 0) is None
+direct(v['hidden'], BLOCK, BLOCK, quick[1])
+close_blocks('/dev/vdb', KEY)
+v = opened(fill=True)
+assert v['fill'] == dict(valid=1, written=ab_records - 1, failed=0), v['fill']
+assert status()[0]['encryptions'] == (ab_records - 1) * GROUP
+direct(v['hidden'], BLOCK, BLOCK, quick[3])                 # second version: slot 1, generation 2
+expected_ab = bytearray(ab_records * BLOCK)
+expected_ab[BLOCK:2 * BLOCK] = quick[3]
+assert Path(v['hidden']).read_bytes() == expected_ab
+close_blocks('/dev/vdb', KEY)
+results['quick_fill_ab'] = dict(records=ab_records, fill=dict(valid=1, written=ab_records - 1, failed=0))
+
+v = opened(initialize=True)
+st, unit, sectors = status()
 assert v['hidden_bytes'] == st['hidden_bytes'] == records * BLOCK, (v, records)
 assert Path(v['hidden']).read_bytes() == bytes(records * BLOCK)
 results['records'] = records
@@ -391,19 +475,29 @@ def group_first(block):
 
 
 dm('create', 'piv-test-fault', input='0 %d linear /dev/vdb 0\n' % disk)
-v = rs_open(initialize=True, parity=P)
+# Quick initialization with parity, then fill: the four written blocks are
+# skipped, the rest receive zero records with parity.
+v = rs_open(initialize=True, quick=True, parity=P)
 handle = GuestOwner(STACK, KEY, allow_test_stack=True)
 layout, unit, sectors = handle.layout, handle.device.sector_size, handle.device.sectors
 handle.close()
 rs_records = (sectors - KEYSLOT_AREA) // G - 2
 assert v['hidden_bytes'] == rs_records * BLOCK, (v, rs_records)
+assert rs_status()['encryptions'] == 2 * 14 + G
 rs_pattern = {i: hashlib.shake_256(b'v5-rs-%d' % i).digest(BLOCK) for i in range(4)}
 for index, value in rs_pattern.items():
     before = rs_status()['encryptions']
     direct(v['hidden'], index * BLOCK, BLOCK, value)
     assert rs_status()['encryptions'] - before == G
+assert readable(v['hidden'], 4) is None
 rs_close()
-results['rs'] = dict(parity=P, group=G, blocks=rs_records, write_encryptions=G)
+v = rs_open(fill=True)
+assert v['fill'] == dict(valid=4, written=rs_records - 4, failed=0), v['fill']
+assert rs_status()['encryptions'] == (rs_records - 4) * G
+assert direct(v['hidden'], 4 * BLOCK, BLOCK) == bytes(BLOCK)
+rs_close()
+results['rs'] = dict(parity=P, group=G, blocks=rs_records, write_encryptions=G,
+                     quick_fill=dict(valid=4, written=rs_records - 4, failed=0))
 
 # Unreadable carrier sectors (erasures): p per lane recover, including parity
 # sectors; p + 1 in one lane returns EIO, never wrong data; the decoy sector
@@ -423,6 +517,12 @@ assert rejected(lambda: direct(v['hidden'], BLOCK, BLOCK, rs_pattern[1])).errno 
 after = rs_status()
 assert not after['failed'] and after['encryptions'] == before['encryptions']
 rs_close()
+# Fill counts an RS-recovered block as valid and writes nothing.
+v = rs_open(fill=True)
+assert v['fill'] == dict(valid=rs_records, written=0, failed=0), v['fill']
+assert rs_status()['encryptions'] == 0
+assert direct(v['hidden'], BLOCK, BLOCK) == rs_pattern[1]
+rs_close()
 too_many = [3 * i for i in range(P + 1)]          # p + 1 erasures in lane 0
 restack([group_first(1) + j for j in too_many])
 v = rs_open()
@@ -430,9 +530,21 @@ assert rejected(lambda: direct(v['hidden'], BLOCK, BLOCK)).errno == errno.EIO
 assert direct(v['hidden'], 2 * BLOCK, BLOCK) == rs_pattern[2]
 assert not rs_status()['failed']
 rs_close()
+# Fill cannot authenticate block 1's carrier (unreadable sectors): it is left
+# as it was and counted as failed; nothing is written and the owner stays up.
+v = rs_open(fill=True)
+assert v['fill'] == dict(valid=rs_records - 1, written=0, failed=1), v['fill']
+st = rs_status()
+assert st['encryptions'] == 0 and not st['failed']
+assert rejected(lambda: direct(v['hidden'], BLOCK, BLOCK)).errno == errno.EIO
+rs_close()
 restack()
+v = rs_open()
+assert direct(v['hidden'], BLOCK, BLOCK) == rs_pattern[1]    # untouched by the fill
+rs_close()
 results['rs']['erasures'] = dict(recovered_per_lane=P, total=len(lost), parity_sectors_included=True,
-                                 beyond_bound='EIO', strict_write_refused_without_encryption=True)
+                                 beyond_bound='EIO', strict_write_refused_without_encryption=True,
+                                 fill_counts_recovered_as_valid=True, fill_leaves_unreadable_block=True)
 
 # Authenticating sectors with foreign fragments (errors, as from uncoordinated
 # stock writes): p/2 per lane are corrected without erasure information.
@@ -491,4 +603,4 @@ subprocess.run(['cryptsetup', 'close', 'piv-stock'], check=True)
 subprocess.run(['dd', 'if=/dev/vdb', 'of=' + str(W / 'v5-final.img'), 'bs=1M', 'status=none'], check=True)
 (W / 'v5-results.json').write_text(json.dumps(results, indent=2) + '\n')
 (W / 'result.txt').write_text('Format v5 footprint, preservation, guard, KDF tiers, local damage, repair, '
-                              'RS parity and stock readback passed\n')
+                              'quick initialization and fill, RS parity and stock readback passed\n')

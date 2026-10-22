@@ -353,18 +353,48 @@ The directory's 4096-byte data holds, for keyslot j, a 65-byte entry at offset
 
 ## Setup and initialization
 
-pivsetup passes `base`, the KEK and the parity choice (NATIVE_SETUP ABI 5:
-flags INITIALIZE, AB, VERIFY; AB and a non-zero parity only with INITIALIZE).
-Setup scans only the 112 keyslot sectors by default; `--verify` authenticates
-every primary sector first and refuses on any failure. Pending signals are
-polled between ranges and records; completed records stay written
-(cancellation is not rollback).
+pivsetup passes `base`, the KEK and the parity choice (NATIVE_SETUP ABI 6:
+flags INITIALIZE, AB, VERIFY, QUICK, FILL; AB, QUICK and a non-zero parity
+only with INITIALIZE, FILL only without it; the kernel returns the fill counts
+in the same structure). Setup scans only the 112 keyslot sectors by default;
+`--verify` authenticates every primary sector first and refuses on any
+failure. Pending signals are polled between ranges and rounds of records;
+completed records stay written (cancellation is not rollback).
 
 Initialization draws a fresh MK, writes keyslot 0 (both replicas) under the KEK,
 writes the directory listing it, then writes a zero record for every block (one
 slot per block with A/B). Because MK is replaced first, an interrupted
 re-initialization leaves not-yet-written blocks unavailable rather than holding
 their previous contents. The keyslot areas 1–3 keep their existing IVs.
+
+**Quick initialization** (`--initialize --quick`, QUICK; not the default, user
+decision 2026-10-22) stops after the directory. No record authenticates under
+the new MK, so every hidden block reads EIO until it is written: a hidden
+write always replaces the whole record (with A/B, a block without a valid slot
+is written to slot 0 with generation 1, as before). Records left by a previous
+MK do not authenticate either. Tools that read blocks they never wrote
+(filesystem probes and `mkfs` discard/zero checks, `dd` or backups of the
+whole view, partition scanners) therefore see I/O errors; write the blocks
+first or run a fill.
+
+**Fill** (`--fill`, FILL; on an existing volume, after the keyslot and
+directory authenticate) visits every block in rounds of 8 concurrent blocks:
+a block whose record authenticates under MK (any A/B slot; with parity,
+also after RS correction) is skipped; otherwise it receives the same zero
+record initialization writes (A/B: slot 0, generation 1). The write is the
+ordinary strict hidden rewrite: every carrier sector must authenticate
+first, so a carrier with an unreadable sector or a sector failing primary
+authentication is left as it was and counted as failed (the block keeps
+reading EIO) instead of aborting the fill; a block whose check itself hits a
+medium error is treated the same way. Any failure once a write has begun, a
+flush failure, or a non-local error (allocation, encryption cap, nonce
+retries) fails the setup like an initialization failure. A fill completes a
+quick initialization, resumes an interrupted `--initialize` (records it
+completed authenticate and are skipped) and resumes itself after
+cancellation. It is destructive: a damaged record that no longer
+authenticates (and RS cannot correct) is replaced by zeros, so it is never
+run implicitly. It does not rewrite RS-corrected blocks to restore their full
+redundancy (a hidden write of the block does that).
 
 ## Amplification and nonce use
 
@@ -380,7 +410,10 @@ Hot hidden blocks raise the rewrite count of their carrier sectors.
   the owner in the keyslot/directory/record areas is an LRW-AES output on a
   distinct (tweak, input) pair, hence indistinguishable from uniform 128-bit IVs
   up to the TPRP advantage (about q²/2^128 over all blocks) plus the per-sector
-  repeat event. Tail and unlisted keyslot areas are uniform random. SIV
+  repeat event. Tail and unlisted keyslot areas are uniform random, and after a
+  quick initialization never-written record carriers keep their earlier IVs
+  (stock random IVs, or LRW outputs under a previous MK), which look the same
+  to anyone without MK. SIV
   payload, padding, parity and keyslot contents are inside the PRP input and
   never directly visible. Local collision rejection slightly conditions the
   distribution.

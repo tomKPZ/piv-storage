@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
-use crate::ioctl::KernelDevice;
+use crate::ioctl::{FillCounts, KernelDevice};
 use crate::signals;
 
 pub fn fail(point: &str) -> Result<()> {
@@ -70,10 +70,10 @@ pub fn before_setup(device: &KernelDevice, identity: &[u8]) -> Result<()> {
     wait_for(&format!("{prefix}-gate"))
 }
 
-pub fn after_setup(device: &KernelDevice, elapsed: Duration, result: &Result<()>, interrupted: bool) {
+pub fn after_setup(device: &KernelDevice, elapsed: Duration, result: &Result<FillCounts>, interrupted: bool) {
     let Some(prefix) = prefix() else { return };
     let errno = match result {
-        Ok(()) => "null".to_string(),
+        Ok(_) => "null".to_string(),
         Err(error) => error.errno.map_or("null".to_string(), |e| e.to_string()),
     };
     let status = match device.status() {

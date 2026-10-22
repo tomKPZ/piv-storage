@@ -23,6 +23,7 @@ resize are not supported.
 | [Hidden key type](#hidden-key-file-or-passphrase) | `--initialize` and keyslot add | key file | `--hidden-passphrase-file` (Argon2id) | A key file cannot be guessed; a passphrase relies on the KDF cost |
 | [Passphrase cost](#hidden-key-file-or-passphrase) | every passphrase open and keyslot add | `--kdf-cost 3` (1 GiB) | 1, 2, 4 | Higher tiers slow guessing and every open, and need more RAM; the tier is not recorded |
 | [Full audit](#full-audit---verify) | every open | off | `--verify` | Authenticates every sector; time grows with volume size |
+| [Quick initialization](#large-volumes-and-initialization-time) | `--initialize` | off (full) | `--quick`, later `--fill` | Constant-time initialization, but unwritten hidden blocks read EIO until written or filled |
 
 ## Primary cipher profile
 
@@ -328,6 +329,28 @@ What to expect:
 
 ## Large volumes and initialization time
 
+Three ways to get a usable hidden volume:
+
+- **Full** (`--initialize`, default): writes a zero record into every block.
+  Every block reads (zeros) immediately; the time grows with the volume (below).
+- **Quick** (`--initialize --quick`): writes only keyslot 0 and the directory,
+  in constant time (about one open plus 715 sector rewrites). Unwritten blocks
+  read EIO until written, which breaks tools that read blocks they did not
+  write (filesystem probes, `mkfs` checks, whole-view `dd` or backups). Fine
+  for a consumer that writes before it reads, e.g. a key store addressing its
+  own blocks.
+- **Fill** (`--fill` on a later open): writes zero records only into blocks
+  whose record does not authenticate, skipping valid ones. Each block is read
+  and checked first, so filling a whole quick-initialized volume takes about
+  1.3–1.5× a full initialization, and checking a complete volume (nothing to
+  write) about 60% of one (512 MiB, large-*-011: quick initialization 1.9 s /
+  1.6 s at 4096/512-byte sectors, fill of every block 8.5 s / 22.3 s, full
+  initialization 6.6 s / 15.2 s, fill with nothing to write 4.1 s / 9.1 s). It completes a quick or cancelled initialization and
+  resumes itself after cancellation. It is **destructive**: a damaged block
+  that no longer authenticates becomes zeros (blocks whose carrier cannot be
+  read or authenticated are left alone and reported as `failed`). Never run
+  it on a volume whose damaged blocks you still hope to recover.
+
 `--initialize` writes every hidden record, which rewrites essentially every
 primary sector: about 29,000 sectors/s (113 MiB/s) at 4096-byte sectors
 (0.94 s for 128 MiB, open included) and 190,000 sectors/s (95 MiB/s) at 512
@@ -341,8 +364,9 @@ module in the same, slower host session) it took 6.9 s instead of 10.1 s at
 is cached by the host; on real storage initialization approaches the disk's
 bandwidth limit (every carrier sector is read once and written twice through
 the journal). Initialization can be cancelled with SIGINT/SIGTERM; blocks not yet written
-stay unavailable until a later `--initialize` completes
-([cancellation.md](cancellation.md)).
+stay unavailable until a `--fill` (or a new `--initialize`) completes them
+([cancellation.md](cancellation.md)). A fill costs the same per written block
+plus one authenticated read per block.
 
 The per-owner limit of 2^40 primary encryptions (raised from 2^32, which a
 512-byte-sector initialization reached around 2 TiB) also bounds one

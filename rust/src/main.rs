@@ -24,8 +24,9 @@ use secret::Secret;
 
 const USAGE: &str = "\
 usage: pivsetup open-blocks --key-file F (--hidden-key-file F | --hidden-passphrase-file F)
-                            [--device /dev/vdb] [--name piv-native] [--initialize]
-                            [--ab] [--parity 4|8|16] [--verify] [--kdf-cost 1-4]
+                            [--device /dev/vdb] [--name piv-native]
+                            [--initialize [--quick] [--ab] [--parity 4|8|16] | --fill]
+                            [--verify] [--kdf-cost 1-4]
        pivsetup close-blocks --key-file F [--device /dev/vdb] [--name piv-native]
        pivsetup keyslot add|remove --key-file F --slot 0-3
                             [--new-key-file F | --new-passphrase-file F [--kdf-cost 1-4]]
@@ -39,7 +40,13 @@ usage: pivsetup open-blocks --key-file F (--hidden-key-file F | --hidden-passphr
 
 LUKS2 volumes with 16-byte random IVs (aegis128-random + aead, or aes-xts-random
 + hmac-sha256), the journaled integrity layer, and hidden format v5 (4096-byte
-hidden blocks). --initialize destroys all existing hidden contents; --parity
+hidden blocks). --initialize destroys all existing hidden contents and writes
+zeros into every hidden block; with --quick it writes only the keyslot and
+directory, and every hidden block reads EIO until first written (tools that
+read unwritten blocks fail). --fill (on an existing volume, destructive) writes
+zeros into every hidden block whose record does not authenticate, skipping
+valid ones: it completes a quick or interrupted --initialize, resumes itself,
+and turns damaged blocks into zeros. --parity
 adds Reed-Solomon parity fragments per lane (off by default). Keys are read
 from files only. Setup authenticates only the keyslot area; --verify first
 authenticates every primary sector and refuses on any failure (a full audit,
@@ -68,7 +75,7 @@ impl Args {
                       "--source-hidden-passphrase-file", "--target", "--target-key-file",
                       "--target-hidden-key-file", "--target-hidden-passphrase-file", "--parity",
                       "--kdf-cost", "--source-kdf-cost", "--target-kdf-cost"];
-        let switches = ["--initialize", "--ab", "--verify", "--allow-test-stack",
+        let switches = ["--initialize", "--quick", "--fill", "--ab", "--verify", "--allow-test-stack",
                         "--allow-second-disk"];
         while let Some(word) = argv.next() {
             let (key, inline) = match word.split_once('=') {
@@ -187,17 +194,26 @@ fn run(args: Args) -> Result<()> {
     match args.action.as_str() {
         "open-blocks" => {
             args.only(&["--device", "--key-file", "--name", "--hidden-key-file", "--hidden-passphrase-file",
-                        "--initialize", "--ab", "--parity", "--verify", "--kdf-cost", "--allow-test-stack",
-                        "--allow-second-disk"])?;
+                        "--initialize", "--quick", "--fill", "--ab", "--parity", "--verify", "--kdf-cost",
+                        "--allow-test-stack", "--allow-second-disk"])?;
             let secret = hidden_secret(&args, "--hidden")?;
             let options = OpenOptions {
-                name: &name, initialize: args.flag("--initialize"), ab: args.flag("--ab"),
+                name: &name, initialize: args.flag("--initialize"), quick: args.flag("--quick"),
+                fill: args.flag("--fill"), ab: args.flag("--ab"),
                 verify: args.flag("--verify"), parity: blocks::parity(args.value("--parity"))?,
                 kdf_cost: kdf_cost_for(&args, "--kdf-cost", "--hidden-passphrase-file")?, allow,
             };
             let views = blocks::open_blocks(&device, &args.required("--key-file")?, secret, &options)?;
-            println!("{{\n  \"decoy\": {},\n  \"hidden\": {},\n  \"hidden_bytes\": {}\n}}",
+            // --fill adds the block counts: already valid (skipped), written
+            // as zeros, and failed (carrier unreadable or not authenticating).
+            let fill = views.fill.map_or(String::new(), |c| format!(
+                ",\n  \"fill\": {{\"valid\": {}, \"written\": {}, \"failed\": {}}}", c.valid, c.written, c.failed));
+            println!("{{\n  \"decoy\": {},\n  \"hidden\": {},\n  \"hidden_bytes\": {}{fill}\n}}",
                      json_string(&views.decoy), json_string(&views.hidden), views.hidden_bytes);
+            if let Some(counts) = views.fill.filter(|c| c.failed > 0) {
+                eprintln!("pivsetup: --fill left {} hidden block(s) unchanged: their carrier could not be read or \
+                           authenticated (they still read EIO)", counts.failed);
+            }
             Ok(())
         }
         "close-blocks" => {

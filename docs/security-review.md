@@ -100,9 +100,10 @@ not permit nonce reuse.
 **What consumes nonces.** Every primary encryption draws one 16-byte IV: stock
 dm-crypt writes (one per written sector), native decoy writes (exactly one per
 written primary sector), hidden writes (G = 687 + 3p per 4096-byte block; A/B
-writes one slot), keyslot add/remove (28 + G) and initialization (28 + G + G ×
-hidden blocks). Encryptions performed before a failure count; local collision
-retries happen before encryption and do not.
+writes one slot), keyslot add/remove (28 + G), initialization (28 + G + G ×
+hidden blocks; quick initialization 28 + G) and fill (G per block written; the
+check of skipped blocks only reads). Encryptions performed before a failure
+count; local collision retries happen before encryption and do not.
 
 **Consequence of a repeat, per profile.**
 
@@ -212,7 +213,12 @@ multi-snapshot observers are out of scope.
 | Hidden-key holder | Potentially older versions of hidden records from correctly associated fragments. |
 
 Decoy writes change only the IVs of the sectors written, like stock writes, so
-this signature comes from hidden writes (and initialization/keyslot updates).
+this signature comes from hidden writes (and initialization, fill and keyslot
+updates). A quick initialization rewrites only the keyslot and directory
+sectors; never-written record carriers keep their previous IVs (stock random
+IVs or LRW outputs under an earlier master key), which a single image cannot
+tell apart from records without the master key. Its later hidden writes are
+then the per-record signature above, as after a full initialization.
 It indicates hidden-volume activity to a decoy-key holder with journal access.
 No supported mitigation removes it: stock `--integrity-no-journal` would remove
 on-disk journal history, but pivsetup refuses it because a crash during a

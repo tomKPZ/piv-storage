@@ -864,15 +864,58 @@ static int pn_setup_unlock(struct piv_control *p, struct piv_native *n, const u8
  return r;
 }
 
-/* One initialization record per work item (setup holds p->lock; no views
- * exist, so nothing else touches the owner meanwhile).
+/* Fill outcome of one block (PIV_SETUP_FILL). */
+enum { PN_FILL_VALID, PN_FILL_WRITTEN, PN_FILL_FAILED };
+
+/* Local, pre-mutation failures that leave one block as it was during a fill:
+ * a carrier sector failing authentication or unreadable. Anything else
+ * (allocation, nonce exhaustion, encryption cap) aborts the whole setup.
+ */
+static bool pn_fill_local(int r) { return r == -EBADMSG || r == -EIO || r == -ENODATA || r == -EILSEQ; }
+
+/* Fill one block: skip it if a record (any A/B slot; with parity, possibly
+ * after RS correction) authenticates under the master key, else write a zero
+ * record exactly as initialization does (A/B: slot 0, generation 1). The
+ * write is the ordinary strict rewrite: every carrier sector must authenticate
+ * before anything is written, so a damaged or unreadable carrier stays as it
+ * was and counts as failed. Setup holds p->lock and no views exist, so
+ * nothing changes the block between the check and the write.
+ */
+static int pn_fill_block(struct piv_control *p, u64 index, const u8 *zero, int *outcome)
+{
+ struct piv_native *n = p->native;
+ struct piv_range range;
+ size_t length = 2 * n->group * 16 + PN_DATA;
+ u8 *scratch = kvmalloc(length, GFP_NOIO);
+ bool mutated = false;
+ int r;
+ if (!scratch) return -ENOMEM;
+ pn_block_lock(p, &range, index, false);
+ r = pn_read_slots(p, index, scratch, scratch + 2 * n->group * 16, NULL, NULL);
+ piv_range_unlock(p, &range);
+ kvfree_sensitive(scratch, length);
+ if (!r) { *outcome = PN_FILL_VALID; return 0; }
+ /* A medium error is never mere unavailability: the strict write would read
+  * the same carrier, so leave the block alone.
+  */
+ if (pn_fill_local(r)) { *outcome = PN_FILL_FAILED; return 0; }
+ if (r != PN_UNAVAILABLE) return r;
+ r = pn_write(p, true, index * PN_DATA, zero, PN_DATA, true, &mutated);
+ if (!r) *outcome = PN_FILL_WRITTEN;
+ else if (!mutated && pn_fill_local(r) && !READ_ONCE(p->failed)) { *outcome = PN_FILL_FAILED; r = 0; }
+ return r;
+}
+
+/* One initialization record (or fill block) per work item (setup holds
+ * p->lock; no views exist, so nothing else touches the owner meanwhile).
  */
 struct pn_init_work {
  struct work_struct work;
  struct piv_control *p;
  const u8 *zero;
  u64 index;
- int result;
+ int result, outcome;
+ bool fill;
  atomic_t *pending;
  struct completion *done;
 };
@@ -882,15 +925,19 @@ static void pn_init_worker(struct work_struct *work)
  struct pn_init_work *w = container_of(work, struct pn_init_work, work);
  unsigned int noio = memalloc_noio_save();
  bool mutated = false;
- w->result = pn_write(w->p, true, w->index * PN_DATA, w->zero, PN_DATA, true, &mutated);
+ if (w->fill)
+  w->result = pn_fill_block(w->p, w->index, w->zero, &w->outcome);
+ else
+  w->result = pn_write(w->p, true, w->index * PN_DATA, w->zero, PN_DATA, true, &mutated);
  memalloc_noio_restore(noio);
  if (atomic_dec_and_test(w->pending)) complete(w->done);
 }
 
-/* Write zero records [@first, @first + @count) concurrently and wait for all
- * of them; returns the first failure.
+/* Write zero records (or, with @counts, fill blocks) [@first, @first +
+ * @count) concurrently and wait for all of them; returns the first failure.
+ * @counts accumulates per-outcome block counts (valid, written, failed).
  */
-static int pn_init_round(struct piv_control *p, const u8 *zero, u64 first, u32 count)
+static int pn_init_round(struct piv_control *p, const u8 *zero, u64 first, u32 count, u64 *counts)
 {
  struct pn_init_work *w = kcalloc(count, sizeof(*w), GFP_NOIO);
  struct completion done;
@@ -902,35 +949,72 @@ static int pn_init_round(struct piv_control *p, const u8 *zero, u64 first, u32 c
  atomic_set(&pending, count + 1);
  for (i = 0; i < count; i++) {
   INIT_WORK(&w[i].work, pn_init_worker);
-  w[i].p = p; w[i].zero = zero; w[i].index = first + i;
+  w[i].p = p; w[i].zero = zero; w[i].index = first + i; w[i].fill = counts;
   w[i].pending = &pending; w[i].done = &done;
   queue_work(pn_wq, &w[i].work);
  }
  if (!atomic_dec_and_test(&pending)) wait_for_completion_io(&done);
  for (i = 0; i < count && !r; i++) r = w[i].result;
+ for (i = 0; !r && counts && i < count; i++) counts[w[i].outcome]++;
  kfree(w);
+ return r;
+}
+
+/* Initialization records (@counts NULL) or a fill, in rounds of
+ * PN_INIT_PARALLEL concurrent blocks; cancellation is polled between rounds,
+ * when every record written so far is complete. Initialization flushes every
+ * PN_INIT_FLUSH_RECORDS records; a fill flushes at the same points if it
+ * wrote anything since the last flush. Completed records stay committed, also
+ * when cancelled: they are flushed before returning. A failed record write
+ * already failed the attempt.
+ */
+static int pn_records(struct piv_control *p, u64 *counts)
+{
+ struct piv_native *n = p->native;
+ u8 *zero = kzalloc(PN_DATA, GFP_NOIO);
+ u64 i, flushed = 0;
+ int r = 0;
+ if (!zero) return -ENOMEM;
+ for (i = 0; i < n->records;) {
+  u32 count = min_t(u64, n->records - i, PN_INIT_PARALLEL);
+  r = pn_setup_poll(); if (r) break;
+  r = pn_init_round(p, zero, i, count, counts); if (r) break;
+  /* A concurrent work item's failed write stopped the owner. */
+  if (READ_ONCE(p->failed)) { r = -EIO; break; }
+  i += count;
+  if (i % PN_INIT_FLUSH_RECORDS == 0 && (!counts || counts[PN_FILL_WRITTEN] != flushed)) {
+   r = blkdev_issue_flush(p->cc->dev->bdev); if (r) break;
+   if (counts) flushed = counts[PN_FILL_WRITTEN];
+  }
+ }
+ if ((!r || r == -EINTR) && (!counts || counts[PN_FILL_WRITTEN] != flushed)) {
+  int f = blkdev_issue_flush(p->cc->dev->bdev);
+  if (f) r = f;
+ }
+ kfree_sensitive(zero);
  return r;
 }
 
 static int pn_setup(struct piv_control *p, struct file *controller, struct piv_native_setup *s)
 {
  struct piv_native *n;
- u8 *zero, *ivs = NULL, *ks_ivs = NULL;
+ u8 *ivs = NULL, *ks_ivs = NULL;
  u64 i;
  u32 j;
  bool initialize = s->flags & PIV_SETUP_INITIALIZE, ab = s->flags & PIV_SETUP_AB, mutated, ks_done = false;
- bool verify = s->flags & PIV_SETUP_VERIFY;
+ bool verify = s->flags & PIV_SETUP_VERIFY, quick = s->flags & PIV_SETUP_QUICK, fill = s->flags & PIV_SETUP_FILL;
  u64 scan_end, minimum;
  int r;
- if (s->version != 5 || s->size != sizeof(*s) || s->generation != p->profile.generation ||
+ if (s->version != 6 || s->size != sizeof(*s) || s->generation != p->profile.generation ||
      s->context_length > 112 || s->context_length <= 19 ||
      memcmp(s->context, "pivstore/volume/v5", 19) ||
-     (s->flags & ~(PIV_SETUP_INITIALIZE | PIV_SETUP_AB | PIV_SETUP_VERIFY)) ||
-     !pn_parity_valid(s->parity) || s->reserved) return -EINVAL;
+     (s->flags & ~(PIV_SETUP_INITIALIZE | PIV_SETUP_AB | PIV_SETUP_VERIFY | PIV_SETUP_QUICK | PIV_SETUP_FILL)) ||
+     !pn_parity_valid(s->parity) || s->reserved || s->valid || s->written || s->failed) return -EINVAL;
  /* Format v5 needs 16-byte IVs. A/B and parity are chosen at initialization
-  * and afterwards read from the keyslot.
+  * and afterwards read from the keyslot. QUICK only initializes; FILL needs an
+  * existing master key (it is the separate, explicit completion step).
   */
- if (p->profile.iv_size != 16 || ((ab || s->parity) && !initialize)) return -EINVAL;
+ if (p->profile.iv_size != 16 || ((ab || s->parity || quick) && !initialize) || (fill && initialize)) return -EINVAL;
  if (p->native || !piv_quiesced(p) || !p->transaction || p->controller != controller || READ_ONCE(p->failed)) return -EBUSY;
  /* Bound every primary byte offset by the kernel's signed file limit.
   * Fragment indices, hidden capacity and 512-byte addresses are then smaller;
@@ -998,26 +1082,13 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
   kfree_sensitive(k);
   if (!r) r = pn_dir_write(p, &mutated);
   if (r) goto bad;
-  zero = kzalloc(PN_DATA, GFP_NOIO);
-  if (!zero) { r = -ENOMEM; goto bad; }
-  /* Rounds of PN_INIT_PARALLEL concurrent records; cancellation is polled
-   * between rounds, when every record written so far is complete.
-   */
-  for (i = 0; i < n->records;) {
-   u32 count = min_t(u64, n->records - i, PN_INIT_PARALLEL);
-   r = pn_setup_poll(); if (r) break;
-   r = pn_init_round(p, zero, i, count); if (r) break;
-   i += count;
-   if (i % PN_INIT_FLUSH_RECORDS == 0) { r = blkdev_issue_flush(p->cc->dev->bdev); if (r) break; }
-  }
-  /* Completed records stay committed, also when cancelled: flush them before
-   * returning. A failed record write already failed the attempt.
-   */
-  if (!r || r == -EINTR) {
-   int f = blkdev_issue_flush(p->cc->dev->bdev);
-   if (f) r = f;
-  }
-  kfree_sensitive(zero); if (r) goto bad;
+  /* Quick: no records; never-written blocks stay unavailable until written or filled. */
+  if (!quick) { r = pn_records(p, NULL); if (r) goto bad; }
+ } else if (fill) {
+  u64 counts[3] = {};
+  r = pn_records(p, counts);
+  if (r) goto bad;
+  s->valid = counts[PN_FILL_VALID]; s->written = counts[PN_FILL_WRITTEN]; s->failed = counts[PN_FILL_FAILED];
  }
  r = pn_setup_poll(); if (r) goto bad;
  r = piv_checkpoint(p->cc); if (r) goto bad;
