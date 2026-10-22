@@ -22,8 +22,9 @@ mutually exclusive) and are copied before attaching.
   then one G-sector record per 4096-byte hidden block (G = 687 + 3p), so hidden
   capacity is `(floor((sectors - 112) / G) - 2) * 4096` bytes (half with
   `--ab`). Primary sectors after the last complete record carry no hidden data.
-- Range reads stay at most 16 KiB; write preparation at most G tuples (one
-  record, at most 735) or 32 decoy sectors per request. The small 32-bit counters describe bounded requests, not whole-volume
+- Range reads stay at most 16 KiB; a write rewrites at most G sectors (one
+  record, at most 735; 2.9 MiB of RAM at 4096-byte sectors) or 32 decoy
+  sectors per request. The small 32-bit counters describe bounded requests, not whole-volume
   extents.
 - Public workers check `offset <= limit` and `bytes <= limit - offset` before
   computing request ends; mapped sector-to-byte conversion is checked first.

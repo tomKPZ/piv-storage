@@ -21,7 +21,9 @@ leaves no ready native state or public views and spends no primary encryption.
 Reopening repeats the scan; an incomplete scan is never adopted.
 
 Cancellation during `--initialize` waits for the current pn_write call to
-finish, then stops before the next record. Initialization first writes a new
+finish, then stops before the next record and flushes the lower device, so the
+completed records are as durable as after an uncancelled initialization
+(initialization otherwise flushes every 16 records). Initialization first writes a new
 master key into keyslot 0 and the directory, then the zero records in block
 order. After cancellation the completed leading blocks read as authenticated
 zeros and every later block returns EIO, because its old record no longer
@@ -82,14 +84,17 @@ child setup client; its `PIVSETUP_TEST_GATE` hook provides a handshake before
 the native ioctl and reports the kernel status after it. Module-qualified
 kprobes, filtered to the child's PID, witness actual range reads or pn_write
 calls, and `/proc/PID/syscall` must show the SETUP ioctl before a signal is
-sent; a signal delivered before entering the kernel does not count.
+sent; a signal delivered before entering the kernel does not count. While the
+task is on a CPU that file reads `running` even inside the ioctl (a single
+such sample once failed the scan check on aes-sha256-512), so the checks
+resample until the task is observed blocked.
 
 - **Scan** (`--verify`, 25 ms lower read delay, at least three range reads
   witnessed): a second raw SETUP caller is interrupted while the first holds the
   setup mutex and must report EINTR before the first scan is cancelled. The
   encryption counter must stay zero.
-- **Initialize** (2 ms lower write delay, short enough that one 687-sector
-  record finishes within the signal-to-exit timeout; at least two pn_write
+- **Initialize** (2 ms lower write delay, short enough that one record
+  finishes within the signal-to-exit timeout; at least two pn_write
   entries witnessed): the retained counter must equal 28 keyslot + 687
   directory + 687 per completed record, with at least two and fewer than 64
   records completed.

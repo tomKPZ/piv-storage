@@ -23,15 +23,25 @@ review only):
   AEGIS at 4096-byte sectors, 80 at 512; 32 and 56 for XTS + HMAC-SHA256; see
   [observed-layout.md](observed-layout.md)), so a 687-sector record always spans
   more than one section even if it were submitted as one bio.
-- The native owner applies one tuple per lower write and flushes every 32
-  tuples and at the end of the request.
+- The native owner writes a record as a few multi-sector bios (all in flight
+  together) and flushes once at the end of the request. dm-integrity commits
+  on that flush, or earlier, asynchronously, once free journal entries fall to
+  the 50% watermark (`journal_watermark:50`). A 4096-byte record exceeds the
+  whole journal and is always committed in parts; a 512-byte record fits below
+  the watermark and is usually committed by one journal write. That is not a
+  guarantee (journal pressure from earlier writes splits it), so the
+  conclusions below do not change.
 
 **Experiment** (guest power test, `kernel/guest-stateless-power.py` and
 `scripts/guest-stateless-recover.sh`): a hidden write (no A/B) runs over a
 dm-delay test stack and QEMU is killed mid-write; the volume is then replayed by
-stock Linux. With the journal (format v5, all four supported profiles in the
-2026-10-22 v5 matrix), 32 of the record's 687 carrier IVs were changed in
-committed journal or current state when the VM was cut, the block
+stock Linux. At 512-byte sectors the test first commits identical-plaintext
+decoy rewrites so the record crosses the watermark part way (otherwise the
+record would usually be committed whole). With the journal (format v5, all four
+supported profiles, batched record writes, suite-081/082), 96 (4096-byte
+sectors), 640 (AEGIS 512) and 400 (XTS + HMAC 512) of the record's 687 carrier
+IVs were changed in committed journal or current state when the VM was cut,
+the block
 returned EIO after replay, no primary sector was torn, other hidden blocks and
 all primary plaintext were unchanged, a decoy write did not make the damaged
 block valid, and a later full hidden write repaired it. This kills the VM, not

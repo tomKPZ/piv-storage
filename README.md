@@ -159,9 +159,9 @@ hidden write re-encodes its whole G-sector record with a fresh generation.
   to p unreadable or authentication-failing carrier sectors per lane (or p/2
   sectors with foreign fragments); RS output is accepted only through the SIV
   tag.
-- Errors before the first applied tuple (lower reads, authentication,
-  allocation, preparation) fail only that bio. A failed flush or any failure
-  after a write begins applying tuples stops the shared owner (fail-stop);
+- Errors before the first lower write (lower reads, authentication,
+  allocation, encryption) fail only that bio. A failed flush or any failure
+  once a request has begun writing stops the shared owner (fail-stop);
   remove and recreate the stack after fixing the fault
   ([native-faults.md](docs/native-faults.md)).
 - The stock journal makes individual primary sector updates atomic, **not** a

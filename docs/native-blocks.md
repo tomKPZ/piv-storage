@@ -76,22 +76,53 @@ cross-bio accumulation, writeback cache or delay.
   A/B), using raw IVs of sectors whose decoy data fails authentication; the SIV
   tag decides. With parity, a failing tag triggers RS decoding with the
   failing or unreadable sectors as erasures, then a second SIV check.
-- **Hidden write**: authenticates all G carrier sectors (both slots with A/B),
-  seals the block with a fresh generation and fresh fragments, prepares all
-  primary tuples in RAM and applies the exact tuples through the lower journal.
-  There is no durable cross-sector plan; without A/B a crash can destroy the
-  block.
+- **Hidden write**: with A/B, reads both slots' IVs to pick the slot not
+  holding the newest valid version; then authenticates all G carrier sectors of
+  the target slot, seals the block with a fresh generation and fresh fragments
+  and rewrites the carrier (below). There is no durable cross-sector plan;
+  without A/B a crash can destroy the block.
 
-Writes flush the lower device every 32 applied sectors and at completion,
-satisfying FUA before completion; WRITE|PREFLUSH drains the lower journal before
-its payload, and flush bios use the same ordered workqueue. Batches are not
-atomic writes. No discard or write-zeroes is advertised. Suspend/removal uses DM
+### Write path
+
+Every write (decoy request, hidden record, keyslot, directory, initialization
+record) is one rewrite of a set of primary sectors (`piv_batch_*` in
+kernel/piv-control.inc):
+
+1. read all of them with a few multi-sector bios carrying their integrity
+   tuples, submitted together, and authenticate every sector with its own
+   address/IV AAD (a decoy write may replace a sector that fails
+   authentication only if it covers all of it; anything else fails the
+   request);
+2. merge the request bytes (decoy) and draw the fresh IVs (record fragments or
+   decoy IVs), rejecting local collisions with the stored IVs or each other;
+3. encrypt every sector in place in RAM under its fresh IV;
+4. submit the ciphertext and tuples as a few multi-sector bios through the
+   lower journal (at most 128 KiB of data and one page of tuples each: 22 bios
+   for a 687-sector record at 4096-byte sectors, 6 at 512 with AEGIS-128, 9
+   with HMAC-SHA256's 48-byte tuples), wait for all of them, and flush once.
+
+Steps 1–3 finish for the whole request before the first lower write. A
+request holds its plaintext/ciphertext and tuples in RAM: 2.7 MiB for a record
+at 4096-byte sectors, 344 KiB at 512 (previously about 3 MiB of fixed-size
+prepared tuples plus three authenticated reads per sector). Nothing re-reads a
+sector between authentication and its write: the former expected-IV recheck
+served the userspace PREPARE/APPLY interface; every mutation now runs in the
+owner under its lock, and the private owner rejects other bios while views are
+active. Freshly produced ciphertext is not decrypted again (that guarded
+userspace-supplied tuples); later reads authenticate every sector.
+
+Request writes flush once before completion, satisfying FUA;
+WRITE|PREFLUSH drains the lower journal before its payload, and flush bios use
+the same ordered workqueue. Initialization flushes every 16 records and before
+returning, also when cancelled. Batches are not atomic writes; the stock
+journal may commit part of a record before the final flush (it commits when
+half full). No discard or write-zeroes is advertised. Suspend/removal uses DM
 references and generation binding; see the
 [lifecycle notes](native-faults.md#concurrent-lifecycle-and-flushfua-ordering-lifecycle-suite).
 
-Failures before the first applied tuple (reads, authentication, allocation,
-preparation) fail only that bio; APPLY-time or flush failures stop both views
-until teardown ([failure scope](native-faults.md)). Hidden authentication
+Failures before the first lower write (reads, authentication, allocation,
+encryption) fail only that bio; failures once writing began and flush failures
+stop both views until teardown ([failure scope](native-faults.md)). Hidden authentication
 failure returns EIO for that block without stopping the owner. Internally,
 hidden unavailability is the positive sentinel `PN_UNAVAILABLE`; Linux
 `BLK_STS_MEDIUM` (-ENODATA) is a storage error, never mistaken for it.
@@ -101,8 +132,9 @@ write size the hidden view accepts).
 
 ### Bounded authenticated reads
 
-Setup scans, decoy reads and carrier collection use `piv_read_range`, gathering
-at most 16 KiB through the integrity target. Every primary sector still passes
+Setup scans, decoy reads and hidden-read carrier collection use
+`piv_read_range`, gathering at most 16 KiB through the integrity target (writes
+read through the batch path above). Every primary sector still passes
 the AEAD check with its own address/IV AAD and tag offset, and nothing (plaintext
 or IVs) is published until the whole range authenticates. Public reads copy to
 the bio only on full success; large application reads can span several work
@@ -114,7 +146,7 @@ wiped after use. Measurements: [read-performance.md](read-performance.md).
 The control device exposes QUERY (version 2: sector size, encryption-sector
 count, IV/tag/tuple sizes), DEVICES, BEGIN/END, NATIVE_SETUP, NATIVE_DETACH,
 NATIVE_STATUS and NATIVE_KEYSLOT. There is no userspace IV, tuple or primary
-read/write access; prepare/apply exists only inside the kernel and other ioctl
+read/write access; all rewriting happens inside the kernel and other ioctl
 numbers return ENOTTY.
 
 - NATIVE_SETUP ABI 5 (192 bytes): version/size, generation, flags,
@@ -136,16 +168,13 @@ The owner accepts `capi:aegis128-random` (16-byte key, IV and tag) and
 `capi:authenc(hmac(sha256),xts(aes))-random` (dm-crypt authenc key encoding:
 32- or 64-byte XTS key plus the 32-byte HMAC key; 16-byte IV; 32-byte tag), hex
 keys only. `piv_aead` reproduces dm-crypt's
-layout: AAD = LE64(address in 512-byte units) ‖ IV, tuple = tag ‖ IV. Primary
-tuples are prepared in RAM with zero padding up to 4096 bytes (rejected if
-nonzero), never on disk. Fresh preparation spends an encryption even if
-application later fails; exact-current application copies existing
-authenticated tuples without new encryption. Geometry uses checked kernel
-file-offset bounds ([large-volumes.md](large-volumes.md)).
+layout: AAD = LE64(address in 512-byte units) ‖ IV, tuple = tag ‖ IV. Every
+encryption is counted even if the write later fails. Geometry uses checked
+kernel file-offset bounds ([large-volumes.md](large-volumes.md)).
 
 Source split: dm-piv.c owns the owner target and per-sector AEAD;
-piv-control.inc the privileged controls, authenticated tuple
-preparation/application and lifetime gates; piv-native.inc the hidden v5
+piv-control.inc the privileged controls, authenticated batch
+rewrites and lifetime gates; piv-native.inc the hidden v5
 crypto, both views and the ordered workqueue; piv-rs.inc the Reed–Solomon
 encoder and errors-and-erasures decoder. The independent Python codec and
 primary verifier remain cross-checks of kernel output.

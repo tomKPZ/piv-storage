@@ -3,14 +3,16 @@
 ## Bounded range reads
 
 `piv_read_range` gathers at most 16 KiB of primary ciphertext plus its tag/IV
-metadata in one bio to dm-integrity. It reuses one AEAD request and invokes the
-unchanged Linux helper once per sector, advancing the sector AAD and tag offset,
-so per-sector authentication is identical to stock dm-crypt. Plaintext or
+metadata in one bio to dm-integrity. It invokes the per-sector AEAD helper
+(`piv_aead`) once per sector, advancing the sector AAD and tag offset, so
+per-sector authentication is identical to stock dm-crypt. Plaintext or
 carrier IVs are copied out only after every sector in the range verifies;
 private pages and metadata are bounded and wiped on release, including after a
 partial authentication failure. Setup's keyslot/directory scan (and the
-`--verify` full audit), decoy reads and hidden carrier collection use it;
-prepared-tuple application keeps the scalar path. There is no persistent cache,
+`--verify` full audit), decoy reads and hidden-read carrier collection use it;
+writes read their sectors through the batch path
+([write path](native-blocks.md#write-path): up to 128 KiB per bio, all of a
+request's bios in flight together, the same per-sector check). There is no persistent cache,
 lazy verification or cross-bio accumulation: DM still splits decoy bios at
 16 KiB and hidden bios per 4096-byte block, and one hidden block read
 authenticates its whole 687-sector carrier (G = 687 + 3p with parity).
@@ -41,7 +43,7 @@ system calls and comparisons. Reading must spend zero primary encryptions.
 
 **Call counts (separate pass).** Entry kprobes on module-qualified symbols
 (`piv_load_mode`, `piv_read_range`, the private `piv_aead` helper, `pn_write`,
-`piv_checkpoint`) resolve the unique non-cold compiler specialization in
+`piv_checkpoint`, `piv_batch_read`, `piv_batch_submit`) resolve the unique non-cold compiler specialization in
 `[dm_piv]`, never the stock copy. `tracing_on=0` keeps no event data; only
 `kprobe_profile` hit counters are used, and any missed hit fails. The SETUP
 ioctl is bracketed by pivsetup's gate/hold hooks, reads are counted after udev
@@ -55,6 +57,15 @@ settles, and assertions use exact per-operation deltas. With
 | 16 KiB decoy read | 1 | r | |
 | 4 KiB hidden read | ⌈687/r⌉ | 687 | |
 | 16 KiB hidden read | 4·⌈687/r⌉ | 2748 | |
+| 16 KiB decoy write (same bytes) | 0 | 2r (r checks + r encryptions) | 1 pn_write, 1 batch read, 2 submissions (read, write) |
+| 4 KiB hidden write (same bytes) | 0 | 1374 (687 checks + 687 encryptions) | 1 pn_write, 1 batch read, 2 submissions |
+
+The write rows pin the [write path](native-blocks.md#write-path): one
+authenticated read of every touched sector, one encryption each, no per-sector
+loads, re-reads or self-decryption (the previous path made about five AEAD
+calls per sector); the encryption counter must rise by exactly the sector
+count. The write descriptor stays open across the counted window so udev's
+re-probe after closing a written device is not counted.
 
 Probe counts establish calls, not time spent. No probe is enabled during
 timings.

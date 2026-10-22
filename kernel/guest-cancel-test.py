@@ -111,12 +111,36 @@ def symbol(stem):
     return 'dm_piv:' + matches[0]
 
 
-def in_setup(process):
+def setup_state(process):
+    """True/False if /proc shows the task in/out of the SETUP ioctl; None while
+    it is on a CPU (/proc/PID/syscall then reads "running", even inside the
+    ioctl, e.g. while the scan authenticates a range)."""
     try:
         fields = Path(f'/proc/{process.pid}/syscall').read_text().split()
-        return len(fields) >= 3 and int(fields[0], 0) == 16 and int(fields[2], 0) == SETUP_CMD
-    except (FileNotFoundError, ValueError):
+    except FileNotFoundError:
         return False
+    if fields == ['running']:
+        return None
+    try:
+        return len(fields) >= 3 and int(fields[0], 0) == 16 and int(fields[2], 0) == SETUP_CMD
+    except ValueError:
+        return False
+
+
+def in_setup(process):
+    return setup_state(process) is True
+
+
+def held(process, timeout=5):
+    """Definitive in-SETUP check: resample while the task is merely on a CPU.
+    A single sample can read "running" inside the ioctl (suite-076 flake)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = setup_state(process)
+        if state is not None:
+            return state
+        time.sleep(0.001)
+    raise AssertionError('Task stayed on a CPU; SETUP state not observable')
 
 
 def spawn(phase):
@@ -192,8 +216,9 @@ try:
         probe_command(f'p:piv_cancel/{event} {symbol(function)}')
         registered.append(event)
     for phase, event in (('scan', 'range'), ('initialize', 'write')):
-        # A v5 record write is 687 sector writes: a short per-write delay keeps
-        # one record within the signal-to-exit timeout.
+        # A short lower write delay slows initialization records (each a few
+        # multi-sector writes through the journal) without exceeding the
+        # signal-to-exit timeout.
         reload(read_ms=25 if phase == 'scan' else 0,
                write_ms=2 if phase == 'initialize' else 0)
         process = spawn(phase)
@@ -212,7 +237,7 @@ try:
             start = time.monotonic()
             waiter.send_signal(signal.SIGINT)
             wait_until(lambda: (W / 'waiter-interrupted.json').exists(), timeout=10)
-            assert in_setup(process), 'First scan must still hold the setup mutex'
+            assert held(process), 'First scan must still hold the setup mutex'
             results.append(dict(phase='contended-setup-lock', interrupted_seconds=time.monotonic() - start))
         start = time.monotonic()
         process.send_signal(signal.SIGINT)

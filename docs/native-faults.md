@@ -33,12 +33,15 @@ transaction, hidden crash recovery or rollback resistance.
   EIO. A decoy write covering the entire sector replaces it with a fresh IV and
   refreshed raw fragment (user decision 2026-10-21); the record's SIV tag still
   decides hidden validity.
-- **Errors before the first APPLY** (lower read error, primary authentication
-  failure, allocation, nonce-collision retry exhaustion, encryption cap, request
-  validation) fail only that bio. Preparation may already have spent encryption
-  invocations.
-- **APPLY-time and flush errors** (standalone flush, PREFLUSH or completion
-  flush) stop the shared owner and both views: storage may be partial or
+- **Errors before the first lower write** (lower read error, primary
+  authentication failure, allocation, nonce-collision retry exhaustion,
+  encryption cap, encryption, request validation) fail only that bio. Every
+  request reads, authenticates and encrypts all its sectors before submitting
+  any write ([write path](native-blocks.md#write-path)); encryption
+  invocations may already have been spent.
+- **Errors once writing began and flush errors** (any of a request's write
+  bios, standalone flush, PREFLUSH or completion flush) stop the shared owner
+  and both views: storage may be partial or
   durability unknown. dm-integrity also enters its own sticky failed state on
   journal/metadata write errors. Unmount, remove and recreate the stack after
   correcting the underlying problem; there is no error-clearing control. An EIO
@@ -54,7 +57,13 @@ recorded in commit messages.
 
 scripts/guest-stateless-power.sh with kernel/guest-stateless-power.py
 initializes the stock fixture, then reopens it through a dm-delay wrapper
-(1 s write delay) and writes hidden block 0. An O_DIRECT raw observer reads the
+(1 s write delay) and writes hidden block 0. A record is written as a few
+multi-sector bios and one flush, so at 512-byte sectors (a record fits below
+dm-integrity's 50% journal watermark) the stock journal would commit it in one
+write: the test first commits a few identical-plaintext decoy rewrites so the
+record crosses the watermark part way and dm-integrity commits its first part
+alone (4096-byte records exceed the watermark anyway; the prefill is recorded
+in `cut-boundary.json`). An O_DIRECT raw observer reads the
 record's 687 current tag/IV tuples and the dm-integrity journal (whole-section
 commit IDs, pinned no-MAC entry layout) and cuts QEMU once some but not all of
 the 687 carrier IVs have changed (`cut-boundary.json`; a run without the cut
@@ -89,8 +98,8 @@ block. A direct raw read witnesses each injected fault first.
   spend no encryption and leave the owner healthy; after restoration the same
   owner generation reads and rewrites the range and passes the complete
   primary/hidden oracles without repair.
-- **error_writes** (both views): preparation spends encryptions, APPLY hits the
-  failing write, the owner reports failure and both views keep rejecting I/O
+- **error_writes** (both views): encryption is spent, the request's write bios
+  hit the failing device, the owner reports failure and both views keep rejecting I/O
   after the wrapper is restored. Only teardown/recreation clears it. Hidden
   blocks must match the oracle, with local EIO/repair allowed only for records
   intersecting the failed request (and, without the journal, torn sectors only

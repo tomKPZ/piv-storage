@@ -118,7 +118,8 @@ def symbol(stem):
     return 'dm_piv:' + matches[0]
 probes = {event: symbol(function) for event, function in dict(
     load='piv_load_mode', range='piv_read_range', crypto='piv_aead',
-    write='pn_write', checkpoint='piv_checkpoint').items()}
+    write='pn_write', checkpoint='piv_checkpoint', batch='piv_batch_read',
+    submit='piv_batch_submit').items()}
 
 
 def probe_command(value):
@@ -165,7 +166,7 @@ try:
     # on their IVs); the directory (groups 0 and 1) is then read and
     # authenticated. --verify would scan every sector instead.
     setup_expected = dict(load=1, range=(112 + per_range - 1) // per_range + 2 * record_ranges,
-                          crypto=112 + 1 + 2 * GROUP, write=0, checkpoint=1)
+                          crypto=112 + 1 + 2 * GROUP, write=0, checkpoint=1, batch=0, submit=0)
     # Bracket exactly the SETUP ioctl with pivsetup's gate (before) and hold
     # (after) hooks; the binary waits at each point for our marker file.
     counted_gate = '/run/piv-profile-counted'
@@ -202,7 +203,31 @@ try:
                     assert buf[:] == (primary if role == 'decoy' else EXPECTED)[:count]
                 finally:
                     os.close(fd)
-        counted(f'{role}-{count}', read, dict(load=0, range=ranges, crypto=loads, write=0, checkpoint=0))
+        counted(f'{role}-{count}', read, dict(load=0, range=ranges, crypto=loads, write=0, checkpoint=0,
+                                              batch=0, submit=0))
+    # Writes (same bytes, so the oracles hold): one authenticated batch read of
+    # every touched sector, one encryption each, one write submission of a few
+    # multi-sector bios. No per-sector loads, re-reads or self-decryption.
+    status_owner = GuestOwner('/dev/vdb', KEY)
+    for role, count, sectors in (('decoy', 16384, 16384 // unit), ('hidden', 4096, GROUP)):
+        # Close outside the counted window: closing a written dm device makes
+        # udev re-probe it (inotify watch), and those reads must not count.
+        with mmap.mmap(-1, count) as buf:
+            buf[:] = (primary if role == 'decoy' else EXPECTED)[:count]
+            fd = os.open(views[role], os.O_WRONLY | os.O_DIRECT)
+            try:
+                before = blocks.native_status(status_owner.device)['encryptions']
+                def write():
+                    assert os.pwritev(fd, [buf], 0) == count
+                counted(f'{role}-write-{count}', write,
+                        dict(load=0, range=0, crypto=2 * sectors, write=1, checkpoint=0, batch=1, submit=2))
+                assert blocks.native_status(status_owner.device)['encryptions'] - before == sectors
+            finally:
+                os.close(fd)
+        time.sleep(0.5)
+        subprocess.run(['udevadm', 'settle'], check=True)
+    assert not blocks.native_status(status_owner.device)['failed']
+    status_owner.close()
     (W / 'profile-kprobe-counts.txt').write_text((T / 'kprobe_profile').read_text())
 finally:
     if registered:

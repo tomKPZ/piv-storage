@@ -15,6 +15,10 @@
  */
 #define PN_DECOY_BYTES 16384
 #define PN_DECOY_ENTRIES (PN_DECOY_BYTES / 512)
+/* Initialization flushes the lower device after this many records (and before
+ * returning, also when cancelled); request writes flush once each.
+ */
+#define PN_INIT_FLUSH_RECORDS 16
 /* Format v5 (docs/format-v5.md), 16-byte IVs only: each primary IV carries
  * LRW-AES(r[10] || d[6]) with tweak = primary sector; one 4096-byte block is a
  * 4122-byte SIV payload in 687 fragments, followed by 3p Reed-Solomon parity
@@ -37,12 +41,6 @@
 #define PN_KEYSLOT_AREA (PN_KEYSLOTS * 2 * PN_KEYSLOT_SECTORS)
 #define PN_DIRECTORY_GROUPS 2
 #define PN_FLAG_AB 1U
-struct pn_entry {
- __le64 sector;
- __le32 primary;
- u8 replace; /* full-sector decoy write over a sector failing authentication */
- u8 old[16], tuple[PIV_TUPLE_BYTES];
-} __packed;
 #if PIV_AES_KEY_API
 struct pn_lrw { struct aes_enckey tweak; struct aes_key prp; };
 #else
@@ -459,9 +457,9 @@ static int pn_range_ivs(struct piv_control *p, u64 index, u32 count, u8 *ivs, bo
  return 0;
 }
 
-/* Authenticate primary data before accepting its carrier, even for replacement
- * (strict: writes need the authenticated old sectors). Reads pass @tolerant
- * (and with parity @erased, see pn_range_ivs).
+/* Collect a record group's IVs in bounded authenticated ranges. Reads pass
+ * @tolerant (and with parity @erased, see pn_range_ivs); writes do not use
+ * this: piv_batch_read() authenticates every sector they rewrite.
  */
 static int pn_carrier_mode(struct piv_control *p, u64 first, u32 group, u8 *carrier, bool tolerant,
 			   unsigned long *erased, u32 *unreadable)
@@ -474,10 +472,6 @@ static int pn_carrier_mode(struct piv_control *p, u64 first, u32 group, u8 *carr
   j += count;
  }
  return 0;
-}
-static int pn_carrier_at(struct piv_control *p, u64 first, u32 group, u8 *carrier)
-{
- return pn_carrier_mode(p, first, group, carrier, false, NULL, NULL);
 }
 
 /* Collect and open one record group for reading. Raw IVs of sectors failing
@@ -537,102 +531,55 @@ static void pn_free(struct piv_native *n)
  kfree_sensitive(n);
 }
 
-/* Prepare every fresh tuple, then apply them through the lower journal. Entries
- * hold the authenticated old IVs; ivs the replacements. Decoy sectors inside
- * [offset, offset + bytes) merge requested bytes after authenticating old data.
+struct pn_iv_key { u8 iv[16]; u8 fresh; };
+static int pn_iv_cmp(const void *a, const void *b) { return memcmp(a, b, 16); }
+
+/* Local check only, NOT a historical nonce-uniqueness guarantee: -EEXIST if a
+ * fresh IV repeats one of the @count stored IVs or another fresh one (stored
+ * IVs may repeat each other). Sorting keeps a whole record at O(G log G).
  */
-static int pn_commit(struct piv_control *p, bool hidden, u64 offset, const u8 *data, u32 bytes,
-		     struct pn_entry *entries, const u8 *ivs, u32 count, bool *mutated)
+static int pn_collides(const u8 *olds, const u8 *fresh, u32 count)
 {
- struct piv_update *u = kzalloc(sizeof(*u), GFP_NOIO);
- u32 iv = p->profile.iv_size, i;
- u64 unit = p->profile.sector_size;
+ struct pn_iv_key *k = kvmalloc_array(2 * count, sizeof(*k), GFP_NOIO);
+ u32 i;
  int r = 0;
- if (!u) return -ENOMEM;
- u->version = PIV_CONTROL_VERSION; u->size = sizeof(*u); u->generation = p->profile.generation;
- /* Prepare every tuple before the first mutation. No external WAL/replay. */
+ if (!k) return -ENOMEM;
  for (i = 0; i < count; i++) {
-  u64 sector = le64_to_cpu(entries[i].sector), start = sector * unit;
-  bool primary = !hidden && start < offset + bytes && start + unit > offset;
-  memset(u->tuple, 0, sizeof(u->tuple)); u->sector = sector;
-  memcpy(u->expected_iv, entries[i].old, iv); memcpy(u->tuple + PIV_IV_AT(p->cc), ivs + i * iv, iv);
-  if (primary) {
-   struct piv_sector *s = NULL;
-   u64 lo = max(start, offset), hi = min(start + unit, offset + bytes);
-   /* A replaced sector is fully covered by the request; nothing to merge. */
-   if (!entries[i].replace) {
-    r = piv_load(p->cc, sector, &s); if (r) goto done;
-    memcpy(u->tuple, page_address(s->page), unit); piv_sector_free(p->cc, s);
-   }
-   memcpy(u->tuple + lo - start, data + lo - offset, hi - lo);
-   entries[i].primary = cpu_to_le32(1);
-  }
-  r = piv_update(p, u, true, primary, entries[i].replace); if (r) goto done;
-  memcpy(entries[i].tuple, u->tuple, PIV_TUPLE_BYTES);
+  memcpy(k[i].iv, olds + i * 16, 16); k[i].fresh = 0;
+  memcpy(k[count + i].iv, fresh + i * 16, 16); k[count + i].fresh = 1;
  }
- u->flags = PIV_APPLY_DEFER_FLUSH;
- /* Conservative: any APPLY-loop failure may follow a lower write. */
- *mutated = true;
- for (i = 0; i < count; i++) {
-  u->sector = le64_to_cpu(entries[i].sector);
-  memcpy(u->expected_iv, entries[i].old, iv); memcpy(u->tuple, entries[i].tuple, PIV_TUPLE_BYTES);
-  r = piv_update(p, u, false, le32_to_cpu(entries[i].primary), entries[i].replace);
-  if (r) goto done;
-  if ((i + 1) % 32 == 0) { r = blkdev_issue_flush(p->cc->dev->bdev); if (r) goto done; }
- }
- r = blkdev_issue_flush(p->cc->dev->bdev);
-done:
- kfree_sensitive(u);
+ sort(k, 2 * count, sizeof(*k), pn_iv_cmp, NULL);
+ /* A run of equal IVs that contains a fresh one has it next to another. */
+ for (i = 1; i < 2 * count && !r; i++)
+  if ((k[i].fresh || k[i - 1].fresh) && !memcmp(k[i].iv, k[i - 1].iv, 16)) r = -EEXIST;
+ kvfree_sensitive(k, 2 * count * sizeof(*k));
  return r;
 }
 
-/* Replace @count IVs from @first with @fresh (hidden-only tuples: primary
- * plaintext unchanged). Old IVs are read and authenticated first. -EEXIST if a
- * fresh IV repeats an old or another fresh one (callers re-encode and retry).
+/* Encode and write one record group (G fragments, parity included): the
+ * carrier is read and authenticated once (hidden-only rewrite: primary
+ * plaintext unchanged); local IV collisions re-encode before anything is
+ * encrypted. Without @flush the caller flushes later (initialization).
  */
-static int pn_replace(struct piv_control *p, u64 first, u32 count, const u8 *fresh, bool *mutated)
-{
- struct pn_entry *entries = NULL;
- u8 *olds = NULL;
- u32 i, j;
- int r = -E2BIG;
- if (!count || count > PN_MAX_GROUP) return r;
- entries = kvcalloc(count, sizeof(*entries), GFP_NOIO);
- olds = kvmalloc(count * 16, GFP_NOIO);
- r = -ENOMEM;
- if (!entries || !olds) goto done;
- r = pn_carrier_at(p, first, count, olds); if (r) goto done;
- r = -EEXIST;
- for (i = 0; i < count; i++) {
-  entries[i].sector = cpu_to_le64(first + i);
-  memcpy(entries[i].old, olds + i * 16, 16);
-  for (j = 0; j < count; j++) if (!memcmp(fresh + i * 16, olds + j * 16, 16)) goto done;
-  for (j = 0; j < i; j++) if (!memcmp(fresh + i * 16, fresh + j * 16, 16)) goto done;
- }
- r = -EDQUOT;
- if (count > (1ULL << 32) - p->encryptions) goto done;
- r = pn_commit(p, true, 0, NULL, 0, entries, fresh, count, mutated);
-done:
- if (entries) kvfree_sensitive(entries, count * sizeof(*entries));
- if (olds) kvfree_sensitive(olds, count * 16);
- return r;
-}
-
-/* Encode and write one record group (G fragments, parity included),
- * retrying local IV collisions.
- */
-static int pn_write_group(struct piv_control *p, u64 group, u64 generation, const u8 *data, bool *mutated)
+static int pn_write_group(struct piv_control *p, u64 group, u64 generation, const u8 *data, bool flush,
+			  bool *mutated)
 {
  struct piv_native *n = p->native;
+ struct piv_batch *b = NULL;
  u8 *ivs = kvmalloc(n->group * 16, GFP_NOIO);
  u32 attempt;
  int r = -ENOMEM;
  if (!ivs) return r;
- for (attempt = 0; attempt < 16; attempt++) {
+ r = piv_batch_read(p, pn_group_first(n, group), n->group, 0, 0, &b);
+ for (attempt = 0; !r && attempt < 16; attempt++) {
   r = pn_pack(n, group, generation, data, ivs);
-  if (!r) r = pn_replace(p, pn_group_first(n, group), n->group, ivs, mutated);
-  if (r != -EEXIST || *mutated) break;
+  if (!r) r = pn_collides(b->olds, ivs, n->group);
+  if (r != -EEXIST) break;
+  r = 0;
  }
+ if (!r && attempt == 16) r = -EEXIST;
+ if (!r) r = piv_batch_write(b, ivs, flush, mutated);
+ piv_batch_free(b);
  kvfree_sensitive(ivs, n->group * 16);
  return r;
 }
@@ -646,7 +593,7 @@ static int pn_dir_write(struct piv_control *p, bool *mutated)
  if (!data) return -ENOMEM;
  if (n->dir_generation == U64_MAX) { kfree(data); return -EOVERFLOW; }
  pn_dir_build(n, data);
-   r = pn_write_group(p, slot, n->dir_generation + 1, data, mutated);
+ r = pn_write_group(p, slot, n->dir_generation + 1, data, true, mutated);
  if (!r) { n->dir_slot = slot; n->dir_generation++; }
  kfree_sensitive(data);
  return r;
@@ -662,12 +609,18 @@ static int pn_ks_write(struct piv_control *p, u32 slot, const u8 *kek, struct pn
  int r = -ENOMEM;
  if (!ivs) return r;
  for (replica = 0; replica < 2; replica++) {
-  for (attempt = 0; attempt < 16; attempt++) {
+  struct piv_batch *b = NULL;
+  r = piv_batch_read(p, pn_ks_first(slot, replica), PN_KEYSLOT_SECTORS, 0, 0, &b);
+  for (attempt = 0; !r && attempt < 16; attempt++) {
    if (kek) r = pn_ks_seal(p->native, keys, slot, replica, ivs);
-       else { get_random_bytes(ivs, PN_KEYSLOT_SECTORS * 16); r = 0; }
-    if (!r) r = pn_replace(p, pn_ks_first(slot, replica), PN_KEYSLOT_SECTORS, ivs, mutated);
-   if (r != -EEXIST || *mutated) break;
+   else get_random_bytes(ivs, PN_KEYSLOT_SECTORS * 16);
+   if (!r) r = pn_collides(b->olds, ivs, PN_KEYSLOT_SECTORS);
+   if (r != -EEXIST) break;
+   r = 0;
   }
+  if (!r && attempt == 16) r = -EEXIST;
+  if (!r) r = piv_batch_write(b, ivs, true, mutated);
+  piv_batch_free(b);
   if (r) break;
  }
  kfree_sensitive(ivs);
@@ -677,21 +630,25 @@ static int pn_ks_write(struct piv_control *p, u32 slot, const u8 *kek, struct pn
 /* Format v5 write. A hidden write (one 4096-byte block) re-encodes its whole
  * record (with A/B, into the slot not holding the newest valid version); a
  * decoy write re-randomizes only the IVs of the primary sectors it writes,
- * preserving their fragments.
+ * preserving their fragments. @initializing (setup only, hidden): the caller
+ * flushes every few records, and with A/B slot 0 is written with generation 1
+ * without reading the slots (no record authenticates under a new master key).
  */
 static int pn_write_blocks(struct piv_control *p, bool hidden, u64 offset, const u8 *data, u32 bytes,
-			   bool *mutated)
+			   bool initializing, bool *mutated)
 {
  struct piv_native *n = p->native;
- struct pn_entry *entries;
+ struct piv_batch *b = NULL;
  u8 *ivs, *scratch;
  u64 unit = p->profile.sector_size, index, generation = 0;
- u32 count = 0, i, j, attempt;
+ u32 count, i, attempt;
  int slot = 0, r;
  if (hidden) {
   if (bytes != PN_DATA || offset % PN_DATA || offset / PN_DATA >= n->records) return -EINVAL;
   index = offset / PN_DATA;
-  if (n->ab) {
+  if (n->ab && initializing) {
+   generation = 1;
+  } else if (n->ab) {
    size_t length = 2 * n->group * 16 + PN_DATA;
    scratch = kvmalloc(length, GFP_NOIO);
    if (!scratch) return -ENOMEM;
@@ -702,42 +659,34 @@ static int pn_write_blocks(struct piv_control *p, bool hidden, u64 offset, const
    generation = r ? 1 : generation + 1;
    if (!generation) return -EOVERFLOW;
   }
-  return pn_write_group(p, pn_group(n, index, slot), generation, data, mutated);
+  return pn_write_group(p, pn_group(n, index, slot), generation, data, !initializing, mutated);
  }
- entries = kvcalloc(PN_DECOY_ENTRIES, sizeof(*entries), GFP_NOIO);
- ivs = kmalloc(PN_DECOY_ENTRIES * 16, GFP_NOIO);
- r = -ENOMEM;
- if (!entries || !ivs) goto done;
- for (index = offset / unit; index <= (offset + bytes - 1) / unit; index++) {
-  struct piv_sector *s = NULL;
-  /* A sector failing authentication (e.g. media damage) may be
-   * replaced only by a write covering all of it. Its raw stored fragment is
-   * refreshed like any other: the record's SIV tag decides whether it is
-   * still valid, so damage stays damage and is never made authentic.
-   */
-  bool full = index * unit >= offset && (index + 1) * unit <= offset + bytes;
-  if (count == PN_DECOY_ENTRIES) { r = -E2BIG; goto done; }
-  r = piv_load_mode(p->cc, index, &s, full); if (r) goto done;
-  entries[count].sector = cpu_to_le64(index);
-  entries[count].replace = s->bad;
-  memcpy(entries[count++].old, s->original + PIV_IV_AT(p->cc), 16); piv_sector_free(p->cc, s);
- }
- if (!count || count > (1ULL << 32) - p->encryptions) { r = -EDQUOT; goto done; }
- /* Local checks are NOT a historical nonce-uniqueness guarantee. */
+ if (initializing) return -EINVAL;
+ index = offset / unit;
+ count = (offset + bytes - 1) / unit - index + 1;
+ if (count > PN_DECOY_ENTRIES) return -E2BIG;
+ ivs = kmalloc(count * 16, GFP_NOIO);
+ if (!ivs) return -ENOMEM;
+ /* A sector failing authentication (e.g. media damage) may be replaced only
+  * by a write covering all of it. Its raw stored fragment is refreshed like
+  * any other: the record's SIV tag decides whether it is still valid, so
+  * damage stays damage and is never made authentic.
+  */
+ r = piv_batch_read(p, index, count, offset, bytes, &b);
+ if (r) goto done;
+ r = -EDQUOT;
+ if (count > (1ULL << 32) - p->encryptions) goto done;
  for (attempt = 0; attempt < 16; attempt++) {
-  bool collision = false;
   for (i = 0; i < count; i++)
-       pn_decoy_iv(n, le64_to_cpu(entries[i].sector), entries[i].old, ivs + i * 16);
-  for (i = 0; i < count; i++) {
-   for (j = 0; j < count; j++) if (!memcmp(ivs + i * 16, entries[j].old, 16)) collision = true;
-   for (j = 0; j < i; j++) if (!memcmp(ivs + i * 16, ivs + j * 16, 16)) collision = true;
-  }
-  if (!collision) break;
+   pn_decoy_iv(n, index + i, b->olds + i * 16, ivs + i * 16);
+  r = pn_collides(b->olds, ivs, count);
+  if (r != -EEXIST) break;
  }
- if (attempt == 16) { r = -EEXIST; goto done; }
- r = pn_commit(p, false, offset, data, bytes, entries, ivs, count, mutated);
+ if (r) goto done;
+ piv_batch_merge(b, offset, data, bytes);
+ r = piv_batch_write(b, ivs, true, mutated);
 done:
- if (entries) kvfree_sensitive(entries, PN_DECOY_ENTRIES * sizeof(*entries));
+ piv_batch_free(b);
  kfree_sensitive(ivs);
  return r;
 }
@@ -747,9 +696,9 @@ done:
  * point leaves the disk untouched; the caller may then fail only this request.
  */
 static noinline int pn_write(struct piv_control *p, bool hidden, u64 offset, const u8 *data, u32 bytes,
-			     bool *mutated)
+			     bool initializing, bool *mutated)
 {
- return pn_write_blocks(p, hidden, offset, data, bytes, mutated);
+ return pn_write_blocks(p, hidden, offset, data, bytes, initializing, mutated);
 }
 
 /* Cooperative setup only: never interrupt an in-flight hidden-record write.
@@ -949,7 +898,15 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
   if (!zero) { r = -ENOMEM; goto bad; }
   for (i = 0; i < n->hidden_bytes / PN_DATA; i++) {
    r = pn_setup_poll(); if (r) break;
-   r = pn_write(p, true, i * PN_DATA, zero, PN_DATA, &mutated); if (r) break;
+   r = pn_write(p, true, i * PN_DATA, zero, PN_DATA, true, &mutated); if (r) break;
+   if ((i + 1) % PN_INIT_FLUSH_RECORDS == 0) { r = blkdev_issue_flush(p->cc->dev->bdev); if (r) break; }
+  }
+  /* Completed records stay committed, also when cancelled: flush them before
+   * returning. A failed record write already failed the attempt.
+   */
+  if (!r || r == -EINTR) {
+   int f = blkdev_issue_flush(p->cc->dev->bdev);
+   if (f) r = f;
   }
   kfree_sensitive(zero); if (r) goto bad;
  }
@@ -1088,20 +1045,21 @@ static void pn_worker(struct work_struct *work)
 		} else if (bio_op(bio) == REQ_OP_WRITE) {
 			pn_copy_bio(bio, buffer, false);
 			/* Drain earlier journal writes before a WRITE|PREFLUSH payload.
-			 * pn_write flushes each batch before completion, satisfying FUA too.
+			 * pn_write flushes once before completion, satisfying FUA too.
 			 */
 			flushing = bio->bi_opf & REQ_PREFLUSH;
 			r = flushing ? blkdev_issue_flush(p->cc->dev->bdev) : 0;
 			if (!r) {
 				flushing = false;
-				r = pn_write(p, w->hidden, w->offset, buffer, bytes, &mutated);
+				r = pn_write(p, w->hidden, w->offset, buffer, bytes, false, &mutated);
 			}
 		} else r = -EOPNOTSUPP;
 	}
 	/* Scoped isolation: reads, validation, authentication, allocation, nonce
 	 * and preparation failures change no storage and fail only this bio. A
-	 * failed flush leaves earlier durability unknown, and an APPLY-loop failure
-	 * may have partially written; both still stop the shared owner.
+	 * failed flush leaves earlier durability unknown, and a failure once
+	 * writing began may have partially written; both still stop the shared
+	 * owner.
 	 */
 	if (r < 0 && (mutated || flushing)) { p->failed = true; p->native->failed = true; }
 done:

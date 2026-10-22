@@ -234,7 +234,7 @@ for role in ('decoy', 'hidden'):
         status = blocks.native_status(handle.device)
         spent = status['encryptions'] - before_count
         if mode == 'writes':
-            # APPLY reached a failing lower write: storage may be partial, so the
+            # The write bios reached the failing device: storage may be partial, so the
             # shared owner still fails stop.
             assert status['failed'] and spent > 0
             fault()

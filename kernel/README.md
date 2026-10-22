@@ -34,7 +34,7 @@ encrypted filesystem is busy. Interfaces and tests:
   ownership starts and never prints its key in status.
 - The control device exposes only QUERY, DEVICES, BEGIN/END, NATIVE_SETUP,
   NATIVE_DETACH, NATIVE_STATUS and NATIVE_KEYSLOT (kernel/piv-control.h). There
-  is no userspace IV, tuple or primary read/write control; prepare/apply exists
+  is no userspace IV, tuple or primary read/write control; rewriting happens
   only inside the kernel.
 - kernel/piv-io-test.c is a separate guest-only exact-bio-flags helper; never
   link it into dm-piv or load it on the host. kernel/piv-rs-test.c is a

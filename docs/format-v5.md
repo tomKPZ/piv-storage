@@ -311,8 +311,9 @@ primary data of every touched sector before modifying it.
   validity). A partial write to such a sector fails with EIO.
 - **Hidden read:** as in the parity section. The newest valid A/B slot wins.
 
-Every request prepares all tuples before the first APPLY through the lower
-dm-integrity journal; the journal's per-sector atomicity does not make a
+Every request reads, authenticates and re-encrypts all its sectors before the
+first write through the lower dm-integrity journal
+([write path](native-blocks.md#write-path)); the journal's per-sector atomicity does not make a
 G-sector record atomic. Without A/B, an interrupted hidden write leaves the
 block unavailable (EIO) unless parity recovers it; with A/B the previous
 version stays readable. There is no cross-block ordering.

@@ -237,6 +237,15 @@ def provision(args):
     return target
 
 
+def shutdown_grace(args):
+    """Seconds QEMU may take to exit after the task reported completion."""
+    if args.base_image:
+        kind = json.loads(args.base_image.resolve().with_suffix('.json').read_text()).get('kind', '')
+        if 'sanitizer' in kind:
+            return 600
+    return 120
+
+
 def run(args):
     image = prepare()
     if args.provisioned:
@@ -356,7 +365,10 @@ def run(args):
                 console.log = None
         password = None
         code = int(match.group(1))
-        process.wait(timeout=60)
+        # After PIV_TASK_DONE the guest only syncs and powers off. Sanitizer
+        # kernels (KASAN, kmemleak) can need minutes for that after long runs;
+        # a guest still running after the grace is treated as hung.
+        process.wait(timeout=shutdown_grace(args))
         if args.power_cut_script and not (run_dir / 'power-cut.json').exists() and code == 0:
             raise RuntimeError('Expected power cut was not requested')
         if process.returncode != 0 or code != 0:

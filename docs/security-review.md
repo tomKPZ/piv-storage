@@ -101,8 +101,8 @@ not permit nonce reuse.
 dm-crypt writes (one per written sector), native decoy writes (exactly one per
 written primary sector), hidden writes (G = 687 + 3p per 4096-byte block; A/B
 writes one slot), keyslot add/remove (28 + G) and initialization (28 + G + G ×
-hidden blocks). Tuples prepared before a failure count; local collision retries before
-preparation and exact replays do not.
+hidden blocks). Encryptions performed before a failure count; local collision
+retries happen before encryption and do not.
 
 **Consequence of a repeat, per profile.**
 
@@ -153,14 +153,17 @@ dm-crypt fixes, so its own crypto/integrity path needs equivalent review; exact
 header compatibility does not establish that a pinned kernel is free of
 vulnerabilities.
 
-`piv_load` authenticates before primary modification. In-kernel PREPARE
-consumes encryption invocations; APPLY authenticates the candidate and checks
-the expected old IV. Native updates prepare all tuples before applying any,
-serialize through the owner mutex and use the lower journal. Userspace has no
-IV/tuple read or apply ioctls. Hidden reads copy to the caller only after
+Every rewrite authenticates the old sectors (`piv_batch_read`) before
+modifying them, encrypts all of them before submitting any write, serializes
+through the owner mutex and uses the lower journal
+([write path](native-blocks.md#write-path)). The former re-read with an
+expected-IV check and the self-decryption of new ciphertext served userspace
+PREPARE/APPLY tuples and were dropped with that interface; nothing coordinated
+can change a sector between authentication and its write. Userspace has no
+IV/tuple read or write ioctls. Hidden reads copy to the caller only after
 complete record authentication; decoy reads publish a range only after every
-sector in it authenticates. Expected-IV checks prevent stale local updates, not
-rollback by an external writer. Context, size and profile bounds are validated
+sector in it authenticates. Nothing prevents rollback or races by an external
+writer of the lower device. Context, size and profile bounds are validated
 and exercised by control-ioctl and dm-table fuzzing and a sanitizer guest
 (KASAN/UBSAN/lockdep/kmemleak); this is not exhaustive fuzzing, formal
 verification or a memory-safety proof.

@@ -52,7 +52,9 @@ suite.py fails any run (stock or debug kernel) whose console or dmesg contains a
 kernel self-report: KASAN/UBSAN, lockdep, sleeping-in-atomic, BUG/Oops/GPF,
 WARNING or a kmemleak suspect. guest_record forces a final kmemleak scan and
 saves the report; vm.py keeps logging for 10 seconds after a kernel fault so the
-trace is preserved.
+trace is preserved. After the task reports completion, vm.py allows QEMU 600 s
+to power off on a sanitizer image (120 s otherwise) before treating the guest as
+hung; a long KASAN run once needed more than the former 60 s.
 
 ## Findings and known noise
 
