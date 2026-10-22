@@ -11,7 +11,8 @@ owns all subsequent I/O.
 This is not a proven indistinguishability construction or reliable production
 storage. README and ROADMAP are provisional research notes; the internal
 [security and threat-model review](docs/security-review.md) defines observer
-boundaries and open assumptions. Independent cryptographic review remains open.
+boundaries and open assumptions. **No external cryptographic review has been
+conducted** (see [Nonces and limitations](#nonces-and-limitations)).
 
 ## Components
 
@@ -159,6 +160,12 @@ hidden write re-encodes its whole 90-sector record with a fresh generation.
   attempt's own identity-checked mappings and never rolls back disk writes.
 
 ## Nonces and limitations
+
+**No external cryptographic review.** The stored encoding (LRW-AES fragments,
+SIV records, keyslots and directory, passphrase KDF), the use of the AEGIS-128
+and AES-XTS + HMAC-SHA256 primary profiles and the nonce-budget guidance have
+only had internal review ([security review](docs/security-review.md)). Treat
+every security claim here as unreviewed.
 
 Primary IV uniqueness is probabilistic. A decoy rewrite keeps a sector's 6
 payload bytes and draws 10 fresh random bytes, so n rewrites of one sector

@@ -20,7 +20,13 @@ and limits are in README.md and docs/.
 
 ## Remaining work
 
-1. **Faster record writes** (core module, no format change). Every write
+1. **Format v5** (docs/format-v5.md, design approved 2026-10-22): 4 KiB
+   records, parameters in the keyslot, Argon2id cost tiers (default tier 3,
+   cryptsetup-like) and optional Reed–Solomon parity. Replaces v4 outright (no
+   production data, no migration). Do it before items 2–4, which depend on the
+   record size. Follow the implementation plan in the spec. Exit as listed
+   there; v4 code, tests and docs removed.
+2. **Faster record writes** (core module, no format change). Every write
    (decoy, hidden, keyslot, initialization) goes through `pn_commit` /
    `piv_update`, which per sector reads and authenticates three times (range
    read, prepare, apply), self-decrypts, submits one synchronous write and
@@ -35,7 +41,7 @@ and limits are in README.md and docs/.
    Exit: bench shows the gain for hidden writes, initialization and decoy
    writes; faults, power, cancel, batch and lifecycle suites updated and
    passing on the stock and sanitizer images; docs updated.
-2. **Concurrent bios and larger reads** (core module). The single ordered
+3. **Concurrent bios and larger reads** (core module). The single ordered
    `piv-native` worker handles one bio at a time, so decoy writes run 12–50×
    slower than stock dm-crypt and sequential reads 2.5–4.5× slower
    (docs/configuration.md, suite-072). Process independent bios and
@@ -44,10 +50,10 @@ and limits are in README.md and docs/.
    PREFLUSH/FUA/flush semantics, per-sector authentication before publishing
    and the failure-scope rules (a failure after writing begins still stops the
    owner). Revisit the 16 KiB range-read and DM split bounds and the 2^32
-   per-owner cap. Exit as item 1, plus the lifecycle expected ordering updated
+   per-owner cap. Exit as item 2, plus the lifecycle expected ordering updated
    for the new design. Initialization's floor is then disk bandwidth: it reads
    every carrier sector once and writes it about twice (journal).
-3. **Quick and resumable initialization** (pivsetup + module, no format change).
+4. **Quick and resumable initialization** (pivsetup + module, no format change).
    `--initialize --quick` (non-default, user decision 2026-10-22) writes only
    keyslot 0 and the directory; never-written hidden blocks return EIO until
    first written (each hidden write replaces a whole record), which breaks
@@ -59,24 +65,22 @@ and limits are in README.md and docs/.
    explicit, documented destructive command, never automatic. Exit: v4/cancel
    suites cover quick init, EIO on unwritten blocks, fill after cancellation
    and skipping of written blocks; host decoder verifies the result.
-4. **External cryptographic review** of the whole stored encoding (format v4:
-   LRW-AES fragments, SIV records, keyslots/directory, KDFs), of the AEGIS-128
-   and AES-XTS + HMAC-SHA256 primary profiles' usage and of the nonce-budget guidance in
-   docs/security-review.md. Needs an outside reviewer; findings override
-   everything else here.
-5. **Sanitizer build of the 7.2 port kernel** (optional; the KASAN image is
-   6.12 only). docs/kernel-port.md.
-6. **Kernels between 6.12 and 7.2 and other distributions** (optional). The
-   API shims in dm-piv.c use believed-but-unverified version thresholds; a wrong
-   one fails the build rather than misbehaving.
-7. **Deployment beyond test guests** — packaging and module signing, boot
-   integration beyond the test initramfs, and real-device activation. The guards
-   deliberately restrict activation to the pinned disposable QEMU guests; lifting
-   that is a scope change that needs the user.
+5. **Lift the activation guards and deploy beyond test guests** (user
+   approval 2026-10-22). Remove pivsetup's restriction to the pinned QEMU guest
+   and 128/512 MiB `/dev/vdb` (and the test-only `--allow-test-stack` /
+   `--allow-second-disk` escape hatches once unneeded), keeping the safety
+   checks that are not about test confinement: exclusive /run locks, identity
+   checks on mappings, busy-device protection and refusal of foreign stacks.
+   Then packaging and module signing and boot integration beyond the test
+   initramfs. Agent testing still uses only disposable guests and synthetic
+   disks. Exit: activation works on an arbitrary block device inside a guest
+   (e.g. a non-vdb disk of another size), guard tests replaced by tests of the
+   remaining safety checks, docs updated.
 
 ## Standing decisions (binding for autonomous sessions)
 
-- Format v4 only. Primary profiles: AEGIS-128 (default) and aes-xts-random +
+- One hidden format at a time: v4 now, replaced by v5 (approved design) without
+  migration. Primary profiles: AEGIS-128 (default) and aes-xts-random +
   hmac-sha256. v3, the 12-byte-IV profiles, Serpent/Twofish-XTS and
   HMAC-SHA1/SHA512 stay removed (the last four by user decision 2026-10-22,
   for maintenance).

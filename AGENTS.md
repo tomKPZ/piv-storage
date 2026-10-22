@@ -51,8 +51,10 @@ resolved from context/evidence, not for routine implementation decisions.
   LUKS/dm-integrity structures and encrypted records inside IVs. No separate
   partition, root-ext4 file or hidden-volume metadata dependency. /run ownership
   locks are volatile. Early activation must be possible from an initramfs.
-- Format v4 (docs/format-v4.md, user-approved 2026-10-20) is the only hidden
-  format: LRW-randomized fragments (10 random + 6 payload bytes per 16-byte
+- Format v4 (docs/format-v4.md, user-approved 2026-10-20) is the only
+  implemented hidden format until format v5 (docs/format-v5.md, design
+  user-approved 2026-10-22: 4 KiB records, keyslot parameters, Argon2id cost
+  tiers, optional Reed–Solomon parity) replaces it outright. v4: LRW-randomized fragments (10 random + 6 payload bytes per 16-byte
   IV), 90-fragment SIV records, encrypted keyslots (no public magic) with a
   directory, Argon2id passphrase KEKs and optional A/B slots. Never add a persistent encryption counter. Format v3, its invalid
   markers and the 12-byte-IV AES-GCM/ChaCha20-Poly1305 profiles were removed
@@ -106,10 +108,11 @@ resolved from context/evidence, not for routine implementation decisions.
   identity-checked private owner to drain probes; never force public views or
   existing/foreign mappings. Normal close retains busy-device protection.
 - Larger geometry uses checked kernel file-offset bounds rather than a 256 MiB
-  primary cap. Frontend/VM fixtures allow only pinned QEMU /dev/vdb at 128 or
-  512 MiB, plus explicitly opted-in test wrappers. Never broaden this into
-  arbitrary host-device activation as a side effect of geometry work. The actual
-  validated raw size must reach extent parsing. Live resize, rekey and cipher
+  primary cap. pivsetup currently admits only pinned QEMU /dev/vdb at 128 or
+  512 MiB plus opted-in test wrappers; the user approved removing this
+  activation guard (2026-10-22, ROADMAP). Agent testing must still use only
+  disposable guests and synthetic disks. The actual validated raw size must
+  reach extent parsing. Live resize, rekey and cipher
   change are out of scope (stock cryptsetup refuses them on integrity volumes;
   user decision 2026-10-22); `pivsetup migrate` is the offline path.
 - Read sizes for setup, decoy reads and carrier collection are implementation
