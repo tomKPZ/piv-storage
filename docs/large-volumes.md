@@ -142,3 +142,21 @@ artifacts/large-4096-001/share/experimental-dm-piv.ko, SHA-256
 0a97560fd0df8a9709619725689eb9baaf128da4fd6cf7e2830387242bc95948.
 Config/symbol checks and kernel/header/compiler pins are unchanged. Full reports
 are large-results.json and host-verification.json under the named run directories.
+
+## Stock online reencryption and resize (probe, 2026-10-22)
+
+scripts/probe-stock-reencrypt.sh (run with vm.py; artifacts/reencrypt-probe-005
+and -002) checked pinned cryptsetup 2.7.5 on LUKS2 volumes with an integrity
+profile, both aegis128-random/aead and aes-xts-random/hmac-sha256, 4096-byte
+sectors:
+
+- `cryptsetup reencrypt` (online volume-key change, online cipher change and
+  offline) refuses: "Reencryption of device with integrity profile is not
+  supported."
+- `cryptsetup resize` of the active mapping after growing the backing device,
+  and an explicit shrink, both refuse: "Unsupported parameters on device"; the
+  size stays unchanged.
+
+So stock tooling offers no live rekey, cipher change or resize for these volumes
+at all; any live variant would be our own implementation. `pivsetup migrate`
+(copy into a freshly formatted volume) remains the supported path.
