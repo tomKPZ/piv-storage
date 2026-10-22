@@ -69,11 +69,22 @@ unit, group = owner.device.sector_size, 687  # format v5 record size in primary 
 generation = owner.device.generation
 owner.close()
 
+# Module functions may carry compiler suffixes (e.g. pn_write.constprop.0):
+# resolve the unique non-cold copy in [dm_piv], never a stock symbol.
+def symbol(stem):
+    matches = [line.split()[2] for line in Path('/proc/kallsyms').read_text().splitlines()
+               if len(line.split()) == 4 and line.split()[3] == '[dm_piv]'
+               and (line.split()[2] == stem or line.split()[2].startswith(stem + '.'))
+               and '.cold' not in line.split()[2]]
+    assert len(matches) == 1, (stem, matches)
+    return 'dm_piv:' + matches[0]
+
+
 # Dynamic probes record only call metadata/results, never data or keys.
-probes = [('worker', 'pn_worker', False), ('worker_done', 'pn_worker', True),
-          ('write', 'pn_write', False), ('write_done', 'pn_write', True),
+probes = [('worker', symbol('pn_worker'), False), ('worker_done', symbol('pn_worker'), True),
+          ('write', symbol('pn_write'), False), ('write_done', symbol('pn_write'), True),
           ('flush', 'blkdev_issue_flush', False), ('flush_done', 'blkdev_issue_flush', True),
-          ('endio', 'pn_endio', False)]
+          ('endio', symbol('pn_endio'), False)]
 # Completions are traced at pn_endio (the worker's upper-bio completion,
 # process context). A bio_endio probe also fired for about 20,000
 # interrupt-context lower completions per v5 run, which occasionally nested in

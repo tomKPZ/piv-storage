@@ -2,23 +2,33 @@
 /* Stateless paired views over format v5 (docs/format-v5.md; 16-byte random IVs:
  * AEGIS-128 or XTS + HMAC). Only stock dm-integrity persists recovery information. Whole
  * hidden blocks authenticate, but interrupted multi-sector writes can destroy
- * them (A/B slots keep the previous version). All work is serialized under the
- * owner lock in NOIO context.
+ * them (A/B slots keep the previous version). View requests run concurrently
+ * in NOIO context on an unbound workqueue under the owner's shared I/O lock;
+ * requests touching the same sectors or hidden record serialize on range
+ * locks (piv_range_lock).
  */
 /* Positive internal sentinel: LOCAL hidden unavailability. -ENODATA may also
  * mean a block medium error and is never treated as unavailability.
  */
 #define PN_UNAVAILABLE 1
-/* Power-of-two DM split boundary: a decoy work item touches at most 32
- * primary sectors (16 KiB / 512). No cross-bio accumulation or delayed
+/* Power-of-two DM split boundary: a decoy work item touches at most 256
+ * primary sectors (128 KiB / 512). No cross-bio accumulation or delayed
  * completion is used.
  */
-#define PN_DECOY_BYTES 16384
+#define PN_DECOY_BYTES (128 * 1024)
 #define PN_DECOY_ENTRIES (PN_DECOY_BYTES / 512)
-/* Initialization flushes the lower device after this many records (and before
- * returning, also when cancelled); request writes flush once each.
+/* Concurrent view requests (workqueue max_active, shared by all owners). It
+ * bounds request memory: at most about 3 MiB per hidden write or read at
+ * 4096-byte sectors.
  */
+#define PN_MAX_ACTIVE 16
+/* Initialization writes this many records concurrently per round, flushes
+ * the lower device after every PN_INIT_FLUSH_RECORDS records (a multiple) and
+ * before returning, also when cancelled. View writes flush only for FUA.
+ */
+#define PN_INIT_PARALLEL 8
 #define PN_INIT_FLUSH_RECORDS 16
+static_assert(PN_INIT_FLUSH_RECORDS % PN_INIT_PARALLEL == 0);
 /* Format v5 (docs/format-v5.md), 16-byte IVs only: each primary IV carries
  * LRW-AES(r[10] || d[6]) with tweak = primary sector; one 4096-byte block is a
  * 4122-byte SIV payload in 687 fragments, followed by 3p Reed-Solomon parity
@@ -47,9 +57,14 @@ struct pn_lrw { struct aes_enckey tweak; struct aes_key prp; };
 struct pn_lrw { struct crypto_aes_ctx tweak, prp; };
 #endif
 struct piv_native {
- struct crypto_shash *hmac;
+ /* hmac/chacha are rekeyed per call (HKDF, keyslots): setup and keyslot
+  * changes only, when no view request runs. rec_hmac/rec_chacha hold the
+  * record MAC/stream keys, keyed once in pn_keys and then shared by
+  * concurrent requests (a transform must not be rekeyed while in use).
+  */
+ struct crypto_shash *hmac, *rec_hmac;
+ struct crypto_skcipher *chacha, *rec_chacha;
  /* record outer keys, keyslot outer keys from the directory */
- struct crypto_skcipher *chacha;
  struct pn_lrw rec, ks_lrw[PN_KEYSLOTS];
  u8 ks_outer[PN_KEYSLOTS][64];
  bool ks_present[PN_KEYSLOTS];
@@ -137,11 +152,14 @@ static int pn_lrw_init(struct pn_lrw *k, const u8 tweak[32], const u8 prp[32])
 #endif
 }
 
-/* tag = HMAC-SHA256(mac, context || label(8|9) || LE64(id) || plain)[0:16] */
+/* tag = HMAC-SHA256(mac, context || label(8|9) || LE64(id) || plain)[0:16].
+ * The record key (n->mac_key) uses the pre-keyed n->rec_hmac.
+ */
 static int pn_tag(struct piv_native *n, const u8 mac[32], const u8 *context, size_t context_length,
 		  const char *label, u64 id, const u8 *plain, size_t plain_length, u8 tag[16])
 {
 	size_t label_length = strlen(label), length = context_length + label_length + 8 + plain_length;
+	struct crypto_shash *tfm = mac == n->mac_key ? n->rec_hmac : n->hmac;
 	u8 *buffer = kmalloc(length, GFP_NOIO), digest[32];
 	int r;
 	if (!buffer) return -ENOMEM;
@@ -149,8 +167,8 @@ static int pn_tag(struct piv_native *n, const u8 mac[32], const u8 *context, siz
 	memcpy(buffer + context_length, label, label_length);
 	put_unaligned_le64(id, buffer + context_length + label_length);
 	memcpy(buffer + context_length + label_length + 8, plain, plain_length);
-	r = crypto_shash_setkey(n->hmac, mac, 32);
-	if (!r) r = pn_hash(n->hmac, buffer, length, digest);
+	r = tfm == n->hmac ? crypto_shash_setkey(tfm, mac, 32) : 0;
+	if (!r) r = pn_hash(tfm, buffer, length, digest);
 	if (!r) memcpy(tag, digest, 16);
 	memzero_explicit(digest, sizeof(digest));
 	kfree_sensitive(buffer);
@@ -158,6 +176,7 @@ static int pn_tag(struct piv_native *n, const u8 mac[32], const u8 *context, siz
 }
 
 /* ChaCha20(enc, counter 0, nonce = tag[0:12]) keystream XOR over @buffer.
+ * The record key (n->enc_key) uses the pre-keyed n->rec_chacha.
  * Callers may pass stack memory, which a
  * scatterlist must never reference (VMAP_STACK: virt_to_page() of a vmalloc
  * address names the wrong page; CONFIG_DEBUG_SG BUG()s). Bounce through the
@@ -168,11 +187,12 @@ static int pn_stream(struct piv_native *n, const u8 enc[32], const u8 tag[16], u
 	struct skcipher_request *req;
 	struct scatterlist sg;
 	DECLARE_CRYPTO_WAIT(wait);
+	struct crypto_skcipher *tfm = enc == n->enc_key ? n->rec_chacha : n->chacha;
 	u8 iv[16] = {}, *bounce;
-	int r = crypto_skcipher_setkey(n->chacha, enc, 32);
+	int r = tfm == n->chacha ? crypto_skcipher_setkey(tfm, enc, 32) : 0;
 	if (r) return r;
 	bounce = kmemdup(buffer, length, GFP_NOIO);
-	req = skcipher_request_alloc(n->chacha, GFP_NOIO);
+	req = skcipher_request_alloc(tfm, GFP_NOIO);
 	if (!bounce || !req) { r = -ENOMEM; goto out; }
 	memcpy(iv + 4, tag, 12);
 	sg_init_one(&sg, bounce, length);
@@ -425,8 +445,7 @@ static void pn_decoy_iv(struct piv_native *n, u64 sector, const u8 old[16], u8 i
 }
 
 /* IVs of @count sectors from @index (one bounded range). With @tolerant, a
- * range failing primary authentication falls back to per-sector loads and
- * takes the raw stored IV of each failing sector. Only SIV-checked decoding
+ * sector failing primary authentication contributes its raw stored IV. Only SIV-checked decoding
  * (keyslots, the directory, hidden reads) may use that: its tag rejects any
  * damaged, missing or mixed fragment, so nothing unauthenticated is accepted.
  * With @erased (hidden records with parity), a range read error also falls
@@ -437,9 +456,13 @@ static void pn_decoy_iv(struct piv_native *n, u64 sector, const u8 old[16], u8 i
 static int pn_range_ivs(struct piv_control *p, u64 index, u32 count, u8 *ivs, bool tolerant,
 			unsigned long *erased, u32 at, u32 *unreadable)
 {
+ unsigned long scratch[BITS_TO_LONGS(PIV_READ_SECTORS)];
  u32 j, iv = p->profile.iv_size;
- int r = piv_read_range(p, index, count, NULL, ivs);
- if (!tolerant || !r || (r != -EBADMSG && (!erased || r == -ENOMEM || r == -EINVAL))) return r;
+ int r;
+ /* Tolerant: failing sectors give raw IVs; with @erased they are marked. */
+ r = piv_read_range(p, index, count, NULL, ivs, tolerant ? (erased ? erased : scratch) : NULL, erased ? at : 0);
+ if (!tolerant || !r || !erased || r == -ENOMEM || r == -EINVAL) return r;
+ /* A read error with parity: find the unreadable sectors one by one. */
  for (j = 0; j < count; j++) {
   struct piv_sector *s = NULL;
   r = piv_load_mode(p->cc, index + j, &s, true);
@@ -466,7 +489,7 @@ static int pn_carrier_mode(struct piv_control *p, u64 first, u32 group, u8 *carr
 {
  u32 j = 0, iv = p->profile.iv_size;
  while (j < group) {
-  u32 count = min_t(u32, group - j, PIV_READ_BYTES / p->profile.sector_size);
+  u32 count = min_t(u32, group - j, PIV_READ_SECTORS);
   int r = pn_range_ivs(p, first + j, count, carrier + j * iv, tolerant, erased, j, unreadable);
   if (r) return r;
   j += count;
@@ -527,7 +550,9 @@ static void pn_free(struct piv_native *n)
 {
  if (!n) return;
  if (!IS_ERR_OR_NULL(n->hmac)) crypto_free_shash(n->hmac);
+ if (!IS_ERR_OR_NULL(n->rec_hmac)) crypto_free_shash(n->rec_hmac);
  if (!IS_ERR_OR_NULL(n->chacha)) crypto_free_skcipher(n->chacha);
+ if (!IS_ERR_OR_NULL(n->rec_chacha)) crypto_free_skcipher(n->rec_chacha);
  kfree_sensitive(n);
 }
 
@@ -627,39 +652,66 @@ static int pn_ks_write(struct piv_control *p, u32 slot, const u8 *kek, struct pn
  return r;
 }
 
+/* The primary sectors of block @index's record group(s): both slots with A/B
+ * (adjacent groups), so one range lock covers every access to the block.
+ */
+static void pn_block_lock(struct piv_control *p, struct piv_range *range, u64 index, bool exclusive)
+{
+ struct piv_native *n = p->native;
+ piv_range_lock(p, range, pn_group_first(n, pn_group(n, index, 0)), (u64)n->group * (n->ab ? 2 : 1), exclusive);
+}
+
 /* Format v5 write. A hidden write (one 4096-byte block) re-encodes its whole
  * record (with A/B, into the slot not holding the newest valid version); a
  * decoy write re-randomizes only the IVs of the primary sectors it writes,
- * preserving their fragments. @initializing (setup only, hidden): the caller
- * flushes every few records, and with A/B slot 0 is written with generation 1
- * without reading the slots (no record authenticates under a new master key).
+ * preserving their fragments. Each holds an exclusive range lock over every
+ * sector it reads and rewrites. Nothing is flushed here (the caller flushes
+ * for FUA), except before an A/B slot rewrite. @initializing (setup only,
+ * hidden): the caller flushes every few records, and with A/B slot 0 is
+ * written with generation 1 without reading the slots (no record
+ * authenticates under a new master key). *@mutated: storage may have changed
+ * or a flush failed; either stops the owner.
  */
 static int pn_write_blocks(struct piv_control *p, bool hidden, u64 offset, const u8 *data, u32 bytes,
 			   bool initializing, bool *mutated)
 {
  struct piv_native *n = p->native;
  struct piv_batch *b = NULL;
+ struct piv_range range;
  u8 *ivs, *scratch;
  u64 unit = p->profile.sector_size, index, generation = 0;
  u32 count, i, attempt;
- int slot = 0, r;
+ int slot = 0, r = 0;
  if (hidden) {
   if (bytes != PN_DATA || offset % PN_DATA || offset / PN_DATA >= n->records) return -EINVAL;
   index = offset / PN_DATA;
+  pn_block_lock(p, &range, index, true);
   if (n->ab && initializing) {
    generation = 1;
   } else if (n->ab) {
    size_t length = 2 * n->group * 16 + PN_DATA;
    scratch = kvmalloc(length, GFP_NOIO);
-   if (!scratch) return -ENOMEM;
-   r = pn_read_slots(p, index, scratch, scratch + 2 * n->group * 16, &slot, &generation);
-   kvfree_sensitive(scratch, length);
-   if (r && r != PN_UNAVAILABLE) return r;
-   slot = (r || slot < 0) ? 0 : !slot;
-   generation = r ? 1 : generation + 1;
-   if (!generation) return -EOVERFLOW;
+   r = scratch ? pn_read_slots(p, index, scratch, scratch + 2 * n->group * 16, &slot, &generation) : -ENOMEM;
+   if (scratch) kvfree_sensitive(scratch, length);
+   if (r == PN_UNAVAILABLE || !r) {
+    slot = (r || slot < 0) ? 0 : !slot;
+    generation = r ? 1 : generation + 1;
+    r = generation ? 0 : -EOVERFLOW;
+   }
+   /* A/B keeps the newest version readable across a crash only if it is
+    * durable before the other slot is overwritten. Without a completion
+    * flush, an earlier write of this block (finished: the range lock
+    * serializes them) may still sit in the uncommitted journal, so flush
+    * first. A flush failure stops the owner like any flush error.
+    */
+   if (!r) {
+    r = blkdev_issue_flush(p->cc->dev->bdev);
+    if (r) *mutated = true;
+   }
   }
-  return pn_write_group(p, pn_group(n, index, slot), generation, data, !initializing, mutated);
+  if (!r) r = pn_write_group(p, pn_group(n, index, slot), generation, data, false, mutated);
+  piv_range_unlock(p, &range);
+  return r;
  }
  if (initializing) return -EINVAL;
  index = offset / unit;
@@ -667,6 +719,7 @@ static int pn_write_blocks(struct piv_control *p, bool hidden, u64 offset, const
  if (count > PN_DECOY_ENTRIES) return -E2BIG;
  ivs = kmalloc(count * 16, GFP_NOIO);
  if (!ivs) return -ENOMEM;
+ piv_range_lock(p, &range, index, count, true);
  /* A sector failing authentication (e.g. media damage) may be replaced only
   * by a write covering all of it. Its raw stored fragment is refreshed like
   * any other: the record's SIV tag decides whether it is still valid, so
@@ -674,8 +727,6 @@ static int pn_write_blocks(struct piv_control *p, bool hidden, u64 offset, const
   */
  r = piv_batch_read(p, index, count, offset, bytes, &b);
  if (r) goto done;
- r = -EDQUOT;
- if (count > (1ULL << 32) - p->encryptions) goto done;
  for (attempt = 0; attempt < 16; attempt++) {
   for (i = 0; i < count; i++)
    pn_decoy_iv(n, index + i, b->olds + i * 16, ivs + i * 16);
@@ -684,8 +735,9 @@ static int pn_write_blocks(struct piv_control *p, bool hidden, u64 offset, const
  }
  if (r) goto done;
  piv_batch_merge(b, offset, data, bytes);
- r = piv_batch_write(b, ivs, true, mutated);
+ r = piv_batch_write(b, ivs, false, mutated);
 done:
+ piv_range_unlock(p, &range);
  piv_batch_free(b);
  kfree_sensitive(ivs);
  return r;
@@ -738,6 +790,8 @@ static int pn_keys(struct piv_native *n, u64 sectors)
  if (!r) r = pn_lrw_init(&n->rec, tweak, prp);
  if (!r) r = pn_hkdf(n, n->key, n->context, n->context_length, "mac", n->mac_key);
  if (!r) r = pn_hkdf(n, n->key, n->context, n->context_length, "enc", n->enc_key);
+ if (!r) r = crypto_shash_setkey(n->rec_hmac, n->mac_key, 32);
+ if (!r) r = crypto_skcipher_setkey(n->rec_chacha, n->enc_key, 32);
  memzero_explicit(tweak, sizeof(tweak)); memzero_explicit(prp, sizeof(prp));
  return r;
 }
@@ -810,6 +864,54 @@ static int pn_setup_unlock(struct piv_control *p, struct piv_native *n, const u8
  return r;
 }
 
+/* One initialization record per work item (setup holds p->lock; no views
+ * exist, so nothing else touches the owner meanwhile).
+ */
+struct pn_init_work {
+ struct work_struct work;
+ struct piv_control *p;
+ const u8 *zero;
+ u64 index;
+ int result;
+ atomic_t *pending;
+ struct completion *done;
+};
+
+static void pn_init_worker(struct work_struct *work)
+{
+ struct pn_init_work *w = container_of(work, struct pn_init_work, work);
+ unsigned int noio = memalloc_noio_save();
+ bool mutated = false;
+ w->result = pn_write(w->p, true, w->index * PN_DATA, w->zero, PN_DATA, true, &mutated);
+ memalloc_noio_restore(noio);
+ if (atomic_dec_and_test(w->pending)) complete(w->done);
+}
+
+/* Write zero records [@first, @first + @count) concurrently and wait for all
+ * of them; returns the first failure.
+ */
+static int pn_init_round(struct piv_control *p, const u8 *zero, u64 first, u32 count)
+{
+ struct pn_init_work *w = kcalloc(count, sizeof(*w), GFP_NOIO);
+ struct completion done;
+ atomic_t pending;
+ u32 i;
+ int r = 0;
+ if (!w) return -ENOMEM;
+ init_completion(&done);
+ atomic_set(&pending, count + 1);
+ for (i = 0; i < count; i++) {
+  INIT_WORK(&w[i].work, pn_init_worker);
+  w[i].p = p; w[i].zero = zero; w[i].index = first + i;
+  w[i].pending = &pending; w[i].done = &done;
+  queue_work(pn_wq, &w[i].work);
+ }
+ if (!atomic_dec_and_test(&pending)) wait_for_completion_io(&done);
+ for (i = 0; i < count && !r; i++) r = w[i].result;
+ kfree(w);
+ return r;
+}
+
 static int pn_setup(struct piv_control *p, struct file *controller, struct piv_native_setup *s)
 {
  struct piv_native *n;
@@ -829,7 +931,7 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
   * and afterwards read from the keyslot.
   */
  if (p->profile.iv_size != 16 || ((ab || s->parity) && !initialize)) return -EINVAL;
- if (p->native || !piv_quiesced(p) || !p->transaction || p->controller != controller || p->failed) return -EBUSY;
+ if (p->native || !piv_quiesced(p) || !p->transaction || p->controller != controller || READ_ONCE(p->failed)) return -EBUSY;
  /* Bound every primary byte offset by the kernel's signed file limit.
   * Fragment indices, hidden capacity and 512-byte addresses are then smaller;
   * all per-request allocations remain bounded independently of volume size.
@@ -845,8 +947,10 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
  n->base_length = s->context_length;
  n->dir_slot = -1;
  n->hmac = crypto_alloc_shash("hmac(sha256)", 0, 0);
+ n->rec_hmac = crypto_alloc_shash("hmac(sha256)", 0, 0);
  n->chacha = crypto_alloc_skcipher("chacha20", 0, 0);
- if (IS_ERR(n->hmac) || IS_ERR(n->chacha)) { r = -ENOENT; goto bad; }
+ n->rec_chacha = crypto_alloc_skcipher("chacha20", 0, 0);
+ if (IS_ERR(n->hmac) || IS_ERR(n->rec_hmac) || IS_ERR(n->chacha) || IS_ERR(n->rec_chacha)) { r = -ENOENT; goto bad; }
  p->native = n;
  /* Key guard: a keyslot must authenticate under the given KEK; its IVs come
   * from the keyslot-area scan. A decoy write under an unproven key would
@@ -859,11 +963,11 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
   * rejects any damaged fragment, so nothing unauthenticated is accepted.
   */
  scan_end = verify ? p->profile.sectors : PN_KEYSLOT_AREA;
- ivs = kmalloc(PIV_READ_BYTES / 512 * 16, GFP_NOIO);
+ ivs = kmalloc(PIV_READ_SECTORS * 16, GFP_NOIO);
  if (!initialize) ks_ivs = kzalloc(PN_KEYSLOT_AREA * 16, GFP_NOIO);
  if (!ivs || (!initialize && !ks_ivs)) { r = -ENOMEM; goto bad; }
  for (i = 0; i < scan_end;) {
-  u32 count = min_t(u64, scan_end - i, PIV_READ_BYTES / p->profile.sector_size);
+  u32 count = min_t(u64, scan_end - i, PIV_READ_SECTORS);
   r = pn_setup_poll(); if (r) goto bad;
   r = pn_range_ivs(p, i, count, ivs, !verify, NULL, 0, NULL); if (r) goto bad;
   for (j = 0; ks_ivs && j < count && i + j < PN_KEYSLOT_AREA; j++)
@@ -896,10 +1000,15 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
   if (r) goto bad;
   zero = kzalloc(PN_DATA, GFP_NOIO);
   if (!zero) { r = -ENOMEM; goto bad; }
-  for (i = 0; i < n->hidden_bytes / PN_DATA; i++) {
+  /* Rounds of PN_INIT_PARALLEL concurrent records; cancellation is polled
+   * between rounds, when every record written so far is complete.
+   */
+  for (i = 0; i < n->records;) {
+   u32 count = min_t(u64, n->records - i, PN_INIT_PARALLEL);
    r = pn_setup_poll(); if (r) break;
-   r = pn_write(p, true, i * PN_DATA, zero, PN_DATA, true, &mutated); if (r) break;
-   if ((i + 1) % PN_INIT_FLUSH_RECORDS == 0) { r = blkdev_issue_flush(p->cc->dev->bdev); if (r) break; }
+   r = pn_init_round(p, zero, i, count); if (r) break;
+   i += count;
+   if (i % PN_INIT_FLUSH_RECORDS == 0) { r = blkdev_issue_flush(p->cc->dev->bdev); if (r) break; }
   }
   /* Completed records stay committed, also when cancelled: flush them before
    * returning. A failed record write already failed the attempt.
@@ -938,7 +1047,7 @@ static int pn_keyslot(struct piv_control *p, struct piv_native_keyslot *ks)
      ks->slot >= PN_KEYSLOTS || (ks->op != PIV_KEYSLOT_ADD && ks->op != PIV_KEYSLOT_REMOVE) ||
      memchr_inv(ks->reserved, 0, sizeof(ks->reserved)) ||
      (ks->op == PIV_KEYSLOT_REMOVE && memchr_inv(ks->kek, 0, sizeof(ks->kek)))) return -EINVAL;
- if (!n || !n->ready || n->failed || p->failed || p->blocked) return -EBUSY;
+ if (!n || !n->ready || READ_ONCE(n->failed) || READ_ONCE(p->failed) || p->blocked) return -EBUSY;
  for (j = 0; j < PN_KEYSLOTS; j++) present += n->ks_present[j];
  if (ks->op == PIV_KEYSLOT_ADD) {
   if (n->ks_present[ks->slot]) return -EEXIST;
@@ -962,25 +1071,34 @@ static int pn_keyslot(struct piv_control *p, struct piv_native_keyslot *ks)
   r = pn_dir_write(p, &mutated);
   if (!r) r = pn_ks_write(p, ks->slot, NULL, NULL, &mutated);
  }
- if (r && mutated) { p->failed = true; n->failed = true; }
+ if (r && mutated) { WRITE_ONCE(p->failed, true); WRITE_ONCE(n->failed, true); }
  return r;
 }
 
+/* Hidden blocks are read under a shared range lock over their record
+ * group(s), so a concurrent hidden write is never collected half-done. Decoy
+ * reads need none (each sector is whole and authenticated on its own).
+ */
 static int pn_read(struct piv_control *p, bool hidden, u64 offset, u8 *data, u32 bytes)
 {
  u64 unit = hidden ? PN_DATA : p->profile.sector_size, first = offset / unit, last = (offset + bytes - 1) / unit, i;
- size_t carrier = 2 * PN_MAX_GROUP * 16, length = hidden ? carrier + PN_DATA : PIV_READ_BYTES;
+ size_t carrier = 2 * PN_MAX_GROUP * 16;
+ size_t length = hidden ? carrier + PN_DATA : min_t(u64, last - first + 1, PIV_READ_SECTORS) * unit;
  u8 *record = kvmalloc(length, GFP_NOIO);
  int r = 0;
  if (!record) return -ENOMEM;
  for (i = first; i <= last; i++) {
   u64 start = i * unit, lo = max(start, offset), hi = min(start + unit, offset + bytes);
   if (hidden) {
-   r = pn_read_record(p, i, record, record + carrier); if (r) break;
+   struct piv_range range;
+   pn_block_lock(p, &range, i, false);
+   r = pn_read_record(p, i, record, record + carrier);
+   piv_range_unlock(p, &range);
+   if (r) break;
    memcpy(data + lo - offset, record + carrier + lo - start, hi - lo);
   } else {
-   u32 count = min_t(u64, last - i + 1, PIV_READ_BYTES / unit);
-   r = piv_read_range(p, i, count, record, NULL); if (r) break;
+   u32 count = min_t(u64, last - i + 1, PIV_READ_SECTORS);
+   r = piv_read_range(p, i, count, record, NULL, NULL, 0); if (r) break;
    hi = min(start + count * unit, offset + bytes);
    memcpy(data + lo - offset, record + lo - start, hi - lo);
    i += count - 1;
@@ -1015,43 +1133,56 @@ static noinline void pn_endio(struct bio *bio, blk_status_t status)
 	bio_endio(bio);
 }
 
+/* One public bio. Workers run concurrently under p->io (shared); owner state
+ * changes take it exclusively and so wait for them. Every access to p->native
+ * happens before the bio completes, so a view removed after its last
+ * completion never races a worker.
+ */
 static void pn_worker(struct work_struct *work)
 {
 	struct pn_work *w = container_of(work, struct pn_work, work);
 	struct piv_control *p = w->p;
+	struct piv_native *n;
 	struct bio *bio = w->bio;
 	u32 bytes = bio->bi_iter.bi_size;
 	u8 *buffer = NULL;
 	unsigned int noio;
 	bool mutated = false, flushing = false;
 	int r = -EIO;
-	mutex_lock(&p->lock); noio = memalloc_noio_save();
-	if (!p->live || !p->native || !p->native->ready || p->native->failed ||
-	    p->blocked || p->transaction || p->failed) goto done;
+	down_read(&p->io); noio = memalloc_noio_save();
+	n = p->native;
+	if (!p->live || !n || !n->ready || READ_ONCE(n->failed) ||
+	    p->blocked || p->transaction || READ_ONCE(p->failed)) goto done;
 	if (!bytes && (bio_op(bio) == REQ_OP_FLUSH || (bio->bi_opf & REQ_PREFLUSH))) {
+		/* Covers every write completed before this flush was issued. */
 		flushing = true;
 		r = blkdev_issue_flush(p->cc->dev->bdev);
 	} else {
-		u64 limit = w->hidden ? p->native->hidden_bytes : p->profile.sectors * p->profile.sector_size;
+		u64 limit = w->hidden ? n->hidden_bytes : p->profile.sectors * p->profile.sector_size;
 		/* Hidden requests are whole aligned 4096-byte blocks (DM splits per block). */
 		if (!bytes || bytes > (w->hidden ? PN_DATA : PN_DECOY_BYTES) || (w->offset & 511) ||
 		    (bytes & 511) || (w->hidden && (bytes != PN_DATA || w->offset % PN_DATA)) ||
 		    w->offset > limit || bytes > limit - w->offset) { r = -EINVAL; goto done; }
-		buffer = kmalloc(bytes, GFP_NOIO);
+		buffer = kvmalloc(bytes, GFP_NOIO);
 		if (!buffer) { r = -ENOMEM; goto done; }
 		if (bio_op(bio) == REQ_OP_READ) {
 			r = pn_read(p, w->hidden, w->offset, buffer, bytes);
 			if (!r) pn_copy_bio(bio, buffer, true);
 		} else if (bio_op(bio) == REQ_OP_WRITE) {
 			pn_copy_bio(bio, buffer, false);
-			/* Drain earlier journal writes before a WRITE|PREFLUSH payload.
-			 * pn_write flushes once before completion, satisfying FUA too.
-			 */
+			/* Drain earlier journal writes before a WRITE|PREFLUSH payload. */
 			flushing = bio->bi_opf & REQ_PREFLUSH;
 			r = flushing ? blkdev_issue_flush(p->cc->dev->bdev) : 0;
 			if (!r) {
 				flushing = false;
 				r = pn_write(p, w->hidden, w->offset, buffer, bytes, false, &mutated);
+			}
+			/* FUA: durable before completion. Plain writes are not flushed,
+			 * as in stock dm-crypt; a later flush or FUA request covers them.
+			 */
+			if (!r && (bio->bi_opf & REQ_FUA)) {
+				flushing = true;
+				r = blkdev_issue_flush(p->cc->dev->bdev);
 			}
 		} else r = -EOPNOTSUPP;
 	}
@@ -1061,9 +1192,14 @@ static void pn_worker(struct work_struct *work)
 	 * writing began may have partially written; both still stop the shared
 	 * owner.
 	 */
-	if (r < 0 && (mutated || flushing)) { p->failed = true; p->native->failed = true; }
+	if (r < 0 && (mutated || flushing)) { WRITE_ONCE(p->failed, true); WRITE_ONCE(n->failed, true); }
+	/* A write or flush still in flight when a concurrent request stopped the
+	 * owner reports EIO: whether it reached storage is unknown.
+	 */
+	if (!r && bio_op(bio) != REQ_OP_READ && READ_ONCE(p->failed)) r = -EIO;
 done:
-	kfree_sensitive(buffer); memalloc_noio_restore(noio); mutex_unlock(&p->lock);
+	if (buffer) kvfree_sensitive(buffer, bytes);
+	memalloc_noio_restore(noio); up_read(&p->io);
 	pn_endio(bio, errno_to_blk_status(r > 0 ? -EIO : r));
 	kref_put(&p->refs, piv_free); kfree(w);
 }
@@ -1101,7 +1237,7 @@ static int pn_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	r = dm_get_device(ti, argv[0], BLK_OPEN_READ | BLK_OPEN_WRITE, &v->owner);
 	if (r) goto free_ref;
 	mutex_lock(&found->lock);
-	if (!found->live || !found->native || !found->native->ready || found->native->failed ||
+	if (!found->live || !found->native || !found->native->ready || READ_ONCE(found->native->failed) ||
 	    disk_devt(v->owner->bdev->bd_disk) != MKDEV(found->devices.owner_major, found->devices.owner_minor) ||
 	    ti->begin || ti->len != (v->hidden ? found->native->hidden_bytes / 512 : found->profile.sectors * (found->profile.sector_size / 512)) ||
 	    (found->native->views & (v->hidden ? 2 : 1))) r = -EINVAL;

@@ -226,7 +226,7 @@ def provision(args):
             console.send("stty -echo; mkdir -p /mnt/piv-work; "
                          "mount -t 9p -o trans=virtio,version=9p2000.L pivwork /mnt/piv-work "
                          "&& bash /mnt/piv-work/provision.sh; "
-                         "rc=$?; printf '\\nPIV_TASK_DONE=%s\\n' \"$rc\"; sync; poweroff\n")
+                         "rc=$?; printf '\\nPIV_TASK_DONE=%s\\n' \"$rc\"; sync; systemctl poweroff -i || poweroff -f\n")
             match = console.expect(rb"\nPIV_TASK_DONE=(\d+)[\r\n]")
             console.log = None
         process.wait(timeout=120)
@@ -348,7 +348,7 @@ def run(args):
             console.send("stty -echo; mkdir -p /mnt/piv-work; "
                          "mount -t 9p -o trans=virtio,version=9p2000.L pivwork /mnt/piv-work "
                          "&& bash /mnt/piv-work/task.sh; "
-                         "rc=$?; printf '\\nPIV_TASK_DONE=%s\\n' \"$rc\"; sync; poweroff\n")
+                         "rc=$?; printf '\\nPIV_TASK_DONE=%s\\n' \"$rc\"; sync; systemctl poweroff -i || poweroff -f\n")
             match = console.expect(rb"\n(?:PIV_TASK_DONE=(\d+)[\r\n]|PIV_POWER_CUT[\r\n])")
             console.log = None
         if match.group(1) is None:
@@ -377,7 +377,7 @@ def run(args):
                 console.send("stty -echo; mkdir -p /mnt/piv-work; "
                              "mount -t 9p -o trans=virtio,version=9p2000.L pivwork /mnt/piv-work "
                              "&& bash /mnt/piv-work/reboot-task.sh; "
-                             "rc=$?; printf '\\nPIV_TASK_DONE=%s\\n' \"$rc\"; sync; poweroff\n")
+                             "rc=$?; printf '\\nPIV_TASK_DONE=%s\\n' \"$rc\"; sync; systemctl poweroff -i || poweroff -f\n")
                 match = console.expect(rb'\nPIV_TASK_DONE=(\d+)[\r\n]')
                 console.log = None
         password = None

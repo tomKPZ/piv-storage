@@ -22,9 +22,10 @@ mutually exclusive) and are copied before attaching.
   then one G-sector record per 4096-byte hidden block (G = 687 + 3p), so hidden
   capacity is `(floor((sectors - 112) / G) - 2) * 4096` bytes (half with
   `--ab`). Primary sectors after the last complete record carry no hidden data.
-- Range reads stay at most 16 KiB; a write rewrites at most G sectors (one
-  record, at most 735; 2.9 MiB of RAM at 4096-byte sectors) or 32 decoy
-  sectors per request. The small 32-bit counters describe bounded requests, not whole-volume
+- Range reads stay at most 1024 sectors (4 MiB at 4096-byte sectors); a write
+  rewrites at most G sectors (one record, at most 735; 2.9 MiB of RAM at
+  4096-byte sectors) or 256 decoy sectors per request, and at most 16 view
+  requests (8 initialization records) run at once. The small 32-bit counters describe bounded requests, not whole-volume
   extents.
 - Public workers check `offset <= limit` and `bytes <= limit - offset` before
   computing request ends; mapped sector-to-byte conversion is checked first.
@@ -42,10 +43,11 @@ interrupt stalled lower I/O or roll back records already written. Host
 diagnostic image decoding and IV scans use memory proportional to image
 geometry and are not a constant-memory large-storage interface.
 
-The 2^32 per-owner encryption counter is a resetting diagnostic cap. Full
+The per-owner encryption counter is a resetting diagnostic cap at 2^40 (it was
+2^32, which a 512-byte-sector initialization reaches around 2 TiB). Full
 initialization consumes one encryption per carrier sector (keyslot, directory
-and every record), so a sufficiently large initialization could hit the cap
-after partial changes. Neither a larger disk nor reopening solves per-key
+and every record), so only an initialization of about 2^40 sectors (512 TiB at
+512-byte sectors) could hit the cap after partial changes. Neither a larger disk nor reopening solves per-key
 lifetime accounting. There is no claim of unrestricted initialization size,
 nonce safety across history or crash recovery.
 
@@ -87,8 +89,8 @@ key and run kernel/guest-large-test.py:
 - End-of-device reads return EOF without changing the buffer; past-end writes
   fail without marking the owner failed or wrapping to low addresses.
 - A high-address lower read error (dm-flakey) and a witnessed ciphertext
-  corruption of the last record's last carrier sector: the decoy read of that
-  16 KiB work item leaves the caller buffer unchanged, the failure is local
+  corruption of the last record's last carrier sector: the decoy read of a
+  16 KiB request (within one work item) leaves the caller buffer unchanged, the failure is local
   (same owner continues) and complete oracles match after reopening; with only
   data corrupted, the last hidden block still reads correctly (raw IV, SIV
   tag).

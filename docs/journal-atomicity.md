@@ -24,9 +24,10 @@ review only):
   [observed-layout.md](observed-layout.md)), so a 687-sector record always spans
   more than one section even if it were submitted as one bio.
 - The native owner writes a record as a few multi-sector bios (all in flight
-  together) and flushes once at the end of the request. dm-integrity commits
-  on that flush, or earlier, asynchronously, once free journal entries fall to
-  the 50% watermark (`journal_watermark:50`). A 4096-byte record exceeds the
+  together) and, like stock dm-crypt, does not flush after a plain write.
+  dm-integrity commits on the next flush or FUA request, or earlier,
+  asynchronously, once free journal entries fall to the 50% watermark
+  (`journal_watermark:50`) or its commit timer fires. A 4096-byte record exceeds the
   whole journal and is always committed in parts; a 512-byte record fits below
   the watermark and is usually committed by one journal write. That is not a
   guarantee (journal pressure from earlier writes splits it), so the
@@ -63,6 +64,30 @@ the device: it does not model a torn device write or hardware power loss.
    accept them), and a decoy write covering a whole failing sector replaces it.
    A torn sector therefore does not block activation; it returns EIO until
    overwritten.
+
+## Unflushed writes
+
+View writes follow stock flush semantics
+([write path](native-blocks.md#write-path)): a plain decoy or hidden write
+completes when its lower write bios complete, and is durable only after a
+later flush or FUA request (a FUA write flushes before completing). Each
+primary sector stays old or new across a crash, as with stock dm-crypt. A
+hidden block written since the last flush is in the same position as one whose
+write was interrupted: after a crash it reads as the old block, the new block
+or, without A/B, EIO until rewritten. Before completion flushes were dropped
+only a write in flight at the crash could do that; now any write not yet
+covered by a flush can. Filesystems on the hidden view already issue flush/FUA
+where they need durability (for example ext4 journal commits), so this matches
+the stock contract that unflushed writes may be lost, except that a lost
+single-slot hidden block becomes unavailable rather than old.
+
+A/B keeps its guarantee: before rewriting a slot, an A/B hidden write flushes
+the lower device, so the slot holding the newest version is committed before
+the other slot is overwritten. Without that flush, two successive unflushed
+writes of one block could leave both slots torn by one crash. Writes of the
+same block are serialized by its range lock, so the flush covers the previous
+write of the block. A failure of that flush stops the owner like any flush
+error.
 
 ## No-journal mode is unsupported
 

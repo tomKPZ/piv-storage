@@ -26,6 +26,7 @@ results = []
 # groups, then 687-sector records for 4096-byte hidden blocks (the native
 # fixture has no parity; every supported profile has 16-byte IVs).
 GROUP, BLOCK = 687, 4096
+DECOY_ITEM = 131072   # one whole decoy work item (the DM split boundary, PN_DECOY_BYTES)
 
 def record_span(device, block):
     """First and last primary sector carrying hidden block @block."""
@@ -218,7 +219,7 @@ for role in ('decoy', 'hidden'):
         # Sector0 may be served from dm-integrity's cached setup checkpoint.
         # Choose record10, which setup did not write, and witness the raw fault.
         unit = handle.device.sector_size
-        size = BLOCK if role == 'hidden' else 16384
+        size = BLOCK if role == 'hidden' else DECOY_ITEM
         start = record_span(handle.device, 10)[0] * unit
         offset = 10 * BLOCK if role == 'hidden' else ((start + size - 1) // size) * size
         affected = (range(10, 11) if role == 'hidden' else
@@ -285,7 +286,7 @@ for role in ('decoy', 'hidden'):
     generation = handle.device.generation
     unit = handle.device.sector_size
     layout = handle.layout
-    size = 16384 if role == 'decoy' else BLOCK
+    size = DECOY_ITEM if role == 'decoy' else BLOCK
     first10, last10 = record_span(handle.device, 10)
     offset = ((first10 * unit + size - 1) // size) * size if role == 'decoy' else 10 * BLOCK
     last = ((offset + size - 1) // unit if role == 'decoy' else last10)

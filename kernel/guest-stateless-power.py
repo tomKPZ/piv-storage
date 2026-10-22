@@ -64,8 +64,9 @@ def committed_new_ivs():
 old = bytearray((w / 'expected-hidden-volume').read_bytes())
 (w / 'power-primary.sha256').write_text(subprocess.check_output(['sha256sum', views['decoy']], text=True).split()[0] + '\n')
 contents = [b'partial-record power cut'.ljust(4096, b'!'), b'partial-record power cut, retry'.ljust(4096, b'?')]
-# A record write is a few multi-sector bios and one flush. dm-integrity commits
-# its journal on that flush, or earlier once free entries fall to the 50%
+# A record write is a few multi-sector bios; the writer's fsync then flushes.
+# dm-integrity commits its journal on that flush, or earlier once free entries
+# fall to the 50%
 # watermark (journal_watermark:50), which queues an asynchronous commit of the
 # sections filled so far. A 4096-byte record exceeds the journal, so it is
 # always committed in parts. A 512-byte record fits below the watermark and
@@ -93,6 +94,9 @@ def prefill_journal():
         try:
             assert os.preadv(fd, [chunk], offset) == 16384
             assert os.pwritev(fd, [chunk], offset) == 16384
+            # Plain writes are not flushed by dm-piv (stock semantics); the
+            # fsync commits each prefill request as before.
+            os.fsync(fd)
         finally:
             os.close(fd)
             chunk.close()

@@ -187,7 +187,7 @@ payload bytes and draws 10 fresh random bytes, so n rewrites of one sector
 repeat an IV with probability about n²/2^81; IVs of distinct sectors behave as
 independent 128-bit values. Encodings use fresh seeded kernel randomness and
 reject duplicates only within one update and its replaced IVs; there is **no
-historical collision detection**. The 2^32 per-owner encryption cap resets on
+historical collision detection**. The 2^40 per-owner encryption cap resets on
 reopen and does not enforce the per-key lifetime budget, to which all writes,
 retries, failed preparations and clones count. VM snapshot restores, image
 clones and cloned RNG state invalidate these estimates. A 4096-byte hidden

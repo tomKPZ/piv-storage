@@ -59,7 +59,7 @@ runs the selected suites concurrently, one fresh VM per suite.
 - Profiles: `aegis-4096`, `aegis-512`, `aes-sha256-4096` and `aes-sha256-512`
   (AES-XTS + HMAC-SHA256).
 - `--suites routine` (default): faults, profile, cancel, lifecycle, batch,
-  early, power, v5. `--suites all` adds controls, migrate (second 512 MiB disk)
+  stress (concurrent I/O oracles and a fault under load), early, power, v5. `--suites all` adds controls, migrate (second 512 MiB disk)
   and fuzz (seeded control-ioctl fuzzing with `PIV_FUZZ_STEPS`/`PIV_FUZZ_SEED`,
   plus dm table/constructor fuzzing; best on the sanitizer image). `bench`
   (the [configuration.md](configuration.md) measurements, on the pristine

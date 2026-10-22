@@ -35,15 +35,15 @@ PROFILES = {
     'aes-sha256-4096': dict(PIV_PRIMARY_CIPHER='aes-xts-random', PIV_INTEGRITY='hmac-sha256', PIV_SECTOR_SIZE='4096'),
     'aes-sha256-512': dict(PIV_PRIMARY_CIPHER='aes-xts-random', PIV_INTEGRITY='hmac-sha256', PIV_SECTOR_SIZE='512'),
 }
-SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early', 'power', 'controls', 'v5', 'migrate', 'fuzz',
-          'bench')
+SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'stress', 'early', 'power', 'controls', 'v5', 'migrate',
+          'fuzz', 'bench')
 # Routine tier: run after kernel or pivsetup changes. The opt-in remainder is for
 # changes in its own area: controls (descriptive write-pattern statistics),
 # migrate (pivsetup migrate) and
 # fuzz (control ioctls and table constructors; most useful on the sanitizer).
 # bench (docs/configuration.md numbers) is explicit only and should run with
 # --jobs 1; 'all' excludes it.
-DEFAULT_SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'early', 'power', 'v5')
+DEFAULT_SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'stress', 'early', 'power', 'v5')
 # Guest RAM floors (MiB): Argon2id tier 3 (1 GiB, the default --kdf-cost) runs
 # in pivsetup and in the Python cross-check; bench also measures tier 4 (2 GiB).
 SUITE_MEMORY_MIB = {'v5': 3072, 'bench': 3584}
@@ -186,6 +186,8 @@ class Matrix:
             'batch': (ROOT / 'scripts/guest-batch.sh', final,
                       [ko, ROOT / 'kernel/check-config.py', ROOT / 'kernel/guest-batch-test.py', *keys, *oracles],
                       'batch-final.img'),
+            'stress': (ROOT / 'scripts/guest-stress.sh', final,
+                       [ko, ROOT / 'kernel/guest-stress-test.py', *keys, *oracles], 'stress-final.img'),
             'power': (ROOT / 'scripts/guest-stateless-power.sh', control / 'control.img',
                       [ko, ROOT / 'kernel/guest-stateless-power.py', *keys], None),
             'migrate': (ROOT / 'scripts/guest-migrate.sh', final,
@@ -242,7 +244,7 @@ class Matrix:
                                         cwd=ROOT, capture_output=True, text=True)
                 (run_dir / 'analysis.json').write_text(result.stdout)
                 self.record(key, dict(host_verified=result.returncode == 0))
-            elif name == 'v5':
+            elif name in ('v5', 'stress'):
                 self.host_check(key, out / output, control, out / 'expected-primary.sha256',
                                 out / 'expected-hidden-volume')
             elif output:

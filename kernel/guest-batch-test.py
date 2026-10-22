@@ -25,7 +25,7 @@ size = owner.device.sectors * unit
 groups_end = (112 + (owner.device.sectors - 112) // group * group) * unit
 # Current target contract; historical pre-batching runs retain frozen harnesses.
 batched = True
-quantum = 16384
+quantum = 131072   # DM split boundary of decoy work items (PN_DECOY_BYTES)
 results = []
 
 def direct(offset, count, write=None):
@@ -54,8 +54,13 @@ def expected_count(offset, count):
 cases = [('4k', 0, 4096), ('16k', 0, 16384),
          ('unaligned', 512, 16384),
          ('record-boundary', (112 + 3 * group) * unit - 512, 4096),
-         ('32k-split', 0, 32768),
-         ('last-16k', size - 16384, 16384)]
+         ('32k', 0, 32768),
+         ('128k', 0, 131072),
+         ('unaligned-128k', 512, 131072),
+         ('256k-split', 0, 262144),
+         ('1m-split', 1 << 20, 1 << 20),
+         ('last-16k', size - 16384, 16384),
+         ('last-128k', size - 131072, 131072)]
 if groups_end < size:
     cases.append(('carrier-tail', groups_end - 512, min(4096, size - groups_end + 512)))
 for label, offset, count in cases:

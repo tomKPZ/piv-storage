@@ -2,26 +2,31 @@
 
 ## Bounded range reads
 
-`piv_read_range` gathers at most 16 KiB of primary ciphertext plus its tag/IV
-metadata in one bio to dm-integrity. It invokes the per-sector AEAD helper
-(`piv_aead`) once per sector, advancing the sector AAD and tag offset, so
-per-sector authentication is identical to stock dm-crypt. Plaintext or
-carrier IVs are copied out only after every sector in the range verifies;
-private pages and metadata are bounded and wiped on release, including after a
-partial authentication failure. Setup's keyslot/directory scan (and the
-`--verify` full audit), decoy reads and hidden-read carrier collection use it;
-writes read their sectors through the batch path
-([write path](native-blocks.md#write-path): up to 128 KiB per bio, all of a
-request's bios in flight together, the same per-sector check). There is no persistent cache,
-lazy verification or cross-bio accumulation: DM still splits decoy bios at
-16 KiB and hidden bios per 4096-byte block, and one hidden block read
-authenticates its whole 687-sector carrier (G = 687 + 3p with parity).
+`piv_read_range` reads at most 1024 primary sectors (a whole record; 4 MiB at
+4096-byte sectors, 512 KiB at 512) plus their tag/IV metadata as one batch of
+multi-sector bios to dm-integrity, all in flight together (up to 128 KiB of data
+and one page of tuples per bio, the same batch code as writes). It invokes the
+per-sector AEAD helper (`piv_aead`) once per sector, advancing the sector AAD
+and tag offset, so per-sector authentication is identical to stock dm-crypt.
+Plaintext or carrier IVs are copied out only after every sector in the range
+verifies; for hidden carrier collection, sectors failing authentication
+contribute only their raw IVs to SIV-checked decoding. Private pages and
+metadata are bounded and wiped on release, including after a partial
+authentication failure. Setup's keyslot/directory scan (and the `--verify` full
+audit), decoy reads, hidden-read carrier collection and private owner reads
+use it; writes read their sectors through the batch path
+([write path](native-blocks.md#write-path)). There is no persistent cache,
+lazy verification or cross-bio accumulation: DM splits decoy bios at 128 KiB
+and hidden bios per 4096-byte block, and one hidden block read authenticates
+its whole 687-sector carrier (G = 687 + 3p with parity) with one range call.
+Concurrent requests overlap their reads ([concurrency](native-blocks.md#concurrency)).
 
-One range call submits one read to dm-integrity; the lower target may split it
-or serve it from its journal/cache, so call counts are not physical-media read
-counts. Fewer submissions must never skip a per-sector check; the profile and
-fault suites assert this (see [native-faults.md](native-faults.md) for the
-late-sector corruption/no-output regression).
+One range call submits one batch of reads to dm-integrity; the lower target may
+split them or serve them from its journal/cache, so call counts are not
+physical-media read counts. Fewer submissions must never skip a per-sector
+check; the profile and fault suites assert this (see
+[native-faults.md](native-faults.md) for the late-sector corruption/no-output
+regression).
 
 ## `profile` suite
 
@@ -47,20 +52,21 @@ system calls and comparisons. Reading must spend zero primary encryptions.
 `[dm_piv]`, never the stock copy. `tracing_on=0` keeps no event data; only
 `kprobe_profile` hit counters are used, and any missed hit fails. The SETUP
 ioctl is bracketed by pivsetup's gate/hold hooks, reads are counted after udev
-settles, and assertions use exact per-operation deltas. With
-`r = 16384 / sector_size` sectors per range:
+settles, and assertions use exact per-operation deltas. Each range read is one
+batch submission:
 
 | Operation | range reads | primary authentications | other |
 | --- | ---: | ---: | --- |
-| SETUP (keyslot area, directory, checkpoint) | ⌈112/r⌉ + 2·⌈687/r⌉ | 112 + 1374 + 1 | 1 checkpoint (one scalar load), 0 writes |
-| 512-byte decoy read | 1 | 1 | |
-| 16 KiB decoy read | 1 | r | |
-| 4 KiB hidden read | ⌈687/r⌉ | 687 | |
-| 16 KiB hidden read | 4·⌈687/r⌉ | 2748 | |
-| 16 KiB decoy write (same bytes) | 0 | 2r (r checks + r encryptions) | 1 pn_write, 1 batch read, 2 submissions (read, write) |
+| SETUP (keyslot area, directory, checkpoint) | 3 | 112 + 1374 + 1 | 1 checkpoint (one scalar load), 3 submissions, 0 writes |
+| 512-byte decoy read | 1 | 1 | 1 submission |
+| 16 KiB decoy read | 1 | 16384 / S | 1 submission |
+| 128 KiB decoy read | 1 | 131072 / S | 1 submission |
+| 4 KiB hidden read | 1 | 687 | 1 submission |
+| 16 KiB hidden read | 4 | 2748 | 4 submissions |
+| 16 KiB and 128 KiB decoy write (same bytes) | 0 | 2n (n checks + n encryptions, n = bytes / S) | 1 pn_write, 1 batch read, 2 submissions (read, write) |
 | 4 KiB hidden write (same bytes) | 0 | 1374 (687 checks + 687 encryptions) | 1 pn_write, 1 batch read, 2 submissions |
 
-The write rows pin the [write path](native-blocks.md#write-path): one
+S is the primary sector size. The write rows pin the [write path](native-blocks.md#write-path): one
 authenticated read of every touched sector, one encryption each, no per-sector
 loads, re-reads or self-decryption (the previous path made about five AEAD
 calls per sector); the encryption counter must rise by exactly the sector

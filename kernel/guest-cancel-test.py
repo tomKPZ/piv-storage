@@ -223,7 +223,10 @@ try:
                write_ms=2 if phase == 'initialize' else 0)
         process = spawn(phase)
         wait_until(lambda: (W / (phase + '-ready.json')).exists())
-        (T / f'events/piv_cancel/{event}/filter').write_text(f'common_pid == {process.pid}')
+        # Scan ranges run in the SETUP caller; initialization records run on
+        # the module's workqueue (nothing else writes during this test).
+        (T / f'events/piv_cancel/{event}/filter').write_text(
+            f'common_pid == {process.pid}' if event == 'range' else '0')
         (T / 'trace').write_text('')
         (T / f'events/piv_cancel/{event}/enable').write_text('1')
         (T / 'tracing_on').write_text('1')

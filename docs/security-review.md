@@ -137,7 +137,8 @@ RNG snapshots, cloned images and VM restores can repeat randomness and void the
 birthday model. Under XTS + HMAC a deployment may accept a larger budget given
 the milder consequence; that is a policy choice, not an analysed bound.
 
-**Not enforced.** The per-owner 2^32 encryption counter starts after earlier
+**Not enforced.** The per-owner encryption counter (capped at 2^40, raised
+from 2^32 so large initializations are not blocked) starts after earlier
 stock encryptions and resets on recreation; it is a diagnostic cap, not a
 remaining allowance. A stateless image cannot know its own lifetime usage, so
 the budget must be tracked outside the volume, and no on-disk ledger is added
@@ -154,8 +155,10 @@ header compatibility does not establish that a pinned kernel is free of
 vulnerabilities.
 
 Every rewrite authenticates the old sectors (`piv_batch_read`) before
-modifying them, encrypts all of them before submitting any write, serializes
-through the owner mutex and uses the lower journal
+modifying them, encrypts all of them before submitting any write, holds a
+range lock over every sector it rewrites (concurrent requests touching the same
+sectors or hidden record serialize; [concurrency](native-blocks.md#concurrency))
+and uses the lower journal
 ([write path](native-blocks.md#write-path)). The former re-read with an
 expected-IV check and the self-decryption of new ciphertext served userspace
 PREPARE/APPLY tuples and were dropped with that interface; nothing coordinated

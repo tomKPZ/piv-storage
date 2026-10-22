@@ -227,14 +227,15 @@ static void piv_owner_read(struct work_struct *work)
 	mutex_lock(&p->lock);
 	noio = memalloc_noio_save();
 	if (p->live && !p->native && p->cc == cc) {
-		buffer = kmalloc(bytes, GFP_NOIO);
-		r = buffer ? piv_read_range(p, index, bytes / cc->sector_size, buffer, NULL) : -ENOMEM;
+		buffer = kvmalloc(bytes, GFP_NOIO);
+		r = buffer ? piv_read_range(p, index, bytes / cc->sector_size, buffer, NULL, NULL, 0) : -ENOMEM;
 		if (!r)
 			pn_copy_bio(bio, buffer, true);
 	}
 	memalloc_noio_restore(noio);
 	mutex_unlock(&p->lock);
-	kfree_sensitive(buffer);
+	if (buffer)
+		kvfree_sensitive(buffer, bytes);
 	bio->bi_status = errno_to_blk_status(r);
 	bio_endio(bio);
 	kfree(w);
@@ -258,7 +259,7 @@ static int piv_crypt_map(struct dm_target *ti, struct bio *bio)
 	bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
 	if ((bio->bi_iter.bi_sector & ((cc->sector_size >> SECTOR_SHIFT) - 1)) ||
 	    (bio->bi_iter.bi_size & (cc->sector_size - 1)) || !bio->bi_iter.bi_size ||
-	    bio->bi_iter.bi_size > PIV_READ_BYTES)
+	    bio->bi_iter.bi_size > PIV_OWNER_BYTES)
 		return DM_MAPIO_KILL;
 	w = kmalloc(sizeof(*w), GFP_NOWAIT | __GFP_NOWARN);
 	if (!w)
@@ -401,7 +402,7 @@ static int piv_crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 	set_bit(PIV_KEY_VALID, &cc->flags);
 	ti->num_flush_bios = 1;
-	r = dm_set_target_max_io_len(ti, PIV_READ_BYTES >> SECTOR_SHIFT);
+	r = dm_set_target_max_io_len(ti, PIV_OWNER_BYTES >> SECTOR_SHIFT);
 	if (r)
 		goto bad;
 	r = piv_register(cc, ti);
@@ -520,7 +521,10 @@ static int __init piv_module_init(void)
 	int r = -ENOMEM;
 
 	pn_gf_init();
-	pn_wq = alloc_ordered_workqueue("piv-native", WQ_MEM_RECLAIM);
+	/* Unbound and concurrent; requests touching the same sectors or record
+	 * serialize on range locks (piv_range_lock).
+	 */
+	pn_wq = alloc_workqueue("piv-native", WQ_MEM_RECLAIM | WQ_UNBOUND, PN_MAX_ACTIVE);
 	piv_io_wq = alloc_workqueue("kpiv_io", WQ_MEM_RECLAIM | WQ_UNBOUND, 0);
 	if (!pn_wq || !piv_io_wq)
 		goto free_wq;

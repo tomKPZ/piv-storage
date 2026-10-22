@@ -40,12 +40,26 @@ transaction, hidden crash recovery or rollback resistance.
   any write ([write path](native-blocks.md#write-path)); encryption
   invocations may already have been spent.
 - **Errors once writing began and flush errors** (any of a request's write
-  bios, standalone flush, PREFLUSH or completion flush) stop the shared owner
-  and both views: storage may be partial or
-  durability unknown. dm-integrity also enters its own sticky failed state on
-  journal/metadata write errors. Unmount, remove and recreate the stack after
-  correcting the underlying problem; there is no error-clearing control. An EIO
-  write may have partially changed the disk.
+  bios, standalone flush, PREFLUSH, FUA completion flush or the flush before an
+  A/B slot rewrite) stop the shared owner and both views: storage may be
+  partial or durability unknown. dm-integrity also enters its own sticky failed
+  state on journal/metadata write errors. Unmount, remove and recreate the
+  stack after correcting the underlying problem; there is no error-clearing
+  control. An EIO write may have partially changed the disk.
+- **Concurrent requests at a fail-stop.** Requests run concurrently
+  ([concurrency](native-blocks.md#concurrency)). One that has not yet started
+  writing when the owner stops writes nothing and fails with EIO (it checks
+  before encrypting and again before its first write bio); a write or flush
+  still in flight completes with EIO, since whether it reached storage is
+  unknown; requests waiting for a range lock proceed and fail the same way, so
+  nothing hangs. Reads that already authenticated their data may still return
+  it.
+- **Plain writes are not flushed** (stock dm-crypt semantics). dm-integrity
+  completes a journaled write before committing it, so a lower write error
+  often surfaces only at the next commit: a flush, FUA, journal watermark or
+  commit timer. The failing request is then the flush (or a later write once
+  dm-integrity has entered its failed state), and earlier writes that reported
+  success may be lost, as with stock dm-crypt.
 
 Fault tests use only disposable synthetic guest disks. VM SIGKILL preserves the
 host page cache and is not hardware power-loss evidence. Primary sector
@@ -57,12 +71,13 @@ recorded in commit messages.
 
 scripts/guest-stateless-power.sh with kernel/guest-stateless-power.py
 initializes the stock fixture, then reopens it through a dm-delay wrapper
-(1 s write delay) and writes hidden block 0. A record is written as a few
-multi-sector bios and one flush, so at 512-byte sectors (a record fits below
-dm-integrity's 50% journal watermark) the stock journal would commit it in one
-write: the test first commits a few identical-plaintext decoy rewrites so the
-record crosses the watermark part way and dm-integrity commits its first part
-alone (4096-byte records exceed the watermark anyway; the prefill is recorded
+(1 s write delay) and writes hidden block 0 followed by fsync. A record is
+written as a few multi-sector bios and committed at the latest by that flush,
+so at 512-byte sectors (a record fits below dm-integrity's 50% journal
+watermark) the stock journal would commit it in one write: the test first
+commits a few identical-plaintext decoy rewrites (each followed by fsync, since
+plain writes are not flushed) so the record crosses the watermark part way and
+dm-integrity commits its first part alone (4096-byte records exceed the watermark anyway; the prefill is recorded
 in `cut-boundary.json`). An O_DIRECT raw observer reads the
 record's 687 current tag/IV tuples and the dm-integrity journal (whole-section
 commit IDs, pinned no-MAC entry layout) and cuts QEMU once some but not all of
@@ -85,8 +100,9 @@ linear wrapper below stock dm-integrity and reload it as
 (`error_reads`, `error_writes` or one-sector `corrupt_bio_byte`) after
 activation and once udev probes drain. Targets lie in hidden record 10, away
 from sector 0, whose setup checkpoint may be served from dm-integrity's journal
-cache. Decoy requests use an aligned 16 KiB span, hidden requests one 4096-byte
-block. A direct raw read witnesses each injected fault first.
+cache. Decoy requests use one aligned 128 KiB span (a whole decoy work item),
+hidden requests one 4096-byte block. A direct raw read witnesses each injected
+fault first.
 
 - **Setup**: pivsetup's `PIVSETUP_TEST_FAIL` hook fails after cryptsetup open,
   before/after native setup and after each public view; a lower read error is
@@ -98,13 +114,15 @@ block. A direct raw read witnesses each injected fault first.
   spend no encryption and leave the owner healthy; after restoration the same
   owner generation reads and rewrites the range and passes the complete
   primary/hidden oracles without repair.
-- **error_writes** (both views): encryption is spent, the request's write bios
-  hit the failing device, the owner reports failure and both views keep rejecting I/O
+- **error_writes** (both views): encryption is spent, the request's writes hit
+  the failing device (at its write bios or, since dm-integrity completes
+  journaled writes before committing them, at the fsync's flush), the owner
+  reports failure and both views keep rejecting I/O
   after the wrapper is restored. Only teardown/recreation clears it. Hidden
   blocks must match the oracle, with local EIO/repair allowed only for records
   intersecting the failed request (and, without the journal, torn sectors only
   within the request's span, restored by full-sector writes).
-- **Late-sector corruption**: the corrupted sector is the last of one 16 KiB
+- **Late-sector corruption**: the corrupted sector is the last of one 128 KiB
   decoy work item or the last carrier sector of record 10. A decoy read must
   leave a sentinel-filled direct-I/O buffer unchanged (earlier sectors may have
   decrypted privately). A hidden read of record 10 still succeeds, because only
@@ -141,19 +159,25 @@ with plain, FUA or PREFLUSH|FUA flags, or submits a flush. It accepts no keys, p
 unloaded before stress begins.
 
 Dynamic kprobe entry/return events around pn_worker, pn_write,
-blkdev_issue_flush and pn_endio (the worker's public-bio completion; a
+blkdev_issue_flush and pn_endio (module-qualified, resolving compiler suffixes
+such as `.constprop`; pn_endio is the worker's public-bio completion; a
 bio_endio probe also caught about 20,000 interrupt-context lower completions
 per v5 run, a few of which nested in another probe's handler and were counted
-as misses) record function metadata and results, never plaintext or keys. kernel/lifecycle_trace.py requires complete non-overlapping
-ordered workers, successful paired lower flushes, a completed flush before write
-return and public completion, and a preflush before a PREFLUSH payload (possibly
-in a separate DM-split flush bio); a standalone flush must reach a native
-worker. Probe misses, ring-buffer overruns, missing events and negative results
-fail the test. See the [kprobe tracing documentation](https://docs.kernel.org/trace/kprobetrace.html).
+as misses) record function metadata and results, never plaintext or keys.
+Workers run concurrently, so kernel/lifecycle_trace.py groups events per
+kworker PID (one kworker runs one work item at a time) and uses the globally
+ordered trace for cross-worker order. It requires complete workers (entry,
+completion, return), successful paired non-nested lower flushes, no flush inside
+pn_write, a plain write completing without any flush, a FUA write completing
+only after a successful flush that follows its write, a completed flush before
+a PREFLUSH payload starts (possibly in a separate DM-split flush bio), and a
+standalone flush reaching a native worker. Probe misses, ring-buffer overruns,
+missing events and negative results fail the test. See the [kprobe tracing documentation](https://docs.kernel.org/trace/kprobetrace.html).
 
 Concurrent writers own disjoint logical regions sharing carrier groups and mix
 direct and O_DSYNC writes with fsync while another thread suspends/resumes the
-public views. Held descriptors must block removal, close and unload without
+public views (the stress suite adds heavier concurrency, overlapping writes and
+a fault under load; [native-blocks.md](native-blocks.md#reproduce)). Held descriptors must block removal, close and unload without
 changing mapping identities; a request queued on a suspended view waits for
 resume while its peer stays usable. Complete oracles are checked afterwards and
 after a new owner generation, followed by stock full-primary readback and

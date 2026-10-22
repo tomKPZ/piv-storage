@@ -297,7 +297,7 @@ primary data of every touched sector before modifying it.
   (up to 16 attempts). Hidden writes stay strict: any failing or unreadable
   carrier sector fails the write. With A/B, write the other slot with
   generation max + 1.
-- **Decoy write** (≤ 16 KiB per work item): for each written primary sector,
+- **Decoy write** (≤ 128 KiB per work item): for each written primary sector,
   decode the old IV, keep its 6 payload bytes, draw fresh `r'` and re-encode
   (rejecting a result equal to the old IV); keyslot sectors use the listed
   OK_k, the directory, data and parity fragments use the record keys,

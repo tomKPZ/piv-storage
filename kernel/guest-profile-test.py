@@ -159,14 +159,17 @@ try:
         probe_command(f'p:piv_profile/{event} {function}')
         registered.append(event)
     (T / 'events/piv_profile/enable').write_text('1')
-    per_range = 16384 // unit
+    per_range = 1024                                  # PIV_READ_SECTORS: sectors per range read
     GROUP = 687                                       # format v5 record without parity
     record_ranges = (GROUP + per_range - 1) // per_range  # one 687-sector record
+    keyslot_ranges = (112 + per_range - 1) // per_range
     # Default setup scans only the 112 keyslot sectors (the keyslot check runs
     # on their IVs); the directory (groups 0 and 1) is then read and
-    # authenticated. --verify would scan every sector instead.
-    setup_expected = dict(load=1, range=(112 + per_range - 1) // per_range + 2 * record_ranges,
-                          crypto=112 + 1 + 2 * GROUP, write=0, checkpoint=1, batch=0, submit=0)
+    # authenticated. --verify would scan every sector instead. Each range read
+    # is one batch submission of a few concurrent bios.
+    setup_expected = dict(load=1, range=keyslot_ranges + 2 * record_ranges,
+                          crypto=112 + 1 + 2 * GROUP, write=0, checkpoint=1, batch=0,
+                          submit=keyslot_ranges + 2 * record_ranges)
     # Bracket exactly the SETUP ioctl with pivsetup's gate (before) and hold
     # (after) hooks; the binary waits at each point for our marker file.
     counted_gate = '/run/piv-profile-counted'
@@ -194,7 +197,8 @@ try:
     subprocess.run(['udevadm', 'settle'], check=True)
     # Hidden reads authenticate each 4096-byte block's 687 sectors.
     hidden_cases = (('hidden', 4096, GROUP, record_ranges), ('hidden', 16384, 4 * GROUP, 4 * record_ranges))
-    for role, count, loads, ranges in (('decoy', 512, 1, 1), ('decoy', 16384, per_range, 1)) + hidden_cases:
+    decoy_cases = (('decoy', 512, 1, 1), ('decoy', 16384, 16384 // unit, 1), ('decoy', 131072, 131072 // unit, 1))
+    for role, count, loads, ranges in decoy_cases + hidden_cases:
         def read():
             with mmap.mmap(-1, count) as buf:
                 fd = os.open(views[role], os.O_RDONLY | os.O_DIRECT)
@@ -204,12 +208,13 @@ try:
                 finally:
                     os.close(fd)
         counted(f'{role}-{count}', read, dict(load=0, range=ranges, crypto=loads, write=0, checkpoint=0,
-                                              batch=0, submit=0))
+                                              batch=0, submit=ranges))
     # Writes (same bytes, so the oracles hold): one authenticated batch read of
     # every touched sector, one encryption each, one write submission of a few
     # multi-sector bios. No per-sector loads, re-reads or self-decryption.
     status_owner = GuestOwner('/dev/vdb', KEY)
-    for role, count, sectors in (('decoy', 16384, 16384 // unit), ('hidden', 4096, GROUP)):
+    for role, count, sectors in (('decoy', 16384, 16384 // unit), ('decoy', 131072, 131072 // unit),
+                                 ('hidden', 4096, GROUP)):
         # Close outside the counted window: closing a written dm device makes
         # udev re-probe it (inotify watch), and those reads must not count.
         with mmap.mmap(-1, count) as buf:
