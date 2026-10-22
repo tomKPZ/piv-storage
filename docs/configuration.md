@@ -189,13 +189,15 @@ cost tier `--kdf-cost`:
 | Hidden key type | Added open time (measured) | Parameters |
 | --- | ---: | --- |
 | Key file | none | 256-bit random key |
-| Passphrase, `--kdf-cost 1` | 0.13–0.19 s | 64 MiB, t = 3 |
-| Passphrase, `--kdf-cost 2` | 0.52–0.56 s | 256 MiB, t = 3 |
-| Passphrase, `--kdf-cost 3` (default) | 2.1–2.5 s | 1 GiB, t = 3 |
-| Passphrase, `--kdf-cost 4` | 7.9–9.2 s | 2 GiB, t = 6 |
+| Passphrase, `--kdf-cost 1` | 0.10–0.16 s | 64 MiB, t = 3 |
+| Passphrase, `--kdf-cost 2` | 0.46–0.55 s | 256 MiB, t = 3 |
+| Passphrase, `--kdf-cost 3` (default) | 2.10–2.15 s | 1 GiB, t = 3 |
+| Passphrase, `--kdf-cost 4` | 8.1–8.3 s | 2 GiB, t = 6 |
 
-Added open time is the passphrase open minus the key-file open in suite-077
-(guest, pivsetup's single-threaded Argon2id). Tier 3 matches cryptsetup's own
+Added open time is the passphrase open minus the median key-file open in
+suite-112 (2026-10-22, all four profiles; guest, pivsetup's Argon2id with the
+four lanes computed sequentially; suite-077 measured 0.13–0.19, 0.52–0.56,
+2.1–2.5 and 7.9–9.2 s). Tier 3 matches cryptsetup's own
 LUKS2 keyslot defaults (1 GiB, 4 lanes, about 2 s), so the hidden keyslot is
 no longer the cheaper guessing target at the default. The tier is recorded
 nowhere: pass the same `--kdf-cost` on every open (a wrong tier is rejected
