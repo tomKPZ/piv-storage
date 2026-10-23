@@ -150,7 +150,7 @@ directory; measured capacities, performance and initialization times are in
 has too few hidden blocks for mke2fs. Setup never creates
 filesystems. Unmount both filesystems before `close-blocks`. Larger geometry
 uses checked kernel bounds ([large-volumes.md](docs/large-volumes.md)); the
-largest tested volumes are 3 GiB (4096-byte sectors) and 2 GiB (512).
+largest tested volumes are 3 GiB (4096-byte sectors) and 8 GiB (512).
 
 ## Format v5 in brief
 
@@ -302,7 +302,7 @@ Read this list before trusting real data to the prototype.
   reuses RNG state and nonce budget.
 - **Memory.** Passphrase tier 3 needs about 1 GiB of free RAM, also in the
   initramfs; pivsetup refuses early when less is available.
-- **Scale.** Tested up to 3 GiB volumes on a host-cached virtual disk; times
+- **Scale.** Tested up to 8 GiB volumes on a host-cached virtual disk; times
   for larger disks are extrapolations (initialization on real disks runs at
   roughly disk bandwidth / 3). There is no discard/TRIM support.
 

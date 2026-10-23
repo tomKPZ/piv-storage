@@ -20,7 +20,7 @@ and limits are in README.md and docs/.
 - Tested on the pinned Debian 6.12.113 guest kernel, its KASAN/UBSAN/lockdep
   build and the Debian backports 7.2.9 kernel; journaled volumes; 128 and
   512 MiB fixtures plus arbitrary devices (300 MiB disk, loop, dm-linear
-  offset, GPT partition) and 2–3 GiB volumes. Test tiers and rerun policy:
+  offset, GPT partition) and 2–8 GiB volumes. Test tiers and rerun policy:
   docs/development.md.
 - Activation is no longer confined to the test guest (user approval
   2026-10-22): `--device` is required and any block device or partition is

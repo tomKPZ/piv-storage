@@ -138,7 +138,8 @@ journal, was the bottleneck (measured before batched writes; not re-measured).
 cryptsetup sizes the journal itself (it has no
 `--journal-size` option for LUKS2 integrity; cryptsetup 2.8.8 rejects it and
 the devices suite checks the guest's 2.7.5): on the 128 MiB test disks it is
-about 1 MiB, and on real volumes of 8 GiB or more it is 64 MiB. The journal
+about 1 MiB, and on real volumes of 8 GiB or more it is 64 MiB (measured
+on the 8 GiB `large` run, suite-123-part3-large-8g). The journal
 keeps recently written sectors, so a single raw image shows the decoy-key
 holder recent writes ([security
 review](security-review.md#journal-history-and-the-decoy-key-holder)). A
@@ -309,7 +310,7 @@ is the tag plus the 16-byte IV (32 bytes for AEGIS, 48 for HMAC-SHA256):
 For a 1 TiB disk this gives roughly 1.5 GiB of hidden capacity at 4096-byte
 sectors and 11.2 GiB at 512 (AEGIS-128, no parity; half with A/B). These are
 extrapolations, not measurements: the largest tested volumes are 3 GiB
-(4096-byte sectors) and 2 GiB (512) ([large-volumes.md](large-volumes.md)).
+(4096-byte sectors) and 8 GiB (512) ([large-volumes.md](large-volumes.md)).
 
 ## Activation and boot time
 
@@ -435,7 +436,7 @@ The per-owner limit of 2^40 primary encryptions (raised from 2^32, which a
 512-byte-sector initialization reached around 2 TiB) also bounds one
 initialization (G encryptions per hidden block, about one per primary sector):
 at 512-byte sectors it is reached around 512 TiB. These figures are extrapolated beyond the largest tested
-volumes (3 GiB and 2 GiB; [large-volumes.md](large-volumes.md)).
+volumes (3 GiB at 4096-byte and 8 GiB at 512-byte sectors; [large-volumes.md](large-volumes.md)).
 
 ## How the numbers were measured
 

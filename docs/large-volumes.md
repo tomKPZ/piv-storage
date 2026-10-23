@@ -7,7 +7,7 @@ path also checks a sector offset before shifting it into bytes. This is an
 arithmetic boundary, not a claim that every size below it is tested or
 practical. pivsetup accepts block devices of any size (the 128/512 MiB
 activation guard was removed on 2026-10-22); the largest tested volumes are
-3 GiB at 4096-byte and 2 GiB at 512-byte sectors (below).
+3 GiB at 4096-byte and 8 GiB at 512-byte sectors (below).
 
 The frontend passes the actual validated raw byte size to the integrity
 parser. In the harness, `vm.py run --blank-mib 512` creates a fresh 512 MiB
@@ -135,11 +135,18 @@ primary sector and decoded every hidden block):
 | large-3g-012 | 3 GiB | 4096 | 770,149 | 4.4 MiB | 0.20 s | 5.9 s | 5.3 s | 0.21 s | 1.3 s | 19 s, 141 MB RSS |
 | large-2g-512-012 | 2 GiB | 512 | 3,885,080 | 22.1 MiB | 0.20 s | 11.6 s | 8.8 s | 0.22 s | 2.6 s | 80 s |
 | large-3g-013 | 3 GiB | 4096 | 770,149 | 4.4 MiB | 0.21 s | 6.9 s | 8.2 s | 0.28 s | 1.8 s | passed |
+| suite-123-part3-large-8g | 8 GiB | 512 | 15,187,960 | 86.3 MiB | 0.29 s | 52.7 s | 95.7 s | 0.41 s | 16.4 s | passed |
 
 The -012 runs used pivsetup 32d49336 (before the busy-device checks moved
 ahead of the superblock read); large-3g-013 repeated the 3 GiB run with the
 final pivsetup 4f5ace03 while a 16-VM suite matrix shared the host (hence the
-slower times).
+slower times). suite-123-part3-large-8g (2026-10-23, the `large` suite with
+`PIV_LARGE_MIB=8192`, AES-XTS + HMAC-SHA256, 512-byte sectors, all cases above)
+is the first run with the real-volume journal size: its integrity dump shows
+2,048 journal sections and the table `journal_sectors:131072` (64 MiB). Its
+full initialization (95.7 s, about 78 MiB/s of primary data) took longer than
+the fill of every block (52.7 s) in the same run; host-cache effects on the
+8 GiB sparse image were not separated.
 
 Run it with the native module of a suite matrix (fresh prefix; generated disks
 and keys stay in ignored artifacts/):
