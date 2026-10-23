@@ -34,6 +34,7 @@ import time
 
 from pivstore.blocks import close_blocks, open_blocks
 from pivstore.kernel_api import dm
+from pivstore.records import shaped_extent
 
 W = Path('/mnt/piv-work')
 KEY = W / 'ext4-passphrase.key'
@@ -292,8 +293,10 @@ def recover():
         result['torn_groups'] = sorted({(sector - 112) // GROUP for sector in torn if sector >= 112})
         if state.get('no_journal'):
             # Only in-flight hidden writes rewrite carriers (the decoy is never
-            # written here): every torn sector lies in a hidden-block record.
-            assert all(sector >= 112 + 2 * GROUP for sector in torn), result['torn_runs']
+            # written here): every torn sector lies in a hidden-block record's
+            # shaped extent (block 0's reaches 4 KiB below its record).
+            lowest = shaped_extent(112 + 2 * GROUP, GROUP, 512, expected['decoy_bytes'] // 512)[0]
+            assert all(sector >= lowest for sector in torn), result['torn_runs']
             repair_torn(views['decoy'], torn)
             assert not unreadable_sectors(views['decoy'], expected['decoy_bytes'])
             result['eio_blocks_after_decoy_repair'] = scan_hidden(views['hidden'], views['hidden_bytes'])[:64]

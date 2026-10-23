@@ -111,7 +111,8 @@ direct-mode lower table) are the recommended mode (user decision 2026-10-23):
 the journal keeps recent hidden writes readable to a decoy-key holder after a
 crash or while active. The cost: a crash during an unflushed write tears its
 sectors (EIO), including the decoy sectors carrying an in-flight hidden record,
-whose decoy plaintext is then lost
+whose decoy plaintext is then lost (hidden writes flush before completing, so
+only writes in flight at the crash are exposed)
 ([journal-atomicity.md](docs/journal-atomicity.md#no-journal-mode)).
 Journaled volumes stay supported as the integrity-first choice. No other
 persistent LUKS2 flag is accepted.
@@ -277,7 +278,8 @@ reopen and does not enforce the per-key lifetime budget, to which all writes,
 retries, failed preparations and clones count. VM snapshot restores, image
 clones and cloned RNG state invalidate these estimates. A 4096-byte hidden
 write reencrypts G = 687 + 3p primary sectors (2.7 MiB at 4096-byte sectors,
-344 KiB at 512, without parity), plus journal overhead on journaled volumes; decoy writes have no
+344 KiB at 512, without parity; at 512 plus up to 14 neighbouring sectors to
+reach 4 KiB edges), plus journal overhead on journaled volumes; decoy writes have no
 hidden amplification.
 
 Each stored IV is expected to look uniformly random without the hidden key under
@@ -288,8 +290,8 @@ changes exactly the IVs an ordinary write changes. Explicit limitations: a
 single raw image of a journaled volume can contain journal history; a
 decoy-key holder can decrypt retained journal entries and may see a hidden
 write's G sectors reencrypted with unchanged plaintext (no-journal volumes
-avoid this but a crash image can show one torn G-sector run per in-flight
-hidden write)
+avoid this but a crash image can show one torn, 4 KiB-aligned run of about
+G sectors per in-flight hidden write)
 ([security review](docs/security-review.md#journal-history-and-the-decoy-key-holder));
 multiple snapshots, hidden-write amplification, memory, installed software, keys
 and host artifacts; no protection against root, a compromised kernel, memory or
@@ -338,13 +340,16 @@ Read this list before trusting real data to the prototype.
   keeps recent writes (roughly the last 190 hidden-block writes at 512-byte
   sectors) and removed keyslots visible to a decoy-key holder with one raw
   image ([configuration.md](docs/configuration.md#integrity-journal)).
-- **Crashes.** Without `--ab`, any hidden block written since the last flush
-  may read EIO after a crash or power cut, which can break a hidden
-  filesystem; use `--ab` for filesystems. Without the journal, a crash also
-  tears (EIO) the sectors of unflushed writes, including the 687 decoy sectors
-  carrying an in-flight hidden record: their decoy plaintext is lost, and that
-  hidden block cannot be rewritten until those decoy sectors are rewritten
-  (restore the affected decoy files). Flush soon after hidden writes. Failures show only as EIO and dmesg
+- **Crashes.** Without `--ab`, a hidden block whose write was in flight may
+  read EIO after a crash or power cut, which can break a hidden filesystem;
+  use `--ab` for filesystems. Hidden writes flush before completing, so a
+  completed hidden write is durable. Without the journal, a crash also tears
+  (EIO) the sectors of unflushed decoy writes and of in-flight hidden writes
+  (about 696 decoy sectors per record at 512-byte sectors, shaped to 4 KiB
+  edges): their decoy plaintext is lost, and that hidden block (or its
+  neighbour, whose write also authenticates the edge sectors) cannot be
+  rewritten until those decoy sectors are rewritten (restore the affected
+  decoy files). Failures show only as EIO and dmesg
   messages; there is no status command or non-destructive hidden scrub
   (`--fill` is destructive). See [native-faults.md](docs/native-faults.md).
 - **Kernel upgrades.** Only Debian 6.12.113 and 7.2.9 are tested. A failed DKMS

@@ -144,20 +144,24 @@ separately: dm-integrity writes data in place and tags through its metadata
 buffers, which are written at the next flush. A crash between the two leaves
 those sectors failing authentication (EIO), as on any stock no-journal volume.
 For dm-piv this includes the carrier sectors of an in-flight hidden write,
-whose decoy plaintext the user never changed. In the power test (suite-125, all
-three no-journal profiles, single slot and `--ab`) every cut landed after the
-record's data and before its tags: exactly the record's 687 carrier sectors
-were torn, the hidden block still read its old contents (the old IVs were
-intact) and hidden writes to it failed with EIO until those decoy sectors were
-rewritten ([journal-atomicity.md](journal-atomicity.md#no-journal-mode)). Their
-decoy plaintext is lost: restore the affected decoy files (or rewrite those
-sectors), then rewrite the hidden block. A torn run of exactly one record at a
-record boundary also remains visible to a decoy-key holder in a crash image
+whose decoy plaintext the user never changed. Every hidden write therefore
+flushes before it completes, so only writes in flight at the crash are
+exposed (before that change any hidden write since the last flush was: up to
+12 torn records after one ext4 cut). In the power test, which cuts during the
+write (all three no-journal profiles, single slot and `--ab`), exactly the
+record's shaped extent was torn (696 sectors at 512-byte sectors, one 4 KiB-aligned run), the
+hidden block still read its old contents (the old IVs were intact) and hidden
+writes to it failed with EIO until those decoy sectors were rewritten
+([journal-atomicity.md](journal-atomicity.md#no-journal-mode)). Their decoy
+plaintext is lost: restore the affected decoy files (or rewrite those
+sectors), then rewrite the hidden block. Such a run on the record lattice
+also remains visible to a decoy-key holder in a crash image
 ([security review](security-review.md#journal-history-and-the-decoy-key-holder)).
 
 **Recommendation.** Use **no-journal** (user decision 2026-10-23: deniability
-comes before integrity), with `--ab` for hidden data, and flush (fsync, or a
-filesystem's commits) soon after hidden writes to shorten the tear window. Use
+comes before integrity), with `--ab` for hidden data. Hidden writes are
+flushed by dm-piv itself; decoy writes, as on any no-journal volume, are
+exposed until the filesystem's next commit or fsync. Use
 the journal if per-sector crash atomicity of the decoy matters more than
 hiding recent hidden activity from a decoy-key holder. An existing journaled volume can be
 switched with the same command; by source reading (pinned 6.12
@@ -400,6 +404,35 @@ second run). AEGIS-128 decoy random reads measured 13–20% lower in both runs
 while stock rows in the same session were 2–10% lower (still at stock speed);
 treat it as unresolved noise.
 
+**No-journal volumes, write shaping and hidden-write flushes** (suite-135,
+2026-10-23, the current module, against suite-133, the previous module on
+the same fixtures in the same session; AES-XTS + HMAC-SHA256 at 512-byte
+sectors, single slot):
+
+| Lower mode | Decoy seq write | Decoy seq read | Decoy random 4 KiB write | Hidden seq write (before) | Hidden random 4 KiB write, depth 1 (before) | depth 16 (before) | Hidden seq read | `--initialize` (before) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| No journal (recommended) | 193 MiB/s | 401 MiB/s | 4,270 IOPS | 2.3 MiB/s (2.9) | 239 IOPS (416) | 741 IOPS (757) | 6.3 MiB/s | 0.75 s (0.66) |
+| Journal | 94 MiB/s | 367 MiB/s | 5,300 IOPS | 1.1 MiB/s (1.2) | 180 IOPS (268) | 312 IOPS (353) | 6.1 MiB/s | 1.33 s (1.26) |
+
+- Without the journal, decoy sequential writes are about twice as fast (data
+  is written once, not journal then in place) and hidden writes 2–2.5×.
+  Decoy random writes measured 20% slower and reads about equal.
+- **Hidden writes now flush before completing** (closing the no-journal tear
+  window; [write path](native-blocks.md#write-path)). That costs a flush per
+  block at queue depth 1: random hidden writes lost 43% (no journal) and 33%
+  (journal); sequential 64 KiB requests (16 blocks in flight, which share
+  flushes) lost 19% and 6%, and depth 16 is unchanged within noise. AEGIS-128
+  at 4096-byte sectors, journaled, did not change beyond noise (186 KiB/s
+  sequential, 49 IOPS random, against 154 KiB/s and 44 IOPS), since each block
+  rewrites 2.7 MiB there anyway. Initialization flushes per round of 8 records
+  instead of every 16; its time did not change beyond noise.
+- **Write shaping** (4 KiB edges) added 1.0% primary encryptions to hidden
+  writes at 512-byte sectors (177,664 instead of 175,872 for 1 MiB) and none at
+  4096. A 64 KiB alignment, evaluated in suite-136 with the same module
+  otherwise, added 18.5% (208,384) and cost a further 20–32% of no-journal
+  hidden write speed for no deniability gain (the run length and record
+  lattice stay visible), so 4 KiB was kept.
+
 What to expect:
 
 - **Decoy reads** are close to stock: random reads at stock speed, large
@@ -412,7 +445,8 @@ What to expect:
   durability comes from fsync/FUA. Either difference is visible to anyone
   timing writes on the running system.
 - **Hidden writes** run at about 160–180 KiB/s at 4096-byte sectors (about 45
-  blocks of 4 KiB per second) and 1.3 MiB/s at 512. They are bound by the G×
+  blocks of 4 KiB per second) and 1.1–2.3 MiB/s at 512 (journal / no journal;
+  table above), each followed by a flush. They are bound by the G×
   write amplification, not by the journal: each 4 KiB block rewrites G = 687
   primary sectors (2.7 MiB at 4096, 344 KiB at 512), which comes to about
   110 MiB/s of rewritten primary data at either sector size, the same rate as
@@ -473,7 +507,8 @@ volumes (3 GiB at 4096-byte and 8 GiB at 512-byte sectors; [large-volumes.md](la
 ## How the numbers were measured
 
 - `bench` suite (scripts/guest-bench.sh, kernel/guest-bench-test.py) run
-  sequentially (`--jobs 1`) in suite-094 (format v5, concurrent requests,
+  sequentially (`--jobs 1`) in suite-094 (the no-journal, shaping and
+  hidden-flush rows in suite-133/135/136) (format v5, concurrent requests,
   2026-10-22; KDF tier rows from suite-077, matched within 0.6 s; queue-depth-16
   rows from suite-120, with suite-113 as the previous-module baseline) on the pinned
   Debian 6.12.113 guest: 2 vCPUs, `-cpu max` under KVM on an Intel Xeon @

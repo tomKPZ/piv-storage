@@ -88,7 +88,7 @@ the same sectors (`piv_range_lock` in kernel/piv-control.inc):
 | Request | Range lock over primary sectors |
 | --- | --- |
 | Decoy write | exclusive, the sectors it rewrites |
-| Hidden write | exclusive, the block's whole record group (both slots with A/B) |
+| Hidden write | exclusive, the block's record group(s) (both slots with A/B) extended to the 4 KiB edges of its [shaped rewrite](#write-shaping) |
 | Hidden read | shared, the block's record group(s) |
 | Decoy read, flush | none |
 
@@ -96,7 +96,10 @@ So two writes to overlapping primary sectors (including sub-sector decoy
 writes into one 4096-byte sector), or a decoy write and a hidden write of the
 same record, never interleave their read–authenticate–re-encrypt–write
 sequences, and a hidden read never collects a half-written record (it returns
-the old or the new block, not EIO). Decoy reads need no lock: dm-integrity keeps
+the old or the new block, not EIO). At 512-byte sectors the shaped extents of
+adjacent blocks share a 4 KiB unit, so hidden writes of adjacent blocks
+serialize; a hidden read does not wait for a neighbour's write, whose
+refresh of the read's edge sectors keeps their fragments. Decoy reads need no lock: dm-integrity keeps
 each sector whole and every sector is authenticated on its own. Entries queue in
 arrival order and wait only for earlier conflicting entries, so there is no
 starvation, and a request holds at most one range, so there is no deadlock.
@@ -148,11 +151,13 @@ owner like any other failure once writing began.
   tag decides. With parity, a failing tag triggers RS decoding with the
   failing or unreadable sectors as erasures, then a second SIV check.
 - **Hidden write**: with A/B, reads both slots' IVs to pick the slot not
-  holding the newest valid version and flushes the lower device (see below);
-  then authenticates all G carrier sectors of the target slot, seals the block
-  with a fresh generation and fresh fragments and rewrites the carrier (below).
-  There is no durable cross-sector plan; without A/B a crash can destroy the
-  block.
+  holding the newest valid version and, if needed, flushes the lower device
+  (see below); then authenticates all G carrier sectors of the target slot plus
+  the neighbouring sectors up to the 4 KiB edges, seals the block with a fresh
+  generation and fresh fragments, rewrites the carrier and refreshes the
+  neighbours' IVs ([write shaping](#write-shaping)), and flushes before
+  completing. There is no durable cross-sector plan; without A/B a crash
+  during the write can destroy the block.
 
 ### Write path
 
@@ -184,27 +189,41 @@ exclusive `io` lock (control calls), and the private owner rejects other bios
 while views are active. Freshly produced ciphertext is not decrypted again
 (that guarded userspace-supplied tuples); later reads authenticate every sector.
 
-**Flush semantics** follow stock dm-crypt: a plain write completes once its
-lower write bios complete, without a flush, so it is durable only after a
-later flush or FUA request (dm-integrity commits its journal on flush/FUA, when
-half full, or on its commit timer; in direct mode it writes data in place and
-its buffered tags at the next flush). A FUA write flushes the lower device after
-its write and before completing. WRITE|PREFLUSH flushes before its payload, and
-an empty flush flushes the lower device; both cover every write completed
-before they were issued, since a request completes only after its lower writes
-did. An A/B hidden write also flushes before rewriting a slot, so the slot
-holding the newest version is durable before the other one is overwritten
-([journal atomicity](journal-atomicity.md)), unless that version is already
-durable: the owner counts completed lower write batches and records, at each
-successful flush, the count sampled when the flush started; each hidden write
-records the count after it (per hash of the block index, 1024 buckets, so a
-collision costs only a flush). The pre-write flush is skipped when a
-successful flush started after the block's previous write completed. Keyslot and directory writes
-flush after each write. Initialization flushes every 16 records and before
-returning, also when cancelled. Batches are not atomic writes; the stock
-journal may commit part of a record at any time, and without the journal a
-crash can tear sectors whose data landed before their tags. No discard or write-zeroes is
-advertised. Suspend/removal uses DM references and generation binding; see the
+**Flush semantics.** Decoy writes follow stock dm-crypt: a plain write
+completes once its lower write bios complete, without a flush, so it is
+durable only after a later flush or FUA request (dm-integrity commits its
+journal on flush/FUA, when half full, or on its commit timer; in direct mode it
+writes data in place and its buffered tags at the next flush). A FUA decoy
+write flushes the lower device after its write and before completing.
+WRITE|PREFLUSH flushes before its payload, and an empty flush flushes the
+lower device; both cover every write completed before they were issued, since
+a request completes only after its lower writes did.
+
+**Hidden writes flush before completing** (since 2026-10-23, user priorities
+deniability > integrity > performance): after its record batch, outside the
+range lock, a hidden write flushes the lower device unless a successful flush
+that started after the batch completed already covers it (concurrent writers
+share flushes). On a direct-mode (stock no-journal) lower device this is what
+makes the record durable: dm-integrity writes the data in place at once but
+the tags only at the next flush, and a crash in between tears every rewritten
+sector, losing its decoy plaintext and leaving a record-shaped run of failing
+sectors in a single image. The flush shrinks that window from "until the
+next flush" to the write itself ([no-journal mode](journal-atomicity.md#no-journal-mode)).
+Journaled volumes flush too: it costs hidden write throughput there but makes
+an acknowledged hidden write durable (a lost single-slot write would otherwise
+read EIO), and keeps one write path. A FUA hidden write adds no second flush.
+Before rewriting an A/B slot the owner still checks that the block's previous
+version is durable ([journal atomicity](journal-atomicity.md)): it counts
+completed lower write batches and records, at each successful flush, the count
+sampled when the flush started; each hidden write records the count after it
+(per hash of the block index, 1024 buckets). With completion flushes this
+pre-write flush is normally skipped. Keyslot and directory writes flush after
+each write (each keyslot replica separately, so one replica is complete before
+the other changes). Initialization and fill flush after every round of 8
+records, so a crash tears at most one round's records. Batches are not atomic
+writes; the stock journal may commit part of a record at any time, and
+without the journal a crash during a write tears sectors whose data landed
+before their tags. No discard or write-zeroes is advertised. Suspend/removal uses DM references and generation binding; see the
 [lifecycle notes](native-faults.md#concurrent-lifecycle-and-flushfua-ordering-lifecycle-suite).
 
 Failures before the first lower write (reads, authentication, allocation,
@@ -218,11 +237,59 @@ positive sentinel `PN_UNAVAILABLE`; Linux `BLK_STS_MEDIUM` (-ENODATA) is a
 storage error, never mistaken for it.
 
 Damaged hidden blocks are repaired by a full 4096-byte block write (the only
-write size the hidden view accepts).
+write size the hidden view accepts), provided their shaped extent
+authenticates.
 
 Initialization writes records in rounds of 8 concurrent work items on the same
-workqueue (setup holds the lifecycle mutex and no views exist yet); it polls for
-cancellation between rounds, when every record written so far is complete.
+workqueue (setup holds the lifecycle mutex and no views exist yet): within
+each run of 16 blocks the even blocks, then the odd ones, so the round's
+shaped extents never overlap; it polls for cancellation between rounds, when
+every record written so far is complete and flushed.
+
+### Write shaping
+
+Every rewrite other than a decoy request (hidden records, the directory,
+keyslot replicas, wipes) is extended to 4 KiB-aligned primary byte edges
+(`PN_SHAPE_BYTES`, `pn_shaped_write` in kernel/piv-native.inc). Without it a
+hidden write at 512-byte sectors rewrote exactly the record's 687 sectors from
+`112 + G·g`: a 351,744-byte run (not a 4 KiB multiple) at an unaligned offset,
+a shape ordinary filesystems do not produce, visible without keys to any
+address trace (journal, I/O tracing, several snapshots). The extension
+sectors, at most 7 on each side, keep their plaintext and get decoy-write IVs
+(listed keyslots, the directory and records keep their fragments under fresh
+random bytes; unlisted keyslot areas and the tail get random IVs; a keyslot
+write refreshes its own other replica under the new keyslot keys). They are
+read, authenticated, collision-checked, counted against the encryption cap
+and encrypted exactly like the core sectors, inside the same range lock, so
+the lower write set of each hidden write is one 4 KiB-aligned run (the end is
+clamped to the device, whose last sector may be unaligned). At 4096-byte
+primary sectors every sector is already 4 KiB, and nothing changes.
+
+Choices and limits:
+
+- **Failing neighbour sector.** A neighbouring sector that fails
+  authentication or cannot be read fails the hidden write before anything is
+  written (local EIO, as for a failing carrier sector), rather than skipping
+  the extension at that edge, which would reveal the unaligned shape, or
+  replacing a sector whose plaintext is unknown. A full-sector decoy write of
+  the damaged sector restores writability. The v5 suite covers this with an
+  unreadable first sector of the next record.
+- **Neighbours stay valid.** A neighbour's fragment is the same in its old
+  and new IV, so a crash or a failed write that tears an extension sector
+  leaves the neighbouring record readable (only its decoy plaintext is lost on
+  no-journal volumes); the fault, power and stress suites check this.
+- **Alignment.** 4 KiB matches the block size of ordinary filesystems and adds
+  at most 14 sectors at 512-byte sectors (about 7 on average: 1.0% more
+  encryptions in the bench suite). 64 KiB was evaluated
+  ([configuration.md](configuration.md#throughput)); it hides nothing more
+  that matters (the length and the record lattice stay) at 18.5% more
+  amplification and 20–32% lower no-journal hidden write speed, so 4 KiB was
+  chosen.
+- **What it does not hide.** The write is still about 344 KiB (G sectors plus
+  the edges) at offsets on the record lattice, rewrites unchanged plaintext
+  (visible to a decoy-key holder as re-encryption without content change), and
+  arrives as one burst followed by a flush. Shaping removes the unaligned
+  edges, not the size, the lattice or the unchanged-plaintext signature.
 
 ### Bounded authenticated reads
 

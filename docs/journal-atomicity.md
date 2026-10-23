@@ -24,8 +24,9 @@ review only):
   [observed-layout.md](observed-layout.md)), so a 687-sector record always spans
   more than one section even if it were submitted as one bio.
 - The native owner writes a record as a few multi-sector bios (all in flight
-  together) and, like stock dm-crypt, does not flush after a plain write.
-  dm-integrity commits on the next flush or FUA request, or earlier,
+  together) and, since 2026-10-23, flushes after it before completing the
+  hidden write (decoy writes, like stock dm-crypt, are not flushed).
+  dm-integrity commits on that flush, or earlier,
   asynchronously, once free journal entries fall to the 50% watermark
   (`journal_watermark:50`) or its commit timer fires. A 4096-byte record exceeds the
   whole journal and is always committed in parts; a 512-byte record fits below
@@ -71,27 +72,28 @@ power loss.
 
 ## Unflushed writes
 
-View writes follow stock flush semantics
-([write path](native-blocks.md#write-path)): a plain decoy or hidden write
-completes when its lower write bios complete, and is durable only after a
-later flush or FUA request (a FUA write flushes before completing). Each
-primary sector stays old or new across a crash, as with stock dm-crypt. A
-hidden block written since the last flush is in the same position as one whose
-write was interrupted: after a crash it reads as the old block, the new block
-or, without A/B, EIO until rewritten. Before completion flushes were dropped
-only a write in flight at the crash could do that; now any write not yet
-covered by a flush can. Filesystems on the hidden view already issue flush/FUA
-where they need durability (for example ext4 journal commits), so this matches
-the stock contract that unflushed writes may be lost, except that a lost
-single-slot hidden block becomes unavailable rather than old.
+Decoy writes follow stock flush semantics
+([write path](native-blocks.md#write-path)): a plain decoy write completes
+when its lower write bios complete and is durable only after a later flush or
+FUA request; each primary sector stays old or new across a crash on journaled
+volumes, as with stock dm-crypt.
 
-A/B keeps its guarantee: before rewriting a slot, an A/B hidden write flushes
-the lower device, so the slot holding the newest version is committed before
-the other slot is overwritten. Without that flush, two successive unflushed
-writes of one block could leave both slots torn by one crash. Writes of the
-same block are serialized by its range lock, so the flush covers the previous
-write of the block. A failure of that flush stops the owner like any flush
-error.
+Hidden writes flush before completing (user priorities 2026-10-23:
+deniability > integrity > performance), unless a flush that started after
+the write already covers it. An acknowledged hidden write is therefore
+durable: after a crash a hidden block reads the old block, the new block or,
+without A/B, EIO only if its write was still in flight. Previously (stock
+semantics for hidden writes too) any hidden write not yet covered by a flush
+could be lost that way, and on no-journal volumes it also tore its carrier
+until the next flush (below). The cost is a flush per hidden block at low
+queue depth ([configuration.md](configuration.md#throughput)).
+
+A/B keeps its guarantee: before rewriting a slot, an A/B hidden write makes
+sure the slot holding the newest version is durable, flushing first unless a
+successful flush started after the block's previous write completed (with
+completion flushes that check normally skips). Writes of the same block are
+serialized by its range lock. A failure of either flush stops the owner like
+any flush error.
 
 ## No-journal mode
 
@@ -109,7 +111,16 @@ metadata reaches the disk at the next flush or FUA (or bufio writeback, or
 deactivation). Nothing orders the two, so a crash in between leaves sectors
 whose data and tag/IV come from different writes: they fail authentication.
 
-**Power test** (suite-125, reproduced identically in suite-128, on the
+**Hidden-write flush (2026-10-23).** Every hidden write now flushes the lower
+device before it completes (outside its range lock; concurrent writers share
+flushes), and initialization and fill flush after every round of 8 records
+instead of every 16. That closes the window in which a completed hidden
+write's carrier sat on disk with data but without tags until some later
+flush; what remains is the write itself (its batch and its flush). The
+alternative, a repair tool, would not hide the record-shaped tear from a
+decoy-key holder and could not restore the lost decoy plaintext.
+
+**Power test, before the flush** (suite-125, reproduced identically in suite-128, on the
 sanitizer kernel in suite-129 and on the 7.2.9 port kernel in suite-131; the
 same dm-delay test with a 1 s write delay; on
 no-journal fixtures the cut lands as soon as any data or tag byte of the
@@ -122,8 +133,8 @@ carrier changed on disk while the writer's fsync is outstanding):
 | AEGIS-128 512 | single, `--ab` | same | same | old | EIO |
 
 Every cut caught the record's data written and its tags still buffered, the
-widest window: it lasts until the next flush, so an unflushed hidden write
-leaves its carrier exposed this long. The block read its **old** contents
+widest window: it lasted until the next flush, so an unflushed hidden write
+left its carrier exposed this long. The block read its **old** contents
 because the stored IVs (with the old fragments) were intact; the torn sectors'
 raw IVs feed SIV-checked decoding. Hidden writes stay strict, so rewriting
 that block failed locally (EIO, no fail-stop) until full-sector decoy writes
@@ -134,29 +145,50 @@ left the in-flight record's carrier. A cut after the tag flush leaves the new
 block and no tears; tags reaching the disk before data (not observed here)
 would tear the same sectors.
 
-Other no-journal runs: the ext4power suite (ext4 on single-slot and A/B
-hidden views, 512-byte sectors; suite-125 and suite-128, 12 volumes) left torn
-sectors in 5 of 12 volumes, always whole records at record boundaries: 1, 1,
-6 and 12 records in A/B or single-slot volumes (one single-slot cut tore 11
-consecutive records, a burst of unflushed hidden writes). No hidden block read
-EIO before or after the decoy repair (the stored IVs still held the old
-fragments), every mount replayed, every fsync'ed file survived and fsck was
-clean. In the stress suite's concurrent lower-write-error phase, 2
+**Power test, with the flush and write shaping** (suite-137, all three
+no-journal profiles, single slot and `--ab`): the test still cuts while the
+write is in flight (its observer waits for the first changed carrier byte),
+so it still tears: exactly the record's shaped extent, one 4 KiB-aligned run
+([write shaping](native-blocks.md#write-shaping)) of 696 sectors at 512-byte
+sectors (1,480–2,175; A/B slot 1: 2,168–2,863) and 687 at 4096
+(1,486–2,172; A/B 2,173–2,859). Block 0 read its old contents, the hidden
+rewrite failed locally until the decoy repair, and the neighbouring blocks
+whose edge sectors were torn (directory group 1, block 1) stayed readable,
+because their fragments are the same in the old and new IVs. This test
+measures the in-flight window, which the flush does not change; the window it
+closes shows in the ext4 runs.
+
+Other no-journal runs, before the flush: the ext4power suite (ext4 on
+single-slot and A/B hidden views, 512-byte sectors; suite-125 and suite-128,
+12 volumes) left torn sectors in 5 of 12 volumes, always whole records at
+record boundaries: 1, 1, 6 and 12 records in A/B or single-slot volumes (one
+single-slot cut tore 11 consecutive records, a burst of unflushed hidden
+writes). No hidden block read EIO before or after the decoy repair (the stored
+IVs still held the old fragments), every mount replayed, every fsync'ed file
+survived and fsck was clean. With the flush (suites 137, 140 and 141, three profiles, 18 volumes): no
+volume had a torn sector, no hidden block read EIO, every mount replayed and
+fsck was clean. Cuts are random in time; a cut during an in-flight hidden
+write can still tear its extent. In the stress suite's concurrent lower-write-error phase, 2
 to 1,377 decoy sectors were torn, all inside the region that phase wrote.
-Lower write errors (fault suite, suite-127) tore exactly the failed
-request's sectors and nothing else: a 128 KiB decoy write (256 sectors at 512,
-32 at 4096), a hidden write's 687-sector record, 14 sectors of the
-initialization's keyslot revocation and 2,061 (512) or 5,496 (4096) sectors of
-fill records, because tags buffered by dm-integrity reached the disk at
+Lower write errors (fault suite, suite-127; with shaping and the flush
+suite-138) tore exactly the failed request's sectors and nothing else: a
+128 KiB decoy write (256 sectors at 512, 32 at 4096), a hidden write's record
+(suite-138: its whole shaped extent, 696 sectors at 512 including 5 and 3 edge
+sectors of the neighbouring records, which stayed readable; 687 at 4096), the
+initialization's first keyslot revocation write (24 sectors at 512, its
+shaped extent reaching into keyslot 0's second replica; 14 at 4096) and one
+or two fill records (696–1,392 sectors; suite-127, flushing every 16 records:
+2,061 or 5,496), because tags buffered by dm-integrity reached the disk at
 deactivation after their data writes had failed. Full-sector decoy writes
 repaired all of them.
 
 **Residual signature.** A crash image of a no-journal volume shows no journal
-history, but each hidden write not yet covered by a flush can leave one run
-of exactly G failing sectors starting at a record boundary (`112 + G·g`;
-ext4power saw up to 12 such records after one cut); stock crash tears follow
-the filesystem's write extents. ROADMAP's hidden-write shaping would
-align such runs to ordinary block edges but not hide their length.
+history. A hidden write in flight at the crash (at most 16 concurrent work
+items; initialization and fill: one round of 8 records) can leave one
+4 KiB-aligned run of failing sectors covering its record's shaped extent
+(about G sectors on the record lattice `112 + G·g`); stock crash tears follow
+the filesystem's write extents. Shaping aligns the runs but does not hide
+their length or lattice.
 
 **Earlier result** (format v4): the same hazard was measured on
 AEGIS no-journal volumes (every 4096 run, some 512 runs), and support was

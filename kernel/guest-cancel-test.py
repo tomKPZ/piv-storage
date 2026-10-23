@@ -17,6 +17,7 @@ import time
 import pivstore.blocks as blocks
 from pivstore.kernel_api import command, dm, mapping_identity
 from pivstore.kernel_owner import GuestOwner
+from pivstore.records import shaped_count
 
 W = Path('/mnt/piv-work')
 T = Path('/sys/kernel/tracing')
@@ -176,34 +177,69 @@ def open_views(**options):
     return v
 
 
-def verify(v, unavailable_from=None):
+def init_rounds(total):
+    """Block order of initialization and fill rounds (kernel pn_records): per
+    run of 16 blocks the 8 even ones, then the 8 odd ones (adjacent blocks'
+    shaped rewrites would serialize)."""
+    for first in range(0, total, 16):
+        for phase in (0, 1):
+            members = list(range(first + phase, min(first + 16, total), 2))
+            if members:
+                yield members
+
+
+def record_cost(index, unit, sectors):
+    """Primary encryptions of block @index's shaped record rewrite (no A/B)."""
+    return shaped_count(112 + (2 + index) * GROUP, GROUP, unit, sectors)
+
+
+def setup_cost(unit, sectors):
+    """Initialization before records: the revocation of keyslots 1-3 (3 x 2
+    replicas of 14 sectors) and directory group 1, keyslot 0 (2 x 14) and the
+    directory, each shaped to 4 KiB edges."""
+    return (sum(shaped_count(14 * r, 14, unit, sectors) for r in range(8))
+            + shaped_count(112 + GROUP, GROUP, unit, sectors) + shaped_count(112, GROUP, unit, sectors))
+
+
+def completed_rounds(spent, total, unit, sectors):
+    """Blocks of the whole rounds whose record encryptions add up to @spent:
+    cancellation is polled only between rounds."""
+    done, cost = [], 0
+    for members in init_rounds(total):
+        if cost == spent:
+            break
+        cost += sum(record_cost(index, unit, sectors) for index in members)
+        done += members
+    assert cost == spent, (cost, spent)
+    return done
+
+
+def verify(v, completed=None):
     assert subprocess.check_output(['sha256sum', v['decoy']], text=True).split()[0] == PRIMARY
-    if unavailable_from is None:
+    if completed is None:
         assert Path(v['hidden']).read_bytes() == expected
         return
     # Interrupted v5 re-initialization: a new master key was written first, so
-    # completed leading blocks are zeros and every later block is unavailable
-    # (old records no longer authenticate) rather than retaining old content.
+    # completed blocks are zeros and every other block is unavailable (old
+    # records no longer authenticate) rather than retaining old content.
     # Exact O_DIRECT reads: buffered page reads would include unavailable neighbours.
+    total = len(expected) // BLOCK
+    missing = [index for index in range(total) if index not in set(completed)]
     fd = os.open(v['hidden'], os.O_RDONLY | os.O_DIRECT)
     try:
-        with mmap.mmap(-1, unavailable_from * BLOCK) as buf:
-            assert os.preadv(fd, [buf], 0) == unavailable_from * BLOCK
-            assert buf[:] == expected[:unavailable_from * BLOCK]
-    finally:
-        os.close(fd)
-    for index in (unavailable_from, len(expected) // BLOCK - 1):
-        fd = os.open(v['hidden'], os.O_RDONLY | os.O_DIRECT)
-        try:
-            with mmap.mmap(-1, BLOCK) as buf:
+        with mmap.mmap(-1, BLOCK) as buf:
+            for index in completed:
+                assert os.preadv(fd, [buf], index * BLOCK) == BLOCK
+                assert buf[:] == expected[index * BLOCK:(index + 1) * BLOCK], index
+            for index in sorted({missing[0], missing[-1]}):
                 try:
                     os.preadv(fd, [buf], index * BLOCK)
                 except OSError as exc:
                     assert exc.errno == errno.EIO
                 else:
                     raise AssertionError(f'Block {index} after interrupted v5 initialization was readable')
-        finally:
-            os.close(fd)
+    finally:
+        os.close(fd)
 
 
 absent()
@@ -269,20 +305,22 @@ try:
         assert mapping_identity('piv-test-delay') == wrapper
         v = open_views()
         handle = GuestOwner(SOURCE, KEY)
+        unit, sectors = handle.device.sector_size, handle.device.sectors
         handle.close()
-        unavailable_from, total = None, len(expected) // BLOCK
+        done, total = None, len(expected) // BLOCK
         if phase == 'scan':
             assert status['encryptions'] == 0
         else:
-            # Initialization: the revocation of keyslots 1-3 (3 x 2 x 14 sectors)
-            # and directory group 1 (687), keyslot 0 (2 x 14) and the directory
-            # (687) precede the 687-sector zero records. Fill writes records only.
-            setup = 4 * 2 * 14 + 2 * GROUP if phase == 'initialize' else 0
-            completed, remainder = divmod(status['encryptions'] - setup, GROUP)
-            assert not remainder and 2 <= completed < min(64, total), status
-            expected[:completed * BLOCK] = bytes(completed * BLOCK)
-            unavailable_from = completed
-        verify(v, unavailable_from)
+            # Initialization: the keyslot revocation, keyslot 0 and the
+            # directory (setup_cost) precede the zero records, written in
+            # whole rounds (init_rounds). Fill writes records only.
+            setup = setup_cost(unit, sectors) if phase == 'initialize' else 0
+            done = completed_rounds(status['encryptions'] - setup, total, unit, sectors)
+            completed = len(done)
+            assert 2 <= completed < min(64, total), status
+            for index in done:
+                expected[index * BLOCK:(index + 1) * BLOCK] = bytes(BLOCK)
+        verify(v, done)
         blocks.close_blocks(SOURCE, KEY)
         fill = None
         if phase != 'scan':

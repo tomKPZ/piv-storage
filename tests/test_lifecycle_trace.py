@@ -46,6 +46,23 @@ class LifecycleTraceTests(unittest.TestCase):
                  'worker_done']
         self.assertEqual(check_trace(trace(whole), 2)['flush_completions'], 2)
 
+    def test_hidden_write_flushes_inside_pn_write(self):
+        inside = ['worker', 'write', 'flush', 'flush_done', 'write_done', 'endio', 'worker_done']
+        for mode in (0, 1):
+            with self.subTest(mode=mode):
+                self.assertEqual(check_trace(trace(inside), mode, hidden=True)['flush_completions'], 1)
+        preflush = ['worker', 'flush', 'flush_done', 'write', 'flush', 'flush_done', 'write_done', 'endio',
+                    'worker_done']
+        self.assertEqual(check_trace(trace(preflush), 2, hidden=True)['flush_completions'], 2)
+        # No flush inside pn_write, a second (FUA) flush after it, or a decoy
+        # write flushing inside pn_write are all wrong.
+        missing = ['worker', 'write', 'write_done', 'endio', 'worker_done']
+        after = ['worker', 'write', 'flush', 'flush_done', 'write_done', 'flush', 'flush_done', 'endio',
+                 'worker_done']
+        for events, mode, hidden in ((missing, 0, True), (after, 1, True), (inside, 0, False)):
+            with self.subTest(events=events, hidden=hidden), self.assertRaises(AssertionError):
+                check_trace(trace(events), mode, hidden=hidden)
+
     def test_concurrent_workers_overlap(self):
         read = ['worker', 'endio', 'worker_done']
         write = ['worker', 'write', 'write_done', 'endio', 'worker_done']

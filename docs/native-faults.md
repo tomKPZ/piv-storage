@@ -6,7 +6,9 @@ journaled, or direct on stock persistent no-journal volumes (recommended for
 deniability; see [journal-atomicity.md](journal-atomicity.md#no-journal-mode)).
 An interrupted hidden write may leave that one 4096-byte hidden block
 unreadable (unless RS parity recovers it); without the journal it can also
-tear (EIO) the primary sectors it was rewriting, never others.
+tear (EIO) the primary sectors it was rewriting (its record's
+[shaped extent](native-blocks.md#write-shaping)), never others, and the
+neighbouring records whose edge sectors it refreshed stay readable.
 A record's whole plaintext must authenticate (SIV tag over all 687 data
 fragments, after any RS correction) before it is returned, so old and
 new carrier fragments are never mixed into a valid block. Independently valid
@@ -23,7 +25,10 @@ transaction, hidden crash recovery or rollback resistance.
 - **Decoy writes over damaged hidden blocks** re-randomize only the written
   sectors' IVs and preserve their fragments, so damage stays damage. Nothing
   fabricates authenticated zeros. A full 4096-byte hidden write repairs the
-  block; it needs authenticated plaintext of all G carrier sectors.
+  block; it needs authenticated plaintext of all G carrier sectors and of the
+  neighbouring sectors up to the 4 KiB edges of its shaped extent (a failing
+  neighbour sector fails the write locally, before anything is written; the v5
+  suite checks this with an unreadable first sector of the next record).
 - **Unreadable or damaged carrier sectors with parity** (`--parity p`): up to p
   per lane (erasures: unreadable or failing authentication) or p/2 per lane
   (foreign fragments in authenticating sectors) are corrected on read; beyond
@@ -43,8 +48,9 @@ transaction, hidden crash recovery or rollback resistance.
   any write ([write path](native-blocks.md#write-path)); encryption
   invocations may already have been spent.
 - **Errors once writing began and flush errors** (any of a request's write
-  bios, standalone flush, PREFLUSH, FUA completion flush or the flush before an
-  A/B slot rewrite) stop the shared owner and both views: storage may be
+  bios, standalone flush, PREFLUSH, FUA completion flush, a hidden write's
+  completion flush or the flush before an A/B slot rewrite) stop the shared
+  owner and both views: storage may be
   partial or durability unknown. dm-integrity also enters its own sticky failed
   state on journal/metadata write errors. Unmount, remove and recreate the
   stack after correcting the underlying problem; there is no error-clearing
@@ -63,7 +69,8 @@ transaction, hidden crash recovery or rollback resistance.
   unknown; requests waiting for a range lock proceed and fail the same way, so
   nothing hangs. Reads that already authenticated their data may still return
   it.
-- **Plain writes are not flushed** (stock dm-crypt semantics). dm-integrity
+- **Plain decoy writes are not flushed** (stock dm-crypt semantics; hidden
+  writes are). dm-integrity
   completes a journaled write before committing it, so a lower write error
   often surfaces only at the next commit: a flush, FUA, journal watermark or
   commit timer. The failing request is then the flush (or a later write once
@@ -106,7 +113,7 @@ the journal (journaled fixtures) and requires block 0 to be complete-old,
 complete-new or EIO (A/B: never EIO), every
 other hidden block unchanged and the full primary hash unchanged. Journaled
 fixtures must show no torn primary sector. On no-journal fixtures every torn
-sector must lie in the record span; the test records them
+sector must lie in the record span (the shaped extent); the test records them
 (`power-results.json`), checks that a hidden rewrite fails with EIO while they
 remain, and restores them by full-sector decoy writes of the pre-cut
 plaintext before the remaining checks. A decoy write
@@ -155,11 +162,13 @@ dm-integrity's in-memory journal is lost), not a hardware power loss, and the
 small sample says nothing about rare interleavings. Use `--ab` for hidden
 filesystems ([configuration.md](configuration.md#ab-record-slots)).
 
-No-journal (suite-125 and suite-128, three profiles, 12 volumes: 6
-single-slot and 6 A/B): no hidden block read EIO, every mount replayed, every
-recorded file was intact and fsck was clean; 5 volumes had torn sectors, all
-whole records at record boundaries (1 to 12 records, 687 sectors each),
-repaired by decoy writes before mounting.
+No-journal before hidden writes flushed (suite-125 and suite-128, three
+profiles, 12 volumes: 6 single-slot and 6 A/B): no hidden block read EIO,
+every mount replayed, every recorded file was intact and fsck was clean; 5
+volumes had torn sectors, all whole records at record boundaries (1 to 12
+records, 687 sectors each), repaired by decoy writes before mounting. With
+the completion flush (suites 137, 140 and 141, 18 volumes): no torn sector, no EIO block, every mount
+replayed, every recorded file intact, fsck clean.
 
 ## Lower-device errors and setup cleanup (`faults` suite)
 
@@ -305,14 +314,16 @@ leaves no ready native state or public views and spends no primary encryption.
 Reopening repeats the scan; an incomplete scan is never adopted.
 
 Cancellation during `--initialize` waits for the current round of up to 8
-concurrent record writes to finish, then stops before the next round and
-flushes the lower device, so the completed records (always a prefix of the
-blocks) are as durable as after an uncancelled initialization (initialization
-otherwise flushes every 16 records). Initialization first writes a new
-master key into keyslot 0 and the directory, then the zero records in block
-order. After cancellation the completed leading blocks read as authenticated
-zeros and every later block returns EIO, because its old record no longer
-authenticates under the new master key. Setup does not poll between the keyslot
+concurrent record writes to finish; every round is flushed before the next
+one starts, and cancellation is polled only then, so the completed records
+are as durable as after an uncancelled initialization. Initialization first
+writes a new master key into keyslot 0 and the directory, then the zero
+records in rounds: within each run of 16 blocks the 8 even blocks, then the 8
+odd ones (adjacent blocks' shaped rewrites share a 4 KiB unit and would
+serialize). The completed blocks are therefore whole rounds, not always a
+prefix: they read as authenticated zeros and every other block returns EIO,
+because its old record no longer authenticates under the new master key (the
+cancel suite derives the completed rounds from the encryption count). Setup does not poll between the keyslot
 and directory writes; only a crash there could leave a keyslot without a
 directory, which later opens refuse until `--initialize` is retried.
 
@@ -403,7 +414,7 @@ Each cancellation must report EINTR with inactive status, no views, zero hidden
 capacity and no failure, exit 130 without cleanup notes, leave no mappings or
 control nodes, keep the wrapper identity, and have no missed probes or trace
 overruns. Reopened views must match the full primary hash and, for the
-initialization and fill cases, zeros up to the completed prefix and EIO beyond it. A
+initialization and fill cases, zeros in the completed rounds and EIO elsewhere. A
 normal full initialization then runs to completion, followed by close, custom
 unload, stock full-primary readback and host verification of `cancel-final.img`
 against `expected-cancel-hidden`.

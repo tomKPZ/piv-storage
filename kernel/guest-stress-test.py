@@ -33,6 +33,7 @@ import time
 import pivstore.blocks as blocks
 import pivstore.kernel_owner as owners
 from pivstore.kernel_api import dm, mapping_identity
+from pivstore.records import shaped_extent
 
 W = Path('/mnt/piv-work')
 SOURCE = '/dev/mapper/piv-test-fault'
@@ -426,13 +427,17 @@ assert not status()[0]['failed']
 # Stock persistent no-journal (direct mode): a lower write that landed while
 # another (data or tag) failed leaves its sector torn (EIO). Torn sectors must
 # lie in the region phase C wrote (decoy stripes and the striped hidden
-# records); their plaintext is lost, so a full-sector decoy write of a fresh
+# records, shaped to 4 KiB edges: their extents reach the last sectors of
+# directory group 1 and the first of block R's record, whose fragments the
+# refresh keeps); their plaintext is lost, so a full-sector decoy write of a fresh
 # value replaces each (the failing-sector replacement path), which keeps the
 # stored fragment.
 torn = unreadable_units(views['decoy'], len(image) // UNIT)
 results['phase_c_torn_primary_sectors'] = torn
 if NO_JOURNAL:
-    assert all(striped[0] <= u * UNIT < striped[1] for u in torn), torn
+    shaped = (shaped_extent(first_record // unit, GROUP, unit, len(image) // unit)[0] * unit,
+              shaped_extent(striped[1] // unit - GROUP, GROUP, unit, len(image) // unit)[1] * unit)
+    assert all(shaped[0] <= u * UNIT < shaped[1] for u in torn), torn
     for u in torn:
         decoy_write(views, u * UNIT, value('c-torn-repair', u), sync=True)
     assert not unreadable_units(views['decoy'], len(image) // UNIT)

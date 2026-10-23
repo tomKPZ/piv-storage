@@ -52,6 +52,24 @@ def block_count(sectors, ab=False, rs_parity=0):
     return usable // 2 if ab else usable
 
 
+SHAPE_BYTES = 4096                          # native rewrite alignment (kernel PN_SHAPE_BYTES)
+
+
+def shaped_extent(first, count, sector_size, sectors, align=SHAPE_BYTES):
+    """Primary sectors [lo, hi) that the native owner rewrites for a record,
+    directory, keyslot replica or wipe of [first, first + count): extended to
+    align-byte edges and clamped to the device (kernel pn_shape). Extension
+    sectors keep their plaintext and fragments (decoy-write IVs)."""
+    unit = max(1, align // sector_size)
+    return first - first % unit, min(-(-(first + count) // unit) * unit, sectors)
+
+
+def shaped_count(first, count, sector_size, sectors, align=SHAPE_BYTES):
+    """Primary encryptions of one shaped rewrite."""
+    lo, hi = shaped_extent(first, count, sector_size, sectors, align)
+    return hi - lo
+
+
 def derive(key, salt, label):
     return HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=b'pivstore/v5/' + label).derive(key)
 

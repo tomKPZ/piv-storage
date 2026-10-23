@@ -31,13 +31,12 @@
 /* Recent hidden writes per block hash (A/B flush skipping, pn_ab_flush). */
 #define PN_RECENT 1024
 static_assert((PN_RECENT & (PN_RECENT - 1)) == 0);
-/* Initialization writes this many records concurrently per round, flushes
- * the lower device after every PN_INIT_FLUSH_RECORDS records (a multiple) and
- * before returning, also when cancelled. View writes flush only for FUA.
+/* Initialization writes this many records concurrently per round (every
+ * other block, pn_records) and flushes the lower device after every round.
+ * Hidden view writes flush after their record; decoy view writes only for
+ * FUA.
  */
 #define PN_INIT_PARALLEL 8
-#define PN_INIT_FLUSH_RECORDS 16
-static_assert(PN_INIT_FLUSH_RECORDS % PN_INIT_PARALLEL == 0);
 /* Format v5 (docs/format-v5.md), 16-byte IVs only: each primary IV carries
  * LRW-AES(r[10] || d[6]) with tweak = primary sector; one 4096-byte block is a
  * 4122-byte SIV payload in 687 fragments, followed by 3p Reed-Solomon parity
@@ -629,32 +628,115 @@ static int pn_collides(const u8 *olds, const u8 *fresh, u32 count)
  return r;
 }
 
-/* Encode and write one record group (G fragments, parity included): the
- * carrier is read and authenticated once (hidden-only rewrite: primary
- * plaintext unchanged); local IV collisions re-encode before anything is
- * encrypted. Without @flush the caller flushes later (initialization).
+/* Write shaping (docs/native-blocks.md#write-shaping). Every rewrite other
+ * than a decoy request (hidden records, the directory, keyslots, wipes) is
+ * extended to PN_SHAPE_BYTES-aligned primary byte edges, so its lower write
+ * set is one aligned run, as ordinary filesystem writes are, instead of an
+ * unaligned G-sector run at a record boundary that an address trace (journal,
+ * I/O tracing, several snapshots) reveals without keys. The extension
+ * sectors keep their plaintext and get decoy-write IVs (pn_edge_iv: listed
+ * keyslot, directory and record fragments kept, random elsewhere); they are
+ * read, authenticated, collision-checked, counted and encrypted exactly like
+ * the core sectors, so a failing neighbour sector fails the whole rewrite
+ * before anything is written. The end is clamped to the device, whose own end
+ * may be unaligned. At 4096-byte sectors 4 KiB shaping changes nothing.
  */
-static int pn_write_group(struct piv_control *p, u64 group, u64 generation, const u8 *data, bool flush,
-			  bool *mutated)
+#define PN_SHAPE_BYTES 4096U
+static_assert(PN_SHAPE_BYTES % 4096 == 0 && (PN_SHAPE_BYTES & (PN_SHAPE_BYTES - 1)) == 0);
+static_assert(PN_MAX_GROUP + 2 * (PN_SHAPE_BYTES / 512 - 1) <= PIV_BATCH_MAX);
+
+static void pn_shape(const struct piv_control *p, u64 first, u64 count, u64 *lo, u64 *hi)
+{
+ u64 align = max_t(u64, 1, PN_SHAPE_BYTES / p->profile.sector_size);
+ *lo = first - first % align;
+ *hi = min_t(u64, roundup(first + count, align), p->profile.sectors);
+}
+
+/* Core IVs of a shaped rewrite: a record group (pn_pack), one keyslot
+ * replica (pn_ks_seal) or fresh random IVs (a wipe).
+ */
+enum { PN_CORE_GROUP, PN_CORE_KEYSLOT, PN_CORE_RANDOM };
+struct pn_core {
+ int kind;
+ u64 group, generation;
+ const u8 *data;
+ u32 slot, replica;
+ const struct pn_ks_keys *keys;
+};
+
+static int pn_core_ivs(struct piv_native *n, const struct pn_core *c, u32 count, u8 *ivs)
+{
+ switch (c->kind) {
+ case PN_CORE_GROUP:
+  return pn_pack(n, c->group, c->generation, c->data, ivs);
+ case PN_CORE_KEYSLOT:
+  return pn_ks_seal(n, c->keys, c->slot, c->replica, ivs);
+ default:
+  get_random_bytes(ivs, count * 16);
+  return 0;
+ }
+}
+
+/* Extension sector IV: the decoy-write rule (pn_decoy_iv). A keyslot write
+ * refreshes its own slot's other replica under the new keyslot keys (the
+ * directory does not list them yet during an add), so writing replica 1
+ * keeps the replica 0 just written.
+ */
+static void pn_edge_iv(struct piv_native *n, const struct pn_core *c, u64 sector, const u8 old[16], u8 iv[16])
+{
+ if (c->kind == PN_CORE_KEYSLOT && sector < PN_KEYSLOT_AREA && sector / (2 * PN_KEYSLOT_SECTORS) == c->slot)
+  pn_refresh(&c->keys->lrw, sector, old, iv);
+ else
+  pn_decoy_iv(n, sector, old, iv);
+}
+
+/* Rewrite core sectors [@first, @first + @count) with pn_core_ivs and the rest
+ * of their shaped extent with pn_edge_iv, keeping every sector's plaintext:
+ * one authenticated batch read, local IV collisions redrawn before anything
+ * is encrypted, one batch write and, with @flush, a flush. The caller holds
+ * the extent exclusively (a range lock over the shaped extent, or p->io).
+ */
+static int pn_shaped_write(struct piv_control *p, u64 first, u32 count, const struct pn_core *c, bool flush,
+			   bool *mutated)
 {
  struct piv_native *n = p->native;
  struct piv_batch *b = NULL;
- u8 *ivs = kvmalloc(n->group * 16, GFP_NOIO);
- u32 attempt;
- int r = -ENOMEM;
- if (!ivs) return r;
- r = piv_batch_read(p, pn_group_first(n, group), n->group, 0, 0, &b);
+ u64 lo, hi;
+ u32 total, head, i, attempt;
+ u8 *ivs;
+ int r;
+ pn_shape(p, first, count, &lo, &hi);
+ if (hi - lo > PIV_BATCH_MAX) return -EINVAL;
+ total = hi - lo;
+ head = first - lo;
+ ivs = kvmalloc_array(total, 16, GFP_NOIO);
+ if (!ivs) return -ENOMEM;
+ r = piv_batch_read(p, lo, total, 0, 0, &b);
  for (attempt = 0; !r && attempt < 16; attempt++) {
-  r = pn_pack(n, group, generation, data, ivs);
-  if (!r) r = pn_collides(b->olds, ivs, n->group);
+  r = pn_core_ivs(n, c, count, ivs + head * 16);
+  for (i = 0; !r && i < total; i++)
+   if (i < head || i >= head + count) pn_edge_iv(n, c, lo + i, b->olds + i * 16, ivs + i * 16);
+  if (!r) r = pn_collides(b->olds, ivs, total);
   if (r != -EEXIST) break;
   r = 0;
  }
  if (!r && attempt == 16) r = -EEXIST;
  if (!r) r = piv_batch_write(b, ivs, flush, mutated);
  piv_batch_free(b);
- kvfree_sensitive(ivs, n->group * 16);
+ kvfree_sensitive(ivs, total * 16);
  return r;
+}
+
+/* Encode and write one record group (G fragments, parity included), shaped:
+ * hidden-only rewrite, primary plaintext unchanged. Without @flush the caller
+ * flushes later (hidden view writes, initialization).
+ */
+static int pn_write_group(struct piv_control *p, u64 group, u64 generation, const u8 *data, bool flush,
+			  bool *mutated)
+{
+ struct piv_native *n = p->native;
+ struct pn_core c = { .kind = PN_CORE_GROUP, .group = group, .generation = generation, .data = data };
+ return pn_shaped_write(p, pn_group_first(n, group), n->group, &c, flush, mutated);
 }
 
 /* Write the directory into the A/B directory slot not holding the current one. */
@@ -672,61 +754,26 @@ static int pn_dir_write(struct piv_control *p, bool *mutated)
  return r;
 }
 
-/* Overwrite @count (<= PIV_BATCH_MAX) primary sectors from @first with fresh
- * random IVs, keeping their plaintext (every sector must authenticate first),
- * and flush: revokes whatever keyslot or record fragments they carried.
+/* Overwrite @count primary sectors from @first (shaped) with fresh random
+ * IVs, keeping their plaintext (every sector must authenticate first), and
+ * flush: revokes whatever keyslot or record fragments they carried.
  */
 static int pn_wipe(struct piv_control *p, u64 first, u32 count, bool *mutated)
 {
- struct piv_batch *b = NULL;
- u8 *ivs = kvmalloc(count * 16, GFP_NOIO);
- u32 attempt;
- int r = -ENOMEM;
- if (!ivs) return r;
- r = piv_batch_read(p, first, count, 0, 0, &b);
- for (attempt = 0; !r && attempt < 16; attempt++) {
-  get_random_bytes(ivs, count * 16);
-  r = pn_collides(b->olds, ivs, count);
-  if (r != -EEXIST) break;
-  r = 0;
- }
- if (!r && attempt == 16) r = -EEXIST;
- if (!r) r = piv_batch_write(b, ivs, true, mutated);
- piv_batch_free(b);
- kvfree_sensitive(ivs, count * 16);
- return r;
+ struct pn_core c = { .kind = PN_CORE_RANDOM };
+ return pn_shaped_write(p, first, count, &c, true, mutated);
 }
 
-/* Write keyslot @slot (both replicas) under @kek, or overwrite it with fresh
- * random IVs when @kek is NULL.
+/* Write keyslot @slot (both replicas, each a shaped rewrite followed by a
+ * flush, so one replica is complete before the other changes) under @kek, or
+ * overwrite it with fresh random IVs when @kek is NULL.
  */
 static int pn_ks_write(struct piv_control *p, u32 slot, const u8 *kek, struct pn_ks_keys *keys, bool *mutated)
 {
- u8 *ivs;
- u32 replica, attempt;
- int r = -ENOMEM;
- if (!kek) {
-  for (replica = 0, r = 0; !r && replica < 2; replica++)
-   r = pn_wipe(p, pn_ks_first(slot, replica), PN_KEYSLOT_SECTORS, mutated);
-  return r;
- }
- ivs = kmalloc(PN_KEYSLOT_SECTORS * 16, GFP_NOIO);
- if (!ivs) return r;
- for (replica = 0; replica < 2; replica++) {
-  struct piv_batch *b = NULL;
-  r = piv_batch_read(p, pn_ks_first(slot, replica), PN_KEYSLOT_SECTORS, 0, 0, &b);
-  for (attempt = 0; !r && attempt < 16; attempt++) {
-   r = pn_ks_seal(p->native, keys, slot, replica, ivs);
-   if (!r) r = pn_collides(b->olds, ivs, PN_KEYSLOT_SECTORS);
-   if (r != -EEXIST) break;
-   r = 0;
-  }
-  if (!r && attempt == 16) r = -EEXIST;
-  if (!r) r = piv_batch_write(b, ivs, true, mutated);
-  piv_batch_free(b);
-  if (r) break;
- }
- kfree_sensitive(ivs);
+ struct pn_core c = { .kind = kek ? PN_CORE_KEYSLOT : PN_CORE_RANDOM, .slot = slot, .keys = keys };
+ int r = 0;
+ for (c.replica = 0; !r && c.replica < 2; c.replica++)
+  r = pn_shaped_write(p, pn_ks_first(slot, c.replica), PN_KEYSLOT_SECTORS, &c, true, mutated);
  return r;
 }
 
@@ -754,21 +801,33 @@ static int pn_ab_flush(struct piv_control *p, u64 index)
 }
 
 /* The primary sectors of block @index's record group(s): both slots with A/B
- * (adjacent groups), so one range lock covers every access to the block.
+ * (adjacent groups), so one range lock covers every access to the block. A
+ * writer (@exclusive) locks their shaped extent (pn_shape), which covers the
+ * neighbouring sectors its shaped rewrite refreshes; so adjacent blocks'
+ * writes, which share an aligned unit at 512-byte sectors, serialize. Readers
+ * lock only the groups: a neighbour's refresh keeps every fragment they
+ * collect, and dm-integrity keeps each sector whole.
  */
 static void pn_block_lock(struct piv_control *p, struct piv_range *range, u64 index, bool exclusive)
 {
  struct piv_native *n = p->native;
- piv_range_lock(p, range, pn_group_first(n, pn_group(n, index, 0)), (u64)n->group * (n->ab ? 2 : 1), exclusive);
+ u64 first = pn_group_first(n, pn_group(n, index, 0)), count = (u64)n->group * (n->ab ? 2 : 1), lo, hi;
+ if (exclusive) {
+  pn_shape(p, first, count, &lo, &hi);
+  first = lo;
+  count = hi - lo;
+ }
+ piv_range_lock(p, range, first, count, exclusive);
 }
 
 /* Format v5 write. A hidden write (one 4096-byte block) re-encodes its whole
  * record (with A/B, into the slot not holding the newest valid version); a
  * decoy write re-randomizes only the IVs of the primary sectors it writes,
  * preserving their fragments. Each holds an exclusive range lock over every
- * sector it reads and rewrites. Nothing is flushed here (the caller flushes
- * for FUA), except before an A/B slot rewrite. @initializing (setup only,
- * hidden): the caller flushes every few records, and with A/B slot 0 is
+ * sector it reads and rewrites. A hidden write is flushed before returning
+ * (and with A/B, if needed, before rewriting a slot); a decoy write is not
+ * (the caller flushes for FUA). @initializing (setup only,
+ * hidden): the caller flushes after every round, and with A/B slot 0 is
  * written with generation 1 without reading the slots (no record
  * authenticates under a new master key). *@mutated: storage may have changed
  * or a flush failed; either stops the owner.
@@ -782,6 +841,7 @@ static int pn_write_blocks(struct piv_control *p, bool hidden, u64 offset, const
  u8 *ivs, *scratch;
  u64 unit = p->profile.sector_size, index, generation = 0;
  u32 count, i, attempt;
+ s64 done;
  int slot = 0, r = 0;
  if (hidden) {
   if (bytes != PN_DATA || offset % PN_DATA || offset / PN_DATA >= n->records) return -EINVAL;
@@ -800,12 +860,12 @@ static int pn_write_blocks(struct piv_control *p, bool hidden, u64 offset, const
     r = generation ? 0 : -EOVERFLOW;
    }
    /* A/B keeps the newest version readable across a crash only if it is
-    * durable before the other slot is overwritten. Without a completion
-    * flush, an earlier write of this block (finished: the range lock
-    * serializes them) may still sit in the uncommitted journal (or, on a
-    * direct-mode lower device, in volatile metadata buffers), so flush
-    * first, unless a successful flush started after it completed
-    * (pn_ab_flush). A flush failure stops the owner like any flush error.
+    * durable before the other slot is overwritten. Hidden view writes are
+    * flushed before completing (below), so this normally finds the earlier
+    * write of this block (finished: the range lock serializes them) durable
+    * and skips; it still flushes when that write was an initialization or
+    * fill record not yet covered by a flush (pn_ab_flush). A flush failure
+    * stops the owner like any flush error.
     */
    if (!r) {
     r = pn_ab_flush(p, index);
@@ -815,7 +875,17 @@ static int pn_write_blocks(struct piv_control *p, bool hidden, u64 offset, const
   if (!r) r = pn_write_group(p, pn_group(n, index, slot), generation, data, false, mutated);
   /* Counted even if the write failed: it may have reached the lower device. */
   if (n->ab && *mutated) pn_ab_wrote(p, index);
+  done = atomic64_read(&p->writes_done);
   piv_range_unlock(p, &range);
+  /* Durable before completion (outside the range lock, so other requests
+   * proceed meanwhile): on a direct-mode (no-journal) lower device the data
+   * lands in place at once but its tags only at the next flush, and a crash
+   * in between tears every sector of the record (and its decoy plaintext). A
+   * flush that started after this write completed already covers it.
+   * Initialization flushes per round instead (pn_records). A failed flush
+   * stops the owner (*mutated is set).
+   */
+  if (!r && !initializing && done > atomic64_read(&p->flushed)) r = piv_flush(p);
   return r;
  }
  if (initializing) return -EINVAL;
@@ -1079,9 +1149,10 @@ static void pn_init_worker(struct work_struct *work)
  if (atomic_dec_and_test(w->pending)) complete(w->done);
 }
 
-/* Write zero records (or, with @counts, fill blocks) [@first, @first +
- * @count) concurrently and wait for all of them; returns the first failure.
- * @counts accumulates per-outcome block counts (valid, written, failed).
+/* Write zero records (or, with @counts, fill blocks) @first, @first + 2,
+ * ... (@count blocks) concurrently and wait for all of them; returns the
+ * first failure. @counts accumulates per-outcome block counts (valid,
+ * written, failed).
  */
 static int pn_init_round(struct piv_control *p, const u8 *zero, u64 first, u32 count, u64 *counts)
 {
@@ -1095,7 +1166,7 @@ static int pn_init_round(struct piv_control *p, const u8 *zero, u64 first, u32 c
  atomic_set(&pending, count + 1);
  for (i = 0; i < count; i++) {
   INIT_WORK(&w[i].work, pn_init_worker);
-  w[i].p = p; w[i].zero = zero; w[i].index = first + i; w[i].fill = counts;
+  w[i].p = p; w[i].zero = zero; w[i].index = first + 2 * i; w[i].fill = counts;
   w[i].pending = &pending; w[i].done = &done;
   queue_work(p->wq, &w[i].work);
  }
@@ -1107,36 +1178,38 @@ static int pn_init_round(struct piv_control *p, const u8 *zero, u64 first, u32 c
 }
 
 /* Initialization records (@counts NULL) or a fill, in rounds of
- * PN_INIT_PARALLEL concurrent blocks; cancellation is polled between rounds,
- * when every record written so far is complete. Initialization flushes every
- * PN_INIT_FLUSH_RECORDS records; a fill flushes at the same points if it
- * wrote anything since the last flush. Completed records stay committed, also
- * when cancelled: they are flushed before returning. A failed record write
- * already stopped the owner (pn_init_worker); a failed flush stops it here.
+ * PN_INIT_PARALLEL concurrent blocks: within each run of 2 * PN_INIT_PARALLEL
+ * blocks the even ones, then the odd ones, because adjacent blocks' shaped
+ * rewrites share an aligned unit and would serialize on their range locks.
+ * Cancellation is polled between rounds, when every record written so far is
+ * complete. Every round that wrote anything is flushed before the next one,
+ * so a crash on a direct-mode (no-journal) lower device tears at most the
+ * records of one round. Completed records stay committed, also when
+ * cancelled (cancellation is polled only after a round's flush). A failed
+ * record write already
+ * stopped the owner (pn_init_worker); a failed flush stops it here.
  */
 static int pn_records(struct piv_control *p, u64 *counts)
 {
  struct piv_native *n = p->native;
  u8 *zero = kzalloc(PN_DATA, GFP_NOIO);
  u64 i, flushed = 0;
+ u32 phase;
  int r = 0;
  if (!zero) return -ENOMEM;
- for (i = 0; i < n->records;) {
-  u32 count = min_t(u64, n->records - i, PN_INIT_PARALLEL);
-  r = pn_setup_poll(); if (r) break;
-  r = pn_init_round(p, zero, i, count, counts); if (r) break;
-  /* A concurrent work item's failed write stopped the owner. */
-  if (READ_ONCE(p->failed)) { r = -EIO; break; }
-  i += count;
-  if (i % PN_INIT_FLUSH_RECORDS == 0 && (!counts || counts[PN_FILL_WRITTEN] != flushed)) {
-   r = piv_flush(p);
-   if (r) { pn_stop(p); break; }
-   if (counts) flushed = counts[PN_FILL_WRITTEN];
+ for (i = 0; !r && i < n->records; i += 2 * PN_INIT_PARALLEL) {
+  for (phase = 0; phase < 2 && i + phase < n->records; phase++) {
+   u32 count = min_t(u64, DIV_ROUND_UP(n->records - i - phase, 2), PN_INIT_PARALLEL);
+   r = pn_setup_poll(); if (r) break;
+   r = pn_init_round(p, zero, i + phase, count, counts); if (r) break;
+   /* A concurrent work item's failed write stopped the owner. */
+   if (READ_ONCE(p->failed)) { r = -EIO; break; }
+   if (!counts || counts[PN_FILL_WRITTEN] != flushed) {
+    r = piv_flush(p);
+    if (r) { pn_stop(p); break; }
+    if (counts) flushed = counts[PN_FILL_WRITTEN];
+   }
   }
- }
- if ((!r || r == -EINTR) && (!counts || counts[PN_FILL_WRITTEN] != flushed)) {
-  int f = piv_flush(p);
-  if (f) { pn_stop(p); r = f; }
  }
  kfree_sensitive(zero);
  return r;
@@ -1461,10 +1534,11 @@ static int pn_request(struct piv_control *p, struct pn_work *w, bool *mutated, b
 		*flushing = false;
 		r = pn_write(p, w->hidden, w->offset, buffer, bytes, false, mutated);
 	}
-	/* FUA: durable before completion. Plain writes are not flushed, as in
-	 * stock dm-crypt; a later flush or FUA request covers them.
+	/* FUA: durable before completion. Plain decoy writes are not flushed,
+	 * as in stock dm-crypt; a later flush or FUA request covers them. Hidden
+	 * writes already flushed after their record (pn_write_blocks).
 	 */
-	if (!r && (bio->bi_opf & REQ_FUA)) {
+	if (!r && !w->hidden && (bio->bi_opf & REQ_FUA)) {
 		*flushing = true;
 		r = piv_flush(p);
 	}

@@ -241,13 +241,18 @@ multi-snapshot observers are out of scope.
 
 | Observer | What retained journal entries can show |
 | --- | --- |
-| No keys | Recently rewritten sector numbers and old IVs; runs of contiguous record sectors rewritten together. |
+| No keys | Recently rewritten sector numbers and old IVs; runs of about G contiguous sectors rewritten together on the record lattice (4 KiB-aligned since write shaping, so no longer odd-length unaligned runs). |
 | Decoy-key holder (coercion case) | Old and new primary plaintext of those sectors: contiguous record sectors reencrypted with unchanged plaintext, unusual for ordinary filesystems. |
 | Hidden-key holder | Potentially older versions of hidden records from correctly associated fragments. |
 
 Decoy writes change only the IVs of the sectors written, like stock writes, so
 this signature comes from hidden writes (and initialization, fill and keyslot
-updates). A quick initialization rewrites only the keyslot and directory
+updates). Write shaping ([native-blocks.md](native-blocks.md#write-shaping))
+extends each of these rewrites to 4 KiB edges, which removes the unaligned
+start and odd length (351,744 bytes at 512-byte sectors) that no ordinary
+filesystem write has; it does not hide the run length (about 344–352 KiB), the
+record lattice of the offsets, the flush that follows each hidden write or,
+for a decoy-key holder, that the plaintext did not change. A quick initialization rewrites only the keyslot and directory
 sectors; never-written record carriers keep their previous IVs (stock random
 IVs or LRW outputs under an earlier master key), which a single image cannot
 tell apart from records without the master key. Its later hidden writes are
@@ -268,15 +273,16 @@ cryptsetup, and would hide sector numbers only from keyless observers.
 **Residual no-journal signature.** Without the journal, data and tags reach
 the disk separately, so a crash during an unflushed write tears its sectors
 (they fail authentication), as on any stock no-journal volume. A torn hidden
-write is one run of exactly G (687 + 3p) failing sectors starting at a record
-boundary `112 + G·g` that the decoy user never wrote, and their decoy
-plaintext is lost; stock tears follow filesystem write extents. A decoy-key
-holder with a crash image can see that run (the power and ext4power suites
-measured whole-record runs only, up to 12 records after one ext4 cut;
+write is a run of failing sectors covering a record's shaped extent (G = 687 +
+3p sectors from a record boundary `112 + G·g`, extended to 4 KiB edges) that
+the decoy user never wrote, and their decoy plaintext is lost; stock tears
+follow filesystem write extents. Since 2026-10-23 every hidden write flushes
+before completing, so such a run can only come from a hidden write in flight
+at the crash (at most the 16 concurrent work items; initialization and fill:
+one round of 8 records), no longer from every hidden write since the last
+flush (previously up to 12 records after one ext4 cut;
 [journal-atomicity.md](journal-atomicity.md#no-journal-mode)). It is absent
-after a clean close or once the hidden writes' tags were flushed, and it
-reveals only the records written since the last flush, not the history a
-journal keeps.
+after a clean close and reveals no history.
 
 ## Disposition
 

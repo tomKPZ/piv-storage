@@ -153,7 +153,7 @@ per-operation deltas. Each range read is one batch submission:
 | 4 KiB hidden read | 1 | 687 | 1 submission |
 | 16 KiB hidden read | 4 | 2748 | 4 submissions |
 | 16 KiB and 128 KiB decoy write (same bytes) | 0 | 2n (n checks + n encryptions, n = bytes / S) | 1 pn_write, 1 batch read, 2 submissions (read, write) |
-| 4 KiB hidden write (same bytes) | 0 | 1374 (687 checks + 687 encryptions) | 1 pn_write, 1 batch read, 2 submissions |
+| 4 KiB hidden write (same bytes) | 0 | 2m (m checks + m encryptions; m = 687 at 4096-byte sectors, 696 at 512: block 0's record shaped to 4 KiB edges) | 1 pn_write, 1 batch read, 2 submissions |
 
 S is the primary sector size. The write rows pin the
 [write path](native-blocks.md#write-path): one authenticated read of every
@@ -168,6 +168,14 @@ Afterwards both complete views are checked, the stack closes, the module
 unloads, stock Linux authenticates and hashes the full primary, and suite.py
 verifies `profile-final.img` on the host. `profile-results.json` keeps all
 timing samples and counts; `profile-kprobe-counts.txt` the raw counters.
+
+**Write shaping.** Before closing, hidden writes of blocks 0, 1, 2, the middle
+and last block and a two-block write (3, 4) run one at a time while
+`block:block_bio_queue` events are traced on the owner's lower dm-integrity
+device; `kernel/shape_trace.py` requires the union of their write bios to be
+exactly the record's shaped extent (`pivstore.records.shaped_extent`), on
+4 KiB edges (`shaped_hidden_writes` in the results). The v5 suite does the
+same for an A/B write and a keyslot add (both replicas and the directory).
 
 Limits: these are warm-cache diagnostics under QEMU: O_DIRECT bypasses only the
 public page cache, and the stock pass plus repeated opens warm lower, host and

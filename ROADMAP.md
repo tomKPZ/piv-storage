@@ -11,8 +11,9 @@ and limits are in README.md and docs/.
   dm-integrity volume with 16-byte random IVs (AES-XTS + HMAC-SHA256 authenc,
   the recommended profile, or AEGIS-128). Hidden format v5 (4 KiB records, keyslot parameters, Argon2id
   cost tiers, optional Reed–Solomon parity) is the only format. View bios run
-  concurrently (range locks per sector range/record, stock flush semantics,
-  batched 1024-sector authenticated reads).
+  concurrently (range locks per sector range/record, stock flush semantics for
+  decoy writes, hidden writes flushed before completing and shaped to 4 KiB
+  edges, batched 1024-sector authenticated reads).
 - Setup is the static Rust `pivsetup` (open/close, keyslots, migrate, keygen;
   full or `--quick` initialization and the explicit, destructive `--fill`);
   Python keeps only independent read-only diagnostics and guest test
@@ -31,20 +32,7 @@ and limits are in README.md and docs/.
 
 ## Remaining work
 
-1. **Shape hidden writes for keyless observers** (kernel, no format change).
-   A hidden write rewrites exactly the record's G sectors starting at
-   `112 + G·g`; at 512-byte sectors that is a 351,744-byte run (not a 4 KiB
-   multiple) at unaligned offsets, a shape ordinary filesystems do not
-   produce and that any address trace (journal, I/O tracing, multiple
-   snapshots) reveals without keys. Extend each record rewrite to 4 KiB
-   (consider larger, e.g. 64 KiB) aligned edges by refreshing the neighbouring
-   sectors' IVs with the decoy-write rule (fragments kept, fresh random bytes,
-   plaintext unchanged, same authentication and collision rules), inside the
-   same range lock. Measure the amplification cost with `bench` and choose
-   the alignment; document what it does not hide (a decoy-key holder still
-   sees unchanged-plaintext rewrites). Exit: profile/v5 counts updated, a test
-   asserting every hidden-write lower bio set is aligned, docs updated.
-2. **Parallel Argon2 lanes** (pivsetup). Tiers use 4 lanes, but the vendored
+1. **Parallel Argon2 lanes** (pivsetup). Tiers use 4 lanes, but the vendored
    `argon2` 0.5.3 computes them sequentially (no `parallel` feature; its
    block-filling routine is private), so an attacker gains up to ~4× in time
    per guess versus the defender's open time. Thread the lanes (argon2 ≥ 0.6
@@ -53,7 +41,7 @@ and limits are in README.md and docs/.
    still match; no format change). Then decide whether to raise tier passes so
    tier 3 stays ≈ 2 s. Exit: vectors unchanged, tier timings re-measured with
    `bench`, docs updated.
-3. **`pivsetup status` and a non-destructive hidden scrub.** Today fail-stop
+2. **`pivsetup status` and a non-destructive hidden scrub.** Today fail-stop
    is visible only as EIO plus dmesg, and `--fill` is the only whole-volume
    hidden pass (destructive). Add `pivsetup status` (owner active/failed,
    encryptions, hidden size, views, via the existing STATUS ioctl; no new
@@ -65,7 +53,7 @@ and limits are in README.md and docs/.
    (with and without parity); docs (README before-production section,
    configuration.md) updated.
 
-4. **Investigate storing the tooling inside the LUKS2 header** (research
+3. **Investigate storing the tooling inside the LUKS2 header** (research
    first; implement only after a design the user approves). The installed
    pivsetup, dm-piv.ko, pivtab, initramfs hook and key files on the root
    filesystem or /boot reveal that a hidden volume exists. For users who want
@@ -106,18 +94,6 @@ and limits are in README.md and docs/.
    cryptsetup behaviour table (verified in a disposable guest), the boot
    procedure, its residual tells, and a recommendation; no implementation
    without user approval.
-
-5. **No-journal tear window** (needs a user decision before kernel work).
-   On direct-mode volumes dm-integrity writes data in place and tags at the
-   next flush, so every unflushed hidden write leaves its 687 carrier sectors
-   torn by a crash until then (measured: power suites, up to 12 records per
-   ext4 cut; docs/journal-atomicity.md#no-journal-mode). The decoy plaintext
-   of those sectors is lost, the tear is a record-shaped single-image
-   signature, and strict hidden writes then refuse to rewrite the block until
-   the decoy sectors are rewritten. Options: flush after every hidden record
-   write on direct-mode volumes (shrinks the window to the write itself; costs
-   hidden write speed; measure with `bench`), and/or a documented repair tool.
-   Exit: chosen option implemented, power/ext4power re-measured, docs updated.
 
 Open, unverified deployment areas (pick up only with a concrete need; each
 needs a disposable-guest test first):

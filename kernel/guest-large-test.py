@@ -18,6 +18,7 @@ import time
 from pivstore.blocks import open_blocks, close_blocks, native_status
 from pivstore.kernel_api import dm
 from pivstore.kernel_owner import GuestOwner
+from pivstore.records import shaped_count
 
 W = Path('/mnt/piv-work')
 KEY = W / 'passphrase.key'
@@ -103,8 +104,12 @@ old_cap_block = (OLD_CAP // unit - first_sector(0)) // group
 assert size > OLD_CAP and capacity == records * BLOCK
 assert owner.raw_bytes == RAW
 # Revocation of keyslots 1-3 (3 x 2 x 14) and directory group 1 (687), keyslot
-# 0 (2 x 14), the directory (687), then one 687-sector record per block.
-assert native_status(owner.device)['encryptions'] == 4 * 28 + 2 * group + records * group
+# 0 (2 x 14), the directory (687), then one 687-sector record per block, each
+# rewrite shaped to 4 KiB edges (the sum telescopes to about the area).
+def shaped(first, count): return shaped_count(first, count, unit, sectors)
+assert native_status(owner.device)['encryptions'] == (
+    sum(shaped(14 * r, 14) for r in range(8)) + shaped(112 + group, group) + shaped(112, group)
+    + sum(shaped(first_sector(block), group) for block in range(records)))
 expected = bytearray(capacity)
 assert Path(v['hidden']).read_bytes() == expected
 for index in sorted({0, old_cap_block, capacity // BLOCK - 1}):

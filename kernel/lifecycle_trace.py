@@ -2,16 +2,18 @@
 import re
 
 
-def check_trace(text, mode):
+def check_trace(text, mode, hidden=False):
     """Check the actual native worker call order in a globally ordered trace.
 
     Workers run concurrently on an unbound workqueue, so different kworkers may
     overlap; one kworker runs one work item at a time, so events are grouped per
     PID. Expected ordering (mode: 0 plain, 1 FUA, 2 PREFLUSH|FUA, 3 flush):
-    a plain write completes without any flush; a FUA write completes only
-    after a successful flush that follows its write; a PREFLUSH payload starts
-    only after a successful flush (possibly in a separate DM-split flush bio);
-    a standalone flush reaches a native worker.
+    a plain decoy write completes without any flush; a FUA decoy write
+    completes only after a successful flush that follows its write; a hidden
+    write (@hidden) flushes exactly once inside pn_write, after its record
+    write, in every mode, and FUA adds no second flush; a PREFLUSH payload
+    starts only after a successful flush (possibly in a separate DM-split flush
+    bio); a standalone flush reaches a native worker.
     """
     workers, active = [], {}
     for position, line in enumerate(text.splitlines()):
@@ -40,8 +42,9 @@ def check_trace(text, mode):
         if 'write' in w:
             start, end = w.index('write'), w.index('write_done')
             assert end > start and w.index('endio', end) > end, w
-            # View writes never flush inside pn_write (no A/B in this fixture).
-            assert 'flush' not in w[start:end], w
+            # Decoy writes never flush inside pn_write; hidden writes flush once
+            # after their record (no A/B in this fixture, so no pre-write flush).
+            assert w[start:end].count('flush_done') == (1 if hidden else 0), w
     writes = [w for w in workers if 'write' in [e for _, e in w]]
     if mode == 3:
         assert not writes and any('flush_done' in w for w in names), names
@@ -49,8 +52,10 @@ def check_trace(text, mode):
         assert len(writes) == 1, names
         w = [event for _, event in writes[0]]
         after = w[w.index('write_done'):w.index('endio')]
-        if mode == 0:
-            assert 'flush' not in w, w
+        if mode == 0 or hidden:
+            assert 'flush' not in after, w
+            if mode != 2:
+                assert 'flush' not in w[:w.index('write')], w
         else:
             assert 'flush_done' in after, w
         if mode == 2:

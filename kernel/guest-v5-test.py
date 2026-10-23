@@ -9,6 +9,7 @@ import mmap
 import os
 from pathlib import Path
 import random
+import re
 import subprocess
 
 from pivstore import rs
@@ -18,7 +19,8 @@ from pivstore.kernel_owner import GuestOwner
 from pivstore.format import base_context
 from pivstore.profile import Image, UnsupportedImage
 from pivstore.records import (DATA_FRAGMENTS, FRAGMENT, KEYSLOT_SECTORS, Records, correct_fragments, open_slot,
-                              open_volume, parity_fragments, unlock)
+                              open_volume, parity_fragments, shaped_count, shaped_extent, unlock)
+from shape_trace import check_shaped
 
 W = Path('/mnt/piv-work')
 KEY = W / 'passphrase.key'
@@ -140,11 +142,43 @@ def readable(path, index):
         return None
 
 
-def setup_writes():
+def setup_writes(unit, sectors, group=GROUP):
     """Primary encryptions of an initialization without records: the revocation
-    of keyslots 1-3 (3 x 2 x 14 sectors) and directory group 1, keyslot 0
-    (2 x 14) and one directory write."""
-    return 4 * 2 * 14 + 2 * GROUP
+    of keyslots 1-3 (3 x 2 replicas of 14 sectors) and directory group 1,
+    keyslot 0 (2 x 14) and one directory write, each shaped to 4 KiB edges
+    (neighbouring sectors refreshed, plaintext unchanged)."""
+    replicas = sum(shaped_count(r * KEYSLOT_SECTORS, KEYSLOT_SECTORS, unit, sectors) for r in range(8))
+    return (replicas + shaped_count(KEYSLOT_AREA + group, group, unit, sectors)
+            + shaped_count(KEYSLOT_AREA, group, unit, sectors))
+
+
+def record_cost(group, unit, sectors, size=GROUP):
+    """Primary encryptions of one shaped record rewrite of @group."""
+    return shaped_count(KEYSLOT_AREA + group * size, size, unit, sectors)
+
+
+def traced(action):
+    """Run @action with block:block_bio_queue tracing; returns the trace text
+    and the owner's lower dm-integrity device ('major,minor')."""
+    T = Path('/sys/kernel/tracing')
+    lower = os.stat('/dev/mapper/piv-native_dif').st_rdev
+    event = T / 'events/block/block_bio_queue'
+    (T / 'tracing_on').write_text('0')
+    (T / 'buffer_size_kb').write_text('4096')
+    (T / 'trace').write_text('')
+    (event / 'enable').write_text('1')
+    try:
+        (T / 'tracing_on').write_text('1')
+        action()
+        (T / 'tracing_on').write_text('0')
+        text = (T / 'trace').read_text()
+        stats = '\n'.join(p.read_text() for p in (T / 'per_cpu').glob('cpu*/stats'))
+        assert not re.search(r'(?:overrun|dropped events):\s*[1-9]', stats), stats
+    finally:
+        (T / 'tracing_on').write_text('0')
+        (event / 'enable').write_text('0')
+        (T / 'trace').write_text('')
+    return text, f'{os.major(lower)},{os.minor(lower)}'
 
 
 def write_profile(count=48):
@@ -254,17 +288,19 @@ v = opened()                             # layout (A/B) comes from the keyslot
 assert direct(v['hidden'], 0, BLOCK) == first, 'A/B did not fall back to the previous version'
 before = status()[0]['encryptions']
 direct(v['hidden'], 0, BLOCK, second)
-assert status()[0]['encryptions'] - before == GROUP
+assert status()[0]['encryptions'] - before == record_cost(2, unit, sectors)
 assert direct(v['hidden'], 0, BLOCK) == second
 close_blocks('/dev/vdb', KEY)
 v = opened()
 assert direct(v['hidden'], 0, BLOCK) == second
 assert direct(v['hidden'], BLOCK, BLOCK) == bytes(BLOCK)
 
-# A/B flush skipping: a hidden write flushes the lower device first only if
-# the block's previous write (on this owner) is not yet covered by a
-# successful flush. Count the module's piv_flush calls (entry kprobe, hit
-# counters only) around plain O_DIRECT writes without fsync.
+# Flushes per hidden write: every hidden write flushes the lower device once
+# after its record (durable before completion, closing the no-journal tear
+# window), and the A/B pre-write flush, needed only if the block's previous
+# write is not yet covered by a successful flush, is therefore skipped. Count
+# the module's piv_flush calls (entry kprobe, hit counters only) around plain
+# O_DIRECT writes without fsync; an empty flush (fsync) calls it once.
 T = Path('/sys/kernel/tracing')
 flush_symbol = [line.split()[2] for line in Path('/proc/kallsyms').read_text().splitlines()
                 if len(line.split()) == 4 and line.split()[3] == '[dm_piv]'
@@ -322,11 +358,22 @@ finally:
     (T / 'events/piv_v5/enable').write_text('0')
     kprobe_command('-:piv_v5/flush')
 results['ab_flush_skipping'] = steps
-assert [count for _, count in steps] == [0, 1, 0, 1, 0], steps
+assert [count for _, count in steps] == [1, 1, 1, 1, 1], steps
 assert direct(v['hidden'], BLOCK, BLOCK) == first and direct(v['hidden'], 2 * BLOCK, BLOCK) == first
 direct(v['hidden'], BLOCK, BLOCK, bytes(BLOCK))
 direct(v['hidden'], 2 * BLOCK, BLOCK, bytes(BLOCK))
-print('A/B flush skipping passed:', steps, flush=True)
+print('Hidden write flushes (A/B pre-write flush skipped) passed:', steps, flush=True)
+
+# Write shaping (A/B): the lower write set of a hidden write is exactly the
+# written slot's shaped extent (4 KiB edges), whichever slot it chose.
+text, lower = traced(lambda: direct(v['hidden'], BLOCK, BLOCK, first))
+slots = [shaped_extent(KEYSLOT_AREA + g * GROUP, GROUP, unit, sectors) for g in (4, 5)]
+try:
+    runs = check_shaped(text, lower, unit, [slots[0]], sectors)
+except AssertionError:
+    runs = check_shaped(text, lower, unit, [slots[1]], sectors)
+direct(v['hidden'], BLOCK, BLOCK, bytes(BLOCK))
+results['shaped_ab_write'] = runs
 
 # Keyslots: add a key-file slot and passphrase slots (default tier 3 and tier
 # 1) on the active owner, rewrite the whole keyslot/directory area through the
@@ -339,7 +386,18 @@ before = status()[0]['encryptions']
 assert rejected(lambda: keyslot('/dev/vdb', KEY, 1, second_key, hidden_key=os.urandom(32))).errno == errno.EKEYREJECTED
 assert rejected(lambda: keyslot('/dev/vdb', KEY, 1, second_key, hidden_passphrase=passphrase)).errno == errno.EKEYREJECTED
 assert status()[0]['encryptions'] == before        # refused before writing anything
-keyslot('/dev/vdb', KEY, 1, second_key, hidden_key=HKEY)
+# Shaped keyslot add: both replicas of slot 1 (each a shaped rewrite) and the
+# directory group not holding the current directory, all on 4 KiB edges.
+text, lower = traced(lambda: keyslot('/dev/vdb', KEY, 1, second_key, hidden_key=HKEY))
+replicas = [shaped_extent(r * KEYSLOT_SECTORS, KEYSLOT_SECTORS, unit, sectors) for r in (2, 3)]
+replicas = (replicas[0][0], max(replicas[0][1], replicas[1][1]))
+assert replicas[1] >= shaped_extent(3 * KEYSLOT_SECTORS, KEYSLOT_SECTORS, unit, sectors)[0]
+directories = [shaped_extent(KEYSLOT_AREA + g * GROUP, GROUP, unit, sectors) for g in (0, 1)]
+try:
+    runs = check_shaped(text, lower, unit, [replicas, directories[0]], sectors)
+except AssertionError:
+    runs = check_shaped(text, lower, unit, [replicas, directories[1]], sectors)
+results['shaped_keyslot_add'] = runs
 keyslot('/dev/vdb', KEY, 2, passphrase=passphrase, hidden_key=second_key)   # pivsetup derives the tier-3 KEK
 keyslot('/dev/vdb', KEY, 3, passphrase=third_passphrase, kdf_cost=1, hidden_passphrase=passphrase)
 # Independent Python Argon2id KEKs must open the same slots: Rust/Python KDF
@@ -413,7 +471,7 @@ results['keyslots'] = dict(added=[1, 2, 3], removed=[3, 0, 2], last_slot_protect
                            wrong_passphrase_rejected=True, wrong_tier_rejected=True,
                            decoy_rewrite_of_keyslot_area_preserved=True,
                            keyslot_ops_need_listed_credential=True, unlisted_keyslot_rejected=True)
-results['ab'] = dict(fallback_after_damaged_newest_slot=True, rewrite_encryptions=GROUP)
+results['ab'] = dict(fallback_after_damaged_newest_slot=True, rewrite_encryptions=record_cost(2, unit, sectors))
 
 # Re-initialization revokes every earlier keyslot and directory: capture the
 # old master key through the remaining listed slot 1 (and the stale slot 2),
@@ -435,14 +493,14 @@ v = opened(initialize=True, quick=True)
 st, unit, sectors = status()
 records = (sectors - KEYSLOT_AREA) // GROUP - 2
 assert v['hidden_bytes'] == st['hidden_bytes'] == records * BLOCK, (v, records)
-assert st['encryptions'] == setup_writes(), st
+assert st['encryptions'] == setup_writes(unit, sectors), st
 for index in (0, 1, records // 2, records - 1):
     assert readable(v['hidden'], index) is None, index
 quick = {i: hashlib.shake_256(b'quick-%d' % i).digest(BLOCK) for i in (1, 3, records // 2)}
 for index, value in quick.items():
     before = status()[0]['encryptions']
     direct(v['hidden'], index * BLOCK, BLOCK, value)
-    assert status()[0]['encryptions'] - before == GROUP
+    assert status()[0]['encryptions'] - before == record_cost(2 + index, unit, sectors)
 for index, value in quick.items():
     assert direct(v['hidden'], index * BLOCK, BLOCK) == value
 primary_quick = subprocess.check_output(['sha256sum', v['decoy']], text=True).split()[0]
@@ -484,7 +542,8 @@ close_blocks('/dev/vdb', KEY)
 damage(RESERVED + 3 * GROUP + 100)                   # one fragment of block 3's record
 v = opened(fill=True)
 assert v['fill'] == dict(valid=2, written=records - 2, failed=0), v['fill']
-assert status()[0]['encryptions'] == (records - 2) * GROUP
+assert status()[0]['encryptions'] == sum(record_cost(2 + i, unit, sectors) for i in range(records)
+                                        if i not in (1, records // 2))
 expected_quick = bytearray(records * BLOCK)
 for index in (1, records // 2):
     expected_quick[index * BLOCK:(index + 1) * BLOCK] = quick[index]
@@ -495,7 +554,7 @@ v = opened(fill=True)                                        # idempotent: nothi
 assert v['fill'] == dict(valid=records, written=0, failed=0), v['fill']
 assert status()[0]['encryptions'] == 0
 close_blocks('/dev/vdb', KEY)
-results['quick_fill'] = dict(records=records, quick_encryptions=setup_writes(), unwritten='EIO',
+results['quick_fill'] = dict(records=records, quick_encryptions=setup_writes(unit, sectors), unwritten='EIO',
                              fill_first=dict(valid=2, written=records - 2, failed=0),
                              damaged_block_rewritten_as_zeros=True, fill_again=dict(valid=records, written=0),
                              primary_preserved=True)
@@ -504,13 +563,13 @@ results['quick_fill'] = dict(records=records, quick_encryptions=setup_writes(), 
 # (generation 1) and fill completes the rest.
 v = opened(initialize=True, quick=True, ab=True)
 ab_records = ((sectors - KEYSLOT_AREA) // GROUP - 2) // 2
-assert v['hidden_bytes'] == ab_records * BLOCK and status()[0]['encryptions'] == setup_writes()
+assert v['hidden_bytes'] == ab_records * BLOCK and status()[0]['encryptions'] == setup_writes(unit, sectors)
 assert readable(v['hidden'], 0) is None
 direct(v['hidden'], BLOCK, BLOCK, quick[1])
 close_blocks('/dev/vdb', KEY)
 v = opened(fill=True)
 assert v['fill'] == dict(valid=1, written=ab_records - 1, failed=0), v['fill']
-assert status()[0]['encryptions'] == (ab_records - 1) * GROUP
+assert status()[0]['encryptions'] == sum(record_cost(2 + 2 * i, unit, sectors) for i in range(ab_records) if i != 1)
 direct(v['hidden'], BLOCK, BLOCK, quick[3])                 # second version: slot 1, generation 2
 expected_ab = bytearray(ab_records * BLOCK)
 expected_ab[BLOCK:2 * BLOCK] = quick[3]
@@ -524,19 +583,20 @@ assert v['hidden_bytes'] == st['hidden_bytes'] == records * BLOCK, (v, records)
 assert Path(v['hidden']).read_bytes() == bytes(records * BLOCK)
 results['records'] = records
 
-# Hidden writes re-encode exactly one 687-fragment record per 4096-byte block.
+# Hidden writes re-encode exactly one 687-fragment record per 4096-byte block,
+# shaped to 4 KiB edges (the neighbouring sectors get decoy-write IVs).
 pattern = {i: hashlib.shake_256(b'v5-%d' % i).digest(BLOCK) for i in (0, 1, records // 2, records - 1)}
 for index, value in pattern.items():
     before = status()[0]['encryptions']
     direct(v['hidden'], index * BLOCK, BLOCK, value)
-    assert status()[0]['encryptions'] - before == GROUP
+    assert status()[0]['encryptions'] - before == record_cost(2 + index, unit, sectors)
 for index, value in pattern.items():
     assert direct(v['hidden'], index * BLOCK, BLOCK) == value
 # A multi-block direct write is split per block by DM: one record each.
 before = status()[0]['encryptions']
 pair = hashlib.shake_256(b'v5-pair').digest(2 * BLOCK)
 direct(v['hidden'], 2 * BLOCK, 2 * BLOCK, pair)
-assert status()[0]['encryptions'] - before == 2 * GROUP
+assert status()[0]['encryptions'] - before == record_cost(4, unit, sectors) + record_cost(5, unit, sectors)
 assert direct(v['hidden'], 2 * BLOCK, 2 * BLOCK) == pair
 hidden_before = Path(v['hidden']).read_bytes()
 
@@ -641,20 +701,20 @@ layout, unit, sectors = handle.layout, handle.device.sector_size, handle.device.
 handle.close()
 rs_records = (sectors - KEYSLOT_AREA) // G - 2
 assert v['hidden_bytes'] == rs_records * BLOCK, (v, rs_records)
-assert rs_status()['encryptions'] == 4 * 2 * 14 + 2 * G
+assert rs_status()['encryptions'] == setup_writes(unit, sectors, G)
 rs_pattern = {i: hashlib.shake_256(b'v5-rs-%d' % i).digest(BLOCK) for i in range(4)}
 for index, value in rs_pattern.items():
     before = rs_status()['encryptions']
     direct(v['hidden'], index * BLOCK, BLOCK, value)
-    assert rs_status()['encryptions'] - before == G
+    assert rs_status()['encryptions'] - before == record_cost(2 + index, unit, sectors, G)
 assert readable(v['hidden'], 4) is None
 rs_close()
 v = rs_open(fill=True)
 assert v['fill'] == dict(valid=4, written=rs_records - 4, failed=0), v['fill']
-assert rs_status()['encryptions'] == (rs_records - 4) * G
+assert rs_status()['encryptions'] == sum(record_cost(2 + i, unit, sectors, G) for i in range(4, rs_records))
 assert direct(v['hidden'], 4 * BLOCK, BLOCK) == bytes(BLOCK)
 rs_close()
-results['rs'] = dict(parity=P, group=G, blocks=rs_records, write_encryptions=G,
+results['rs'] = dict(parity=P, group=G, blocks=rs_records, write_encryptions=record_cost(2, unit, sectors, G),
                      quick_fill=dict(valid=4, written=rs_records - 4, failed=0))
 
 # Unreadable carrier sectors (erasures): p per lane recover, including parity
@@ -681,6 +741,26 @@ assert v['fill'] == dict(valid=rs_records, written=0, failed=0), v['fill']
 assert rs_status()['encryptions'] == 0
 assert direct(v['hidden'], BLOCK, BLOCK) == rs_pattern[1]
 rs_close()
+# Shaping: a hidden write also authenticates the neighbouring sectors up to
+# its 4 KiB edges. At 512-byte sectors block 0's extent reaches into block 1's
+# first sectors: with one of them unreadable, writing block 0 fails locally
+# before encrypting (conservative: no unaligned fallback, no owner stop);
+# block 2's extent does not reach it, and block 1 still reads (RS erasure).
+restack([group_first(1)])
+v = rs_open()
+before = rs_status()
+neighbour_blocks = shaped_extent(group_first(0), G, unit, sectors)[1] > group_first(1)
+if neighbour_blocks:
+    assert rejected(lambda: direct(v['hidden'], 0, BLOCK, rs_pattern[0])).errno == errno.EIO
+    after = rs_status()
+    assert not after['failed'] and after['encryptions'] == before['encryptions']
+else:
+    direct(v['hidden'], 0, BLOCK, rs_pattern[0])
+direct(v['hidden'], 2 * BLOCK, BLOCK, rs_pattern[2])
+assert direct(v['hidden'], BLOCK, BLOCK) == rs_pattern[1]
+assert direct(v['hidden'], 0, BLOCK) == rs_pattern[0]
+rs_close()
+results['rs']['unreadable_neighbour_refuses_shaped_write'] = neighbour_blocks
 too_many = [3 * i for i in range(P + 1)]          # p + 1 erasures in lane 0
 restack([group_first(1) + j for j in too_many])
 v = rs_open()

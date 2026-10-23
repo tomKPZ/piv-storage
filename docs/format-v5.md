@@ -349,11 +349,17 @@ primary data of every touched sector before modifying it.
   filesystem created through it also mounts through stock dm-crypt.
 - **Hidden write (one block):** authenticate the primary data of all G carrier
   sectors (to obtain exact old IVs), seal, re-encode G fragments with fresh `r`
-  and write through the journal; primary plaintext is unchanged. A fresh IV
-  equal to an old or another fresh IV of the same request triggers re-encoding
-  (up to 16 attempts). Hidden writes stay strict: any failing or unreadable
-  carrier sector fails the write. With A/B, write the other slot with
-  generation max + 1.
+  and write through the lower device; primary plaintext is unchanged. A fresh
+  IV equal to an old or another fresh IV of the same request triggers
+  re-encoding (up to 16 attempts). Hidden writes stay strict: any failing or
+  unreadable carrier sector fails the write. With A/B, write the other slot
+  with generation max + 1. The write is flushed before it completes.
+- **Write shaping (implementation, no format change):** every rewrite other
+  than a decoy request (records, the directory, keyslot replicas, wipes) is
+  extended to 4 KiB-aligned primary byte edges; the extra sectors (at most 7
+  per side at 512-byte sectors, none at 4096) are authenticated and get
+  decoy-write IVs (fragments kept), and a failing one fails the write
+  ([write shaping](native-blocks.md#write-shaping)).
 - **Decoy write** (≤ 128 KiB per work item): for each written primary sector,
   decode the old IV, keep its 6 payload bytes, draw fresh `r'` and re-encode
   (rejecting a result equal to the old IV); keyslot sectors use the listed
@@ -369,7 +375,7 @@ primary data of every touched sector before modifying it.
 - **Hidden read:** as in the parity section. The newest valid A/B slot wins.
 
 Every request reads, authenticates and re-encrypts all its sectors before the
-first write through the lower dm-integrity journal
+first write through the lower dm-integrity device
 ([write path](native-blocks.md#write-path)); the journal's per-sector atomicity does not make a
 G-sector record atomic. Without A/B, an interrupted hidden write leaves the
 block unavailable (EIO) unless parity recovers it; with A/B the previous
@@ -430,9 +436,12 @@ completed records stay written (cancellation is not rollback).
 Initialization draws a fresh MK and first **revokes** all earlier state: it
 overwrites keyslot areas 1–3 (both replicas) and directory group 1 with fresh
 random IVs (keeping their primary plaintext, as a keyslot remove does; every
-such sector must authenticate). It then writes keyslot 0 (both replicas) under
+such sector must authenticate; shaped like every rewrite, so at 512-byte
+sectors the edges reach into keyslot 0's second replica, which gets random
+IVs too, and into the first record). It then writes keyslot 0 (both replicas) under
 the KEK, writes the directory listing it into group 0, then writes a zero
-record for every block (one slot per block with A/B). Afterwards no earlier
+record for every block (one slot per block with A/B; rounds of 8 blocks, even
+then odd blocks of each run of 16, flushed after each round). Afterwards no earlier
 keyslot or directory authenticates, so old passphrases are revoked and, after
 a quick re-initialization, the old records are reachable through no keyslot
 (only someone who already extracted the old MK could still decode them; a
@@ -473,7 +482,8 @@ redundancy (a hidden write of the block does that).
 ## Amplification and nonce use
 
 A 4 KiB hidden write rewrites G sectors (687 without parity), close to v4's
-8 × 90 = 720 for the same 4 KiB. At 4096-byte primary sectors that is about
+8 × 90 = 720 for the same 4 KiB, plus up to 14 shaping sectors at 512-byte
+primary sectors (on average about 7, 1%). At 4096-byte primary sectors that is about
 2.7 MiB of primary data per 4 KiB hidden write (plus journal), the same order
 as v4. The per-sector collision analysis is unchanged (80 random bits per IV).
 Hot hidden blocks raise the rewrite count of their carrier sectors.

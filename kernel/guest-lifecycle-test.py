@@ -112,7 +112,7 @@ try:
                 # return probe runs on the other CPU. Drain that evidence.
                 deadline = time.monotonic() + 5
                 while True:
-                    try: check_trace((T / 'trace').read_text(), mode)
+                    try: check_trace((T / 'trace').read_text(), mode, hidden=bool(role))
                     except AssertionError:
                         if time.monotonic() >= deadline: raise
                         time.sleep(0.01)
@@ -124,7 +124,7 @@ try:
             text = (T / 'trace').read_text()
             stats = '\n'.join(p.read_text() for p in (T / 'per_cpu').glob('cpu*/stats'))
             assert not re.search(r'(?:overrun|dropped events):\s*[1-9]', stats), stats
-            traces.append(dict(case=label, **check_trace(text, mode)))
+            traces.append(dict(case=label, **check_trace(text, mode, hidden=bool(role))))
     profile = (T / 'kprobe_profile').read_text()
     (W / 'kprobe-profile.txt').write_text(profile)
     seen = set()

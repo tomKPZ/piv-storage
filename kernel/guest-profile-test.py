@@ -6,11 +6,14 @@ import mmap
 import os
 from pathlib import Path
 import random
+import re
 import subprocess
 import time
 
 import pivstore.blocks as blocks
 from pivstore.kernel_owner import GuestOwner
+from pivstore.records import shaped_count, shaped_extent
+from shape_trace import check_shaped
 
 W = Path('/mnt/piv-work')
 T = Path('/sys/kernel/tracing')
@@ -215,10 +218,15 @@ try:
                                               batch=0, submit=ranges))
     # Writes (same bytes, so the oracles hold): one authenticated batch read of
     # every touched sector, one encryption each, one write submission of a few
-    # multi-sector bios. No per-sector reads, re-reads or self-decryption.
+    # multi-sector bios. No per-sector reads, re-reads or self-decryption. A
+    # hidden write rewrites block 0's record (group 2) shaped to 4 KiB edges:
+    # its 687 sectors plus the neighbouring sectors up to the aligned edges.
     status_owner = GuestOwner('/dev/vdb', KEY)
+    BLOCK0, device_sectors = 112 + 2 * GROUP, sectors
+    shaped = shaped_count(BLOCK0, GROUP, unit, device_sectors)
+    results['hidden_write_shaped_sectors'] = shaped
     for role, count, sectors in (('decoy', 16384, 16384 // unit), ('decoy', 131072, 131072 // unit),
-                                 ('hidden', 4096, GROUP)):
+                                 ('hidden', 4096, shaped)):
         # Close outside the counted window: closing a written dm device makes
         # udev re-probe it (inotify watch), and those reads must not count.
         with mmap.mmap(-1, count) as buf:
@@ -243,6 +251,48 @@ finally:
         (T / 'events/piv_profile/enable').write_text('0')
     for event in reversed(registered):
         probe_command(f'-:piv_profile/{event}')
+
+# Write shaping: the lower write bios of each hidden write (block:block_bio_queue
+# on the owner's dm-integrity device, one write at a time, same bytes) form
+# exactly the record's shaped extent, starting and ending on 4 KiB edges.
+lower = os.stat('/dev/mapper/piv-native_dif').st_rdev
+lower = f'{os.major(lower)},{os.minor(lower)}'
+records = len(EXPECTED) // 4096
+event = T / 'events/block/block_bio_queue'
+shape_cases = []
+(T / 'tracing_on').write_text('0')
+(T / 'buffer_size_kb').write_text('4096')
+(event / 'enable').write_text('1')
+try:
+    for indices in ((0,), (1,), (2,), (records // 2,), (records - 1,), (3, 4)):
+        offset, length = indices[0] * 4096, len(indices) * 4096
+        (T / 'trace').write_text('')
+        (T / 'tracing_on').write_text('1')
+        with mmap.mmap(-1, length) as buf:
+            buf[:] = EXPECTED[offset:offset + length]
+            fd = os.open(views['hidden'], os.O_WRONLY | os.O_DIRECT)
+            try:
+                assert os.pwritev(fd, [buf], offset) == length
+            finally:
+                os.close(fd)
+        (T / 'tracing_on').write_text('0')
+        text = (T / 'trace').read_text()
+        stats = '\n'.join(p.read_text() for p in (T / 'per_cpu').glob('cpu*/stats'))
+        assert not re.search(r'(?:overrun|dropped events):\s*[1-9]', stats), stats
+        # A multi-block write is split per block (16 work items may overlap);
+        # adjacent blocks share an aligned unit, so their extents merge.
+        extents = [shaped_extent(112 + (2 + i) * GROUP, GROUP, unit, device_sectors) for i in indices]
+        merged = [list(extents[0])]
+        for lo, hi in extents[1:]:
+            if lo <= merged[-1][1]: merged[-1][1] = max(merged[-1][1], hi)
+            else: merged.append([lo, hi])
+        runs = check_shaped(text, lower, unit, merged, device_sectors)
+        shape_cases.append(dict(blocks=list(indices), runs=runs))
+finally:
+    (event / 'enable').write_text('0')
+    (T / 'trace').write_text('')
+results['shaped_hidden_writes'] = shape_cases
+print('Hidden write shaping passed:', shape_cases, flush=True)
 
 assert hashlib.sha256(Path(views['decoy']).read_bytes()).hexdigest() == PRIMARY
 assert Path(views['hidden']).read_bytes() == EXPECTED

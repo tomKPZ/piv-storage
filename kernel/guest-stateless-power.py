@@ -18,6 +18,7 @@ import time
 from pivstore.blocks import open_blocks, close_blocks
 from pivstore.kernel_api import dm
 from pivstore.kernel_owner import GuestOwner
+from pivstore.records import shaped_extent
 
 w = Path('/mnt/piv-work')
 AB = os.environ.get('PIV_POWER_AB') == '1'
@@ -33,10 +34,12 @@ layout = owner.layout
 owner.close()
 # Hidden block 0's record: after 112 keyslot sectors and two 687-sector
 # directory groups (format v5, no parity); with A/B its slots 0 and 1 are the
-# next two groups. The span covers every sector the write may touch.
-first, group = 112 + 2 * 687, 687
-span = group * (2 if AB else 1)
-unit = layout.sector_size
+# next two groups. The span covers every sector the write may touch: the
+# group(s) shaped to 4 KiB edges (at 512-byte sectors the last sectors of
+# directory group 1 and the first of the next record get decoy-write IVs).
+group, unit = 687, layout.sector_size
+first, end = shaped_extent(112 + 2 * group, group * (2 if AB else 1), unit, layout.sectors)
+span = end - first
 start = layout.offsets(first)[1]
 base = start // 512 * 512
 skip = start - base
@@ -122,7 +125,7 @@ if NO_JOURNAL:
         tags = {i for i in range(span) if now_tuples[i] != before_tuples[i]}
         data = {i for i in range(span) if now_data[i] != before_data[i]}
         if tags or data:
-            slots = sorted({(first + i - 112) // group - 2 for i in tags | data})
+            slots = sorted({(first + i - 112) // group - 2 for i in tags | data})   # -1: directory group 1
             (w / 'cut-boundary.json').write_text(json.dumps(dict(
                 mechanism='in-flight direct-mode carrier observed with delayed lower writes',
                 no_journal=True, ab=AB, span_sectors=span, changed_tuples=len(tags), changed_data=len(data),

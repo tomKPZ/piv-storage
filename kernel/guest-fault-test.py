@@ -12,6 +12,7 @@ from unittest.mock import patch
 import pivstore.blocks as blocks
 import pivstore.kernel_owner as owners
 from pivstore.kernel_api import dm, mapping_identity
+from pivstore.records import shaped_extent
 
 W = Path('/mnt/piv-work')
 SOURCE = '/dev/mapper/piv-test-fault'
@@ -244,9 +245,12 @@ for role in ('decoy', 'hidden'):
                     blocks_touched(handle.device, offset // unit, (offset + size - 1) // unit))
         old = direct(v[role], offset=offset, size=size)
         # Primary sectors this request may rewrite: the decoy range, or the
-        # hidden record's whole carrier (hidden-only tuples).
+        # hidden record's whole carrier shaped to 4 KiB edges (hidden-only
+        # tuples; the neighbouring records' edge sectors keep their fragments,
+        # so blocks 9 and 11 stay readable even if those sectors tear).
         span = (range(offset // unit, (offset + size - 1) // unit + 1) if role == 'decoy'
-                else range(record_span(handle.device, 10)[0], record_span(handle.device, 10)[1] + 1))
+                else range(*shaped_extent(record_span(handle.device, 10)[0], GROUP, unit,
+                                          handle.device.sectors)))
         saved = {sector: direct(v['decoy'], offset=sector * unit, size=unit) for sector in span}
         sectors = handle.device.sectors
         before_count = blocks.native_status(handle.device)['encryptions']
@@ -515,6 +519,21 @@ finally:
 v = open_views(); assert verify(v) is False; close_views(); absent()
 results.append('sector 0 damaged: setup, END and DETACH checkpoint another sector; replica 1 unlocks')
 print('Sector-0 damage: setup, END, DETACH and replica-1 unlock passed', flush=True)
+# Restore keyslot 0's replica 0 (its fragment was destroyed above) through the
+# keyslot interface, so the setup-fault checks below start from two intact
+# replicas: write shaping lets the initialization's first revocation write
+# (keyslot 1 replica 0, extended to 4 KiB edges) refresh the last sectors of
+# keyslot 0's replica 1 with random IVs, and on no-journal volumes a failed
+# write can still leave those IVs on disk; the previous volume then reopens
+# through replica 0.
+spare = os.urandom(32)
+v = open_views()
+blocks.keyslot(SOURCE, KEY, 1, spare, hidden_key=HKEY)
+blocks.keyslot(SOURCE, KEY, 0, hidden_key=spare)
+blocks.keyslot(SOURCE, KEY, 0, HKEY, hidden_key=spare)
+blocks.keyslot(SOURCE, KEY, 1, hidden_key=HKEY)
+assert verify(v) is False
+close_views(); absent()
 
 
 def gated_setup_fault(label, **options):
@@ -569,11 +588,13 @@ close_views(); absent()
 # area 1) stops the owner; the volume keeps its previous keyslot, directory
 # and records, so it reopens unchanged after recreation. Without the journal,
 # tags buffered by dm-integrity can reach the disk after their data writes
-# failed: only the revocation's sectors (keyslot areas 1-3, directory group 1)
-# may tear.
+# failed: only the revocation's sectors (keyslot areas 1-3, directory group 1,
+# shaped to 4 KiB edges) may tear.
 report = gated_setup_fault('initialize', initialize=True)
 v = open_views()
-torn = setup_tears(v, range(28, 112 + 2 * GROUP))
+UNIT = len(SAVED_DECOY) // SECTORS
+torn = setup_tears(v, range(shaped_extent(28, 14, UNIT, SECTORS)[0],
+                            shaped_extent(112 + GROUP, GROUP, UNIT, SECTORS)[1]))
 assert verify(v) is False; close_views(); absent()
 results.append(dict(setup_write_fault='initialize', owner_failed=True, encryptions=report['status']['encryptions'],
                     previous_volume_intact=True, torn_primary_sectors=len(torn)))
@@ -583,7 +604,7 @@ v = open_views(initialize=True, quick=True); close_views(); absent()
 report = gated_setup_fault('fill', fill=True)
 # Fill writes only hidden-block records.
 v = open_views()
-fill_torn = setup_tears(v, range(112 + 2 * GROUP, SECTORS))
+fill_torn = setup_tears(v, range(shaped_extent(112 + 2 * GROUP, GROUP, UNIT, SECTORS)[0], SECTORS))
 close_views(); absent()
 v = open_views(fill=True)
 assert v['fill']['failed'] == 0 and v['fill']['valid'] + v['fill']['written'] == len(EXPECTED) // BLOCK, v['fill']

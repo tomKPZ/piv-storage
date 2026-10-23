@@ -77,7 +77,11 @@ resolved from context/evidence, not for routine implementation decisions.
   flag; journaled volumes stay supported as the integrity-first choice. No
   other persistent flag or table shape is accepted. Without the journal a
   crash tears in-flight sectors (including a hidden record's decoy carrier);
-  tests assert tears stay within the request and are repairable.
+  tests assert tears stay within the request and are repairable. Hidden
+  writes flush before completing (both modes) and every non-decoy rewrite is
+  shaped to 4 KiB-aligned edges with decoy-rule IVs for the extra sectors
+  (2026-10-23, items "no-journal tear window" and "write shaping"); keep both
+  and the test asserting aligned lower write sets.
   Multi-snapshot observers, rollback resistance and alternative hidden openings
   under coercion are out of scope. Never put host-specific (e.g. corporate
   kernel) identifiers in the repository.
