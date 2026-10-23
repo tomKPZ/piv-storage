@@ -4,9 +4,9 @@ Research prototype exposing two writable Linux device-mapper devices: a decoy
 volume and an independently encrypted hidden volume carried in the decoy's
 persistent random IVs. The primary volume is an ordinary stock LUKS2 volume over
 dm-integrity that stores a fresh random 16-byte IV per sector; the hidden volume
-uses [format v5](docs/format-v5.md). The decoy device exposes 512-byte and the
-hidden device 4096-byte logical blocks of plaintext; each can hold its own
-filesystem. Setup exits; the kernel
+uses [format v5](docs/format-v5.md). The decoy device exposes logical blocks of
+the primary sector size and the hidden device 4096-byte logical blocks of
+plaintext; each can hold its own filesystem. Setup exits; the kernel
 owns all subsequent I/O.
 
 > [!CAUTION]
@@ -19,6 +19,48 @@ owns all subsequent I/O.
 > (observer boundaries and open assumptions) first.
 
 README and ROADMAP are provisional research notes.
+
+## Motivation
+
+Classic steganography hides a message by modifying cover data that has
+structure: pixels or coefficients of images, audio samples, video frames,
+text. Every such modification shifts the cover's statistics, and steganalysis
+exists to detect exactly those shifts. The hider is always in an arms race
+with models of what "natural" cover data looks like.
+
+This project instead hides data in bytes that are **supposed to be uniformly
+random**. A stock LUKS2 volume with authenticated encryption and a random-IV
+profile (`aegis128-random`, `aes-xts-random` + `hmac-sha256`) stores a fresh
+random 16-byte IV for every sector in its dm-integrity metadata. Nothing about
+a correct IV is predictable, so there is no cover model to deviate from: if the
+hidden payload is encrypted so that each stored IV is computationally
+indistinguishable from fresh randomness (format v5 stores every IV as a
+tweakable-block-cipher output over fresh random bytes and a payload fragment),
+then no statistical test on a single image can tell an IV that carries data
+from one that does not. The decoy volume stays a fully usable, ordinary
+LUKS2 volume: stock Linux opens and verifies it, and decoy writes preserve the
+hidden fragments. That is unlike hiding in an outer volume's free space, which
+the decoy filesystem may overwrite.
+
+What this does **not** protect against (see the
+[security review](docs/security-review.md) and
+[Before production use](#before-production-use)):
+
+- **Side channels and behaviour:** write timing and amplification, I/O traces,
+  and the distinctive footprint of a hidden write (hundreds of sectors
+  re-encrypted with unchanged plaintext).
+- **Multiple snapshots and history:** comparing images over time, the
+  dm-integrity journal after a crash or while the volume is active, SSD
+  remapping, VM snapshots and backups.
+- **The system around the volume:** installed software (pivsetup, dm-piv.ko),
+  key files, boot configuration, logs, memory and swap.
+- **Misuse:** opening the volume read-write with stock tools (which destroys
+  hidden data), weak passphrases (keyslots allow offline guessing), cloned
+  images or RNG state, and coercion beyond revealing the decoy.
+- **Unproven assumptions:** indistinguishability rests on standard
+  assumptions about AES and HMAC-SHA256 and on an internal, unreviewed
+  argument; the cipher profile itself is visible in the LUKS2 header and
+  less common than unauthenticated `aes-xts-plain64`.
 
 ## Components
 
