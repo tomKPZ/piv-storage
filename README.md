@@ -336,7 +336,8 @@ Read this list before trusting real data to the prototype.
   systemd-gpt-auto-generator for it: a stock read-write open destroys hidden
   data. There is no decoy-only dm-piv mode, so daily use needs the hidden key,
   and boot activation reveals that a hidden volume is configured (/etc/pivtab
-  and the initramfs; [packaging/README.md](packaging/README.md)).
+  and the initramfs; [packaging/README.md](packaging/README.md) and
+  [header-stash.md](docs/header-stash.md)).
 - **Integrity journal.** Use stock no-journal mode (`cryptsetup open
   --integrity-no-journal --persistent` once after luksFormat). On journaled
   volumes, real volumes of 8 GiB or more get a 64 MiB integrity journal that
@@ -390,5 +391,7 @@ cancellation tests), [format-v5.md](docs/format-v5.md) (hidden format),
 [journal-atomicity.md](docs/journal-atomicity.md),
 [large-volumes.md](docs/large-volumes.md),
 [detectability.md](docs/detectability.md) (matched controls),
+[header-stash.md](docs/header-stash.md) (storing tooling in the LUKS2 header
+or on removable media),
 [observed-layout.md](docs/observed-layout.md) (source evidence).
 Executed test runs are recorded in commit messages.

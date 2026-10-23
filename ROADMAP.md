@@ -33,54 +33,17 @@ and limits are in README.md and docs/.
 
 ## Remaining work
 
-1. **Investigate storing the tooling inside the LUKS2 header** (research
-   first; implement only after a design the user approves). The installed
-   pivsetup, dm-piv.ko, pivtab, initramfs hook and key files on the root
-   filesystem or /boot reveal that a hidden volume exists. For users who want
-   maximum deniability, explore keeping them in ciphertext that is
-   indistinguishable from data stock LUKS2 already stores, with a manual
-   boot path: boot a stock-looking initramfs without opening the main disk,
-   derive a key with a KDF, unlock the stored blob (dm-plain over a header
-   byte range, or an encrypted archive), and run a script from it that loads
-   the module, opens the views and resumes boot. Questions to answer:
-   - **Where the bytes can live.** (a) Unused keyslot-area space: a default
-     16 MiB LUKS2 header has about 15.7 MiB of keyslots area beyond one
-     64-byte-key keyslot (4000 AF stripes × 64 B = 256,000 B). Check whether
-     stock luksFormat fills it with random bytes (required for
-     indistinguishability) or zeros, and whether luksAddKey, luksChangeKey,
-     luksConvertKey, header backup/restore and repair overwrite it. (b) The
-     AF stripes of an active keyslot: with the keyslot's passphrase, stripes
-     1–3999 can be chosen so the stored (encrypted) bytes equal the hidden
-     blob, and the last stripe computed so AF-merge still yields the volume
-     key (about 255,936 B per keyslot, still a working stock keyslot). Any
-     keyslot rewrite destroys it. (c) Other stock-random regions.
-   - **Size.** The static pivsetup is 1.76 MB (638 KB xz -9e); dm-piv.ko must
-     match the running kernel exactly (re-embed on every kernel upgrade) and
-     needs signing under Secure Boot. Estimate a minimal payload (stripped,
-     compressed; possibly a smaller dedicated unlock binary) against the
-     available space.
-   - **What remains visible.** The boot path itself must look stock: an
-     initramfs carrying an unusual KDF binary or script is itself a tell.
-     Check what a stock Debian initramfs already offers (busybox, cryptsetup:
-     e.g. plain mode over a header offset, or a detached LUKS2 header stored
-     in the blob area) and whether booting from removable media is the
-     honest recommendation instead. Key files likewise (passphrase-only
-     operation, or keys inside the blob).
-   - **Robustness and deniability.** Stock tools that rewrite header areas,
-     header backups, fsck/repair, and whether the blob's presence is
-     detectable from a single header image (entropy, keyslot-area allocation
-     in the JSON metadata, cryptsetup version-specific layout).
-   Exit: a written design note (docs/) with measured capacities, a stock
-   cryptsetup behaviour table (verified in a disposable guest), the boot
-   procedure, its residual tells, and a recommendation; no implementation
-   without user approval.
-
-Open, unverified deployment areas (pick up only with a concrete need; each
-needs a disposable-guest test first):
+No active items. Open, unverified deployment areas (pick up only with a
+concrete need; each needs a disposable-guest test first):
 
 - Boot-time `ask` prompts (initramfs askpass), a root filesystem on a view,
   Secure Boot enrollment/enforcement of the DKMS-signed module, dracut and
   non-Debian distributions (packaging/README.md lists what was verified).
+- Optional helper commands for storing the tooling inside the unreachable
+  upper tail (`[14 MiB, 16 MiB)`) of a default LUKS2 header (`docs/header-stash.md`
+  records the disposable-guest measurements, stock `cryptsetup` behaviour
+  table, active-keyslot AF-stripe proof and why the unallocated tail or
+  removable media is preferred; implement only if the user approves a design).
 
 ## Standing decisions (binding for autonomous sessions)
 

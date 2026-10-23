@@ -194,7 +194,8 @@ key file path, which requires `embed-keys`. Security trade-offs:
 - Either way `/etc/pivtab`, the hook and the initramfs reveal that a hidden
   view is configured, and pivsetup always opens both views (there is no
   decoy-only mode of dm-piv). For deniability, do not configure boot activation
-  of the hidden view at all; open it manually when needed.
+  of the hidden view at all; open it manually from removable media or a
+  stashed payload ([header-stash.md](../docs/header-stash.md)) when needed.
 
 Verified in a disposable guest (suite `deploy`): DKMS build, install and
 signature; activation from the installed binary and module; the hook's
