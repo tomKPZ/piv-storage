@@ -308,42 +308,55 @@ external encrypted USB drive (or a live/initramfs USB stick):
 
 ---
 
-## 6. Residual tells and operational failure modes
+## 6. Operational considerations and residual tells
 
-Even with the tooling stored in `[14 MiB, 16 MiB)` of the LUKS2 header (Candidate A),
-important tells and operational risks remain:
-
-1. **Why the volume uses `--integrity` and `*-random` IVs at all**:
-   Stock `cryptsetup luksFormat` defaults to `aes-xts-plain64` without
-   `dm-integrity`. Using `aes-xts-random --integrity hmac-sha256` (or
-   `aegis128-random --integrity aead`) with `--integrity-no-journal` is valid
-   stock `cryptsetup`, but rare in default desktop/server installers.
-2. **Partition / filesystem layout on the decoy**:
-   If the LUKS2 volume is the root filesystem, `/etc/crypttab` and the stock
-   initramfs normally unlock it automatically with `cryptsetup` at boot — which
-   would mount the decoy read-write through stock `dm-crypt` and **destroy
-   hidden records** unless the user always intercepts boot (`break=premount`)
-   or keeps the LUKS2 + `dm-integrity` carrier on a secondary data partition
-   omitted from `/etc/crypttab`.
-3. **Kernel upgrades (`vermagic` lockstep)**:
+1. **Forgetting to add `break=premount` at boot**:
+   On a system where the LUKS2 volume is listed in `/etc/crypttab` (e.g., as the
+   root filesystem), a normal un-intercepted boot runs `scripts/local-top/cryptroot`
+   and halts synchronously at the `Please unlock disk ...:` passphrase prompt.
+   **No writes occur to the LUKS2 header or data area before or during that
+   prompt** (`cryptsetup` only opens the device `O_RDONLY` to parse the header).
+   If the user sees the stock prompt and realizes they forgot `break=premount`,
+   rebooting (`Ctrl-Alt-Del`) or powering off at the prompt leaves the hidden
+   volume completely untouched. Damage only occurs if the user enters the LUKS
+   passphrase into the stock prompt, which opens the volume through stock
+   `dm-crypt` and mounts the decoy filesystem read-write.
+   (`break=premount` runs in `initramfs-tools` *before* `scripts/local-top/cryptroot`;
+   if `unlock.sh` creates `/dev/mapper/<cryptroot-target>` via `dm-piv` before
+   exiting the `break=premount` shell, `cryptroot` sees the target already
+   active and skips `cryptsetup open`.)
+2. **Initial build and kernel upgrades (`vermagic` lockstep)**:
    The kernel loads `dm-piv.ko` only if its `vermagic` and `Module.symvers` CRCs
-   match `uname -r` exactly. Every `apt upgrade` that installs a new
-   `linux-image-*` requires rebuilding `dm-piv.ko` against the new headers and
-   re-embedding the stash into `[14 MiB, 16 MiB)` before rebooting into the new
-   kernel; otherwise the stash's `dm-piv.ko` fails `insmod` with `ENOEXEC`
-   (`Invalid module format`). And building `dm-piv.ko` on the decoy system
-   leaves compiler/header/DKMS traces unless built on another machine.
-4. **Secure Boot**:
-   Under UEFI Secure Boot lockdown, `insmod /run/piv-stash/dm-piv.ko` is
-   rejected unless `dm-piv.ko` is signed by an enrolled Machine Owner Key (MOK).
-   Enrolling a custom MOK in UEFI NVRAM (`MokList`) is visible to anyone who
-   inspects `mokutil --list-enrolled`.
-5. **Multi-snapshot comparison of the LUKS2 header**:
-   Stock `cryptsetup` writes `[14 MiB, 16 MiB)` **only once**, during
-   `luksFormat`. If an observer captures a snapshot of the disk before and after
-   a stash update (for example, when re-embedding `dm-piv.ko` after a kernel
-   upgrade), bytes in `[14 MiB, 16 MiB)` change while no JSON keyslot ever
-   referenced that range.
+   match `uname -r` exactly.
+   - **Initial setup**: Perform the initial `dm-piv.ko` build, `pivsetup`
+     initialization, and `[14 MiB, 16 MiB)` stash write from an ephemeral live
+     environment in RAM (such as Tails or Debian Live) so no `dm-piv` sources or
+     build artifacts ever touch the decoy filesystem.
+   - **Kernel upgrades**: Keep the `dm-piv` module sources, signing key (if
+     any), and stash-update script **inside the hidden volume**, and only
+     rebuild `dm-piv.ko` while `dm-piv.ko` is already loaded and the hidden
+     volume is mounted. When the decoy OS installs a new `linux-image-X.Y.Z`
+     and `linux-headers-X.Y.Z` (ordinary packages on a Linux workstation),
+     build `dm-piv.ko` against `/lib/modules/X.Y.Z/build` from the hidden
+     mount (`M=/mnt/hidden/dm-piv/kernel`) and re-embed the stash before
+     rebooting into the new kernel. Because each stripped `.ko.xz` is only
+     `~40 KiB`, the 2 MiB stash can carry `dm-piv-$(uname -r).ko` for both the
+     current and new kernels simultaneously so the previous kernel remains
+     bootable.
+3. **UEFI Secure Boot and MOK enrollment**:
+   A stock Debian/Ubuntu/Fedora Secure Boot chain does **not** use a user-enrolled
+   MOK in UEFI NVRAM: the UEFI firmware's factory Microsoft 3rd-Party CA verifies
+   `shimx64.efi`, `shim` embeds the distro's CA certificate inside its own binary
+   to verify `grubx64.efi` and `vmlinuz`, and `vmlinuz` embeds the distro kernel
+   key to verify in-tree modules. Thus, on a stock install with no out-of-tree
+   (DKMS) modules, `mokutil --list-enrolled` is empty.
+   - Enrolling a MOK dedicated to `dm-piv` (or having a MOK enrolled when the
+     decoy OS has no out-of-tree modules) is visible via `mokutil --list-enrolled`.
+   - To avoid that tell, either disable Secure Boot, or (if the decoy OS
+     already installs an ordinary DKMS package such as `nvidia-driver` or
+     `v4l2loopback-dkms`) sign `dm-piv.ko` with that existing
+     `/var/lib/dkms/mok.key` so `MokList` contains only the standard DKMS key
+     expected for the decoy OS.
 
 ---
 
