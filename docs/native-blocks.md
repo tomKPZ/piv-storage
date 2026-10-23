@@ -1,8 +1,8 @@
 # Paired native block devices
 
 `dm-piv.ko` is a standalone module (no dm-crypt fork or patch) that implements
-the Linux LUKS2 per-sector AEAD path itself over the stock dm-integrity journal
-and registers `piv-crypt` (private owner) and `piv-view` (public views). Stock
+the Linux LUKS2 per-sector AEAD path itself over the stock dm-integrity device
+(journaled, or direct on persistent no-journal volumes) and registers `piv-crypt` (private owner) and `piv-view` (public views). Stock
 dm-crypt keeps its `crypt` target and can stay loaded with unrelated encrypted
 filesystems mounted throughout setup, I/O and removal of dm-piv. No stock
 symbols are hooked or replaced; only ordinary exported block, device-mapper and
@@ -187,7 +187,8 @@ while views are active. Freshly produced ciphertext is not decrypted again
 **Flush semantics** follow stock dm-crypt: a plain write completes once its
 lower write bios complete, without a flush, so it is durable only after a
 later flush or FUA request (dm-integrity commits its journal on flush/FUA, when
-half full, or on its commit timer). A FUA write flushes the lower device after
+half full, or on its commit timer; in direct mode it writes data in place and
+its buffered tags at the next flush). A FUA write flushes the lower device after
 its write and before completing. WRITE|PREFLUSH flushes before its payload, and
 an empty flush flushes the lower device; both cover every write completed
 before they were issued, since a request completes only after its lower writes
@@ -201,7 +202,8 @@ collision costs only a flush). The pre-write flush is skipped when a
 successful flush started after the block's previous write completed. Keyslot and directory writes
 flush after each write. Initialization flushes every 16 records and before
 returning, also when cancelled. Batches are not atomic writes; the stock
-journal may commit part of a record at any time. No discard or write-zeroes is
+journal may commit part of a record at any time, and without the journal a
+crash can tear sectors whose data landed before their tags. No discard or write-zeroes is
 advertised. Suspend/removal uses DM references and generation binding; see the
 [lifecycle notes](native-faults.md#concurrent-lifecycle-and-flushfua-ordering-lifecycle-suite).
 

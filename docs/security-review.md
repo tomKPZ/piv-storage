@@ -22,7 +22,7 @@ keyslot; the hidden key unlocks a hidden keyslot ([format-v5.md](format-v5.md)).
 | Observer or adversary | Supported reasoning and limits |
 | --- | --- |
 | Passive reader of current IV slots, without hidden key | The encoding is expected to be pseudorandom under the composition assumptions below. This has not been proved or independently reviewed. |
-| Reader of a complete raw disk image | Also sees LUKS configuration, the journal and residual storage. A single image can contain write history. No full-image indistinguishability guarantee follows from current-IV randomness. |
+| Reader of a complete raw disk image | Also sees LUKS configuration, the journal (journaled volumes) and residual storage. A single journaled image can contain write history; a no-journal crash image can contain one torn record-shaped run per in-flight hidden write. No full-image indistinguishability guarantee follows from current-IV randomness. |
 | Reader with primary key but no hidden key | Can authenticate/decrypt primary sectors and inspect IVs. Primary-key disclosure alone is not intended to reveal the hidden key. No coercion or alternative-opening protocol is implemented. |
 | Snapshot, journal-history, known-workload or live-I/O observer | A hidden write's G (687 + 3p) same-plaintext reencryptions are observable. Decoy writes matched stock closed-snapshot footprints in the AEGIS matched controls, but I/O traces still differ. No deniability against these observers is claimed. |
 | Active raw-storage attacker without keys | Can destroy data and replay old valid tuples/records. Authentication rejects altered protected content, subject to cipher assumptions; it does not provide availability, freshness or authenticated metadata/journal ordering. |
@@ -42,7 +42,7 @@ and fixtures are unsuitable for real data.
 Out of scope by user decision: multi-snapshot observers, rollback resistance and
 coercion-resistant alternative hidden openings (these would only move coercion
 from one hidden key to the next). Retained single-image journal history remains
-in scope (see below).
+in scope (see below); no-journal mode removes it.
 
 ## Encoding review (format v5)
 
@@ -185,7 +185,7 @@ Every rewrite authenticates the old sectors (`piv_batch_read`) before
 modifying them, encrypts all of them before submitting any write, holds a
 range lock over every sector it rewrites (concurrent requests touching the same
 sectors or hidden record serialize; [concurrency](native-blocks.md#concurrency))
-and uses the lower journal
+and writes through the lower dm-integrity device, journaled or direct
 ([write path](native-blocks.md#write-path)). The former re-read with an
 expected-IV check and the self-decryption of new ciphertext served userspace
 PREPARE/APPLY tuples and were dropped with that interface; nothing coordinated
@@ -223,7 +223,10 @@ deployment is out of scope.
 
 ## Journal history and the decoy-key holder
 
-From source/layout reasoning; no journal-forensic reconstruction experiment was
+This section applies to journaled volumes; stock persistent no-journal
+volumes (the recommended mode since 2026-10-23) have no journal history, and
+their residual crash signature is described at the end. From source/layout
+reasoning; no journal-forensic reconstruction experiment was
 performed. The journal retains recent sector writes (ciphertext, tag, IV and
 sector number) until wraparound. The 128 MiB fixtures have about 1 MiB of journal
 (1,848–2,048 journal sectors depending on profile), so only a few recent hidden
@@ -254,12 +257,26 @@ A removed keyslot's (or, after re-initialization, a revoked keyslot's) old
 IVs can likewise remain in the journal until it wraps, so its passphrase stays
 testable offline from one raw image during that window; write more than a
 journal's worth of decoy data after a removal to push them out.
-No supported mitigation removes it: stock `--integrity-no-journal` would remove
-on-disk journal history, but pivsetup refuses it because a crash during a
-hidden write could then tear decoy sectors of that record's carrier
-([journal-atomicity.md](journal-atomicity.md)). Journal encryption is untested
-and unverified for LUKS2 integrity profiles in cryptsetup, and would hide sector
-numbers only from keyless observers.
+The supported mitigation is stock no-journal mode (`cryptsetup open
+--integrity-no-journal --persistent` once after luksFormat; configuration.md):
+direct-mode dm-integrity never writes the journal, so a raw image holds no
+write history, and the first direct-mode activation replays and clears any
+journal left by an earlier journaled activation (source reading). Journal
+encryption is untested and unverified for LUKS2 integrity profiles in
+cryptsetup, and would hide sector numbers only from keyless observers.
+
+**Residual no-journal signature.** Without the journal, data and tags reach
+the disk separately, so a crash during an unflushed write tears its sectors
+(they fail authentication), as on any stock no-journal volume. A torn hidden
+write is one run of exactly G (687 + 3p) failing sectors starting at a record
+boundary `112 + G·g` that the decoy user never wrote, and their decoy
+plaintext is lost; stock tears follow filesystem write extents. A decoy-key
+holder with a crash image can see that run (the power and ext4power suites
+measured whole-record runs only, up to 12 records after one ext4 cut;
+[journal-atomicity.md](journal-atomicity.md#no-journal-mode)). It is absent
+after a clean close or once the hidden writes' tags were flushed, and it
+reveals only the records written since the last flush, not the history a
+journal keeps.
 
 ## Disposition
 

@@ -48,6 +48,8 @@ UNIT = json.loads(subprocess.check_output(['cryptsetup', 'luksDump', '--dump-jso
 THREADS = 8
 OPS = int(os.environ.get('PIV_STRESS_OPS', '48'))
 results = dict(threads=THREADS, ops_per_thread=OPS)
+# Fixture persists stock --integrity-no-journal (guest_code sets this).
+NO_JOURNAL = os.environ.get('PIV_NO_JOURNAL') == '1'
 RAW_SECTORS = int(subprocess.check_output(['blockdev', '--getsz', '/dev/vdb']))
 
 
@@ -95,6 +97,25 @@ def io(path, offset, size, data=None, sync=False):
     finally:
         os.close(fd)
         buf.close()
+
+
+def unreadable_units(path, count, chunk=256):
+    """Decoy units whose O_DIRECT reads fail with EIO (per unit on error)."""
+    bad = []
+    for first in range(0, count, chunk):
+        n = min(chunk, count - first)
+        try:
+            io(path, first * UNIT, n * UNIT)
+            continue
+        except OSError as exc:
+            assert exc.errno == errno.EIO, exc
+        for u in range(first, first + n):
+            try:
+                io(path, u * UNIT, UNIT)
+            except OSError as exc:
+                assert exc.errno == errno.EIO, exc
+                bad.append(u)
+    return bad
 
 
 def value(*parts, size=UNIT):
@@ -401,7 +422,22 @@ close_views()
 assert absent()
 views = open_views()
 assert not status()[0]['failed']
-# The journal keeps every primary sector whole; failed writes may be partial.
+# Journaled: every primary sector stays whole; failed writes may be partial.
+# Stock persistent no-journal (direct mode): a lower write that landed while
+# another (data or tag) failed leaves its sector torn (EIO). Torn sectors must
+# lie in the region phase C wrote (decoy stripes and the striped hidden
+# records); their plaintext is lost, so a full-sector decoy write of a fresh
+# value replaces each (the failing-sector replacement path), which keeps the
+# stored fragment.
+torn = unreadable_units(views['decoy'], len(image) // UNIT)
+results['phase_c_torn_primary_sectors'] = torn
+if NO_JOURNAL:
+    assert all(striped[0] <= u * UNIT < striped[1] for u in torn), torn
+    for u in torn:
+        decoy_write(views, u * UNIT, value('c-torn-repair', u), sync=True)
+    assert not unreadable_units(views['decoy'], len(image) // UNIT)
+else:
+    assert not torn, torn
 data = Path(views['decoy']).read_bytes()
 check_decoy_read(0, data)
 image[:] = data

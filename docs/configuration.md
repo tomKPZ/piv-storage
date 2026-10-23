@@ -17,7 +17,7 @@ resize are not supported.
 | --- | --- | --- | --- | --- |
 | [Primary cipher](#primary-cipher-profile) | `luksFormat` | `aes-xts-random` + `hmac-sha256`, 512-bit XTS key | `aegis128-random` + `aead` | An IV repeat under XTS + HMAC leaks only block equality (under AEGIS it is a key compromise); AEGIS reads 25–45% faster |
 | [Sector size](#sector-size) | `luksFormat` | 512 (4096 on 4Kn drives); pivsetup has no default | 4096 | 512 gives 8× hidden capacity, about 2–3.5× faster hidden reads and 7–8× faster hidden writes; 4096 gives 5–9% more decoy space and slightly faster decoy writes |
-| [Integrity journal](#integrity-journal) | first `cryptsetup open` | journal on (required) | none | No-journal volumes are refused |
+| [Integrity journal](#integrity-journal) | first `cryptsetup open` | no journal (`--integrity-no-journal --persistent`, for deniability) | journal (integrity first) | The journal keeps recent hidden writes readable to a decoy-key holder after a crash or seizure; without it a crash can tear the sectors of an in-flight write (EIO) |
 | [A/B record slots](#ab-record-slots) | `--initialize` | `--ab` for a filesystem on the hidden view (pivsetup default: off) | single slot | A/B keeps the previous hidden block after a crash or interrupted write, at half capacity and up to half hidden-read speed |
 | [Reed–Solomon parity](#reedsolomon-parity) | `--initialize` | off | `--parity 4`, `8`, `16` | Survives up to p unreadable or damaged carrier sectors per lane, for 1.7–7% of hidden capacity |
 | [Hidden key type](#hidden-key-file-or-passphrase) | `--initialize` and keyslot add | key file | `--hidden-passphrase-file` (Argon2id) | A key file cannot be guessed; a passphrase relies on the KDF cost |
@@ -122,20 +122,51 @@ volumes](#large-volumes-and-initialization-time)).
 
 ## Integrity journal
 
-dm-integrity's journal makes each primary sector update atomic, and pivsetup
-requires it: a volume whose LUKS2 header persists the `no-journal` flag
-(`cryptsetup open --integrity-no-journal --persistent`), or any non-journal
-lower table, is refused. Without the journal, a crash during a hidden write can
-tear decoy sectors of that hidden record, not just the sectors being written
-([journal-atomicity.md](journal-atomicity.md)). No-journal support was removed
-because it barely helped dm-piv: in suite-072 (AEGIS-128, 4096-byte sectors) it
-raised decoy writes by at most about 17% (5.8 → 6.8 MiB/s), and at 512-byte
-sectors no dm-piv write test was faster. dm-piv's own write path, not the
-journal, was the bottleneck (measured before batched writes; not re-measured).
+Stock dm-integrity runs either journaled (the default) or, when the LUKS2
+header persists the `no-journal` flag, in direct mode. Set the flag once,
+right after `luksFormat`, with `cryptsetup open --integrity-no-journal
+--persistent` (then close); every later open, stock or pivsetup, uses the
+direct-mode table. pivsetup accepts both and no other persistent flag.
+
+**Deniability (why no-journal is recommended).** The journal keeps every
+recent write in the clear on disk (sector number, ciphertext, tag and IV; no
+journal encryption) while the volume is active and after a crash; only a clean
+deactivation wipes it. A hidden write rewrites a whole 687-sector record with
+unchanged plaintext, so a crash or seizure image shows a decoy-key holder
+record-shaped runs re-encrypted with identical plaintext (up to about 190
+hidden writes in a 64 MiB journal at 512-byte sectors; see [below](#journal-size-and-history)
+and the [security review](security-review.md#journal-history-and-the-decoy-key-holder)).
+Direct mode never writes the journal (its first activation replays and clears
+whatever a journaled activation left), so that history does not exist.
+
+**Integrity (the cost).** Without the journal, data and tags reach the disk
+separately: dm-integrity writes data in place and tags through its metadata
+buffers, which are written at the next flush. A crash between the two leaves
+those sectors failing authentication (EIO), as on any stock no-journal volume.
+For dm-piv this includes the carrier sectors of an in-flight hidden write,
+whose decoy plaintext the user never changed. In the power test (suite-125, all
+three no-journal profiles, single slot and `--ab`) every cut landed after the
+record's data and before its tags: exactly the record's 687 carrier sectors
+were torn, the hidden block still read its old contents (the old IVs were
+intact) and hidden writes to it failed with EIO until those decoy sectors were
+rewritten ([journal-atomicity.md](journal-atomicity.md#no-journal-mode)). Their
+decoy plaintext is lost: restore the affected decoy files (or rewrite those
+sectors), then rewrite the hidden block. A torn run of exactly one record at a
+record boundary also remains visible to a decoy-key holder in a crash image
+([security review](security-review.md#journal-history-and-the-decoy-key-holder)).
+
+**Recommendation.** Use **no-journal** (user decision 2026-10-23: deniability
+comes before integrity), with `--ab` for hidden data, and flush (fsync, or a
+filesystem's commits) soon after hidden writes to shorten the tear window. Use
+the journal if per-sector crash atomicity of the decoy matters more than
+hiding recent hidden activity from a decoy-key holder. An existing journaled volume can be
+switched with the same command; by source reading (pinned 6.12
+`replay_journal`), the first direct-mode activation replays and then clears
+the journal. That switch is not tested here.
 
 ### Journal size and history
 
-cryptsetup sizes the journal itself (it has no
+This applies to journaled volumes only. cryptsetup sizes the journal itself (it has no
 `--journal-size` option for LUKS2 integrity; cryptsetup 2.8.8 rejects it and
 the devices suite checks the guest's 2.7.5): on the 128 MiB test disks it is
 about 1 MiB, and on real volumes of 8 GiB or more it is 64 MiB (measured
@@ -169,7 +200,7 @@ blocks.
 
 A/B reads both slots, so hidden reads take up to about twice as long. A write
 rewrites the same 687 sectors but first reads both slots to find the older one
-and flushes the journal unless that version is already durable (so the
+and flushes the lower device unless that version is already durable (so the
 newest slot is durable before the other is overwritten); with concurrent requests A/B writes now run at about the
 single-slot speed (90–105%; 40–50% before suite-094). One 4 KiB hidden block is one record, so with A/B a
 block is either all old or all new after an interruption. Initialization is faster because it writes only one
@@ -359,7 +390,7 @@ writes from 16 threads, then one fsync): decoy 14,750 / 13,070 / 14,830 /
 stock 15,220 / 13,630 / 16,850 / 14,630, so concurrent decoy writes reach
 70–97% of stock (40–63% at depth 1 in the same run). Hidden writes gain little from depth:
 38–56 blocks/s at 4096-byte sectors and 250–330 at 512, single slot or A/B,
-because each block rewrites a whole record through the journal. The review
+because each block rewrites a whole record. The review
 fixes of suite-120 (per-batch AEAD requests, direct-to-bio reads, fewer
 allocations, A/B flush skipping) compared with suite-113 (previous module, same
 bench) changed nothing beyond the ±15% noise band except A/B hidden random
@@ -425,7 +456,8 @@ of the serial version, and on 512 MiB disks (large-*-009 against the previous
 module in the same, slower host session) it took 6.9 s instead of 10.1 s at
 4096-byte sectors and 15.7 s instead of 27.1 s at 512. The test disk
 is cached by the host; on a real disk every carrier sector is read once and
-written twice (journal, then in place), so expect initialization at roughly
+written twice on journaled volumes (journal, then in place; once without the
+journal), so expect initialization at roughly
 **the disk's bandwidth divided by 3** (for example about 5–6 hours per TiB at
 150 MiB/s), whichever limit is lower. Initialization can be cancelled with SIGINT/SIGTERM; blocks not yet written
 stay unavailable until a `--fill` (or a new `--initialize`) completes them
@@ -470,12 +502,15 @@ python3 scripts/suite.py --prefix artifacts/bench-next \
 ## Example
 
 The recommended configuration: a 512-byte-sector AES-XTS + HMAC-SHA256 volume
-with a journaled integrity layer, a hidden key file and A/B slots for a hidden
+with no integrity journal, a hidden key file and A/B slots for a hidden
 filesystem:
 
 ```sh
 cryptsetup luksFormat --type luks2 --cipher aes-xts-random --key-size 512 \
   --integrity hmac-sha256 --sector-size 512 --key-file passphrase.key /dev/sdX2
+# Persist stock no-journal mode once (omit both lines for a journaled volume).
+cryptsetup open --integrity-no-journal --persistent --key-file passphrase.key /dev/sdX2 tmp
+cryptsetup close tmp
 pivsetup keygen --output hidden.key
 pivsetup open-blocks --device /dev/sdX2 --key-file passphrase.key \
   --hidden-key-file hidden.key --initialize --ab

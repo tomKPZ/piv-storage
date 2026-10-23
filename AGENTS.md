@@ -68,9 +68,16 @@ resolved from context/evidence, not for routine implementation decisions.
   the scrypt KDF and the Serpent/Twofish and HMAC-SHA1/SHA512 profiles were
   removed; do not reintroduce them without a user decision. Stock no-journal
   volumes were removed at the same time, but the user reversed that on
-  2026-10-23 (ROADMAP item 1): the journal retains recent writes after a crash
-  or while active, which breaks deniability against a decoy-key holder, and
-  the project's priorities are deniability > integrity > performance/storage.
+  2026-10-23: the journal retains recent writes after a crash or while
+  active, which breaks deniability against a decoy-key holder, and the
+  project's priorities are deniability > integrity > performance/storage.
+  Stock persistent no-journal (`cryptsetup open --integrity-no-journal
+  --persistent`, LUKS2 flag "no-journal", direct-mode lower table with exactly
+  the stock options) is supported and the recommended mode, with no opt-in
+  flag; journaled volumes stay supported as the integrity-first choice. No
+  other persistent flag or table shape is accepted. Without the journal a
+  crash tears in-flight sectors (including a hidden record's decoy carrier);
+  tests assert tears stay within the request and are repairable.
   Multi-snapshot observers, rollback resistance and alternative hidden openings
   under coercion are out of scope. Never put host-specific (e.g. corporate
   kernel) identifiers in the repository.
@@ -93,9 +100,9 @@ resolved from context/evidence, not for routine implementation decisions.
 - IVs and metadata tuples are generated, authenticated and written only inside
   the kernel owner. The control device exposes only QUERY, DEVICES, BEGIN/END,
   SETUP, DETACH, STATUS and KEYSLOT; never re-add userspace IV or tuple access.
-  Write through the ordinary lower dm-integrity journal; its per-sector atomicity
-  does not make a hidden record atomic. Failure scope follows mutation: errors
-  before the first lower write of a request (reads, authentication, allocation,
+  Write through the ordinary lower dm-integrity device (journaled or direct);
+  the journal's per-sector atomicity does not make a hidden record atomic.
+  Failure scope follows mutation: errors before the first lower write of a request (reads, authentication, allocation,
   preparation) fail only that bio; errors once writing has begun, and flush
   errors, stop the shared owner. Local hidden unavailability must not stop the
   decoy.
@@ -150,8 +157,9 @@ resolved from context/evidence, not for routine implementation decisions.
   the 32-byte HMAC key; 32-byte tags), 512/4096-byte sectors. Recommended
   (user decision 2026-10-23): aes-xts-random + hmac-sha256 with a 512-bit XTS
   key, 512-byte sectors and `--ab` for hidden filesystems (pivsetup keeps A/B
-  off by default). Integrity v4
-  fixed padding and the ordinary journal are required. Validate geometry,
+  off by default) on a stock no-journal volume. Integrity v4
+  fixed padding and a stock journaled or persistent no-journal lower table are
+  required. Validate geometry,
   AAD, extents and arithmetic. Offline diagnostics reject dirty journals; native
   setup delegates replay to Linux before authenticated access.
 - Use maintained crypto primitives. Setup is the static Rust `pivsetup` binary

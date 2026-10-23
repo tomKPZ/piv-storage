@@ -51,7 +51,8 @@ t = 3; 2: 256 MiB, t = 3; 3, the default: 1 GiB, t = 3; 4: 2 GiB, t = 6), with
 salt = base context ‖ "/kek/argon2id/" ‖ tier digit; a `*-kdf-cost` option is
 refused without the matching passphrase option. Rust/Python KEK vectors for
 tiers 1 and 3 live in `rust/tests/`. Only the two
-supported primary profiles and journaled dm-integrity volumes are accepted
+supported primary profiles are accepted, on stock persistent no-journal
+(direct-mode, recommended for deniability) or journaled dm-integrity volumes
 ([configuration.md](../docs/configuration.md)).
 
 `--device`/`--source` are required (no default) and name any block device or
@@ -83,7 +84,7 @@ any target hidden contents), refuses a target view smaller than the source's,
 copies both views in 1 MiB O_DIRECT chunks through an mlocked, zeroized buffer,
 flushes, re-reads both devices and compares them byte for byte, then closes
 both. It is neither atomic nor resumable: after a failure, reformat the target
-and rerun. The source is only read (activation still writes ordinary journal
+and rerun. The source is only read (activation still writes ordinary integrity
 metadata). The migrate suite copies the fixture source (AEGIS-128, or AES-XTS +
 HMAC-SHA256 for the aes-sha256 profiles) into a rekeyed, larger,
 512-byte-sector A/B AEGIS-128 target with `--parity 4`.

@@ -1,8 +1,9 @@
 """Read-only LUKS2/dm-integrity profile, cross-checked with stock Linux fixtures.
 
 LUKS2 header checksums and redundant-header selection are delegated to cryptsetup.
-Only journaled (no journal crypto), fixed-padding, 512/4096-byte profiles with 16-byte
-random IVs (original AEGIS-128, or aes-xts-random with hmac-sha256) are accepted.
+Only fixed-padding, 512/4096-byte profiles with 16-byte random IVs (original
+AEGIS-128, or aes-xts-random with hmac-sha256) and no journal crypto are
+accepted, journaled or with a persisted stock "no-journal" flag (direct mode).
 """
 
 from contextlib import AbstractContextManager
@@ -125,6 +126,18 @@ def validate_segment(metadata):
     return int(value)
 
 
+def persistent_no_journal(metadata):
+    """LUKS2 persistent activation flags: none, or exactly "no-journal" (stock
+    `cryptsetup open --integrity-no-journal --persistent`, direct-mode lower
+    table). Returns whether "no-journal" is persisted; refuses other flags."""
+    flags = metadata.get('config', {}).get('flags', []) if isinstance(metadata, dict) else None
+    if flags == []:
+        return False
+    if flags == ['no-journal']:
+        return True
+    raise UnsupportedImage('Unsupported LUKS2 activation flags')
+
+
 class Image(AbstractContextManager):
     def __init__(self, path, *, exclusive=False):
         self.fd = os.open(Path(path), os.O_RDONLY | os.O_NOFOLLOW)
@@ -155,6 +168,7 @@ class Image(AbstractContextManager):
             try:
                 metadata = json.loads(result.stdout)
                 offset = validate_segment(metadata)
+                self.no_journal = persistent_no_journal(metadata)
             except (json.JSONDecodeError, TypeError, KeyError) as exc:
                 raise UnsupportedImage('Invalid LUKS2 segment metadata') from exc
             self.encryption = metadata['segments']['0']['encryption']
@@ -165,6 +179,9 @@ class Image(AbstractContextManager):
                 raise UnsupportedImage('LUKS profile and integrity tuple size disagree')
             if self.layout.sector_size != metadata['segments']['0']['sector_size']:
                 raise UnsupportedImage('LUKS and integrity sector sizes disagree')
+            # Direct mode never writes the journal, and its first activation
+            # replays and clears whatever an earlier journaled activation left,
+            # so a direct-mode image normally holds an empty journal too.
             self.check_empty_journal()
         except BaseException:
             os.close(self.fd)
@@ -196,7 +213,7 @@ class Image(AbstractContextManager):
     def summary(self):
         return {**asdict(self.layout), 'uuid': self.uuid, 'encryption': self.encryption, 'primary_sectors': self.layout.sectors,
                 'gross_carrier_bytes': self.layout.sectors * self.layout.iv_bytes,
-                'journal': 'validated empty; no replay implemented'}
+                'no_journal': self.no_journal, 'journal': 'validated empty; no replay implemented'}
 
     def iv_slots(self):
         """Yield carrier bytes in logical-sector order; does not authenticate them."""

@@ -1,9 +1,12 @@
 # Stateless failure semantics and fault tests
 
 The design keeps no private recovery plan, WAL or history. Primary
-ciphertext/tag/IV updates go through the ordinary dm-integrity journal (the
-only supported mode; see [journal-atomicity.md](journal-atomicity.md)). An interrupted hidden write may
-leave that one 4096-byte hidden block unreadable (unless RS parity recovers it).
+ciphertext/tag/IV updates go through the ordinary lower dm-integrity device:
+journaled, or direct on stock persistent no-journal volumes (recommended for
+deniability; see [journal-atomicity.md](journal-atomicity.md#no-journal-mode)).
+An interrupted hidden write may leave that one 4096-byte hidden block
+unreadable (unless RS parity recovers it); without the journal it can also
+tear (EIO) the primary sectors it was rewriting, never others.
 A record's whole plaintext must authenticate (SIV tag over all 687 data
 fragments, after any RS correction) before it is returned, so old and
 new carrier fragments are never mixed into a valid block. Independently valid
@@ -91,9 +94,22 @@ the 687 carrier IVs have changed (`cut-boundary.json`; a run without the cut
 fails). The observer never writes or bypasses the native owner; journal
 inspection is test instrumentation, not a recovery implementation.
 
+The `powerab` suite runs the same test on a volume initialized with `--ab`
+(block 0's slots are groups 2 and 3). On no-journal fixtures there is no
+journal to observe: the observer also reads the carrier's data sectors and
+cuts as soon as any data or tag byte of the span changed while the writer's
+fsync is outstanding (results in
+[journal-atomicity.md](journal-atomicity.md#no-journal-mode)).
+
 After reboot, scripts/guest-stateless-recover.sh lets stock cryptsetup replay
-the journal and requires block 0 to be complete-old, complete-new or EIO, every
-other hidden block unchanged and the full primary hash unchanged. A decoy write
+the journal (journaled fixtures) and requires block 0 to be complete-old,
+complete-new or EIO (A/B: never EIO), every
+other hidden block unchanged and the full primary hash unchanged. Journaled
+fixtures must show no torn primary sector. On no-journal fixtures every torn
+sector must lie in the record span; the test records them
+(`power-results.json`), checks that a hidden rewrite fails with EIO while they
+remain, and restores them by full-sector decoy writes of the pre-cut
+plaintext before the remaining checks. A decoy write
 must not silently repair an EIO block; a full hidden write then repairs it.
 Stock full-primary readback and a stock dm-crypt coexistence check follow (this
 suite produces no host-verified output image).
@@ -116,6 +132,9 @@ file, unmounts and runs `e2fsck -fn`, checks both decoy hashes through dm-piv
 and, after `rmmod`, through stock read-only cryptsetup. A/B must show no EIO
 block, a clean replay, every recorded file intact and a clean fsck;
 single-slot outcomes are recorded, not asserted (`ext4-power-results.json`).
+On `*-nojournal` profiles both volumes persist stock no-journal; the recovery
+first scans the decoy, requires torn sectors to lie in hidden record carriers
+and restores them (the luksFormat-wiped zeros) before the hidden checks.
 
 Results (2026-10-23, 16 cuts: suite-121 and suites 124–126, each with the four
 fixture ciphers/profiles, 512-byte-sector ext4 volumes):
@@ -135,6 +154,12 @@ page cache intact (writes QEMU completed survive; only guest-side state such as
 dm-integrity's in-memory journal is lost), not a hardware power loss, and the
 small sample says nothing about rare interleavings. Use `--ab` for hidden
 filesystems ([configuration.md](configuration.md#ab-record-slots)).
+
+No-journal (suite-125 and suite-128, three profiles, 12 volumes: 6
+single-slot and 6 A/B): no hidden block read EIO, every mount replayed, every
+recorded file was intact and fsck was clean; 5 volumes had torn sectors, all
+whole records at record boundaries (1 to 12 records, 687 sectors each),
+repaired by decoy writes before mounting.
 
 ## Lower-device errors and setup cleanup (`faults` suite)
 
@@ -164,8 +189,13 @@ fault first.
   reports failure and both views keep rejecting I/O
   after the wrapper is restored. Only teardown/recreation clears it. Hidden
   blocks must match the oracle, with local EIO/repair allowed only for records
-  intersecting the failed request (and, without the journal, torn sectors only
-  within the request's span, restored by full-sector writes).
+  intersecting the failed request. Journaled fixtures must show no torn
+  sector; on no-journal fixtures torn sectors must lie within the request's
+  span and are restored by full-sector decoy writes. Lower write faults during
+  `--initialize` and `--fill` follow the same rule with the setup's write
+  scope (the revocation's keyslot areas 1–3 and directory group 1, or the
+  hidden-block records): on no-journal volumes dm-integrity's buffered tags
+  can reach the disk at deactivation after their data writes failed.
 - **Late-sector corruption**: the corrupted sector is the last of one 128 KiB
   decoy work item or the last carrier sector of record 10. A decoy read must
   leave a sentinel-filled direct-I/O buffer unchanged (earlier sectors may have

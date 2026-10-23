@@ -45,8 +45,9 @@ default. Research prototype without external cryptographic review. Key,
 passphrase and LUKS key files must be regular files owned by root and not
 accessible by group or others (chmod 600).
 LUKS2 volumes with 16-byte random IVs (aes-xts-random + hmac-sha256, the
-recommended profile, or aegis128-random + aead), the journaled integrity layer,
-and hidden format v5 (4096-byte hidden blocks); 512-byte encryption sectors are
+recommended profile, or aegis128-random + aead), a stock integrity layer
+(persistent no-journal, recommended for deniability, or journaled), and
+hidden format v5 (4096-byte hidden blocks); 512-byte encryption sectors are
 recommended (4096 on 4Kn drives). --initialize destroys all existing hidden contents and writes
 zeros into every hidden block; with --quick it writes only the keyslot and
 directory, and every hidden block reads EIO until first written (tools that

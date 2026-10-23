@@ -36,9 +36,16 @@ PROFILES = {
     # AES-XTS + HMAC-SHA256 authenc (user decision 2026-10-22).
     'aes-sha256-4096': dict(PIV_PRIMARY_CIPHER='aes-xts-random', PIV_INTEGRITY='hmac-sha256', PIV_SECTOR_SIZE='4096'),
     'aes-sha256-512': dict(PIV_PRIMARY_CIPHER='aes-xts-random', PIV_INTEGRITY='hmac-sha256', PIV_SECTOR_SIZE='512'),
+    # Stock --integrity-no-journal persisted in the LUKS2 header (direct-mode
+    # lower table): the recommended deniability mode (user decision 2026-10-23).
+    'aes-sha256-512-nojournal': dict(PIV_PRIMARY_CIPHER='aes-xts-random', PIV_INTEGRITY='hmac-sha256',
+                                     PIV_SECTOR_SIZE='512', PIV_NO_JOURNAL='1'),
+    'aes-sha256-4096-nojournal': dict(PIV_PRIMARY_CIPHER='aes-xts-random', PIV_INTEGRITY='hmac-sha256',
+                                      PIV_SECTOR_SIZE='4096', PIV_NO_JOURNAL='1'),
+    'aegis-512-nojournal': dict(PIV_PRIMARY_CIPHER='aegis128-random', PIV_SECTOR_SIZE='512', PIV_NO_JOURNAL='1'),
 }
-SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'stress', 'early', 'power', 'controls', 'v5', 'migrate',
-          'devices', 'deploy', 'fuzz', 'ext4power', 'bench', 'large')
+SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'stress', 'early', 'power', 'powerab', 'controls', 'v5',
+          'migrate', 'devices', 'deploy', 'fuzz', 'ext4power', 'bench', 'large')
 # Routine tier: run after kernel or pivsetup changes. The opt-in remainder is for
 # changes in its own area: controls (descriptive write-pattern statistics),
 # migrate (pivsetup migrate), devices (activation on arbitrary block devices
@@ -51,7 +58,7 @@ SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'stress', 'early', 'power'
 # Explicit only ('all' excludes them): bench (docs/configuration.md numbers;
 # run with --jobs 1) and large (a fresh 512 MiB volume of the profile, or
 # PIV_LARGE_MIB=N for an N MiB second disk; docs/large-volumes.md).
-DEFAULT_SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'stress', 'early', 'power', 'v5')
+DEFAULT_SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'stress', 'early', 'power', 'powerab', 'v5')
 EXPLICIT_SUITES = ('bench', 'large')
 # Guest RAM floors (MiB): Argon2id tier 3 (1 GiB, the default --kdf-cost) runs
 # in pivsetup and in the Python cross-check; bench also measures tier 4 (2 GiB).
@@ -198,6 +205,10 @@ class Matrix:
                        [ko, ROOT / 'kernel/guest-stress-test.py', *keys, *oracles], 'stress-final.img'),
             'power': (ROOT / 'scripts/guest-stateless-power.sh', control / 'control.img',
                       [ko, ROOT / 'kernel/guest-stateless-power.py', *keys], None),
+            # The power cut with an A/B hidden volume (--ab).
+            'powerab': (ROOT / 'scripts/guest-stateless-power-ab.sh', control / 'control.img',
+                        [ko, ROOT / 'kernel/guest-stateless-power.py', ROOT / 'scripts/guest-stateless-power.sh',
+                         *keys], None),
             'migrate': (ROOT / 'scripts/guest-migrate.sh', final,
                         [ko, ROOT / 'kernel/guest-migrate-test.py', *keys, *oracles], None),
             'devices': (ROOT / 'scripts/guest-devices.sh', final,
@@ -216,8 +227,8 @@ class Matrix:
                          [ko, ROOT / 'kernel/guest-controls-test.py', ROOT / 'scripts/control_metrics.py', *keys],
                          None),
             # Own fresh volumes on the second disk (vdb is an unused blank).
-            'ext4power': (ROOT / 'scripts/guest-ext4-power.sh', None,
-                          [ko, ROOT / 'kernel/guest-ext4-power.py'], None),
+            'ext4power': (self.ext4_task(profile) if 'ext4power' in suites else None, None,
+                          [ko, ROOT / 'kernel/guest-ext4-power.py', ROOT / 'scripts/guest-ext4-power.sh'], None),
             'large': (self.large_task(profile) if 'large' in suites else None, None,
                       [ko, ROOT / 'scripts/guest-large.sh', ROOT / 'scripts/guest-control.sh',
                        ROOT / 'kernel/guest-large-test.py'], None),
@@ -246,7 +257,7 @@ class Matrix:
             script, data, files, output = plans[name]
             run_dir = self.args.prefix / f'{profile}-{name}'
             extra = ['--code']
-            if name == 'power':
+            if name in ('power', 'powerab'):
                 extra += ['--power-cut-script', str(ROOT / 'scripts/guest-stateless-recover.sh')]
             if name == 'migrate':
                 extra += ['--second-blank-mib', '512']
@@ -311,6 +322,17 @@ class Matrix:
         settings = ' '.join(f'{k}={v}' for k, v in env.items())
         check = '' if name in PROFILES else f'echo "Unknown fixture profile {name}" >&2; exit 1\n'
         task.write_text(f'#!/bin/bash\nset -euo pipefail\n{check}{settings} bash /mnt/piv-work/guest-large.sh\n')
+        return task
+
+    def ext4_task(self, profile):
+        """Task script for ext4power: the profile's cipher and no-journal mode
+        for the suite's own fresh volumes (512-byte sectors)."""
+        name = profile.removesuffix('-control')
+        task = self.args.prefix / f'{profile}-ext4power-task.sh'
+        env = {k: v for k, v in PROFILES.get(name, {}).items() if k in ('PIV_PRIMARY_CIPHER', 'PIV_NO_JOURNAL')}
+        settings = ' '.join(f'{k}={v}' for k, v in env.items())
+        check = '' if name in PROFILES else f'echo "Unknown fixture profile {name}" >&2; exit 1\n'
+        task.write_text(f'#!/bin/bash\nset -euo pipefail\n{check}{settings} bash /mnt/piv-work/guest-ext4-power.sh\n')
         return task
 
     def suites_for(self, profile):

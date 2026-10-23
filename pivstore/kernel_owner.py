@@ -16,7 +16,7 @@ import subprocess
 import uuid
 
 from .format import PRIMARY_PROFILES
-from .kernel_api import KernelDevice, dm, check_activation_flags, mapping_identity, remove_mapping, validate_integrity_table
+from .kernel_api import KernelDevice, dm, mapping_identity, no_journal, remove_mapping, validate_integrity_table
 from .profile import parse_superblock, validate_segment
 
 
@@ -63,7 +63,7 @@ class GuestOwner:
         self.raw_bytes = check_device(self.source)
         metadata = json.loads(crypt('luksDump', '--dump-json-metadata', self.source).stdout)
         self.offset = validate_segment(metadata)
-        check_activation_flags(metadata)
+        self.no_journal = no_journal(metadata)
         self.encryption = metadata['segments']['0']['encryption']
         self.integrity = metadata['segments']['0']['integrity']['type']
         self.mapping_cipher, self.profile_tag = PRIMARY_PROFILES[(self.encryption, self.integrity)]
@@ -114,7 +114,7 @@ class GuestOwner:
                 validate_integrity_table(dm('table', self.lower_name).stdout, owner_size // self.layout.sector_size,
                                          self.raw_device, self.offset, self.layout.sector_size,
                                          self.layout.journal_sections * self.layout.journal_section_sectors,
-                                 self.layout.tuple_bytes)
+                                 self.layout.tuple_bytes, self.no_journal)
                 # Key-containing table is kept in memory and sent only through stdin.
                 fields = dm('table', '--showkeys', name).stdout.split()
                 if fields[2:4] != ['crypt', self.mapping_cipher]:
@@ -187,7 +187,7 @@ class GuestOwner:
         validate_integrity_table(table, self.device.sectors, self.raw_device, self.offset,
                                  self.layout.sector_size,
                                  self.layout.journal_sections * self.layout.journal_section_sectors,
-                                 self.layout.tuple_bytes)
+                                 self.layout.tuple_bytes, self.no_journal)
         lower = Path('/dev/mapper/' + self.lower_name).stat().st_rdev
         if lower != self.device.lower_device:
             raise ValueError('Native control bound to unexpected lower device')

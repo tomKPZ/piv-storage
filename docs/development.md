@@ -70,7 +70,7 @@ runs the selected suites concurrently, one fresh VM per suite.
 - `--suites routine` (default): faults, profile (including the decoy
   write-batching counts of kernel/guest-batch-test.py, formerly the `batch`
   suite), cancel, lifecycle, stress (concurrent I/O oracles and a fault under
-  load), early, power, v5. `early` (Python-free RAM-root initramfs from the
+  load), early, power, powerab (the power cut with `--ab`), v5. `early` (Python-free RAM-root initramfs from the
   native run) overlaps `deploy` (stock initramfs-tools boot) in proving
   initramfs activation; it stays routine because it is cheap and needs no
   package installation. `--suites all` adds controls, migrate (second 512 MiB disk),
@@ -335,8 +335,9 @@ scripts/guest-control.sh formats /dev/vdb (or `PIV_CONTROL_DEVICE=/dev/vdc`)
 with stock cryptsetup, selected by
 `PIV_PRIMARY_CIPHER` (default `aes-xts-random` with `PIV_INTEGRITY` default
 `hmac-sha256`, or `aegis128-random`) and `PIV_SECTOR_SIZE` (512 default, or
-4096; the recommended configuration), always
-with the default journaled integrity mode. It writes
+4096; the recommended configuration), with the default journaled integrity
+mode, or with `PIV_NO_JOURNAL=1` (the `*-nojournal` suite profiles) after
+persisting stock `--integrity-no-journal` on the first open. It writes
 distinct deterministic synthetic plaintext to every primary sector, reopens
 read-only with stock cryptsetup and hashes every primary byte. Keyslot PBKDF2
 uses a very low iteration count solely to speed up disposable tests.

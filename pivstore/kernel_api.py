@@ -8,6 +8,8 @@ import stat
 import struct
 import subprocess
 
+from .profile import persistent_no_journal
+
 READ = struct.Struct('=IIQQ16sII')
 QUERY = struct.Struct('=IIQQIIIIII')
 
@@ -51,39 +53,47 @@ def remove_mapping(name, identity, *, discard=False):
     dm('remove', '--retry', name)
 
 
-def check_activation_flags(metadata):
-    """LUKS2 persistent flags must be absent or empty; a persisted "no-journal"
-    (stock `--integrity-no-journal --persistent`) is unsupported."""
-    if metadata.get('config', {}).get('flags', []) != []:
-        raise ValueError('Unsupported LUKS2 activation flags')
+def no_journal(metadata):
+    """LUKS2 persistent flags: none, or exactly "no-journal" (stock
+    `cryptsetup open --integrity-no-journal --persistent`, the recommended
+    deniability mode). Returns whether the volume persists it."""
+    return persistent_no_journal(metadata)
 
 
-def validate_integrity_table(table, sectors, raw_device, offset, sector_size=4096, journal_sectors=1848, tuple_size=32):
-    """The stock journaled ("J") lower table."""
+def validate_integrity_table(table, sectors, raw_device, offset, sector_size=4096, journal_sectors=1848, tuple_size=32,
+                             no_journal=False):
+    """The stock lower table: journaled ("J"), or direct ("D") with exactly the
+    journaled options minus journal_watermark/commit_time when the volume
+    persists "no-journal"."""
     if tuple_size not in (32, 48):
         raise ValueError('Unsupported lower tuple size')
     words = table.split()
     if (len(words) < 8 or words[:3] != ['0', str(sectors * (sector_size // 512)), 'integrity'] or
             words[3:7] != [f'{os.major(raw_device)}:{os.minor(raw_device)}',
-                           str(offset // 512), str(tuple_size), 'J'] or
+                           str(offset // 512), str(tuple_size), 'D' if no_journal else 'J'] or
             int(words[7]) != len(words) - 8):
         raise ValueError('Unsupported lower integrity mapping')
     options = words[8:]
-    required = {'interleave_sectors:32768', 'fix_padding', 'journal_watermark:50', 'commit_time:10000'}
+    required = {'interleave_sectors:32768', 'fix_padding'}
+    if not no_journal:
+        required |= {'journal_watermark:50', 'commit_time:10000'}
     if sector_size == 4096:
         required.add('block_size:4096')
     elif sector_size != 512:
         raise ValueError('Unsupported lower sector size')
-    if len(options) != len(required) + 2 or len(set(options)) != len(options) or not required.issubset(options):
+    # Linux 7.2 omits the unused journal size in direct mode; 6.12 reports it.
+    sized = any(o.startswith('journal_sectors:') for o in options) or not no_journal
+    if (len(options) != len(required) + (2 if sized else 1) or len(set(options)) != len(options) or
+            not required.issubset(options)):
         raise ValueError('Unsupported lower integrity options')
     extra = {o.split(':', 1)[0]: o.split(':', 1)[1] for o in set(options) - required if ':' in o}
     # dm-integrity picks buffer_sectors itself (a power of two, at most the
     # default 128, smaller when the journal would not fit); it is in-memory only.
-    if set(extra) != {'journal_sectors', 'buffer_sectors'} or extra['buffer_sectors'] not in (
-            '8', '16', '32', '64', '128') or not extra['journal_sectors'].isdecimal():
+    if set(extra) != ({'journal_sectors', 'buffer_sectors'} if sized else {'buffer_sectors'}) or extra[
+            'buffer_sectors'] not in ('8', '16', '32', '64', '128') or (
+            sized and not extra['journal_sectors'].isdecimal()):
         raise ValueError('Unsupported lower integrity journal/buffer')
-    journal = int(extra['journal_sectors'])
-    if journal != journal_sectors:
+    if sized and int(extra['journal_sectors']) != journal_sectors:
         raise ValueError('Unsupported lower integrity journal size')
 
 

@@ -10,6 +10,14 @@ for EIO, mounts (journal replay), checks every fsync'ed file, runs e2fsck
 -fn, and checks that the decoy plaintext of both volumes is unchanged
 (through dm-piv, then stock read-only cryptsetup). A/B must stay fully
 consistent; single-slot outcomes are recorded as found (docs/native-faults.md).
+
+PIV_NO_JOURNAL=1 (the `*-nojournal` profiles) persists stock
+--integrity-no-journal on both volumes (direct mode). The cut may then tear
+primary sectors of in-flight hidden writes: `recover` scans the decoy first,
+requires every torn sector to lie in hidden record carriers, records them and
+restores their (all-zero, luksFormat-wiped) plaintext by full-sector decoy
+writes before the hidden checks; hidden writes over a torn carrier would
+otherwise fail (strict hidden writes).
 """
 import errno
 import hashlib
@@ -33,6 +41,7 @@ HKEY_FILE = W / 'ext4-hidden.key'
 DISK = '/dev/vdc'
 MODES = {'single': dict(ab=False), 'ab': dict(ab=True)}
 STATE = W / 'ext4-power-state.json'
+GROUP = 687                     # format v5 record sectors (no parity)
 
 
 def sh(*args, check=True):
@@ -121,18 +130,33 @@ def cut():
     profile = (['--cipher', 'aegis128-random', '--key-size', '128', '--integrity', 'aead']
                if cipher == 'aegis128-random' else
                ['--cipher', 'aes-xts-random', '--key-size', '512', '--integrity', 'hmac-sha256'])
+    no_journal = os.environ.get('PIV_NO_JOURNAL') == '1'
     sources = half_devices()
-    state = dict(profile=cipher, sector_size=512, modes={})
+    state = dict(profile=cipher, sector_size=512, no_journal=no_journal, modes={})
     for mode, source in sources.items():
         sh('cryptsetup', 'luksFormat', '--batch-mode', '--type', 'luks2', *profile, '--sector-size', '512',
            '--pbkdf', 'pbkdf2', '--pbkdf-force-iterations', '1000', '--key-file', KEY, source)
+        if no_journal:
+            # Persist stock no-journal once (the documented setup step).
+            sh('cryptsetup', 'open', '--integrity-no-journal', '--persistent', '--key-file', KEY, source,
+               f'piv-persist-{mode}')
+            sh('cryptsetup', 'close', f'piv-persist-{mode}')
         views = open_mode(mode, source, initialize=True, **MODES[mode])
         mke2fs = sh('mkfs.ext4', '-q', '-F', '-b', '4096', views['hidden'])
         info = sh('dumpe2fs', '-h', views['hidden']).stdout
         state['modes'][mode] = dict(source=source, hidden_bytes=views['hidden_bytes'],
                                     decoy_sha256=sha256_device(views['decoy']),
+                                    decoy_bytes=int(sh('blockdev', '--getsize64', views['decoy']).stdout),
                                     has_journal='has_journal' in info, mke2fs=mke2fs.stdout[-200:])
         assert state['modes'][mode]['has_journal'], info
+        if no_journal:
+            # Torn sectors are restored to the luksFormat wipe's zeros.
+            zero = hashlib.sha256()
+            chunk = bytes(1 << 20)
+            for at in range(0, state['modes'][mode]['decoy_bytes'], len(chunk)):
+                zero.update(chunk[:min(len(chunk), state['modes'][mode]['decoy_bytes'] - at)])
+            assert state['modes'][mode]['decoy_sha256'] == zero.hexdigest(), 'decoy is not all zeros'
+
         mount = Path(f'/run/piv-ext4-{mode}')
         mount.mkdir(exist_ok=True)
         sh('mount', '-t', 'ext4', '-o', 'commit=5', views['hidden'], mount)
@@ -174,6 +198,53 @@ def scan_hidden(path, size):
     return eio
 
 
+def unreadable_sectors(path, size, chunk=2048):
+    """512-byte decoy sectors whose O_DIRECT reads fail (EIO), per sector on error."""
+    bad = []
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+    with mmap.mmap(-1, chunk * 512) as many, mmap.mmap(-1, 512) as one:
+        try:
+            for first in range(0, size // 512, chunk):
+                n = min(chunk, size // 512 - first)
+                try:
+                    os.preadv(fd, [memoryview(many)[:n * 512]], first * 512)
+                    continue
+                except OSError as error:
+                    if error.errno != errno.EIO:
+                        raise
+                for sector in range(first, first + n):
+                    try:
+                        os.preadv(fd, [one], sector * 512)
+                    except OSError as error:
+                        if error.errno != errno.EIO:
+                            raise
+                        bad.append(sector)
+        finally:
+            os.close(fd)
+    return bad
+
+
+def runs(sectors):
+    out = []
+    for sector in sectors:
+        if out and out[-1][1] == sector - 1:
+            out[-1][1] = sector
+        else:
+            out.append([sector, sector])
+    return out
+
+
+def repair_torn(path, sectors):
+    fd = os.open(path, os.O_RDWR | os.O_DIRECT)
+    with mmap.mmap(-1, 512) as zero:
+        try:
+            for sector in sectors:
+                assert os.pwritev(fd, [zero], sector * 512) == 512
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
 def check_files(mode, root):
     bad = dict(missing=[], mismatch=[], eio=[])
     entries = [(f'baseline/b{i}', hashlib.sha256(content('baseline-' + mode, i)).hexdigest()) for i in range(64)]
@@ -204,7 +275,7 @@ def kernel_lines(since):
 def recover():
     state = json.loads(STATE.read_text())
     sources = half_devices()
-    results = dict(profile=state['profile'], sector_size=512,
+    results = dict(profile=state['profile'], sector_size=512, no_journal=state.get('no_journal', False),
                    cut_counters=(W / 'ext4-cut-counters.txt').read_text().strip()
                    if (W / 'ext4-cut-counters.txt').exists() else None, modes={})
     for mode, source in sources.items():
@@ -214,6 +285,20 @@ def recover():
         result['eio_blocks'] = scan_hidden(views['hidden'], views['hidden_bytes'])
         result['eio_block_count'] = len(result['eio_blocks'])
         result['eio_blocks'] = result['eio_blocks'][:64]
+        torn = unreadable_sectors(views['decoy'], expected['decoy_bytes'])
+        result['torn_primary_sectors'] = len(torn)
+        result['torn_runs'] = runs(torn)[:16]
+        # Hidden record groups (g >= 2 are hidden-block records) holding torn sectors.
+        result['torn_groups'] = sorted({(sector - 112) // GROUP for sector in torn if sector >= 112})
+        if state.get('no_journal'):
+            # Only in-flight hidden writes rewrite carriers (the decoy is never
+            # written here): every torn sector lies in a hidden-block record.
+            assert all(sector >= 112 + 2 * GROUP for sector in torn), result['torn_runs']
+            repair_torn(views['decoy'], torn)
+            assert not unreadable_sectors(views['decoy'], expected['decoy_bytes'])
+            result['eio_blocks_after_decoy_repair'] = scan_hidden(views['hidden'], views['hidden_bytes'])[:64]
+        else:
+            assert not torn, result['torn_runs']
         result['decoy_unchanged'] = sha256_device(views['decoy']) == expected['decoy_sha256']
         mount = Path(f'/run/piv-ext4-{mode}')
         mount.mkdir(exist_ok=True)

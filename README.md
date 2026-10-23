@@ -50,7 +50,9 @@ What this does **not** protect against (see the
   and the distinctive footprint of a hidden write (hundreds of sectors
   re-encrypted with unchanged plaintext).
 - **Multiple snapshots and history:** comparing images over time, the
-  dm-integrity journal after a crash or while the volume is active, SSD
+  dm-integrity journal after a crash or while the volume is active (on
+  journaled volumes; the recommended no-journal mode has none, but a crash can
+  leave one torn record-shaped run per in-flight hidden write), SSD
   remapping, VM snapshots and backups.
 - **The system around the volume:** installed software (pivsetup, dm-piv.ko),
   key files, boot configuration, logs, memory and swap.
@@ -93,8 +95,8 @@ integration).
 | `aegis128-random` (original AEGIS-128, **not AEGIS-128L**) | `aead` | 16 | 32 |
 
 512- or 4096-byte encryption sectors (512 recommended; 4096 on 4Kn drives),
-integrity v4 fixed padding and the stock
-journaled dm-integrity mode. AES-XTS uses dm-crypt's authenc key encoding: a
+integrity v4 fixed padding and a stock dm-integrity mode: persistent
+no-journal (direct mode, recommended for deniability) or journaled. AES-XTS uses dm-crypt's authenc key encoding: a
 32- or 64-byte XTS key followed by the 32-byte HMAC key. Under XTS + HMAC a
 repeated IV reveals only equal plaintext at that sector (HMAC still prevents
 forgery); under AEGIS-128 it is a key compromise, and dm-piv decoy rewrites
@@ -104,10 +106,15 @@ draw only 80 fresh IV bits, so XTS + HMAC is the recommended profile (see
 metadata; compare detectability against a matched ordinary volume of the same
 profile.
 
-Stock `--integrity-no-journal` volumes (persistent LUKS2 `no-journal` flag)
-are refused: without the journal a crash during a hidden write can tear decoy
-sectors of that record, and the measured write gain for dm-piv was small
-([journal-atomicity.md](docs/journal-atomicity.md)).
+Stock `--integrity-no-journal --persistent` volumes (LUKS2 `no-journal` flag,
+direct-mode lower table) are the recommended mode (user decision 2026-10-23):
+the journal keeps recent hidden writes readable to a decoy-key holder after a
+crash or while active. The cost: a crash during an unflushed write tears its
+sectors (EIO), including the decoy sectors carrying an in-flight hidden record,
+whose decoy plaintext is then lost
+([journal-atomicity.md](docs/journal-atomicity.md#no-journal-mode)).
+Journaled volumes stay supported as the integrity-first choice. No other
+persistent LUKS2 flag is accepted.
 
 ## Usage
 
@@ -117,12 +124,15 @@ performance). Install `pivsetup` and the module (DKMS) as described in
 [packaging/README.md](packaging/README.md); [development.md](docs/development.md)
 covers the VM test harness and [native-blocks.md](docs/native-blocks.md) the
 module. Format the volume with stock cryptsetup (the recommended
-configuration: AES-XTS + HMAC-SHA256, 512-byte sectors, `--ab` for a hidden
-filesystem), then, as root:
+configuration: AES-XTS + HMAC-SHA256, 512-byte sectors, no integrity journal,
+`--ab` for a hidden filesystem), then, as root:
 
 ```sh
 cryptsetup luksFormat --type luks2 --cipher aes-xts-random --key-size 512 \
   --integrity hmac-sha256 --sector-size 512 --key-file /root/luks.key /dev/sdX2
+# Persist stock no-journal mode once (omit for a journaled volume).
+cryptsetup open --integrity-no-journal --persistent --key-file /root/luks.key /dev/sdX2 piv-tmp
+cryptsetup close piv-tmp
 pivsetup keygen --output /root/hidden.key
 pivsetup open-blocks --device /dev/sdX2 --key-file /root/luks.key \
   --hidden-key-file /root/hidden.key --initialize --ab
@@ -237,8 +247,9 @@ hidden write re-encodes its whole G-sector record with a fresh generation.
   once a request has begun writing stops the shared owner (fail-stop);
   remove and recreate the stack after fixing the fault
   ([native-faults.md](docs/native-faults.md)).
-- The stock journal makes individual primary sector updates atomic, **not** a
-  G-sector hidden record. Without `--ab`, power loss can leave a hidden block
+- The stock journal (journaled volumes) makes individual primary sector
+  updates atomic, **not** a G-sector hidden record; without it a crash can
+  also tear the sectors being written (EIO until rewritten). Without `--ab`, power loss can leave a hidden block
   unreadable; with `--ab` the previous version stays readable. No cross-block
   ordering, rollback protection or hidden filesystem recovery is promised.
   Whole-record rollback is accepted.
@@ -266,7 +277,7 @@ reopen and does not enforce the per-key lifetime budget, to which all writes,
 retries, failed preparations and clones count. VM snapshot restores, image
 clones and cloned RNG state invalidate these estimates. A 4096-byte hidden
 write reencrypts G = 687 + 3p primary sectors (2.7 MiB at 4096-byte sectors,
-344 KiB at 512, without parity) plus journal overhead; decoy writes have no
+344 KiB at 512, without parity), plus journal overhead on journaled volumes; decoy writes have no
 hidden amplification.
 
 Each stored IV is expected to look uniformly random without the hidden key under
@@ -274,9 +285,11 @@ the assumptions in [format-v5.md](docs/format-v5.md); layout compatibility and
 statistical tests are not a deniability proof.
 [Matched ordinary-Linux controls](docs/detectability.md) show a decoy write
 changes exactly the IVs an ordinary write changes. Explicit limitations: a
-single raw image can contain journal history; a decoy-key holder can decrypt
-retained journal entries and may see a hidden write's G sectors reencrypted
-with unchanged plaintext
+single raw image of a journaled volume can contain journal history; a
+decoy-key holder can decrypt retained journal entries and may see a hidden
+write's G sectors reencrypted with unchanged plaintext (no-journal volumes
+avoid this but a crash image can show one torn G-sector run per in-flight
+hidden write)
 ([security review](docs/security-review.md#journal-history-and-the-decoy-key-holder));
 multiple snapshots, hidden-write amplification, memory, installed software, keys
 and host artifacts; no protection against root, a compromised kernel, memory or
@@ -319,14 +332,19 @@ Read this list before trusting real data to the prototype.
   data. There is no decoy-only dm-piv mode, so daily use needs the hidden key,
   and boot activation reveals that a hidden volume is configured (/etc/pivtab
   and the initramfs; [packaging/README.md](packaging/README.md)).
-- **Journal history.** Real volumes of 8 GiB or more get a 64 MiB integrity
-  journal that keeps recent writes (roughly the last 190 hidden-block writes at
-  512-byte sectors) and removed keyslots visible to a decoy-key holder with one
-  raw image. Write more than a journal's worth of decoy data after hidden use
-  ([configuration.md](docs/configuration.md#journal-size-and-history)).
+- **Integrity journal.** Use stock no-journal mode (`cryptsetup open
+  --integrity-no-journal --persistent` once after luksFormat). On journaled
+  volumes, real volumes of 8 GiB or more get a 64 MiB integrity journal that
+  keeps recent writes (roughly the last 190 hidden-block writes at 512-byte
+  sectors) and removed keyslots visible to a decoy-key holder with one raw
+  image ([configuration.md](docs/configuration.md#integrity-journal)).
 - **Crashes.** Without `--ab`, any hidden block written since the last flush
   may read EIO after a crash or power cut, which can break a hidden
-  filesystem; use `--ab` for filesystems. Failures show only as EIO and dmesg
+  filesystem; use `--ab` for filesystems. Without the journal, a crash also
+  tears (EIO) the sectors of unflushed writes, including the 687 decoy sectors
+  carrying an in-flight hidden record: their decoy plaintext is lost, and that
+  hidden block cannot be rewritten until those decoy sectors are rewritten
+  (restore the affected decoy files). Flush soon after hidden writes. Failures show only as EIO and dmesg
   messages; there is no status command or non-destructive hidden scrub
   (`--fill` is destructive). See [native-faults.md](docs/native-faults.md).
 - **Kernel upgrades.** Only Debian 6.12.113 and 7.2.9 are tested. A failed DKMS
@@ -340,7 +358,7 @@ Read this list before trusting real data to the prototype.
   offline `pivsetup migrate`, which needs a second device and is not
   resumable. Choose the size and options up front.
 - **Backups.** Back up plaintext copied from the hidden view (and the decoy).
-  Raw images carry journal history, and restoring a VM snapshot or image clone
+  Raw images of journaled volumes carry journal history, and restoring a VM snapshot or image clone
   reuses RNG state and nonce budget.
 - **Memory.** Passphrase tier 3 needs about 1 GiB of free RAM, also in the
   initramfs; pivsetup refuses early when less is available.

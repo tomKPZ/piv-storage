@@ -151,23 +151,28 @@ pub fn validate_segment(metadata: &Value) -> Result<u64> {
     }
 }
 
-/// LUKS2 persistent activation flags must be absent or empty. In particular a
-/// persisted "no-journal" (stock `--integrity-no-journal --persistent`) is
-/// refused: the journaled lower table is required (user decision 2026-10-22).
-pub fn check_activation_flags(metadata: &Value) -> Result<()> {
+/// LUKS2 persistent activation flags: none, or exactly "no-journal" (stock
+/// `cryptsetup open --integrity-no-journal --persistent`, the recommended
+/// deniability mode; user decision 2026-10-23). Any other flag is refused.
+/// Returns whether the volume persists "no-journal".
+pub fn no_journal(metadata: &Value) -> Result<bool> {
     match metadata.get("config").and_then(|c| c.get("flags")) {
-        None => Ok(()),
-        Some(Value::Array(flags)) if flags.is_empty() => Ok(()),
-        Some(Value::Array(flags)) if flags.iter().any(|f| f.as_str() == Some("no-journal")) =>
-            bail!("Unsupported LUKS2 activation flags: stock --integrity-no-journal volumes are not supported"),
+        None => Ok(false),
+        Some(Value::Array(flags)) if flags.is_empty() => Ok(false),
+        Some(Value::Array(flags)) if flags.len() == 1 && flags[0].as_str() == Some("no-journal") => Ok(true),
         Some(_) => bail!("Unsupported LUKS2 activation flags"),
     }
 }
 
-/// The stock journaled ("J") lower dm-integrity table produced by pinned cryptsetup.
+/// The stock lower dm-integrity table produced by pinned cryptsetup: journaled
+/// ("J") by default, or direct ("D") when the volume persists "no-journal".
+/// Direct mode has exactly the journaled options minus the journal watermark
+/// and commit time. Linux 6.12 still reports the unused journal size there;
+/// 7.2 omits it (observed on the port kernel), so direct mode accepts either.
 #[allow(clippy::too_many_arguments)]
 pub fn validate_integrity_table(table: &str, sectors: u64, raw_major: u32, raw_minor: u32, offset: u64,
-                                sector_size: u64, journal_sectors: u64, tuple_size: u64) -> Result<()> {
+                                sector_size: u64, journal_sectors: u64, tuple_size: u64,
+                                no_journal: bool) -> Result<()> {
     if !matches!(tuple_size, 32 | 48) {
         bail!("Unsupported lower tuple size");
     }
@@ -176,12 +181,15 @@ pub fn validate_integrity_table(table: &str, sectors: u64, raw_major: u32, raw_m
     let device = format!("{raw_major}:{raw_minor}");
     let (start_sector, tuple) = ((offset / 512).to_string(), tuple_size.to_string());
     if words.len() < 8 || words[..3] != ["0", length.as_str(), "integrity"]
-        || words[3..7] != [device.as_str(), start_sector.as_str(), tuple.as_str(), "J"]
+        || words[3..7] != [device.as_str(), start_sector.as_str(), tuple.as_str(), if no_journal { "D" } else { "J" }]
         || words[7].parse::<usize>().ok() != Some(words.len() - 8) {
         bail!("Unsupported lower integrity mapping");
     }
     let options = &words[8..];
-    let mut required = vec!["interleave_sectors:32768", "fix_padding", "journal_watermark:50", "commit_time:10000"];
+    let mut required = vec!["interleave_sectors:32768", "fix_padding"];
+    if !no_journal {
+        required.extend(["journal_watermark:50", "commit_time:10000"]);
+    }
     match sector_size {
         4096 => required.push("block_size:4096"),
         512 => {}
@@ -190,7 +198,9 @@ pub fn validate_integrity_table(table: &str, sectors: u64, raw_major: u32, raw_m
     let mut unique: Vec<&str> = options.to_vec();
     unique.sort_unstable();
     unique.dedup();
-    if options.len() != required.len() + 2 || unique.len() != options.len()
+    let has_journal_size = options.iter().any(|o| o.starts_with("journal_sectors:"));
+    let extra = if has_journal_size || !no_journal { 2 } else { 1 };
+    if options.len() != required.len() + extra || unique.len() != options.len()
         || !required.iter().all(|r| options.contains(r)) {
         bail!("Unsupported lower integrity options");
     }
@@ -202,7 +212,7 @@ pub fn validate_integrity_table(table: &str, sectors: u64, raw_major: u32, raw_m
         bail!("Unsupported lower integrity buffer");
     }
     let journal = value("journal_sectors:");
-    if journal != Some(journal_sectors) {
+    if (has_journal_size || !no_journal) && journal != Some(journal_sectors) {
         bail!("Unsupported lower integrity journal size");
     }
     Ok(())
@@ -285,21 +295,41 @@ mod tests {
     fn integrity_table_validation() {
         let table = "0 231456 integrity 254:16 32768 32 J 7 journal_sectors:1848 interleave_sectors:32768 \
                      buffer_sectors:128 journal_watermark:50 commit_time:10000 fix_padding block_size:4096";
-        validate_integrity_table(table, 28_932, 254, 16, 16_777_216, 4096, 1848, 32).unwrap();
-        assert!(validate_integrity_table(table, 28_932, 254, 16, 16_777_216, 4096, 1849, 32).is_err());
-        assert!(validate_integrity_table(table, 28_932, 254, 16, 16_777_216, 4096, 1848, 28).is_err());
-        assert!(validate_integrity_table(&table.replace(" J ", " D "), 28_932, 254, 16, 16_777_216, 4096, 1848, 32).is_err());
-        // Direct mode (stock persistent no-journal) is no longer supported.
+        validate_integrity_table(table, 28_932, 254, 16, 16_777_216, 4096, 1848, 32, false).unwrap();
+        assert!(validate_integrity_table(table, 28_932, 254, 16, 16_777_216, 4096, 1849, 32, false).is_err());
+        assert!(validate_integrity_table(table, 28_932, 254, 16, 16_777_216, 4096, 1848, 28, false).is_err());
+        assert!(validate_integrity_table(&table.replace(" J ", " D "), 28_932, 254, 16, 16_777_216, 4096, 1848, 32, false).is_err());
+        assert!(validate_integrity_table(table, 28_932, 254, 16, 16_777_216, 4096, 1848, 32, true).is_err());
+        // Direct mode (stock persistent no-journal): exactly the observed stock options.
         let direct = "0 231456 integrity 254:16 32768 32 D 5 block_size:4096 journal_sectors:1848 \
                       interleave_sectors:32768 buffer_sectors:128 fix_padding";
-        assert!(validate_integrity_table(direct, 28_932, 254, 16, 16_777_216, 4096, 1848, 32).is_err());
+        validate_integrity_table(direct, 28_932, 254, 16, 16_777_216, 4096, 1848, 32, true).unwrap();
+        assert!(validate_integrity_table(direct, 28_932, 254, 16, 16_777_216, 4096, 1848, 32, false).is_err());
+        assert!(validate_integrity_table(&direct.replace(" D ", " J "), 28_932, 254, 16, 16_777_216, 4096, 1848, 32, true).is_err());
+        assert!(validate_integrity_table(&direct.replace(" D 5 ", " D 6 ").replace("fix_padding", "fix_padding journal_watermark:50"),
+                                         28_932, 254, 16, 16_777_216, 4096, 1848, 32, true).is_err());
+        assert!(validate_integrity_table(&direct.replace(" D 5 ", " D 6 ").replace("fix_padding", "fix_padding allow_discards"),
+                                         28_932, 254, 16, 16_777_216, 4096, 1848, 32, true).is_err());
+        let direct512 = "0 231456 integrity 254:16 32768 48 D 4 journal_sectors:1848 interleave_sectors:32768 \
+                         buffer_sectors:128 fix_padding";
+        validate_integrity_table(direct512, 231_456, 254, 16, 16_777_216, 512, 1848, 48, true).unwrap();
+        // Linux 7.2 omits journal_sectors in direct mode (port-kernel probe).
+        let direct72 = "0 205816 integrity 254:16 32768 48 D 3 interleave_sectors:32768 buffer_sectors:128 fix_padding";
+        validate_integrity_table(direct72, 205_816, 254, 16, 16_777_216, 512, 2056, 48, true).unwrap();
+        assert!(validate_integrity_table(direct72, 205_816, 254, 16, 16_777_216, 512, 2056, 48, false).is_err());
+        assert!(validate_integrity_table(&direct72.replace(" D 3 ", " D 2 ").replace(" buffer_sectors:128", ""),
+                                         205_816, 254, 16, 16_777_216, 512, 2056, 48, true).is_err());
+        assert!(validate_integrity_table(&direct72.replace(" D 3 ", " D 4 ").replace("fix_padding", "fix_padding journal_sectors:9"),
+                                         205_816, 254, 16, 16_777_216, 512, 2056, 48, true).is_err());
         let flags = |text: &str| parse(&format!(r#"{{"config":{{"flags":{text}}}}}"#)).unwrap();
-        check_activation_flags(&flags("[]")).unwrap();
-        check_activation_flags(&parse(r#"{"config":{}}"#).unwrap()).unwrap();
-        assert!(check_activation_flags(&flags(r#"["no-journal"]"#)).is_err());
-        assert!(check_activation_flags(&flags(r#"["allow-discards"]"#)).is_err());
-        assert!(check_activation_flags(&flags(r#"["no-journal","allow-discards"]"#)).is_err());
-        assert!(validate_integrity_table(&table.replace("fix_padding", "fix_hmac"), 28_932, 254, 16, 16_777_216, 4096, 1848, 32).is_err());
+        assert!(!no_journal(&flags("[]")).unwrap());
+        assert!(!no_journal(&parse(r#"{"config":{}}"#).unwrap()).unwrap());
+        assert!(no_journal(&flags(r#"["no-journal"]"#)).unwrap());
+        assert!(no_journal(&flags(r#"["allow-discards"]"#)).is_err());
+        assert!(no_journal(&flags(r#"["no-journal","allow-discards"]"#)).is_err());
+        assert!(no_journal(&flags(r#"["no-journal","no-journal"]"#)).is_err());
+        assert!(no_journal(&flags(r#""no-journal""#)).is_err());
+        assert!(validate_integrity_table(&table.replace("fix_padding", "fix_hmac"), 28_932, 254, 16, 16_777_216, 4096, 1848, 32, false).is_err());
     }
 
     #[test]
@@ -313,10 +343,10 @@ mod tests {
         // Stock table shape for 48-byte (HMAC-SHA256) tuples, buffer 32.
         let table = "0 96640 integrity 7:0 32768 48 J 7 block_size:4096 journal_sectors:792 \
                      interleave_sectors:32768 buffer_sectors:32 journal_watermark:50 commit_time:10000 fix_padding";
-        validate_integrity_table(table, 12_080, 7, 0, 16_777_216, 4096, 792, 48).unwrap();
+        validate_integrity_table(table, 12_080, 7, 0, 16_777_216, 4096, 792, 48, false).unwrap();
         assert!(validate_integrity_table(&table.replace("buffer_sectors:32", "buffer_sectors:33"),
-                                         12_080, 7, 0, 16_777_216, 4096, 792, 48).is_err());
-        assert!(validate_integrity_table(&table.replace(" 48 J ", " 36 J "), 12_080, 7, 0, 16_777_216, 4096, 792, 36).is_err());
+                                         12_080, 7, 0, 16_777_216, 4096, 792, 48, false).is_err());
+        assert!(validate_integrity_table(&table.replace(" 48 J ", " 36 J "), 12_080, 7, 0, 16_777_216, 4096, 792, 36, false).is_err());
     }
 
     #[test]

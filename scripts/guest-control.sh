@@ -57,7 +57,14 @@ if [ "$primary_integrity" != aead ]; then
     cryptsetup luksDump --batch-mode --dump-volume-key --volume-key-file volume.key \
         --key-file passphrase.key "$device" > /dev/null
 fi
-cryptsetup open --key-file passphrase.key "$device" piv-control
+# PIV_NO_JOURNAL=1: persist stock --integrity-no-journal in the LUKS2 header
+# (config flag "no-journal", the recommended deniability mode); every later
+# open then uses a direct-mode lower table.
+case "${PIV_NO_JOURNAL:-0}" in
+    1) cryptsetup open --integrity-no-journal --persistent --key-file passphrase.key "$device" piv-control ;;
+    0) cryptsetup open --key-file passphrase.key "$device" piv-control ;;
+    *) exit 1 ;;
+esac
 size=$(blockdev --getsize64 /dev/mapper/piv-control)
 python3 - "$size" "$PIV_SECTOR_SIZE" <<'PY'
 import hashlib

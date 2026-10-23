@@ -583,11 +583,12 @@ static int piv_batch_write(struct piv_batch *b, const u8 *ivs, bool flush, bool 
  * native postsuspend initializes the journal only after wrote_to_journal. Copy
  * one authenticated CURRENT tuple through the same target before END. This is
  * not encryption, consumes no nonce, and needs no external recovery plan because
- * every byte is identical. Native journaling still protects its sector atomicity.
+ * every byte is identical, so it cannot tear a sector even on a direct-mode
+ * (stock persistent no-journal) lower device, where it is merely redundant.
  * The first sector of the keyslot area that reads and authenticates is used, so
  * one damaged or unreadable sector (e.g. sector 0, a keyslot replica) cannot
  * block setup, END or DETACH. The write is followed by a flush (which also
- * commits the journal), so it needs no FUA of its own.
+ * commits a journal), so it needs no FUA of its own.
  */
 #define PIV_CHECKPOINT_SECTORS 112
 static int piv_checkpoint(struct piv_control *p)

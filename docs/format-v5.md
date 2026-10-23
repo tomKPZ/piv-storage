@@ -45,7 +45,7 @@ public magic, and changes four things:
 Format v5 stores everything in the 16-byte random IVs that stock LUKS2 +
 dm-integrity already keep per primary encryption sector. It works with both
 supported stock profiles (stored random 16-byte IVs, 512- or 4096-byte
-sectors, journaled dm-integrity):
+sectors, journaled or stock persistent no-journal dm-integrity):
 
 | LUKS2 encryption | Integrity | Volume key | Tag | Tuple (tag ‖ IV) |
 | --- | --- | --- | ---: | ---: |
@@ -504,9 +504,10 @@ Hot hidden blocks raise the rewrite count of their carrier sectors.
   unchanged primary plaintext (a 4 KiB write touched 720 sectors in v4 anyway).
   A decoy-key holder who sees journal history or two snapshots can detect it;
   decoy writes have the stock footprint ([detectability.md](detectability.md)).
-  Stock `--integrity-no-journal` would avoid on-disk journal history but is
-  refused, because a crash could then tear decoy sectors
-  ([journal-atomicity.md](journal-atomicity.md)).
+  Stock persistent `--integrity-no-journal` (the recommended mode) avoids
+  on-disk journal history; a crash can then tear the decoy sectors of an
+  in-flight record, leaving one record-shaped failing run
+  ([journal-atomicity.md](journal-atomicity.md#no-journal-mode)).
 - **RS** adds availability only. It does not change what authenticates, so it
   adds no forgery or confidentiality surface beyond more decoding attempts on
   damaged records.

@@ -117,13 +117,17 @@ explains the choices), then initialize the hidden volume once:
 ```sh
 sudo cryptsetup luksFormat --type luks2 --cipher aes-xts-random --key-size 512 \
   --integrity hmac-sha256 --sector-size 512 /dev/disk/by-partuuid/XXXX
+# Persist stock no-journal mode once (omit for a journaled volume).
+sudo cryptsetup open --integrity-no-journal --persistent /dev/disk/by-partuuid/XXXX piv-tmp
+sudo cryptsetup close piv-tmp
 pivsetup keygen --output /root/hidden.key
 sudo pivsetup open-blocks --device /dev/disk/by-partuuid/XXXX --key-file /root/luks.key \
   --hidden-key-file /root/hidden.key --initialize --ab
 ```
 
 This is the recommended configuration: AES-XTS + HMAC-SHA256, 512-byte
-sectors (use 4096 on drives with 4096-byte logical sectors) and `--ab` for a
+sectors (use 4096 on drives with 4096-byte logical sectors), no integrity
+journal (deniability; [configuration.md](../docs/configuration.md#integrity-journal)) and `--ab` for a
 filesystem on the hidden view (a raw key store can omit it for twice the
 capacity). AEGIS-128 (`--cipher aegis128-random --key-size 128 --integrity
 aead`) remains supported.

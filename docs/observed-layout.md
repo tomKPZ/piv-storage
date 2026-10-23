@@ -86,9 +86,14 @@ The lower dm-integrity table has `interleave_sectors:32768`, `fix_padding`,
 journal size above (for example 1,848 and 2,024 for AEGIS),
 `journal_watermark:50` and `commit_time:10000` (journaled mode `J`) and a
 `buffer_sectors` value dm-integrity chooses itself (a power of two up to 128);
-pivsetup accepts exactly these options. A stock `--integrity-no-journal`
-volume (direct mode `D`) is refused
-([journal-atomicity.md](journal-atomicity.md)).
+pivsetup accepts exactly these options. A stock persistent
+`--integrity-no-journal` volume (LUKS2 flag `no-journal`) has a direct-mode
+`D` table with the same options minus `journal_watermark` and `commit_time`
+(for example `D 5 block_size:4096 journal_sectors:1848
+interleave_sectors:32768 buffer_sectors:128 fix_padding` on 6.12; the
+Debian 7.2.9 port kernel omits the unused `journal_sectors`, e.g. `D 3
+interleave_sectors:32768 buffer_sectors:128 fix_padding`); pivsetup accepts
+exactly those shapes for it ([journal-atomicity.md](journal-atomicity.md#no-journal-mode)).
 
 ## Conservative journal handling
 

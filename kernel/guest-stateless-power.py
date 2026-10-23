@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Observe a partially persisted carrier and kill QEMU during delayed I/O."""
+"""Observe a partially persisted carrier and kill QEMU during delayed I/O.
+
+PIV_POWER_AB=1 initializes with --ab (block 0's two slots are groups 2 and 3).
+Journaled fixtures cut once part of the record's IVs is current or committed
+in the journal. Stock persistent no-journal fixtures (PIV_NO_JOURNAL=1, direct
+mode) have no journal to observe: the cut lands as soon as any data or tag
+byte of the carrier changed on disk while the writer's fsync is outstanding,
+an in-flight state whose tears the recovery script measures.
+"""
 import json
 import mmap
 import os
@@ -12,7 +20,9 @@ from pivstore.kernel_api import dm
 from pivstore.kernel_owner import GuestOwner
 
 w = Path('/mnt/piv-work')
-initial = open_blocks('/dev/vdb', w / 'passphrase.key', (w / 'hidden.key').read_bytes(), initialize=True)
+AB = os.environ.get('PIV_POWER_AB') == '1'
+NO_JOURNAL = os.environ.get('PIV_NO_JOURNAL') == '1'
+initial = open_blocks('/dev/vdb', w / 'passphrase.key', (w / 'hidden.key').read_bytes(), initialize=True, ab=AB)
 (w / 'expected-hidden-volume').write_bytes(Path(initial['hidden']).read_bytes())
 close_blocks('/dev/vdb', w / 'passphrase.key')
 dm('create', 'piv-test-delay', input='0 262144 delay /dev/vdb 0 0 /dev/vdb 0 1000\n')
@@ -22,19 +32,31 @@ owner = GuestOwner('/dev/mapper/piv-test-delay', w / 'passphrase.key')
 layout = owner.layout
 owner.close()
 # Hidden block 0's record: after 112 keyslot sectors and two 687-sector
-# directory groups (format v5, no parity).
+# directory groups (format v5, no parity); with A/B its slots 0 and 1 are the
+# next two groups. The span covers every sector the write may touch.
 first, group = 112 + 2 * 687, 687
+span = group * (2 if AB else 1)
+unit = layout.sector_size
 start = layout.offsets(first)[1]
 base = start // 512 * 512
 skip = start - base
-assert layout.offsets(first + group - 1)[1] == start + (group - 1) * layout.tuple_bytes
+assert layout.offsets(first + span - 1)[1] == start + (span - 1) * layout.tuple_bytes
+data_start = layout.offsets(first)[0]
+assert layout.offsets(first + span - 1)[0] == data_start + (span - 1) * unit
 raw = os.open('/dev/vdb', os.O_RDONLY | os.O_DIRECT)
 tuple_size = layout.tuple_bytes
-carrier_bytes = ((skip + group * tuple_size + 511) // 512) * 512
+carrier_bytes = ((skip + span * tuple_size + 511) // 512) * 512
 buffer = mmap.mmap(-1, carrier_bytes)
+data_buffer = mmap.mmap(-1, span * unit)
 def carrier():
     assert os.preadv(raw, [buffer], base) == carrier_bytes
-    return [buffer[skip + i * tuple_size + layout.tag_bytes:skip + (i + 1) * tuple_size] for i in range(group)]
+    return [buffer[skip + i * tuple_size + layout.tag_bytes:skip + (i + 1) * tuple_size] for i in range(span)]
+def tuples():
+    assert os.preadv(raw, [buffer], base) == carrier_bytes
+    return [buffer[skip + i * tuple_size:skip + (i + 1) * tuple_size] for i in range(span)]
+def ciphertexts():
+    assert os.preadv(raw, [data_buffer], data_start) == span * unit
+    return [data_buffer[i * unit:(i + 1) * unit] for i in range(span)]
 before = carrier()
 journal_base = layout.integrity_offset + 8 * 512
 journal_bytes = layout.journal_sections * layout.journal_section_sectors * 512
@@ -58,12 +80,59 @@ def committed_new_ivs():
                 sector = int.from_bytes(journal[at:at + 8], 'little')
                 if sector % factor: continue
                 index = sector // factor - first
-                if not 0 <= index < group: continue
+                if not 0 <= index < span: continue
                 if journal[at + iv_at:at + iv_at + layout.iv_bytes] != before[index]: changed.add(index)
     return changed
 old = bytearray((w / 'expected-hidden-volume').read_bytes())
+# Decoy plaintext of the span: without the journal, torn sectors lose theirs
+# and the recovery restores it by full-sector decoy writes.
+decoy = os.open(views['decoy'], os.O_RDONLY | os.O_DIRECT)
+saved = mmap.mmap(-1, span * unit)
+assert os.preadv(decoy, [saved], first * unit) == span * unit
+os.close(decoy)
+(w / 'power-carrier-plaintext').write_bytes(saved[:])
+(w / 'power-carrier.json').write_text(json.dumps(dict(first=first, group=group, span=span, unit=unit, ab=AB,
+    no_journal=NO_JOURNAL, sectors=layout.sectors)) + '\n')
 (w / 'power-primary.sha256').write_text(subprocess.check_output(['sha256sum', views['decoy']], text=True).split()[0] + '\n')
 contents = [b'partial-record power cut'.ljust(4096, b'!'), b'partial-record power cut, retry'.ljust(4096, b'?')]
+
+
+def writer(new, errors):
+    try:
+        value = mmap.mmap(-1, 4096); value[:] = new
+        fd = os.open(views['hidden'], os.O_RDWR | os.O_DIRECT)
+        assert os.pwritev(fd, [value], 0) == 4096
+        os.fsync(fd); os.close(fd); value.close()
+    except BaseException as exc: errors.append(repr(exc))
+
+
+if NO_JOURNAL:
+    # Direct mode: dm-integrity writes data in place and tags through its
+    # metadata buffers, with no journal; nothing orders the two on disk.
+    new = contents[0]
+    (w / 'power-new-block').write_bytes(new)
+    (w / 'power-old-hidden').write_bytes(old)
+    before_tuples, before_data = tuples(), ciphertexts()
+    os.sync()
+    errors = []
+    thread = threading.Thread(target=writer, args=(new, errors)); thread.start()
+    deadline = time.monotonic() + 300
+    while time.monotonic() < deadline and thread.is_alive():
+        now_tuples, now_data = tuples(), ciphertexts()
+        tags = {i for i in range(span) if now_tuples[i] != before_tuples[i]}
+        data = {i for i in range(span) if now_data[i] != before_data[i]}
+        if tags or data:
+            slots = sorted({(first + i - 112) // group - 2 for i in tags | data})
+            (w / 'cut-boundary.json').write_text(json.dumps(dict(
+                mechanism='in-flight direct-mode carrier observed with delayed lower writes',
+                no_journal=True, ab=AB, span_sectors=span, changed_tuples=len(tags), changed_data=len(data),
+                changed_both=len(tags & data), changed_data_only=len(data - tags), changed_tuples_only=len(tags - data),
+                changed_groups=slots, hardware_power_loss_tested=False)) + '\n')
+            print('PIV_POWER_CUT', flush=True)
+            while True: time.sleep(1)
+        time.sleep(.01)
+    raise AssertionError(f'No in-flight carrier change observed before the writer finished: {errors}')
+
 # A record write is a few multi-sector bios; the writer's fsync then flushes.
 # dm-integrity commits its journal on that flush, or earlier once free entries
 # fall to the 50%
@@ -114,20 +183,14 @@ for attempt in range(6 if prefill else 1):
     before = carrier()
     os.sync()
     errors = []
-    def writer():
-        try:
-            value = mmap.mmap(-1, 4096); value[:] = new
-            fd = os.open(views['hidden'], os.O_RDWR | os.O_DIRECT)
-            assert os.pwritev(fd, [value], 0) == 4096
-            os.fsync(fd); os.close(fd); value.close()
-        except BaseException as exc: errors.append(repr(exc))
-    thread = threading.Thread(target=writer); thread.start()
+    thread = threading.Thread(target=writer, args=(new, errors)); thread.start()
     deadline = time.monotonic() + 300
     while time.monotonic() < deadline:
         current = carrier()
         changed = len({i for i, (a, b) in enumerate(zip(before, current)) if a != b} | committed_new_ivs())
         if 0 < changed < group:
             (w / 'cut-boundary.json').write_text(json.dumps(dict(changed_committed_or_current_ivs=changed, total_carrier_ivs=group,
+                no_journal=False, ab=AB,
                 mechanism='partial current/committed journal carrier observed with delayed lower writes',
                 journal_prefill_requests=prefill, journal_entries=entries, attempt=attempt + 1,
                 earlier_attempts=attempts, hardware_power_loss_tested=False)) + '\n')

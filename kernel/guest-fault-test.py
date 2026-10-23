@@ -38,6 +38,10 @@ def blocks_touched(device, first, last):
     low, high = (first - 112) // GROUP - 2, (last - 112) // GROUP - 2
     return range(max(0, low), high + 1) if last >= 112 + 2 * GROUP else range(0)
 
+# Fixture persists stock --integrity-no-journal (guest_code sets this).
+NO_JOURNAL = os.environ.get('PIV_NO_JOURNAL') == '1'
+
+
 def unreadable(path, unit, sectors, chunk=65536):
     """Primary sectors whose decoy reads fail (O_DIRECT, per-sector on error)."""
     bad, fd = [], os.open(path, os.O_RDONLY | os.O_DIRECT)
@@ -239,6 +243,11 @@ for role in ('decoy', 'hidden'):
         affected = (range(10, 11) if role == 'hidden' else
                     blocks_touched(handle.device, offset // unit, (offset + size - 1) // unit))
         old = direct(v[role], offset=offset, size=size)
+        # Primary sectors this request may rewrite: the decoy range, or the
+        # hidden record's whole carrier (hidden-only tuples).
+        span = (range(offset // unit, (offset + size - 1) // unit + 1) if role == 'decoy'
+                else range(record_span(handle.device, 10)[0], record_span(handle.device, 10)[1] + 1))
+        saved = {sector: direct(v['decoy'], offset=sector * unit, size=unit) for sector in span}
         sectors = handle.device.sectors
         before_count = blocks.native_status(handle.device)['encryptions']
         print(f'Injecting lower {mode} through {role}, {size} bytes at offset {offset}', flush=True)
@@ -263,8 +272,19 @@ for role in ('decoy', 'hidden'):
             handle = owner()
             assert handle.device.generation != generation and not blocks.native_status(handle.device)['failed']
             handle.close()
-            # The journal keeps every primary sector whole across the failed write.
-            assert not unreadable(v['decoy'], unit, sectors)
+            torn = unreadable(v['decoy'], unit, sectors)
+            if NO_JOURNAL:
+                # Without the journal a failed lower write may leave sectors
+                # torn (EIO). They must lie within the request's primary
+                # sectors, and full-sector decoy writes of the saved plaintext
+                # replace them (the failing-sector replacement path).
+                assert set(torn) <= set(span), (torn, span)
+                for sector in torn:
+                    direct(v['decoy'], write=saved[sector], offset=sector * unit, size=unit)
+                assert not unreadable(v['decoy'], unit, sectors)
+            else:
+                # The journal keeps every primary sector whole across the failed write.
+                assert not torn, torn
             repaired = verify(v, unavailable=affected)
         else:
             # Nothing was mutated: only the request fails. A write needing the
@@ -287,7 +307,8 @@ for role in ('decoy', 'hidden'):
         results.append(dict(view=role, fault=mode, bytes=size, offset=offset,
                             failed_both_views=mode == 'writes', recreated=mode == 'writes',
                             same_owner_continued=mode == 'reads', repaired=repaired,
-                            prepared_encryptions=spent))
+                            torn_primary_sectors=torn if mode == 'writes' else [],
+                            no_journal=NO_JOURNAL, prepared_encryptions=spent))
         print(f'{role} lower {mode}: ' + ('fail-stop, teardown, replay and recreation passed' if mode == 'writes'
               else 'local EIO, no encryption, same-owner continuation passed'), flush=True)
 
@@ -521,24 +542,56 @@ def gated_setup_fault(label, **options):
     return report
 
 
+def setup_tears(v, scope):
+    """No-journal: sectors a failed setup write left torn (EIO) must lie in
+    @scope; restore them from the pre-fault decoy plaintext by full-sector
+    decoy writes. Journaled: none may be torn."""
+    unit = len(SAVED_DECOY) // SECTORS
+    torn = unreadable(v['decoy'], unit, SECTORS)
+    if NO_JOURNAL:
+        assert set(torn) <= set(scope), (torn[:16], scope)
+        for sector in torn:
+            direct(v['decoy'], write=SAVED_DECOY[sector * unit:(sector + 1) * unit], offset=sector * unit, size=unit)
+        assert not unreadable(v['decoy'], unit, SECTORS)
+    else:
+        assert not torn, torn[:16]
+    return torn
+
+
+# Decoy plaintext before the setup write faults (setup never changes it).
+v = open_views()
+SAVED_DECOY = Path(v['decoy']).read_bytes()
+handle = owner()
+SECTORS = handle.device.sectors
+handle.close()
+close_views(); absent()
 # A lower write failure during --initialize (the first write revokes keyslot
 # area 1) stops the owner; the volume keeps its previous keyslot, directory
-# and records, so it reopens unchanged after recreation.
+# and records, so it reopens unchanged after recreation. Without the journal,
+# tags buffered by dm-integrity can reach the disk after their data writes
+# failed: only the revocation's sectors (keyslot areas 1-3, directory group 1)
+# may tear.
 report = gated_setup_fault('initialize', initialize=True)
-v = open_views(); assert verify(v) is False; close_views(); absent()
+v = open_views()
+torn = setup_tears(v, range(28, 112 + 2 * GROUP))
+assert verify(v) is False; close_views(); absent()
 results.append(dict(setup_write_fault='initialize', owner_failed=True, encryptions=report['status']['encryptions'],
-                    previous_volume_intact=True))
+                    previous_volume_intact=True, torn_primary_sectors=len(torn)))
 # A lower write failure during --fill (after a quick initialization) stops the
 # owner; a later fill completes and the hidden contents are restored.
 v = open_views(initialize=True, quick=True); close_views(); absent()
 report = gated_setup_fault('fill', fill=True)
+# Fill writes only hidden-block records.
+v = open_views()
+fill_torn = setup_tears(v, range(112 + 2 * GROUP, SECTORS))
+close_views(); absent()
 v = open_views(fill=True)
 assert v['fill']['failed'] == 0 and v['fill']['valid'] + v['fill']['written'] == len(EXPECTED) // BLOCK, v['fill']
 direct(v['hidden'], write=EXPECTED)
 assert verify(v) is False
 close_views(); absent()
 results.append(dict(setup_write_fault='fill', owner_failed=True, encryptions=report['status']['encryptions'],
-                    refill_and_restore=True))
+                    refill_and_restore=True, torn_primary_sectors=len(fill_torn)))
 print('Setup write faults (initialize, fill): owner fail-stop, cleanup and recreation passed', flush=True)
 
 # Leave a closed image and complete oracles for independent authentication.

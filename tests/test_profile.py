@@ -158,19 +158,37 @@ class IntegrityTableTests(unittest.TestCase):
                     validate_integrity_table(changed, count, os.makedev(254, 16), 16777216, size, journal, tuple_size)
 
 
-class NoJournalRefusedTests(unittest.TestCase):
-    def test_direct_mode_table_and_flags_refused(self):
-        from pivstore.kernel_api import check_activation_flags
-        # Stock persistent no-journal (direct mode) is unsupported (2026-10-22).
+class NoJournalTests(unittest.TestCase):
+    def test_direct_mode_table_and_flags(self):
+        from pivstore.kernel_api import no_journal
+        from pivstore.profile import UnsupportedImage, persistent_no_journal
+        # Stock persistent no-journal (direct mode), recommended since 2026-10-23.
         direct = ('0 225728 integrity 254:16 32768 32 D 5 block_size:4096 journal_sectors:1848 '
                   'interleave_sectors:32768 buffer_sectors:128 fix_padding')
-        with self.assertRaises(ValueError):
-            validate_integrity_table(direct, 28216, os.makedev(254, 16), 16777216, 4096, 1848, 32)
-        check_activation_flags({'config': {}})
-        check_activation_flags({'config': {'flags': []}})
-        for flags in (['no-journal'], ['allow-discards'], ['no-journal', 'allow-discards']):
-            with self.subTest(flags=flags), self.assertRaises(ValueError):
-                check_activation_flags({'config': {'flags': flags}})
+        validate_integrity_table(direct, 28216, os.makedev(254, 16), 16777216, 4096, 1848, 32, no_journal=True)
+        direct512 = ('0 213008 integrity 254:16 32768 48 D 4 journal_sectors:2024 '
+                     'interleave_sectors:32768 buffer_sectors:128 fix_padding')
+        validate_integrity_table(direct512, 213008, os.makedev(254, 16), 16777216, 512, 2024, 48, no_journal=True)
+        # Linux 7.2 omits journal_sectors in direct mode (port-kernel probe).
+        direct72 = '0 205816 integrity 254:16 32768 48 D 3 interleave_sectors:32768 buffer_sectors:128 fix_padding'
+        validate_integrity_table(direct72, 205816, os.makedev(254, 16), 16777216, 512, 2056, 48, no_journal=True)
+        for bad, flag in ((direct72, False), (direct72.replace(' D 3 ', ' D 2 ').replace(' buffer_sectors:128', ''), True)):
+            with self.subTest(table=bad, flag=flag), self.assertRaises(ValueError):
+                validate_integrity_table(bad, 205816, os.makedev(254, 16), 16777216, 512, 2056, 48, no_journal=flag)
+        journaled = ('0 225728 integrity 254:16 32768 32 J 7 block_size:4096 journal_sectors:1848 '
+                     'interleave_sectors:32768 buffer_sectors:128 journal_watermark:50 commit_time:10000 fix_padding')
+        for table, flag in ((direct, False), (journaled, True),
+                            (direct.replace(' D 5 ', ' D 6 ') + ' journal_watermark:50', True),
+                            (direct.replace(' D 5 ', ' D 6 ') + ' allow_discards', True),
+                            (direct.replace('fix_padding', 'fix_hmac'), True)):
+            with self.subTest(table=table, flag=flag), self.assertRaises(ValueError):
+                validate_integrity_table(table, 28216, os.makedev(254, 16), 16777216, 4096, 1848, 32, no_journal=flag)
+        self.assertFalse(no_journal({'config': {}}))
+        self.assertFalse(no_journal({'config': {'flags': []}}))
+        self.assertTrue(no_journal({'config': {'flags': ['no-journal']}}))
+        for flags in (['allow-discards'], ['no-journal', 'allow-discards'], ['no-journal', 'no-journal'], 'no-journal'):
+            with self.subTest(flags=flags), self.assertRaises(UnsupportedImage):
+                persistent_no_journal({'config': {'flags': flags}})
 
 
 if __name__ == '__main__':

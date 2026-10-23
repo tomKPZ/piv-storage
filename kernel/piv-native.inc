@@ -802,7 +802,8 @@ static int pn_write_blocks(struct piv_control *p, bool hidden, u64 offset, const
    /* A/B keeps the newest version readable across a crash only if it is
     * durable before the other slot is overwritten. Without a completion
     * flush, an earlier write of this block (finished: the range lock
-    * serializes them) may still sit in the uncommitted journal, so flush
+    * serializes them) may still sit in the uncommitted journal (or, on a
+    * direct-mode lower device, in volatile metadata buffers), so flush
     * first, unless a successful flush started after it completed
     * (pn_ab_flush). A flush failure stops the owner like any flush error.
     */
@@ -812,7 +813,7 @@ static int pn_write_blocks(struct piv_control *p, bool hidden, u64 offset, const
    }
   }
   if (!r) r = pn_write_group(p, pn_group(n, index, slot), generation, data, false, mutated);
-  /* Counted even if the write failed: it may have reached the journal. */
+  /* Counted even if the write failed: it may have reached the lower device. */
   if (n->ab && *mutated) pn_ab_wrote(p, index);
   piv_range_unlock(p, &range);
   return r;
@@ -1453,7 +1454,7 @@ static int pn_request(struct piv_control *p, struct pn_work *w, bool *mutated, b
 	buffer = kvmalloc(bytes, GFP_NOIO);
 	if (!buffer) return -ENOMEM;
 	pn_copy_from_bio(bio, buffer);
-	/* Drain earlier journal writes before a WRITE|PREFLUSH payload. */
+	/* Drain earlier lower writes before a WRITE|PREFLUSH payload. */
 	*flushing = bio->bi_opf & REQ_PREFLUSH;
 	r = *flushing ? piv_flush(p) : 0;
 	if (!r) {
