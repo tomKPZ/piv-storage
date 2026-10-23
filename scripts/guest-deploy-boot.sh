@@ -5,9 +5,12 @@
 source /mnt/piv-work/guest-common.sh
 fail() { echo "DEPLOY FAIL: $*" >&2; exit 1; }
 test -e deploy-phase1.txt
-cp /run/pivsetup/initramfs.log initramfs-activation.log || fail "no initramfs activation log"
-grep -qx 'piv-native: opened' /run/pivsetup/initramfs.log || { cat /run/pivsetup/initramfs.log; fail "initramfs activation"; }
-cp /run/pivsetup/piv-native.json initramfs-open.json
+cp /run/pivsetup/status initramfs-status.txt || fail "no initramfs activation status"
+grep -qx 'piv-native: opened' /run/pivsetup/status || { cat /run/pivsetup/status; fail "initramfs activation"; }
+# Nothing but the status lines reaches the booted system (no JSON, logs or
+# prompted secrets).
+test "$(ls -A /run/pivsetup)" = status || { ls -la /run/pivsetup; fail "initramfs leftovers in /run/pivsetup"; }
+test ! -e /pivsetup || fail "initramfs work directory survived switch_root"
 test "$(dmsetup table piv-native | cut -d ' ' -f 3)" = piv-crypt
 test -b /dev/mapper/piv-native-decoy
 test -b /dev/mapper/piv-native-hidden
@@ -27,7 +30,7 @@ head -c 4096 /dev/urandom > /run/piv-block
 dd if=/run/piv-block of=/dev/mapper/piv-native-hidden bs=4096 count=1 oflag=direct conv=notrunc status=none
 dd if=/dev/mapper/piv-native-hidden bs=4096 count=1 iflag=direct status=none | cmp - /run/piv-block
 dd if=expected-hidden-volume of=/dev/mapper/piv-native-hidden bs=4096 count=1 oflag=direct conv=notrunc status=none
-pivsetup close-blocks --device /dev/vdb --key-file passphrase.key
+pivsetup close-blocks --device /dev/vdb --key-file /etc/piv/passphrase.key
 test ! -e /dev/mapper/piv-native
 modprobe -r dm-piv
 cryptsetup open --readonly --key-file passphrase.key /dev/vdb piv-stock
@@ -37,7 +40,7 @@ dd if=/dev/vdb of=deploy-final.img bs=1M status=none
 # Leave freshly opened (unmounted) views active for systemd-shutdown, which
 # detaches every DM device; the suite host-checks the disk after power-off.
 modprobe dm-piv
-pivsetup open-blocks --device /dev/vdb --key-file passphrase.key --hidden-key-file hidden.key > /dev/null
+pivsetup open-blocks --device /dev/vdb --key-file /etc/piv/passphrase.key --hidden-key-file /etc/piv/hidden.key > /dev/null
 dmsetup ls > active-at-shutdown.txt
 grep -q '^piv-native-hidden' active-at-shutdown.txt
 dmesg > reboot-dmesg.txt

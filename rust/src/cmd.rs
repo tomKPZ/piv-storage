@@ -1,5 +1,6 @@
 //! dmsetup/cryptsetup helpers. Keys and tuple data never appear in argv; a
 //! key-containing table is read into and written from locked memory only.
+//! Helpers run with a cleared environment and a fixed PATH (SAFE_PATH).
 
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
@@ -20,9 +21,18 @@ fn describe(program: &str, args: &[&str]) -> String {
     format!("[{}]", words.join(", "))
 }
 
+/// Search path for the helper programs (cryptsetup, dmsetup): fixed, never the
+/// caller's PATH, so an inherited environment cannot substitute another
+/// binary. The children get only PATH and LC_ALL=C (stable messages/output).
+pub const SAFE_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+
 fn spawn(program: &str, args: &[&str], input: Option<&[u8]>, secret_out: Option<&mut Secret>) -> Result<Output> {
+    // With PATH set via env(), Command resolves the program in that PATH.
     let mut child = Command::new(program)
         .args(args)
+        .env_clear()
+        .env("PATH", SAFE_PATH)
+        .env("LC_ALL", "C")
         .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -112,9 +122,4 @@ pub fn crypt(args: &[&str]) -> Result<String> {
     signals::check()?;
     let output = spawn("cryptsetup", args, None, None)?;
     Ok(checked("cryptsetup", args, output)?.stdout)
-}
-
-pub fn run(program: &str, args: &[&str]) -> Result<String> {
-    let output = spawn(program, args, None, None)?;
-    Ok(checked(program, args, output)?.stdout)
 }

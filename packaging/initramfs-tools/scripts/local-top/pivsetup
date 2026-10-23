@@ -1,8 +1,18 @@
 #!/bin/sh
 # initramfs-tools local-top script: open the dm-piv views listed in the
 # initramfs copy of /etc/pivtab (written by the pivsetup hook) before the root
-# filesystem is mounted. Failures are logged and boot continues; a root
-# filesystem on a view that did not open then fails as usual.
+# filesystem is mounted. Failures are reported on the console and boot
+# continues; a root filesystem on a view that did not open then fails as usual.
+#
+# Only /run/pivsetup/status (one "NAME: opened|failed" line per entry) reaches
+# the booted system (initramfs-tools moves /run to the real root). Prompted
+# secrets and pivsetup's detailed messages stay in /pivsetup on the
+# initramfs root, which is freed at switch_root; open-blocks' JSON is
+# discarded.
+#
+# No PREREQ: udev (init-top) has already started, and the views do not depend
+# on other local-top scripts. A view stacked on a device that another
+# local-top script creates (e.g. cryptroot) is not supported by this script.
 PREREQ=""
 prereqs() { echo "$PREREQ"; }
 case "$1" in prereqs) prereqs; exit 0 ;; esac
@@ -11,10 +21,11 @@ case "$1" in prereqs) prereqs; exit 0 ;; esac
 CONF=/etc/pivtab
 [ -r "$CONF" ] || exit 0
 umask 077
-mkdir -p /run/pivsetup
-LOG=/run/pivsetup/initramfs.log
+mkdir -p /run/pivsetup /pivsetup
+STATUS=/run/pivsetup/status
+LOG=/pivsetup/messages
 
-note() { echo "$*" >> "$LOG"; }
+note() { echo "$*" >> "$STATUS"; }
 
 # Overwrite and delete a prompted secret on the initramfs tmpfs.
 discard() {
@@ -61,11 +72,11 @@ while read -r name device luks hidden options; do
     IFS=$old_ifs
     luks_file=$luks hidden_file=$hidden
     if [ "$luks" = ask ]; then
-        luks_file=/run/pivsetup/$name.luks-secret
+        luks_file=/pivsetup/$name.luks-secret
         prompt "Please unlock $name (LUKS passphrase): " "$luks_file"
     fi
     if [ "$hidden" = ask ]; then
-        hidden_file=/run/pivsetup/$name.hidden-secret
+        hidden_file=/pivsetup/$name.hidden-secret
         prompt "Hidden passphrase for $name: " "$hidden_file"
     fi
     log_begin_msg "pivsetup: opening $name"
@@ -75,14 +86,18 @@ while read -r name device luks hidden options; do
         set --
     fi
     if pivsetup open-blocks --device "$device" --name "$name" --key-file "$luks_file" \
-            "$hidden_option" "$hidden_file" "$@" > "/run/pivsetup/$name.json" 2>> "$LOG"; then
+            "$hidden_option" "$hidden_file" "$@" > /dev/null 2> "/pivsetup/$name.err"; then
         note "$name: opened"
         log_end_msg 0
     else
         note "$name: failed"
         log_end_msg 1
-        log_failure_msg "pivsetup: $name: activation failed (see $LOG)"
+        # Console only (not kept after boot): pivsetup's own messages.
+        while read -r line; do log_failure_msg "$name: $line"; done < "/pivsetup/$name.err"
+        log_failure_msg "pivsetup: $name: activation failed"
     fi
+    cat "/pivsetup/$name.err" >> "$LOG"
+    rm -f "/pivsetup/$name.err"
     [ "$luks" = ask ] && discard "$luks_file"
     [ "$hidden" = ask ] && discard "$hidden_file"
 done < "$CONF"

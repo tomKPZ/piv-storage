@@ -7,13 +7,18 @@ client of this binary).
 
 ```sh
 python3 scripts/build_pivsetup.py        # rootless; prints path and SHA-256
+python3 scripts/build_pivsetup.py --test-hooks   # guest-test build (below)
 ```
 
 The build uses the system rustc/cargo, a project-local `CARGO_HOME` under the
 ignored `downloads/cargo`, the committed `Cargo.lock` (`--locked`, offline after
 the first fetch) and static glibc (`-C target-feature=+crt-static`). Crates:
 `libc`, `zeroize` and RustCrypto `argon2` only (no clap/serde; a
-minimal strict JSON reader parses `cryptsetup luksDump`).
+minimal strict JSON reader parses `cryptsetup luksDump`). The version
+(`pivsetup --version`, with the control ABI versions and whether test hooks
+are compiled in) equals packaging/VERSION, the DKMS package version; a unit
+test checks this. Host tests: `cargo test` with and without
+`--features test-hooks`.
 
 ## Commands
 
@@ -50,8 +55,12 @@ supported primary profiles and journaled dm-integrity volumes are accepted
 ([configuration.md](../docs/configuration.md)).
 
 `--device`/`--source` are required (no default) and name any block device or
-partition holding the LUKS2 volume (symlinks are followed). Before reading a
-key file, privileged commands require root. `open-blocks` then checks the
+partition holding the LUKS2 volume (symlinks are followed once: the device is
+resolved to the kernel's own /dev node, `DEVNAME` from sysfs with the same
+device number, and every later step uses that node and re-checks the device
+number of what it opens). Before reading a key file, privileged commands
+require root. Key, passphrase and LUKS key files must be regular files owned
+by root without group or other permissions. `open-blocks` then checks the
 device (a block device of whole 512-byte sectors, not a whole disk with
 partitions), validates the LUKS2/integrity profile, takes the exclusive
 per-volume /run lock, and for a new owner refuses an existing lower mapping
@@ -84,17 +93,25 @@ HMAC-SHA256 for the aes-sha256 profiles) into a rekeyed, larger,
 Keys are read from files only and live in mlocked, zeroized buffers; they never
 reach argv. The process is non-dumpable. SIGINT and SIGTERM are cooperative
 (exit 130 after cleanup; see [cancellation.md](../docs/cancellation.md)).
-Errors print `pivsetup: [Errno N] message`.
+Errors print `pivsetup: [Errno N] message`; EKEYREJECTED adds a hint about the
+key/passphrase and `--kdf-cost` tier. Tiers 2–4 check `MemAvailable` before
+Argon2id. cryptsetup and dmsetup run with a cleared environment, `LC_ALL=C`
+and the fixed `PATH` /usr/sbin:/usr/bin:/sbin:/bin; device sizes come from
+`BLKGETSIZE64` (no `blockdev`).
 
 ## Test hooks
 
-Explicit environment variables, inert unless set:
-`PIVSETUP_TEST_GATE=PREFIX` (handshake files around the SETUP ioctl, with
-`PIVSETUP_TEST_HOLD=1` to pause afterwards) and `PIVSETUP_TEST_FAIL=POINT`
-(after-cryptsetup-open, before-setup, after-setup, first-view, second-view).
-They ship in the deployed binary (it is the tested binary); only whoever
-controls root's environment can set them, and they can only fail or pause
-setup or write public context to the PREFIX files. See src/hooks.rs. The former
+Compiled in only with the cargo feature `test-hooks` (`build_pivsetup.py
+--test-hooks`, which scripts/suite.py shares into the guests); the default
+release build, which packaging/install.sh requires and the deploy suite
+installs, ignores every `PIVSETUP_TEST_*` variable. Explicit environment
+variables, inert unless set: `PIVSETUP_TEST_GATE=PREFIX` (handshake files
+around the SETUP ioctl, with `PIVSETUP_TEST_HOLD=1` to pause afterwards),
+`PIVSETUP_TEST_FAIL=POINT` (after-cryptsetup-open, before-setup, after-setup,
+first-view, second-view) and `PIVSETUP_TEST_LAX_KEY_FILES=1` (skip the
+key-file permission check: guest test keys live on a 9p share). They can only
+fail or pause setup, relax that check or write public context to the PREFIX
+files. See src/hooks.rs. The former
 test-confinement options `--allow-test-stack` and `--allow-second-disk` were
 removed with the guest-only activation guard (2026-10-22).
 

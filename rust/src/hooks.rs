@@ -1,8 +1,11 @@
 //! Explicit test-only hooks, replacing the Python guest tests' monkeypatching
-//! of pivstore.blocks.native_setup. Inactive unless a PIVSETUP_TEST_* variable
-//! is set. They ship in the deployed binary (the tested binary is the deployed
-//! one): only whoever controls root's environment can set them, and they can
-//! only fail setup, pause it, or write public context (no keys) to PREFIX files.
+//! of pivstore.blocks.native_setup. Compiled in only with the `test-hooks`
+//! cargo feature (scripts/build_pivsetup.py --test-hooks, used by the guest
+//! suites); release builds (the default, packaging/install.sh, the deploy
+//! suite) contain no-op stubs and ignore every PIVSETUP_TEST_* variable. Even
+//! when compiled in they are inactive unless a variable is set, and they can
+//! only fail setup, pause it, relax the key-file permission check or write
+//! public context (no keys) to PREFIX files.
 //!
 //! With PIVSETUP_TEST_GATE=PREFIX:
 //! - before the native SETUP ioctl, write PREFIX-ready.json (control path,
@@ -14,84 +17,123 @@
 //! PIVSETUP_TEST_FAIL=POINT injects an EIO failure (to exercise cleanup) at
 //! one of: after-cryptsetup-open, before-setup, after-setup, first-view,
 //! second-view.
+//!
+//! PIVSETUP_TEST_LAX_KEY_FILES=1 skips the key-file owner/mode check
+//! (main.rs check_key_file): guest test keys live on a 9p share whose files
+//! cannot be root-owned.
 
-use std::path::PathBuf;
-use std::time::Duration;
+pub use imp::*;
 
-use crate::error::{Error, Result};
-use crate::ioctl::{FillCounts, KernelDevice};
-use crate::signals;
+#[cfg(feature = "test-hooks")]
+mod imp {
+    use std::path::PathBuf;
+    use std::time::Duration;
 
-pub fn fail(point: &str) -> Result<()> {
-    if std::env::var("PIVSETUP_TEST_FAIL").as_deref() == Ok(point) {
-        return Err(Error::os(libc::EIO, format!("Injected test failure: {point}")));
+    use crate::error::{Error, Result};
+    use crate::ioctl::{FillCounts, KernelDevice};
+    use crate::signals;
+
+    pub const ENABLED: bool = true;
+
+    pub fn lax_key_files() -> bool {
+        std::env::var("PIVSETUP_TEST_LAX_KEY_FILES").as_deref() == Ok("1")
     }
-    Ok(())
-}
 
-fn prefix() -> Option<String> {
-    std::env::var("PIVSETUP_TEST_GATE").ok().filter(|p| !p.is_empty())
-}
-
-fn write_json(path: &str, text: &str) -> Result<()> {
-    let temporary = format!("{path}.partial");
-    std::fs::write(&temporary, text)?;
-    std::fs::rename(&temporary, path)?;
-    Ok(())
-}
-
-fn wait_for(path: &str) -> Result<()> {
-    let path = PathBuf::from(path);
-    while !path.exists() {
-        signals::check()?;
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    Ok(())
-}
-
-fn json_string(value: &str) -> String {
-    let mut out = String::from("\"");
-    for c in value.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
+    pub fn fail(point: &str) -> Result<()> {
+        if std::env::var("PIVSETUP_TEST_FAIL").as_deref() == Ok(point) {
+            return Err(Error::os(libc::EIO, format!("Injected test failure: {point}")));
         }
+        Ok(())
     }
-    out.push('"');
-    out
-}
 
-pub fn before_setup(device: &KernelDevice, identity: &[u8]) -> Result<()> {
-    let Some(prefix) = prefix() else { return Ok(()) };
-    let context: String = identity.iter().map(|b| format!("{b:02x}")).collect();
-    write_json(&format!("{prefix}-ready.json"), &format!(
-        "{{\"control\": {}, \"generation\": {}, \"context\": \"{context}\", \"pid\": {}}}\n",
-        json_string(&device.control_path.to_string_lossy()), device.generation, std::process::id()))?;
-    wait_for(&format!("{prefix}-gate"))
-}
+    fn prefix() -> Option<String> {
+        std::env::var("PIVSETUP_TEST_GATE").ok().filter(|p| !p.is_empty())
+    }
 
-pub fn after_setup(device: &KernelDevice, elapsed: Duration, result: &Result<FillCounts>, interrupted: bool) {
-    let Some(prefix) = prefix() else { return };
-    let errno = match result {
-        Ok(_) => "null".to_string(),
-        Err(error) => error.errno.map_or("null".to_string(), |e| e.to_string()),
-    };
-    let status = match device.status() {
-        Ok(s) => format!(
-            "{{\"active\": {}, \"views\": {}, \"failed\": {}, \"hidden_bytes\": {}, \"encryptions\": {}}}",
-            s.active, s.views, s.failed, s.hidden_bytes, s.encryptions),
-        Err(_) => "null".to_string(),
-    };
-    let _ = write_json(&format!("{prefix}-setup.json"), &format!(
-        "{{\"seconds\": {:.6}, \"errno\": {errno}, \"interrupted\": {interrupted}, \"status\": {status}}}\n",
-        elapsed.as_secs_f64()));
-    if std::env::var("PIVSETUP_TEST_HOLD").as_deref() == Ok("1") {
-        // Cancellation during the hold must not skip cleanup; ignore it here.
-        let path = PathBuf::from(format!("{prefix}-continue"));
+    fn write_json(path: &str, text: &str) -> Result<()> {
+        let temporary = format!("{path}.partial");
+        std::fs::write(&temporary, text)?;
+        std::fs::rename(&temporary, path)?;
+        Ok(())
+    }
+
+    fn wait_for(path: &str) -> Result<()> {
+        let path = PathBuf::from(path);
         while !path.exists() {
+            signals::check()?;
             std::thread::sleep(Duration::from_millis(5));
         }
+        Ok(())
     }
+
+    fn json_string(value: &str) -> String {
+        let mut out = String::from("\"");
+        for c in value.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    pub fn before_setup(device: &KernelDevice, identity: &[u8]) -> Result<()> {
+        let Some(prefix) = prefix() else { return Ok(()) };
+        let context: String = identity.iter().map(|b| format!("{b:02x}")).collect();
+        write_json(&format!("{prefix}-ready.json"), &format!(
+            "{{\"control\": {}, \"generation\": {}, \"context\": \"{context}\", \"pid\": {}}}\n",
+            json_string(&device.control_path.to_string_lossy()), device.generation, std::process::id()))?;
+        wait_for(&format!("{prefix}-gate"))
+    }
+
+    pub fn after_setup(device: &KernelDevice, elapsed: Duration, result: &Result<FillCounts>, interrupted: bool) {
+        let Some(prefix) = prefix() else { return };
+        let errno = match result {
+            Ok(_) => "null".to_string(),
+            Err(error) => error.errno.map_or("null".to_string(), |e| e.to_string()),
+        };
+        let status = match device.status() {
+            Ok(s) => format!(
+                "{{\"active\": {}, \"views\": {}, \"failed\": {}, \"hidden_bytes\": {}, \"encryptions\": {}}}",
+                s.active, s.views, s.failed, s.hidden_bytes, s.encryptions),
+            Err(_) => "null".to_string(),
+        };
+        let _ = write_json(&format!("{prefix}-setup.json"), &format!(
+            "{{\"seconds\": {:.6}, \"errno\": {errno}, \"interrupted\": {interrupted}, \"status\": {status}}}\n",
+            elapsed.as_secs_f64()));
+        if std::env::var("PIVSETUP_TEST_HOLD").as_deref() == Ok("1") {
+            // Cancellation during the hold must not skip cleanup; ignore it here.
+            let path = PathBuf::from(format!("{prefix}-continue"));
+            while !path.exists() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "test-hooks"))]
+mod imp {
+    use std::time::Duration;
+
+    use crate::error::Result;
+    use crate::ioctl::{FillCounts, KernelDevice};
+
+    pub const ENABLED: bool = false;
+
+    pub fn lax_key_files() -> bool {
+        false
+    }
+
+    pub fn fail(_point: &str) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn before_setup(_device: &KernelDevice, _identity: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn after_setup(_device: &KernelDevice, _elapsed: Duration, _result: &Result<FillCounts>, _interrupted: bool) {}
 }

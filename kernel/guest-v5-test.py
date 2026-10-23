@@ -261,6 +261,73 @@ v = opened()
 assert direct(v['hidden'], 0, BLOCK) == second
 assert direct(v['hidden'], BLOCK, BLOCK) == bytes(BLOCK)
 
+# A/B flush skipping: a hidden write flushes the lower device first only if
+# the block's previous write (on this owner) is not yet covered by a
+# successful flush. Count the module's piv_flush calls (entry kprobe, hit
+# counters only) around plain O_DIRECT writes without fsync.
+T = Path('/sys/kernel/tracing')
+flush_symbol = [line.split()[2] for line in Path('/proc/kallsyms').read_text().splitlines()
+                if len(line.split()) == 4 and line.split()[3] == '[dm_piv]'
+                and (line.split()[2] == 'piv_flush' or line.split()[2].startswith('piv_flush.'))
+                and '.cold' not in line.split()[2]]
+assert len(flush_symbol) == 1, flush_symbol
+
+
+def kprobe_command(value):
+    fd = os.open(T / 'kprobe_events', os.O_WRONLY | os.O_APPEND)
+    try:
+        os.write(fd, (value + '\n').encode())
+    finally:
+        os.close(fd)
+
+
+def flushes():
+    for line in (T / 'kprobe_profile').read_text().splitlines():
+        words = line.split()
+        if words[0].split('/')[-1] == 'flush':
+            assert int(words[2]) == 0, line
+            return int(words[1])
+    raise AssertionError('flush probe missing')
+
+
+def plain_write(index, data):
+    buf = mmap.mmap(-1, BLOCK)
+    fd = os.open(v['hidden'], os.O_WRONLY | os.O_DIRECT)
+    try:
+        buf[:] = data
+        assert os.pwritev(fd, [buf], index * BLOCK) == BLOCK
+    finally:
+        os.close(fd)
+        buf.close()
+
+
+(T / 'tracing_on').write_text('0')
+kprobe_command(f'p:piv_v5/flush dm_piv:{flush_symbol[0]}')
+try:
+    (T / 'events/piv_v5/enable').write_text('1')
+    steps = []
+    for label, action in (('first write of block 1', lambda: plain_write(1, first)),
+                          ('rewrite of block 1', lambda: plain_write(1, second)),
+                          ('first write of block 2', lambda: plain_write(2, first)),
+                          ('fsync', lambda: os.fsync(fd)),
+                          ('rewrite of block 1 after fsync', lambda: plain_write(1, first))):
+        fd = os.open(v['hidden'], os.O_RDONLY)
+        try:
+            before = flushes()
+            action()
+            steps.append((label, flushes() - before))
+        finally:
+            os.close(fd)
+finally:
+    (T / 'events/piv_v5/enable').write_text('0')
+    kprobe_command('-:piv_v5/flush')
+results['ab_flush_skipping'] = steps
+assert [count for _, count in steps] == [0, 1, 0, 1, 0], steps
+assert direct(v['hidden'], BLOCK, BLOCK) == first and direct(v['hidden'], 2 * BLOCK, BLOCK) == first
+direct(v['hidden'], BLOCK, BLOCK, bytes(BLOCK))
+direct(v['hidden'], 2 * BLOCK, BLOCK, bytes(BLOCK))
+print('A/B flush skipping passed:', steps, flush=True)
+
 # Keyslots: add a key-file slot and passphrase slots (default tier 3 and tier
 # 1) on the active owner, rewrite the whole keyslot/directory area through the
 # decoy (fragment refresh must preserve every listed keyslot), then retire the

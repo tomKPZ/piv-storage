@@ -9,12 +9,13 @@
 #   install.sh dkms-remove       dkms remove --all and delete the sources
 #   install.sh initramfs         initramfs-tools hook and local-top script
 #
-# PIV_DKMS_VERSION overrides the DKMS package version (default 0.1).
+# The DKMS package version is packaging/VERSION (pivsetup's version, checked by
+# its unit tests); PIV_DKMS_VERSION overrides it.
 set -euo pipefail
 umask 022
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(dirname "$here")
-version=${PIV_DKMS_VERSION:-0.1}
+version=${PIV_DKMS_VERSION:-$(cat "$here/VERSION")}
 case "$version" in *[!0-9A-Za-z.+~-]*|'') echo "invalid PIV_DKMS_VERSION" >&2; exit 2 ;; esac
 sources=(Makefile dm-piv.c piv-control.h piv-control.inc piv-native.inc piv-rs.inc)
 
@@ -28,7 +29,16 @@ case "${1:-}" in
         binary=${2:?usage: install.sh pivsetup BINARY}
         # The release build is a static executable; refuse anything else.
         head -c 4 "$binary" | cmp -s - <(printf '\177ELF') || { echo "not an ELF binary: $binary" >&2; exit 1; }
-        install -D -m 0755 "$binary" /usr/local/sbin/pivsetup
+        # Only release builds: the guest-test build (cargo feature test-hooks)
+        # honours PIVSETUP_TEST_* variables. Checked on an executable copy.
+        install -D -m 0755 "$binary" /usr/local/sbin/.pivsetup.new
+        reported=$(/usr/local/sbin/.pivsetup.new --version 2>&1 || true)
+        if ! grep -qx 'test hooks: no' <<< "$reported"; then
+            rm -f /usr/local/sbin/.pivsetup.new
+            echo "$binary is not a release build of pivsetup (scripts/build_pivsetup.py without --test-hooks)" >&2
+            exit 1
+        fi
+        mv /usr/local/sbin/.pivsetup.new /usr/local/sbin/pivsetup
         echo "Installed /usr/local/sbin/pivsetup"
         ;;
     dkms)
@@ -62,7 +72,7 @@ case "${1:-}" in
         echo "Installed the initramfs hook. Create /etc/pivtab (see /etc/pivtab.example), then run update-initramfs -u."
         ;;
     *)
-        sed -n '2,12p' "$0" >&2
+        sed -n '2,13p' "$0" >&2
         exit 2
         ;;
 esac

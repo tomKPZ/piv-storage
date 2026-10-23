@@ -119,7 +119,7 @@ def symbol(stem):
     assert len(matches) == 1, (stem, matches)
     return 'dm_piv:' + matches[0]
 probes = {event: symbol(function) for event, function in dict(
-    load='piv_load_mode', range='piv_read_range', crypto='piv_aead',
+    range='piv_read_range', crypto='piv_aead',
     write='pn_write', checkpoint='piv_checkpoint', batch='piv_batch_read',
     submit='piv_batch_submit').items()}
 
@@ -169,9 +169,11 @@ try:
     # on their IVs); the directory (groups 0 and 1) is then read and
     # authenticated. --verify would scan every sector instead. Each range read
     # is one batch submission of a few concurrent bios.
-    setup_expected = dict(load=1, range=keyslot_ranges + 2 * record_ranges,
+    # The checkpoint reads, authenticates and rewrites one sector: one crypto
+    # call and two submissions (read, write).
+    setup_expected = dict(range=keyslot_ranges + 2 * record_ranges,
                           crypto=112 + 1 + 2 * GROUP, write=0, checkpoint=1, batch=0,
-                          submit=keyslot_ranges + 2 * record_ranges)
+                          submit=keyslot_ranges + 2 * record_ranges + 2)
     # Bracket exactly the SETUP ioctl with pivsetup's gate (before) and hold
     # (after) hooks; the binary waits at each point for our marker file.
     counted_gate = '/run/piv-profile-counted'
@@ -209,11 +211,11 @@ try:
                     assert buf[:] == (primary if role == 'decoy' else EXPECTED)[:count]
                 finally:
                     os.close(fd)
-        counted(f'{role}-{count}', read, dict(load=0, range=ranges, crypto=loads, write=0, checkpoint=0,
+        counted(f'{role}-{count}', read, dict(range=ranges, crypto=loads, write=0, checkpoint=0,
                                               batch=0, submit=ranges))
     # Writes (same bytes, so the oracles hold): one authenticated batch read of
     # every touched sector, one encryption each, one write submission of a few
-    # multi-sector bios. No per-sector loads, re-reads or self-decryption.
+    # multi-sector bios. No per-sector reads, re-reads or self-decryption.
     status_owner = GuestOwner('/dev/vdb', KEY)
     for role, count, sectors in (('decoy', 16384, 16384 // unit), ('decoy', 131072, 131072 // unit),
                                  ('hidden', 4096, GROUP)):
@@ -227,7 +229,7 @@ try:
                 def write():
                     assert os.pwritev(fd, [buf], 0) == count
                 counted(f'{role}-write-{count}', write,
-                        dict(load=0, range=0, crypto=2 * sectors, write=1, checkpoint=0, batch=1, submit=2))
+                        dict(range=0, crypto=2 * sectors, write=1, checkpoint=0, batch=1, submit=2))
                 assert blocks.native_status(status_owner.device)['encryptions'] - before == sectors
             finally:
                 os.close(fd)

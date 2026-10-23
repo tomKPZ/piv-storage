@@ -28,9 +28,23 @@ struct piv_control {
 	/* Public-view I/O runs concurrently under @io (shared). Owner state that
 	 * workers read (live, blocked, cc, native and its keyslot/directory
 	 * state) changes only under @lock plus @io exclusive, which also drains
-	 * in-flight requests. Lock order: @lock, then @io.
+	 * in-flight requests. Exception: while no view exists and the owner is
+	 * blocked (suspended), no worker can reach that state, so setup and
+	 * BEGIN/END change native/transaction under @lock alone. Lock order:
+	 * @lock, then @io.
 	 */
 	struct rw_semaphore io;
+	/* View requests and setup's record work: per owner, so a stalled lower
+	 * device occupies only its own owner's workers (PN_MAX_ACTIVE).
+	 */
+	struct workqueue_struct *wq;
+	struct work_struct free_work;
+	/* Flush tracking (piv_flush): lower write batches completed, and the
+	 * value sampled when the newest successful flush started. A write counted
+	 * at or below @flushed is durable.
+	 */
+	atomic64_t writes_done;
+	atomic64_t flushed;
 	/* Range locks over primary sectors (piv_range_lock), arrival order. */
 	spinlock_t ranges_lock;
 	struct list_head ranges;
@@ -49,9 +63,22 @@ struct piv_control {
 	char name[40];
 };
 
+/* The last reference may drop inside a work item of p->wq itself (pn_worker),
+ * which cannot destroy its own workqueue: defer to kpiv_io. Module exit
+ * drains kpiv_io.
+ */
+static void piv_free_work(struct work_struct *work)
+{
+	struct piv_control *p = container_of(work, struct piv_control, free_work);
+	if (p->wq)
+		destroy_workqueue(p->wq);
+	kfree(p);
+}
+
 static void piv_free(struct kref *ref)
 {
-	kfree(container_of(ref, struct piv_control, refs));
+	struct piv_control *p = container_of(ref, struct piv_control, refs);
+	queue_work(piv_io_wq, &p->free_work);
 }
 
 static int piv_open(struct inode *inode, struct file *file)
@@ -65,6 +92,11 @@ static int piv_open(struct inode *inode, struct file *file)
 	return 0;
 }
 
+/* A controller that exits inside BEGIN/END leaves the transaction set:
+ * resume stays refused (-EBUSY) until another controller BEGINs and ENDs it
+ * or the owner is removed (pivsetup's cleanup removes it). A half-finished
+ * setup must not silently become resumable.
+ */
 static int piv_release(struct inode *inode, struct file *file)
 {
 	struct piv_control *p = file->private_data;
@@ -76,100 +108,7 @@ static int piv_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-/* One sector's stored copy: ciphertext zero-padded to 4096 || tag || IV. */
 #define PIV_MAX_TAG 64
-#define PIV_TUPLE_BYTES (4096 + PIV_MAX_TAG + 16)
-/* Offset of the IV within a sector's original copy. */
-#define PIV_IV_AT(cc) (4096 + (cc)->integrity_tag_size)
-
-struct piv_sector {
-	struct piv_io io;
-	struct page *page;
-	struct bio *bio;
-	u8 original[PIV_TUPLE_BYTES];
-	bool bad;	/* piv_load_mode(allow_bad): stored tuple failed authentication */
-};
-
-static void piv_sector_free(struct piv_crypt *cc, struct piv_sector *s)
-{
-	if (!s)
-		return;
-	if (s->bio)
-		bio_put(s->bio);
-	if (s->page) {
-		memzero_explicit(page_address(s->page), PAGE_SIZE);
-		__free_page(s->page);
-	}
-	kfree_sensitive(s->io.integrity_metadata);
-	kfree_sensitive(s);
-}
-
-static int piv_bio(struct piv_crypt *cc, struct piv_sector *s, blk_opf_t op)
-{
-	if (s->bio)
-		bio_put(s->bio);
-	s->bio = bio_alloc(cc->dev->bdev, 1, op, GFP_NOIO);
-	if (!s->bio)
-		return -ENOMEM;
-	s->bio->bi_iter.bi_sector = cc->start + s->io.sector;
-	if (bio_add_page(s->bio, s->page, cc->sector_size, 0) != cc->sector_size)
-		return -ENOMEM;
-	return piv_integrity_alloc(&s->io, s->bio);
-}
-
-/* Write bios encrypt with the requested IV; read bios authenticate/decrypt. */
-static int piv_crypto(struct piv_crypt *cc, struct piv_sector *s,
-		      const u8 *iv)
-{
-	return piv_aead(cc, s->io.sector, s->page, 0, s->io.integrity_metadata, iv,
-			op_is_write(bio_op(s->bio)));
-}
-
-/* Caller holds lifecycle lock. Plaintext lives only in a private wiped page.
- * With @allow_bad, a sector whose stored tuple fails authentication (-EBADMSG,
- * e.g. media damage or an uncoordinated write) is returned with ->bad set
- * and its raw stored ciphertext/tuple in ->original; its page is not plaintext.
- * Only internal full-sector replacement and SIV-protected fragment collection
- * may use that; nothing unauthenticated is ever published.
- */
-static noinline int piv_load_mode(struct piv_crypt *cc, u64 index, struct piv_sector **out, bool allow_bad)
-{
-	struct piv_sector *s;
-	struct bvec_iter saved;
-	int ret = -ENOMEM;
-
-	s = kzalloc(sizeof(*s), GFP_NOIO);
-	if (!s)
-		return ret;
-	s->io.cc = cc;
-	s->io.sector = index << cc->sector_shift;
-	s->io.integrity_metadata = kzalloc(cc->tuple_size, GFP_NOIO);
-	s->page = alloc_page(GFP_NOIO | __GFP_ZERO);
-	if (!s->io.integrity_metadata || !s->page)
-		goto bad;
-	ret = piv_bio(cc, s, REQ_OP_READ);
-	if (ret)
-		goto bad;
-	saved = s->bio->bi_iter;
-	ret = submit_bio_wait(s->bio);
-	if (ret)
-		goto bad;
-	s->bio->bi_iter = saved;
-	memcpy(s->original, page_address(s->page), cc->sector_size);
-	memcpy(s->original + 4096, s->io.integrity_metadata, cc->tuple_size);
-	ret = piv_crypto(cc, s, NULL);
-	if (ret == -EBADMSG && allow_bad) {
-		s->bad = true;
-		ret = 0;
-	}
-	if (ret)
-		goto bad;
-	*out = s;
-	return 0;
-bad:
-	piv_sector_free(cc, s);
-	return ret;
-}
 
 /* Range locks over primary sector indices serialize every request that
  * rewrites sectors with every other request touching them: decoy writes
@@ -213,6 +152,9 @@ static void piv_range_lock(struct piv_control *p, struct piv_range *r, u64 first
 	spin_lock(&p->ranges_lock);
 	list_add_tail(&r->list, &p->ranges);
 	spin_unlock(&p->ranges_lock);
+	/* Uninterruptible: a stalled lower device shows waiters (and an owner
+	 * presuspend waiting for @io) as hung tasks, not as a deadlock.
+	 */
 	wait_event(p->ranges_wait, piv_range_ready(p, r));
 }
 
@@ -284,11 +226,10 @@ static bool piv_quiesced(struct piv_control *p)
  * guarded userspace-supplied tuples; here the same piv_aead() call that every
  * read uses produces it, and later reads authenticate every sector anyway.
  *
- * Bio size: at most PIV_BATCH_BYTES of data and one page of tuples per bio,
+ * Bio size: at most PIV_IO_BYTES of data and one page of tuples per bio,
  * rounded to whole pages, so the tuple buffer of a bio is one order-0 slab
  * object (32 sectors per bio at 4096-byte sectors, 80-128 at 512).
  */
-#define PIV_BATCH_BYTES (128 * 1024)
 #define PIV_BATCH_MAX 1024	/* sectors per request; >= PN_MAX_GROUP */
 struct piv_batch {
 	struct piv_control *p;
@@ -296,8 +237,12 @@ struct piv_batch {
 	u32 count, per_bio, bios, npages;
 	struct page **pages;	/* count * sector_size bytes, sectors packed */
 	u8 **meta;		/* per bio: per_bio tuples (tag || IV) */
-	u8 *olds;		/* 16 bytes per sector: the stored IV */
-	unsigned long *replace;	/* failed authentication; fully overwritten */
+	u8 *olds;		/* rewrites only: 16 bytes per sector, the stored IV */
+	unsigned long *replace;	/* rewrites only: failed authentication; fully overwritten */
+	s64 seq;		/* after a write: the writes_done value counting it */
+	/* One AEAD request and buffer set reused for every sector (piv_aead). */
+	struct aead_request *req;
+	struct piv_aead_buffers *aead;
 };
 
 static u8 *piv_batch_tuple(struct piv_batch *b, u32 i)
@@ -322,10 +267,13 @@ static void piv_batch_free(struct piv_batch *b)
 	if (b->olds)
 		kvfree_sensitive(b->olds, b->count * 16);
 	bitmap_free(b->replace);
+	aead_request_free(b->req);
+	kfree_sensitive(b->aead);
 	kfree(b);
 }
 
-static int piv_batch_alloc(struct piv_control *p, u64 index, u32 count, struct piv_batch **out)
+/* @rewrite: also allocate the stored-IV and replacement bookkeeping. */
+static int piv_batch_alloc(struct piv_control *p, u64 index, u32 count, bool rewrite, struct piv_batch **out)
 {
 	struct piv_crypt *cc = p->cc;
 	struct piv_batch *b;
@@ -339,16 +287,22 @@ static int piv_batch_alloc(struct piv_control *p, u64 index, u32 count, struct p
 	b->p = p;
 	b->index = index;
 	b->count = count;
-	b->per_bio = min_t(u32, PIV_BATCH_BYTES / cc->sector_size, PAGE_SIZE / cc->tuple_size);
+	b->per_bio = min_t(u32, PIV_IO_BYTES / cc->sector_size, PAGE_SIZE / cc->tuple_size);
 	b->per_bio -= b->per_bio % per_page;
 	b->bios = DIV_ROUND_UP(count, b->per_bio);
 	b->npages = DIV_ROUND_UP(count, per_page);
 	b->pages = kvcalloc(b->npages, sizeof(*b->pages), GFP_NOIO);
 	b->meta = kcalloc(b->bios, sizeof(*b->meta), GFP_NOIO);
-	b->olds = kvmalloc(count * 16, GFP_NOIO);
-	b->replace = bitmap_zalloc(count, GFP_NOIO);
-	if (!b->pages || !b->meta || !b->olds || !b->replace)
+	b->req = aead_request_alloc(cc->tfm, GFP_NOIO);
+	b->aead = kzalloc(sizeof(*b->aead), GFP_NOIO);
+	if (!b->pages || !b->meta || !b->req || !b->aead)
 		goto bad;
+	if (rewrite) {
+		b->olds = kvmalloc(count * 16, GFP_NOIO);
+		b->replace = bitmap_zalloc(count, GFP_NOIO);
+		if (!b->olds || !b->replace)
+			goto bad;
+	}
 	for (i = 0; i < b->npages; i++) {
 		b->pages[i] = alloc_page(GFP_NOIO);
 		if (!b->pages[i])
@@ -364,6 +318,17 @@ static int piv_batch_alloc(struct piv_control *p, u64 index, u32 count, struct p
 bad:
 	piv_batch_free(b);
 	return -ENOMEM;
+}
+
+/* Sector @i of the batch in place: encrypt under @iv, or authenticate and
+ * decrypt with @iv NULL.
+ */
+static int piv_batch_crypt(struct piv_batch *b, u32 i, const u8 *iv)
+{
+	struct piv_crypt *cc = b->p->cc;
+	u64 at = (u64)i * cc->sector_size;
+	return piv_aead(cc, b->req, b->aead, (b->index + i) << cc->sector_shift, b->pages[at >> PAGE_SHIFT],
+			at & ~PAGE_MASK, piv_batch_tuple(b, i), iv, iv != NULL);
 }
 
 struct piv_batch_wait {
@@ -384,7 +349,9 @@ static void piv_batch_endio(struct bio *bio)
 
 /* Build every bio of the batch, then submit them all and wait once. Nothing is
  * submitted if building fails. With @mutated (writes), *@mutated is set before
- * the first submission. noinline: the profile suite counts submissions here.
+ * the first submission. A completed write batch (failed or not) is counted in
+ * writes_done (b->seq) for flush tracking. noinline: the profile suite counts
+ * submissions here.
  */
 static noinline int piv_batch_submit(struct piv_batch *b, blk_opf_t op, bool *mutated)
 {
@@ -402,14 +369,13 @@ static noinline int piv_batch_submit(struct piv_batch *b, blk_opf_t op, bool *mu
 	for (c = 0; c < b->bios && !r; c++) {
 		u32 first = c * b->per_bio, n = min(b->per_bio, b->count - first), j;
 		u32 bytes = n * cc->sector_size, page = first / per_page;
-		struct piv_io io = { .cc = cc, .sector = (b->index + first) << cc->sector_shift,
-				     .integrity_metadata = b->meta[c] };
+		sector_t sector = (b->index + first) << cc->sector_shift;
 		bios[c] = bio_alloc(cc->dev->bdev, DIV_ROUND_UP(bytes, PAGE_SIZE), op, GFP_NOIO);
 		if (!bios[c]) {
 			r = -ENOMEM;
 			break;
 		}
-		bios[c]->bi_iter.bi_sector = cc->start + io.sector;
+		bios[c]->bi_iter.bi_sector = sector;
 		bios[c]->bi_end_io = piv_batch_endio;
 		bios[c]->bi_private = &wait;
 		for (j = 0; j * PAGE_SIZE < bytes && !r; j++) {
@@ -418,7 +384,7 @@ static noinline int piv_batch_submit(struct piv_batch *b, blk_opf_t op, bool *mu
 				r = -ENOMEM;
 		}
 		if (!r)
-			r = piv_integrity_alloc(&io, bios[c]);
+			r = piv_integrity_alloc(cc, bios[c], sector, b->meta[c]);
 	}
 	if (r) {
 		for (c = 0; c < b->bios; c++)
@@ -434,14 +400,32 @@ static noinline int piv_batch_submit(struct piv_batch *b, blk_opf_t op, bool *mu
 	if (!atomic_dec_and_test(&wait.pending))
 		wait_for_completion_io(&wait.done);
 	kfree(bios);
+	if (op_is_write(op))
+		b->seq = atomic64_inc_return(&b->p->writes_done);
 	return atomic_read(&wait.error);
+}
+
+/* Flush the lower device. On success every write batch counted before the
+ * flush started is durable: @flushed advances to that count. noinline: the v5
+ * suite counts calls (A/B flush skipping).
+ */
+static noinline int piv_flush(struct piv_control *p)
+{
+	s64 seq = atomic64_read(&p->writes_done), old;
+	int r = blkdev_issue_flush(p->cc->dev->bdev);
+	if (r)
+		return r;
+	old = atomic64_read(&p->flushed);
+	while (old < seq && !atomic64_try_cmpxchg(&p->flushed, &old, seq))
+		;
+	return 0;
 }
 
 /* Read and authenticate @count primary sectors from @index for a rewrite.
  * Every sector must authenticate, except one failing authentication that the
  * decoy request [@offset, @offset + @bytes) covers entirely (@bytes == 0:
- * none): it is marked in ->replace and only its raw stored IV is kept (user
- * decision 2026-10-21). ->olds receives every stored IV. noinline: counted by
+ * none): it is marked in -> replace and only its raw stored IV is kept (user
+ * decision 2026-10-21). -> olds receives every stored IV. noinline: counted by
  * the profile suite.
  */
 static noinline int piv_batch_read(struct piv_control *p, u64 index, u32 count, u64 offset, u32 bytes,
@@ -451,16 +435,14 @@ static noinline int piv_batch_read(struct piv_control *p, u64 index, u32 count, 
 	struct piv_batch *b = NULL;
 	u64 unit = cc->sector_size;
 	u32 i;
-	int r = piv_batch_alloc(p, index, count, &b);
+	int r = piv_batch_alloc(p, index, count, true, &b);
 	if (r)
 		return r;
 	r = piv_batch_submit(b, REQ_OP_READ, NULL);
 	for (i = 0; !r && i < count; i++) {
-		u64 start = (index + i) * unit, at = (u64)i * unit;
-		u8 *tuple = piv_batch_tuple(b, i);
-		memcpy(b->olds + i * 16, tuple + cc->integrity_tag_size, 16);
-		r = piv_aead(cc, (index + i) << cc->sector_shift, b->pages[at >> PAGE_SHIFT], at & ~PAGE_MASK,
-			     tuple, NULL, false);
+		u64 start = (index + i) * unit;
+		memcpy(b->olds + i * 16, piv_batch_tuple(b, i) + cc->integrity_tag_size, 16);
+		r = piv_batch_crypt(b, i, NULL);
 		if (r == -EBADMSG && bytes && start >= offset && start + unit <= offset + bytes) {
 			__set_bit(i, b->replace);
 			r = 0;
@@ -474,49 +456,73 @@ static noinline int piv_batch_read(struct piv_control *p, u64 index, u32 count, 
 	return 0;
 }
 
+/* Destination of authenticated plaintext: a linear buffer, or the remaining
+ * data of a bio (copied straight into its pages, no intermediate buffer).
+ */
+struct piv_out {
+	u8 *data;
+	struct bio *bio;
+	struct bvec_iter iter;
+};
+
+static void piv_out_copy(struct piv_out *o, const u8 *src, u32 length)
+{
+	if (o->data) {
+		memcpy(o->data, src, length);
+		o->data += length;
+		return;
+	}
+	while (length) {
+		struct bio_vec v = bio_iter_iovec(o->bio, o->iter);
+		u32 n = min(length, v.bv_len);
+		memcpy_to_page(v.bv_page, v.bv_offset, src, n);
+		bio_advance_iter_single(o->bio, &o->iter, n);
+		src += n;
+		length -= n;
+	}
+}
+
 /* Bounded authenticated reads (setup scans, decoy reads, hidden carrier
- * collection, owner reads): at most PIV_READ_SECTORS sectors per call, read as
- * one batch of multi-sector bios in flight together. No cache: every call
- * fetches current tuples through the same integrity device.
+ * collection, owner reads, the checkpoint): at most PIV_READ_SECTORS sectors
+ * per call, read as one batch of multi-sector bios in flight together. No
+ * cache: every call fetches current tuples through the same integrity device.
  */
 #define PIV_READ_SECTORS PIV_BATCH_MAX
-/* Private owner reads before native ownership (DM split bound). */
-#define PIV_OWNER_BYTES (128 * 1024)
 
 /* Read @count primary sectors from @index and authenticate every one with its
- * own address/IV AAD before publishing anything: plaintext into @data and/or
- * stored IVs into @ivs, only after all sectors verify. With @bad (tolerant IV
- * collection for SIV-checked decoding; @data must be NULL), a sector failing
- * authentication sets bit @bad_at + i and contributes its raw stored IV.
- * noinline: the profile and cancel suites count calls.
+ * own address/IV AAD before publishing anything: plaintext bytes [@skip,
+ * @skip + @length) of the range into @out and/or stored IVs into @ivs, only
+ * after all sectors verify. With @bad (tolerant IV collection for SIV-checked
+ * decoding; @out must be NULL), a sector failing authentication sets bit
+ * @bad_at + i and contributes its raw stored IV. noinline: the profile and
+ * cancel suites count calls.
  */
-static noinline int piv_read_range(struct piv_control *p, u64 index, u32 count, u8 *data, u8 *ivs,
-				   unsigned long *bad, u32 bad_at)
+static noinline int piv_read_range(struct piv_control *p, u64 index, u32 count, struct piv_out *out,
+				   u64 skip, u64 length, u8 *ivs, unsigned long *bad, u32 bad_at)
 {
 	struct piv_crypt *cc = p->cc;
 	struct piv_batch *b = NULL;
 	u32 i;
 	int r;
-	if (!count || count > PIV_READ_SECTORS || (bad && data))
+	if (!count || count > PIV_READ_SECTORS || (bad && out) ||
+	    (out && (skip > (u64)count * cc->sector_size || length > (u64)count * cc->sector_size - skip)))
 		return -EINVAL;
-	r = piv_batch_alloc(p, index, count, &b);
+	r = piv_batch_alloc(p, index, count, false, &b);
 	if (r)
 		return r;
 	r = piv_batch_submit(b, REQ_OP_READ, NULL);
 	for (i = 0; !r && i < count; i++) {
-		u64 at = (u64)i * cc->sector_size;
-		r = piv_aead(cc, (index + i) << cc->sector_shift, b->pages[at >> PAGE_SHIFT], at & ~PAGE_MASK,
-			     piv_batch_tuple(b, i), NULL, false);
+		r = piv_batch_crypt(b, i, NULL);
 		if (r == -EBADMSG && bad) {
 			__set_bit(bad_at + i, bad);
 			r = 0;
 		}
 	}
-	if (!r && data) {
-		u64 bytes = (u64)count * cc->sector_size;
-		for (i = 0; i < b->npages; i++)
-			memcpy(data + (u64)i * PAGE_SIZE, page_address(b->pages[i]),
-			       min_t(u64, PAGE_SIZE, bytes - (u64)i * PAGE_SIZE));
+	while (!r && out && length) {
+		u32 n = min_t(u64, length, PAGE_SIZE - (skip & ~PAGE_MASK));
+		piv_out_copy(out, page_address(b->pages[skip >> PAGE_SHIFT]) + (skip & ~PAGE_MASK), n);
+		skip += n;
+		length -= n;
 	}
 	for (i = 0; !r && ivs && i < count; i++)
 		memcpy(ivs + i * cc->iv_size, piv_batch_tuple(b, i) + cc->integrity_tag_size, cc->iv_size);
@@ -543,13 +549,13 @@ static void piv_batch_merge(struct piv_batch *b, u64 offset, const u8 *data, u32
  * the stored ones), write the batch and, with @flush, flush the lower device.
  * Encryptions are reserved (counted) before encrypting, even if the write
  * later fails. *@mutated is set once writing begins; earlier failures changed
- * nothing. A request that sees the owner fail-stopped (by a concurrent
- * request) writes nothing.
+ * nothing. A request that already sees the owner fail-stopped (by a
+ * concurrent request) writes nothing; one stopped after the last check below
+ * may still write, and its caller then reports EIO (pn_worker).
  */
 static int piv_batch_write(struct piv_batch *b, const u8 *ivs, bool flush, bool *mutated)
 {
 	struct piv_control *p = b->p;
-	struct piv_crypt *cc = p->cc;
 	u32 i;
 	int r;
 	if (READ_ONCE(p->failed))
@@ -561,9 +567,7 @@ static int piv_batch_write(struct piv_batch *b, const u8 *ivs, bool flush, bool 
 	if (r)
 		return r;
 	for (i = 0; i < b->count; i++) {
-		u64 at = (u64)i * cc->sector_size;
-		r = piv_aead(cc, (b->index + i) << cc->sector_shift, b->pages[at >> PAGE_SHIFT], at & ~PAGE_MASK,
-			     piv_batch_tuple(b, i), ivs + i * 16, true);
+		r = piv_batch_crypt(b, i, ivs + i * 16);
 		if (r)
 			return r;
 	}
@@ -571,7 +575,7 @@ static int piv_batch_write(struct piv_batch *b, const u8 *ivs, bool flush, bool 
 		return -EIO;
 	r = piv_batch_submit(b, REQ_OP_WRITE | REQ_SYNC, mutated);
 	if (!r && flush)
-		r = blkdev_issue_flush(cc->dev->bdev);
+		r = piv_flush(p);
 	return r;
 }
 
@@ -589,32 +593,44 @@ static int piv_batch_write(struct piv_batch *b, const u8 *ivs, bool flush, bool 
 static int piv_checkpoint(struct piv_control *p)
 {
 	struct piv_crypt *cc = p->cc;
+	u8 *saved = kmalloc(cc->sector_size + cc->tuple_size, GFP_NOIO);
 	u64 i;
 	int ret = -EIO;
 
+	if (!saved)
+		return -ENOMEM;
 	for (i = 0; i < PIV_CHECKPOINT_SECTORS && i < p->profile.sectors; i++) {
-		struct piv_sector *s = NULL;
+		struct piv_batch *b = NULL;
+		u8 *data, *tuple;
 
-		ret = piv_load_mode(cc, i, &s, true);
-		if (ret == -ENOMEM)
-			return ret;
+		ret = piv_batch_alloc(p, i, 1, false, &b);
 		if (ret)
-			continue;	/* unreadable: try the next sector */
-		if (s->bad) {
-			piv_sector_free(cc, s);
-			ret = -EBADMSG;
+			break;
+		data = page_address(b->pages[0]);
+		tuple = piv_batch_tuple(b, 0);
+		ret = piv_batch_submit(b, REQ_OP_READ, NULL);
+		if (!ret) {
+			/* Keep the stored copy; authentication decrypts in place. */
+			memcpy(saved, data, cc->sector_size);
+			memcpy(saved + cc->sector_size, tuple, cc->tuple_size);
+			ret = piv_batch_crypt(b, 0, NULL);
+		}
+		if (ret) {
+			/* Unreadable or failing authentication: try the next sector. */
+			piv_batch_free(b);
+			if (ret == -ENOMEM)
+				break;
 			continue;
 		}
-		memcpy(page_address(s->page), s->original, cc->sector_size);
-		memcpy(s->io.integrity_metadata, s->original + 4096, cc->tuple_size);
-		ret = piv_bio(cc, s, REQ_OP_WRITE | REQ_SYNC);
+		memcpy(data, saved, cc->sector_size);
+		memcpy(tuple, saved + cc->sector_size, cc->tuple_size);
+		ret = piv_batch_submit(b, REQ_OP_WRITE | REQ_SYNC, NULL);
 		if (!ret)
-			ret = submit_bio_wait(s->bio);
-		if (!ret)
-			ret = blkdev_issue_flush(cc->dev->bdev);
-		piv_sector_free(cc, s);
-		return ret;
+			ret = piv_flush(p);
+		piv_batch_free(b);
+		break;
 	}
+	kfree_sensitive(saved);
 	return ret;
 }
 
@@ -689,7 +705,8 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			ret = piv_checkpoint(p);
 			if (ret) { WRITE_ONCE(p->failed, true); WRITE_ONCE(p->native->failed, true); }
 		}
-		if (!ret) { pn_free(p->native); p->native = NULL; }
+		/* No view exists; @io exclusive anyway, per the owner-state rule. */
+		if (!ret) { down_write(&p->io); pn_free(p->native); p->native = NULL; up_write(&p->io); }
 	} else if (cmd == PIV_QUERY || cmd == PIV_DEVICES)
 		profile = p->profile;
 	else if (p->native)
@@ -814,9 +831,8 @@ static int piv_register(struct piv_crypt *cc, struct dm_target *ti)
 	 * parsed the profile; re-check the invariants this code relies on.
 	 */
 	if ((cc->sector_size != 512 && cc->sector_size != 4096) ||
-	    cc->iv_size != 16 || cc->integrity_iv_size != cc->iv_size ||
+	    cc->iv_size != 16 ||
 	    cc->integrity_tag_size > PIV_MAX_TAG || cc->tuple_size != cc->integrity_tag_size + cc->iv_size ||
-	    cc->iv_offset || cc->start ||
 	    !(dm_table_get_mode(ti->table) & BLK_OPEN_WRITE)) {
 		ti->error = "piv_control requires the tested writable-owner AEAD profile";
 		return -EINVAL;
@@ -825,12 +841,15 @@ static int piv_register(struct piv_crypt *cc, struct dm_target *ti)
 	if (!p)
 		return -ENOMEM;
 	kref_init(&p->refs);
+	INIT_WORK(&p->free_work, piv_free_work);
 	mutex_init(&p->lock);
 	init_rwsem(&p->io);
 	spin_lock_init(&p->ranges_lock);
 	INIT_LIST_HEAD(&p->ranges);
 	init_waitqueue_head(&p->ranges_wait);
 	atomic64_set(&p->encryptions, 0);
+	atomic64_set(&p->writes_done, 0);
+	atomic64_set(&p->flushed, 0);
 	p->live = true;
 	p->blocked = true;
 	p->cc = cc;
@@ -849,6 +868,16 @@ static int piv_register(struct piv_crypt *cc, struct dm_target *ti)
 	};
 	snprintf(p->name, sizeof(p->name), "pivctl-%llu",
 		 (unsigned long long)p->profile.generation);
+	/* Unbound and concurrent; requests touching the same sectors or record
+	 * serialize on range locks (piv_range_lock). Reclaim-capable: writeback
+	 * through the views must progress under memory pressure.
+	 */
+	p->wq = alloc_workqueue("piv-native-%llu", WQ_MEM_RECLAIM | WQ_UNBOUND, PN_MAX_ACTIVE,
+				(unsigned long long)p->profile.generation);
+	if (!p->wq) {
+		kref_put(&p->refs, piv_free);
+		return -ENOMEM;
+	}
 	p->misc = (struct miscdevice) {
 		.minor = MISC_DYNAMIC_MINOR, .name = p->name,
 		.fops = &piv_fops, .mode = 0600,

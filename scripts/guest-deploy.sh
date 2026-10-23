@@ -15,18 +15,28 @@ tar -xf scaffold.tar -C /root/piv-src
 tar -xf packaging.tar -C /root/piv-packaging
 P=/root/piv-packaging/packaging
 
-# pivsetup: the installed binary is the shared, host-built static binary.
+# pivsetup: the installed binary is the host-built static release binary
+# (no PIVSETUP_TEST_* hooks); install.sh refuses the test-hooks build.
 rm -f /usr/local/sbin/pivsetup
-bash "$P/install.sh" pivsetup /mnt/piv-work/pivsetup
-cmp /usr/local/sbin/pivsetup /mnt/piv-work/pivsetup
+if bash "$P/install.sh" pivsetup /mnt/piv-work/pivsetup 2> install-hooks.err; then
+    fail "install.sh accepted the test-hooks build"
+fi
+grep -q 'not a release build' install-hooks.err || { cat install-hooks.err; fail "test-hooks refusal message"; }
+bash "$P/install.sh" pivsetup /mnt/piv-work/pivsetup-release
+cmp /usr/local/sbin/pivsetup /mnt/piv-work/pivsetup-release
 file_type=$(od -An -c -N4 /usr/local/sbin/pivsetup | tr -d ' ')
 test "$file_type" = '177ELF'
+/usr/local/sbin/pivsetup --version > pivsetup-version.txt
+grep -qx "pivsetup $(cat "$P/VERSION")" pivsetup-version.txt || fail "pivsetup version"
+grep -qx 'test hooks: no' pivsetup-version.txt || fail "release build has test hooks"
+grep -q '^control ABI: QUERY 2, request 2, SETUP 6, STATUS 4, KEYSLOT 2$' pivsetup-version.txt || fail "ABI versions"
+version=$(cat "$P/VERSION")
 
 # DKMS: build, install and sign (DKMS generates a throwaway MOK key pair in
 # /var/lib/dkms inside this disposable guest).
 bash "$P/install.sh" dkms /root/piv-src > dkms-install.log 2>&1 || { cat dkms-install.log; fail dkms; }
 dkms status > dkms-status.txt
-grep -q "^dm-piv/0.1, $release, x86_64: installed" dkms-status.txt || fail "dkms status"
+grep -q "^dm-piv/$version, $release, x86_64: installed" dkms-status.txt || fail "dkms status"
 module=$(modinfo -n dm-piv)
 case "$module" in /lib/modules/"$release"/updates/dkms/dm-piv.ko*) ;; *) fail "module path $module" ;; esac
 modinfo dm-piv > deploy-modinfo.txt
@@ -63,17 +73,34 @@ guest_stock_live_start
 modprobe dm-piv
 test -d /sys/module/dm_piv
 guest_stock_live_check
-/usr/local/sbin/pivsetup open-blocks --device /dev/vdb --key-file passphrase.key \
-    --hidden-key-file hidden.key > deploy-open.json
-cmp /dev/mapper/piv-native-hidden expected-hidden-volume
-test "$(sha256sum /dev/mapper/piv-native-decoy | cut -d ' ' -f 1)" = "$(cat expected-primary.sha256)"
-/usr/local/sbin/pivsetup close-blocks --device /dev/vdb --key-file passphrase.key
-
-# initramfs-tools integration.
-bash "$P/install.sh" initramfs
+# Key files must be root-owned and private: the 9p share's are refused (the
+# release build ignores PIVSETUP_TEST_LAX_KEY_FILES, exported by guest-common).
+test "$PIVSETUP_TEST_LAX_KEY_FILES" = 1
+if /usr/local/sbin/pivsetup open-blocks --device /dev/vdb --key-file passphrase.key \
+        --hidden-key-file hidden.key > /dev/null 2> key-mode.err; then
+    fail "accepted key files on the 9p share"
+fi
+grep -qE 'Key file .* (is not owned by root|is accessible by group or others)' key-mode.err ||
+    { cat key-mode.err; fail "key-file refusal message"; }
 install -d -m 0700 /etc/piv
 install -m 0600 passphrase.key /etc/piv/passphrase.key
 install -m 0600 hidden.key /etc/piv/hidden.key
+install -m 0644 hidden.key /var/tmp/piv-readable.key
+if /usr/local/sbin/pivsetup open-blocks --device /dev/vdb --key-file /etc/piv/passphrase.key \
+        --hidden-key-file /var/tmp/piv-readable.key > /dev/null 2> key-mode.err; then
+    fail "accepted a world-readable hidden key file"
+fi
+grep -q 'is accessible by group or others' key-mode.err || { cat key-mode.err; fail "key-file mode message"; }
+rm -f /var/tmp/piv-readable.key
+# PIVSETUP_TEST_FAIL is ignored by the release build (the test build fails here).
+PIVSETUP_TEST_FAIL=before-setup /usr/local/sbin/pivsetup open-blocks --device /dev/vdb \
+    --key-file /etc/piv/passphrase.key --hidden-key-file /etc/piv/hidden.key > deploy-open.json
+cmp /dev/mapper/piv-native-hidden expected-hidden-volume
+test "$(sha256sum /dev/mapper/piv-native-decoy | cut -d ' ' -f 1)" = "$(cat expected-primary.sha256)"
+/usr/local/sbin/pivsetup close-blocks --device /dev/vdb --key-file /etc/piv/passphrase.key
+
+# initramfs-tools integration.
+bash "$P/install.sh" initramfs
 # Invalid configurations make mkinitramfs fail with the hook's message.
 negative() {
     printf '%s\n' "$1" > /etc/pivtab
@@ -89,6 +116,10 @@ negative 'native /dev/vdb ask ask hidden-passphrase' 'invalid mapping name'
 negative 'piv-native /dev/vdb ask ask hidden-passphrase,bogus' 'unknown option'
 negative 'piv-native vdb ask ask hidden-passphrase' 'must be a /dev path'
 negative 'piv-native /dev/vdb /etc/piv/missing.key /etc/piv/hidden.key embed-keys' 'not a readable regular file'
+# embed-keys needs the private-image configuration (UMASK=0077).
+mv /etc/initramfs-tools/conf.d/pivsetup /var/tmp/piv-conf
+negative 'piv-native /dev/vdb /etc/piv/passphrase.key /etc/piv/hidden.key embed-keys' 'embed-keys needs UMASK=0077'
+mv /var/tmp/piv-conf /etc/initramfs-tools/conf.d/pivsetup
 printf 'piv-native /dev/vdb /etc/piv/passphrase.key /etc/piv/hidden.key embed-keys\n' > /etc/pivtab
 update-initramfs -u -k "$release" > update-initramfs.log 2>&1 || { cat update-initramfs.log; fail update-initramfs; }
 initrd=/boot/initrd.img-$release

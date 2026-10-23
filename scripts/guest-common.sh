@@ -17,6 +17,10 @@ case "$(blockdev --getsize64 /dev/vdb)" in
     *) echo "Unsupported disposable guest disk size" >&2; exit 1 ;;
 esac
 cd /mnt/piv-work
+# Test keys live on the 9p share, whose files cannot be root-owned 0600: the
+# test-hooks pivsetup build skips its key-file permission check with this. The
+# release build (deploy suite) ignores it.
+export PIVSETUP_TEST_LAX_KEY_FILES=1
 
 guest_packages() {
     export DEBIAN_FRONTEND=noninteractive

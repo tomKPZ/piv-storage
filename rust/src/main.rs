@@ -38,9 +38,12 @@ usage: pivsetup open-blocks --device D --key-file F (--hidden-key-file F | --hid
                         [--ab] [--parity 4|8|16]
                         [--source-kdf-cost 1-4] [--target-kdf-cost 1-4]
        pivsetup keygen --output F
+       pivsetup --version
 
 D is the block device (or partition) holding the LUKS2 volume; there is no
-default. Research prototype without external cryptographic review.
+default. Research prototype without external cryptographic review. Key,
+passphrase and LUKS key files must be regular files owned by root and not
+accessible by group or others (chmod 600).
 LUKS2 volumes with 16-byte random IVs (aegis128-random + aead, or aes-xts-random
 + hmac-sha256), the journaled integrity layer, and hidden format v5 (4096-byte
 hidden blocks). --initialize destroys all existing hidden contents and writes
@@ -118,6 +121,14 @@ impl Args {
         self.path(key).ok_or_else(|| Error::new(format!("{key} is required")))
     }
 
+    /// A required LUKS key-file path, after the key-file permission check
+    /// (cryptsetup reads the file itself).
+    fn key_file(&self, key: &str) -> Result<PathBuf> {
+        let path = self.required(key)?;
+        secret::check_key_file(&path)?;
+        Ok(path)
+    }
+
     fn flag(&self, key: &str) -> bool {
         self.flags.iter().any(|f| f == key)
     }
@@ -133,12 +144,12 @@ impl Args {
 }
 
 fn read_key(path: &Path) -> Result<Secret> {
-    Secret::read_file(path, 33)
+    Secret::read_key_file(path, 33)
 }
 
 /// Whole file without trailing newlines (Python: read().rstrip(b'\n')).
 fn read_passphrase(path: &Path) -> Result<Secret> {
-    let mut secret = Secret::read_file(path, MAX_PASSPHRASE + 1)?;
+    let mut secret = Secret::read_key_file(path, MAX_PASSPHRASE + 1)?;
     if secret.len() > MAX_PASSPHRASE {
         return Err(Error::new("Passphrase file is too large"));
     }
@@ -203,7 +214,7 @@ fn run(args: Args) -> Result<()> {
                 verify: args.flag("--verify"), parity: blocks::parity(args.value("--parity"))?,
                 kdf_cost: kdf_cost_for(&args, "--kdf-cost", "--hidden-passphrase-file")?,
             };
-            let views = blocks::open_blocks(&device, &args.required("--key-file")?, secret, &options)?;
+            let views = blocks::open_blocks(&device, &args.key_file("--key-file")?, secret, &options)?;
             // --fill adds the block counts: already valid (skipped), written
             // as zeros, and failed (carrier unreadable or not authenticating).
             let fill = views.fill.map_or(String::new(), |c| format!(
@@ -218,7 +229,7 @@ fn run(args: Args) -> Result<()> {
         }
         "close-blocks" => {
             args.only(&["--device", "--key-file", "--name"])?;
-            blocks::close_blocks(&args.required("--device")?, &args.required("--key-file")?, &name)
+            blocks::close_blocks(&args.required("--device")?, &args.key_file("--key-file")?, &name)
         }
         "migrate" => {
             args.only(&["--source", "--source-key-file", "--source-hidden-key-file",
@@ -234,8 +245,8 @@ fn run(args: Args) -> Result<()> {
                 source_kdf_cost: kdf_cost_for(&args, "--source-kdf-cost", "--source-hidden-passphrase-file")?,
                 target_kdf_cost: kdf_cost_for(&args, "--target-kdf-cost", "--target-hidden-passphrase-file")?,
             };
-            let report = migrate::migrate(&source, &args.required("--source-key-file")?, source_secret,
-                                          &args.required("--target")?, &args.required("--target-key-file")?,
+            let report = migrate::migrate(&source, &args.key_file("--source-key-file")?, source_secret,
+                                          &args.required("--target")?, &args.key_file("--target-key-file")?,
                                           target_secret, &layout)?;
             println!("{{\n  \"decoy\": {{\"bytes\": {}, \"target_bytes\": {}}},\n  \
                       \"hidden\": {{\"bytes\": {}, \"target_bytes\": {}}},\n  \"verified\": true\n}}",
@@ -253,7 +264,7 @@ fn run(args: Args) -> Result<()> {
             let tier = kdf_cost_for(&args, "--new-kdf-cost", "--new-passphrase-file")?;
             let slot: u32 = args.value("--slot").and_then(|s| s.parse().ok()).filter(|&s| s < 4)
                 .ok_or_else(|| Error::new("--slot must be 0, 1, 2 or 3"))?;
-            let key_file = args.required("--key-file")?;
+            let key_file = args.key_file("--key-file")?;
             let kek = match (args.operation.as_deref(), args.path("--new-key-file"), args.path("--new-passphrase-file")) {
                 (Some("remove"), None, None) => None,
                 (Some("add"), Some(key), None) => {
@@ -293,9 +304,22 @@ fn run(args: Args) -> Result<()> {
     }
 }
 
+/// `pivsetup --version`: the package version (also the DKMS package version,
+/// packaging/VERSION), the control ABI versions it speaks and whether the
+/// PIVSETUP_TEST_* hooks are compiled in.
+fn version() -> String {
+    format!("pivsetup {}\ncontrol ABI: QUERY {}, request {}, SETUP {}, STATUS {}, KEYSLOT {}\ntest hooks: {}",
+            env!("CARGO_PKG_VERSION"), ioctl::QUERY_VERSION, ioctl::REQUEST_VERSION, ioctl::SETUP_VERSION,
+            ioctl::STATUS_VERSION, ioctl::KEYSLOT_VERSION, if hooks::ENABLED { "compiled in" } else { "no" })
+}
+
 fn main() {
     secret::harden_process();
     signals::install();
+    if matches!(std::env::args().nth(1).as_deref(), Some("--version" | "version")) && std::env::args().len() == 2 {
+        println!("{}", version());
+        std::process::exit(0);
+    }
     let code = match Args::parse(std::env::args().skip(1)).and_then(run) {
         Ok(()) => 0,
         Err(error) => {
@@ -306,6 +330,10 @@ fn main() {
             }
             for note in &error.notes {
                 eprintln!("pivsetup: {note}");
+            }
+            if error.errno == Some(libc::EKEYREJECTED) {
+                eprintln!("pivsetup: hint: wrong hidden key or passphrase, or a passphrase given with another \
+                           --kdf-cost tier than its keyslot was created with (the tier is not recorded)");
             }
             if error.interrupted { 130 } else { 1 }
         }

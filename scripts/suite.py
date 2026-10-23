@@ -20,6 +20,7 @@ import json
 import re
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -200,7 +201,8 @@ class Matrix:
             'devices': (ROOT / 'scripts/guest-devices.sh', final,
                         [ko, ROOT / 'kernel/guest-devices-test.py', *keys, *oracles], None),
             'deploy': (ROOT / 'scripts/guest-deploy.sh', final,
-                       [Path(self.args.scaffold), self.args.packaging, *keys, *oracles], 'deploy-final.img'),
+                       [Path(self.args.scaffold), self.args.packaging, self.args.pivsetup_release, *keys, *oracles],
+                       'deploy-final.img'),
             'fuzz': (ROOT / 'scripts/guest-fuzz.sh', final,
                      [ko, ROOT / 'kernel/guest-table-fuzz.py', ROOT / 'kernel/guest-ioctl-fuzz.py', *keys, *oracles], None),
             'v5': (ROOT / 'scripts/guest-v5.sh', control / 'control.img',
@@ -358,18 +360,26 @@ def main():
     # Static Rust setup frontend shared into every guest (scripts/build_pivsetup.py).
     sys.path.insert(0, str(ROOT / 'scripts'))
     from build_pivsetup import build
-    args.pivsetup = build(quiet=True)
+    # Guest tests use the test-hooks build; the deploy suite installs the
+    # release build (no PIVSETUP_TEST_* hooks) as pivsetup-release. Private
+    # copies: later rebuilds cannot change the binaries of a running matrix.
+    args.pivsetup = args.prefix / 'pivsetup'
+    shutil.copy(build(quiet=True, test_hooks=True), args.pivsetup)
+    args.pivsetup_release = args.prefix / 'pivsetup-release'
+    shutil.copy(build(quiet=True), args.pivsetup_release)
     # packaging/ (install.sh, DKMS and initramfs-tools files) for the deploy suite.
     args.packaging = args.prefix / 'packaging.tar'
     with tarfile.open(args.packaging, 'x') as archive:
         archive.add(ROOT / 'packaging', arcname='packaging')
     pivsetup_sha256 = hashlib.sha256(args.pivsetup.read_bytes()).hexdigest()
-    log(f'pivsetup {pivsetup_sha256}')
+    release_sha256 = hashlib.sha256(args.pivsetup_release.read_bytes()).hexdigest()
+    log(f'pivsetup {pivsetup_sha256} (test hooks), release {release_sha256}')
     matrix = Matrix(args)
     work = [(p, None) for p in args.profile] + [(c.name, c.resolve()) for c in args.control]
     with ThreadPoolExecutor(max_workers=len(work)) as pool:
         list(pool.map(lambda item: matrix.profile(*item), work))
     summary = dict(provisioned=args.provisioned, accel=args.accel, pivsetup_sha256=pivsetup_sha256,
+                   pivsetup_release_sha256=release_sha256,
                    module_input_sha256=args.module_input_sha256,
                    reuse_native=str(args.reuse_native.resolve()) if args.reuse_native else None,
                    base_image=str(args.base_image) if args.base_image else None,

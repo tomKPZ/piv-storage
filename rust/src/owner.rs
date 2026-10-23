@@ -58,15 +58,20 @@ pub fn require_root() -> Result<()> {
 /// as /dev/disk/by-* are followed) of a nonzero whole number of 512-byte
 /// sectors that is not a partitioned whole disk. LUKS2/integrity profile,
 /// geometry bounds, holders and exclusive use are checked afterwards.
-pub fn check_device(source: &Path) -> Result<u64> {
+///
+/// Returns the size and the kernel's own node for the device (/dev/DEVNAME
+/// from sysfs, same device number): later steps use that path, so a symlink
+/// that changes during setup (udev by-* links) cannot switch devices.
+pub fn check_device(source: &Path) -> Result<(u64, PathBuf)> {
     require_root()?;
     let info = fs::metadata(source)
         .map_err(|e| Error::new(format!("Cannot access {}: {e}", source.display())))?;
     if !info.file_type().is_block_device() {
         bail!("{} is not a block device", source.display());
     }
-    let size: u64 = cmd::run("blockdev", &["--getsize64", path_str(source)?])?.trim().parse()
-        .map_err(|_| Error::new("Invalid device size"))?;
+    let node = kernel_node(info.rdev())
+        .map_err(|e| Error::new(format!("Cannot resolve the device node of {}: {}", source.display(), e.message)))?;
+    let size = device_size(&node, info.rdev())?;
     if size == 0 || size % 512 != 0 {
         bail!("Unsupported block device size {size}");
     }
@@ -74,7 +79,47 @@ pub fn check_device(source: &Path) -> Result<u64> {
     if has_partitions(major, minor)? {
         bail!("{} has a partition table in use; give the partition that holds the LUKS volume", source.display());
     }
+    Ok((size, node))
+}
+
+/// /dev/DEVNAME of block device @rdev (sysfs uevent), which must itself be a
+/// block device node (not a symlink) with that device number.
+fn kernel_node(rdev: u64) -> Result<PathBuf> {
+    let uevent = fs::read_to_string(format!("/sys/dev/block/{}:{}/uevent", libc::major(rdev), libc::minor(rdev)))?;
+    let name = uevent.lines().find_map(|l| l.strip_prefix("DEVNAME="))
+        .filter(|n| !n.is_empty() && !n.split('/').any(|part| part.is_empty() || part == "." || part == ".."))
+        .ok_or_else(|| Error::new("no DEVNAME in sysfs"))?;
+    let node = PathBuf::from(format!("/dev/{name}"));
+    let info = fs::symlink_metadata(&node)?;
+    if !info.file_type().is_block_device() || info.rdev() != rdev {
+        bail!("{} is not the expected block device node", node.display());
+    }
+    Ok(node)
+}
+
+/// Opens @path read-only, checks it is still block device @rdev and returns
+/// its size (BLKGETSIZE64).
+pub fn device_size(path: &Path, rdev: u64) -> Result<u64> {
+    let file = open_device(path, rdev)?;
+    let mut size: u64 = 0;
+    // SAFETY: BLKGETSIZE64 writes one u64 into the live local.
+    if unsafe { libc::ioctl(file.as_raw_fd(), BLKGETSIZE64, &mut size as *mut u64) } != 0 {
+        return Err(Error::last_os(&format!("Size of {}", path.display())));
+    }
     Ok(size)
+}
+
+/// _IOR(0x12, 114, size_t)
+const BLKGETSIZE64: libc::c_ulong = 0x8008_1272;
+
+/// Read-only open that verifies the opened file is block device @rdev.
+fn open_device(path: &Path, rdev: u64) -> Result<fs::File> {
+    let file = fs::OpenOptions::new().read(true).custom_flags(libc::O_CLOEXEC).open(path)?;
+    let info = file.metadata()?;
+    if !info.file_type().is_block_device() || info.rdev() != rdev {
+        bail!("{} changed during setup", path.display());
+    }
+    Ok(file)
 }
 
 /// A whole disk whose kernel partition table lists partitions: its partitions
@@ -145,7 +190,8 @@ impl Owner {
         if !valid_piv_name(name, 40) {
             bail!("Invalid experimental mapping name");
         }
-        let raw_bytes = check_device(source)?;
+        let (raw_bytes, node) = check_device(source)?;
+        let source = node.as_path();
         let source_text = path_str(source)?;
         let metadata = json::parse(&crypt(&["luksDump", "--dump-json-metadata", source_text])?)
             .map_err(|e| Error::new(format!("Invalid LUKS2 metadata: {e}")))?;
@@ -218,7 +264,7 @@ impl Owner {
             check_unclaimed(&self.source)?;
         }
         // Only static format fields: live journal recovery belongs to Linux.
-        let raw = fs::File::open(&self.source)?;
+        let raw = open_device(&self.source, libc::makedev(self.raw_major, self.raw_minor))?;
         let mut header = vec![0u8; 4096];
         read_exact_at(&raw, &mut header, self.offset)?;
         drop(raw);
@@ -241,8 +287,8 @@ impl Owner {
             if self.mappings.len() != 2 {
                 bail!("Created mapping identity is missing");
             }
-            let owner_size: u64 = cmd::run("blockdev", &["--getsize64", &format!("/dev/mapper/{name}")])?
-                .trim().parse().map_err(|_| Error::new("Invalid owner size"))?;
+            let owner_path = PathBuf::from(format!("/dev/mapper/{name}"));
+            let owner_size = device_size(&owner_path, fs::metadata(&owner_path)?.rdev())?;
             let table = dm_ok(&["table", &self.lower_name])?;
             self.check_integrity_table(&table, owner_size / self.layout.sector_size)?;
             self.reload_as_owner()?;

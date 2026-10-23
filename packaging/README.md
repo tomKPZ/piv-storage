@@ -21,7 +21,9 @@ Debian-style system; run it as root from a checkout.
   `aegis128` (default) or `authenc`, `xts`, `aes`, `hmac` and `sha256`; format
   v5 also needs `chacha20` and `hmac(sha256)`. Tested only on Debian 13's
   6.12.113 and trixie-backports 7.2.9 kernels.
-- cryptsetup and dmsetup (tested with cryptsetup 2.7.5), `blockdev`.
+- cryptsetup and dmsetup (tested with cryptsetup 2.7.5) in /usr/sbin, /usr/bin,
+  /sbin or /bin: pivsetup runs them with a cleared environment and that fixed
+  `PATH`, never the caller's.
 - For DKMS: `dkms` (tested 3.2.2) and the headers of every kernel to build for.
 - For boot activation: initramfs-tools (tested 0.148.4); for `ask` prompts,
   cryptsetup-initramfs (`/lib/cryptsetup/askpass`).
@@ -38,16 +40,33 @@ sudo packaging/install.sh pivsetup rust/target/x86_64-unknown-linux-gnu/release/
 
 It goes to `/usr/local/sbin/pivsetup`. Compare the printed SHA-256 when
 copying the binary to another machine; it needs no runtime libraries.
+`install.sh` refuses the guest-test build (`build_pivsetup.py --test-hooks`,
+cargo feature `test-hooks`), which honours `PIVSETUP_TEST_*` variables;
+`pivsetup --version` prints the version, the control ABI versions it speaks
+and whether test hooks are compiled in. A dm-piv module speaking other ABI
+versions is refused with both versions in the message: install the module and
+pivsetup from the same tree (both carry the version in packaging/VERSION).
+
+Key, passphrase and LUKS key files must be regular files owned by root and not
+accessible by group or others (`chmod 600`); pivsetup refuses others. Hidden
+passphrases at Argon2id tiers 2–4 need 256 MiB–2 GiB of free memory; pivsetup
+checks `MemAvailable` first. A rejected key or passphrase prints a hint: the
+tier (`--kdf-cost`) is not recorded and must match the keyslot's.
 
 ## dm-piv with DKMS
 
 ```sh
 sudo apt install dkms linux-headers-$(uname -r)
-sudo packaging/install.sh dkms           # kernel/ sources -> /usr/src/dm-piv-0.1
+sudo packaging/install.sh dkms           # kernel/ sources -> /usr/src/dm-piv-VERSION
 sudo modprobe dm-piv
 ```
 
-DKMS rebuilds the module for each newly installed kernel (`AUTOINSTALL`).
+DKMS rebuilds the module for each newly installed kernel (`AUTOINSTALL`). If
+that build fails (for example a kernel whose internal APIs changed), DKMS
+reports the error during the kernel package installation, the new kernel has
+no dm-piv, and an initramfs built for it fails `update-initramfs` with the
+hook's missing-module error (so a boot-activation setup notices before
+reboot); keep booting the previous kernel until the module builds.
 `install.sh dkms-remove` removes it again. Without DKMS, build against the
 running kernel's headers and install by hand:
 
@@ -124,13 +143,18 @@ sudo update-initramfs -u
 ```
 
 The hook (`/etc/initramfs-tools/hooks/pivsetup`) validates `/etc/pivtab`,
-copies pivsetup, cryptsetup, dmsetup, blockdev, the dm-piv module of the target
+copies pivsetup, cryptsetup, dmsetup, the dm-piv module of the target
 kernel and the profile crypto modules, and fails `update-initramfs` on any
 configuration error or a missing module. The local-top script loads the
 modules, waits up to `ROOTDELAY` (default 30 s) for each device and runs
-`pivsetup open-blocks`, logging to `/run/pivsetup/initramfs.log` (visible after
-boot); a failure is logged and boot continues. A root filesystem on a view is
-named `root=/dev/mapper/NAME-decoy` (or `-hidden`).
+`pivsetup open-blocks`. Only `/run/pivsetup/status` (one `NAME: opened` or
+`NAME: failed` line per entry) remains after boot; pivsetup's messages go to
+the console on failure and, like prompted secrets, otherwise stay on the
+initramfs root, which is freed at switch_root (no JSON or detailed log is
+kept). A failure does not stop the boot. A root filesystem on a view is
+named `root=/dev/mapper/NAME-decoy` (or `-hidden`). The script declares no
+`PREREQ`: udev already runs, and views on devices that other local-top
+scripts create (e.g. a cryptroot mapping) are not supported.
 
 Each `/etc/pivtab` line is `NAME DEVICE LUKS-KEY HIDDEN-SECRET OPTIONS`. A key is
 either `ask` (prompted at boot through cryptsetup's askpass; hidden secrets
@@ -138,7 +162,10 @@ then must be a passphrase, option `hidden-passphrase`, with `kdf-cost=N`) or a
 key file path, which requires `embed-keys`. Security trade-offs:
 
 - `embed-keys` copies both keys into the initramfs. The image is created mode
-  0600 (`conf.d/pivsetup` sets `UMASK=0077`), but it normally lies unencrypted
+  0600 (`conf.d/pivsetup` sets `UMASK=0077`; the hook refuses `embed-keys`
+  without that setting). Images built before installing it keep their old
+  mode: `chmod 600 /boot/initrd.img-*` (and remove stale copies). The image
+  normally lies unencrypted
   in /boot: anyone who reads it can open both views and prove the hidden volume
   exists. Use it only for testing or where the boot partition is protected as
   well as the keys.
@@ -154,7 +181,10 @@ Verified in a disposable guest (suite `deploy`): DKMS build, install and
 signature; activation from the installed binary and module; the hook's
 rejection of invalid configurations; and a reboot whose stock initramfs-tools
 boot opened both views from an `embed-keys` entry before root was mounted,
-with hidden and decoy contents intact. The suite also leaves unmounted views active at power-off: Debian's
+with hidden and decoy contents intact, leaving only the status file in
+/run/pivsetup. It also checks the release binary (no test hooks, refusal of
+the test build, `--version`), key-file permission refusals and the
+`embed-keys` refusal without `UMASK=0077`. The suite also leaves unmounted views active at power-off: Debian's
 systemd-shutdown detached all four mappings (views, owner, integrity) and the
 disk verified on the host afterwards. Still unmount and close the views
 before shutdown where possible: a filesystem on a view must be unmounted

@@ -85,6 +85,7 @@ pub fn passphrase_kek(passphrase: &[u8], base_context: &[u8], tier: u8) -> Resul
         bail!("Unsupported KDF cost tier");
     }
     let (memory, passes) = ARGON2_TIERS[usize::from(tier - 1)];
+    check_kdf_memory(tier, memory, mem_available_kib())?;
     let mut salt = base_context.to_vec();
     salt.extend_from_slice(b"/kek/argon2id/");
     salt.push(b'0' + tier);
@@ -96,6 +97,25 @@ pub fn passphrase_kek(passphrase: &[u8], base_context: &[u8], tier: u8) -> Resul
         .hash_password_into(passphrase, &salt, &mut kek)
         .map_err(|e| Error::new(e.to_string()))?;
     Ok(kek)
+}
+
+/// MemAvailable of /proc/meminfo in KiB (None if unreadable).
+fn mem_available_kib() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    text.lines().find_map(|l| l.strip_prefix("MemAvailable:"))?.trim().strip_suffix("kB")?.trim().parse().ok()
+}
+
+/// Tiers 2-4 need 256 MiB-2 GiB: refuse up front with a clear message rather
+/// than failing (or being OOM-killed) inside Argon2id. Unknown availability
+/// does not refuse.
+fn check_kdf_memory(tier: u8, memory_kib: u32, available_kib: Option<u64>) -> Result<()> {
+    match available_kib {
+        Some(available) if tier >= 2 && available < u64::from(memory_kib) => Err(Error::os(libc::ENOMEM, format!(
+            "Argon2id cost tier {tier} needs {} MiB of memory but only {} MiB is available (MemAvailable); \
+             free memory, or give the tier the keyslot was created with (--kdf-cost)",
+            memory_kib / 1024, available / 1024))),
+        _ => Ok(()),
+    }
 }
 
 fn setup_flags(initialize: bool, quick: bool, fill: bool, ab: bool, verify: bool, parity: u32) -> Result<u32> {
@@ -325,6 +345,25 @@ fn random_hex(bytes: usize) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kdf_memory_precheck() {
+        let tier3 = ARGON2_TIERS[2].0;
+        assert!(check_kdf_memory(3, tier3, Some(u64::from(tier3) - 1)).is_err());
+        assert!(check_kdf_memory(3, tier3, Some(u64::from(tier3))).is_ok());
+        assert!(check_kdf_memory(3, tier3, None).is_ok());
+        // Tier 1 (64 MiB) is never refused.
+        assert!(check_kdf_memory(1, ARGON2_TIERS[0].0, Some(1)).is_ok());
+        let error = check_kdf_memory(4, ARGON2_TIERS[3].0, Some(512 * 1024)).unwrap_err();
+        assert_eq!(error.errno, Some(libc::ENOMEM));
+        assert!(error.message.contains("2048 MiB") && error.message.contains("512 MiB"));
+    }
+
+    #[test]
+    fn version_matches_packaging() {
+        // One version source for pivsetup and the DKMS package (install.sh).
+        assert_eq!(env!("CARGO_PKG_VERSION"), include_str!("../../packaging/VERSION").trim());
+    }
 
     #[test]
     fn setup_flags_match_kernel_abi() {

@@ -2,10 +2,12 @@
 """Pinned disposable guest: configuration benchmark on a pristine stock fixture.
 
 Times stock and native activation, decoy and hidden throughput (4096-byte
-hidden blocks), A/B, RS parity and the Argon2id passphrase cost tiers,
+hidden blocks; random writes also at queue depth 16), A/B, RS parity and the
+Argon2id passphrase cost tiers,
 checking every byte read back. Destroys the fixture's decoy
 contents (guest-owned copy only). Results: bench-results.json.
 """
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import mmap
@@ -25,6 +27,7 @@ MIB = 1024 * 1024
 DECOY_BYTES, DECOY_CHUNK = 16 * MIB, MIB
 HIDDEN_LIMIT, HIDDEN_CHUNK = MIB, 64 * 1024
 RANDOM_DECOY, RANDOM_HIDDEN = 256, 64
+DEPTH = 16
 STOCK = '/dev/mapper/piv-stock-bench'
 results = dict(activation=[], throughput=[], encryptions=[])
 
@@ -90,6 +93,28 @@ def scattered(path, offsets, unit, data=None):
             os.close(fd)
 
 
+def concurrent(path, offsets, unit, data):
+    """Random O_DIRECT writes of @unit bytes from DEPTH threads (one request
+    in flight each, so queue depth DEPTH), then one fsync. Returns seconds."""
+    parts = [offsets[i::DEPTH] for i in range(DEPTH)]
+    fd = os.open(path, os.O_RDWR | os.O_DIRECT)
+
+    def worker(part):
+        with mmap.mmap(-1, unit) as buf:
+            for offset in part:
+                buf[:] = data[offset]
+                assert os.pwritev(fd, [buf], offset) == unit
+
+    try:
+        start = time.monotonic()
+        with ThreadPoolExecutor(DEPTH) as pool:
+            list(pool.map(worker, parts))
+        os.fsync(fd)
+        return time.monotonic() - start
+    finally:
+        os.close(fd)
+
+
 def encryptions():
     owner = GuestOwner('/dev/vdb', KEY)
     try:
@@ -130,6 +155,17 @@ def workload(config, path, role, offset, length, chunk, unit, count, native=True
     record(config, role, f'random-read-{unit}', unit * len(offsets), seconds, len(offsets))
     image = bytearray(data)
     for o, value in blocks_.items():
+        image[o - offset:o - offset + unit] = value
+    # Queue depth 16: the same number of random writes from 16 threads.
+    rng = random.Random(f'{config}/{role}/qd{DEPTH}')
+    offsets = sorted({offset + rng.randrange(length // unit) * unit for _ in range(count)})
+    rng.shuffle(offsets)
+    deep = {o: os.urandom(unit) for o in offsets}
+    seconds = concurrent(path, offsets, unit, deep)
+    record(config, role, f'random-write-{unit}-qd{DEPTH}', unit * len(offsets), seconds, len(offsets))
+    back, _ = scattered(path, offsets, unit)
+    assert back == deep, (config, role)
+    for o, value in deep.items():
         image[o - offset:o - offset + unit] = value
     return hashlib.sha256(image).hexdigest()
 

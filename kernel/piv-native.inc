@@ -12,16 +12,25 @@
  */
 #define PN_UNAVAILABLE 1
 /* Power-of-two DM split boundary: a decoy work item touches at most 256
- * primary sectors (128 KiB / 512). No cross-bio accumulation or delayed
+ * primary sectors (PIV_IO_BYTES / 512). No cross-bio accumulation or delayed
  * completion is used.
  */
-#define PN_DECOY_BYTES (128 * 1024)
-#define PN_DECOY_ENTRIES (PN_DECOY_BYTES / 512)
-/* Concurrent view requests (workqueue max_active, shared by all owners). It
- * bounds request memory: at most about 3 MiB per hidden write or read at
- * 4096-byte sectors.
+#define PN_DECOY_ENTRIES (PIV_IO_BYTES / 512)
+/* Concurrent view requests per owner (its workqueue's max_active). It bounds
+ * request memory: at most about 3 MiB per hidden write or read at 4096-byte
+ * sectors.
  */
 #define PN_MAX_ACTIVE 16
+/* A request failing with -ENOMEM before any lower write is retried (with
+ * back-off, about 28 s in total) instead of failing the bio: under memory
+ * pressure writeback must not see I/O errors from a transient allocation
+ * failure. Order-0 GFP_NOIO page allocations do not fail outside OOM-victim
+ * context, so this covers the remaining larger allocations.
+ */
+#define PN_NOMEM_RETRIES 240
+/* Recent hidden writes per block hash (A/B flush skipping, pn_ab_flush). */
+#define PN_RECENT 1024
+static_assert((PN_RECENT & (PN_RECENT - 1)) == 0);
 /* Initialization writes this many records concurrently per round, flushes
  * the lower device after every PN_INIT_FLUSH_RECORDS records (a multiple) and
  * before returning, also when cancelled. View writes flush only for FUA.
@@ -38,6 +47,7 @@ static_assert(PN_INIT_FLUSH_RECORDS % PN_INIT_PARALLEL == 0);
 #define PN_DATA (1U << PN_BLOCK_LOG2)
 #define PN_RANDOM 10
 #define PN_FRAGMENT 6
+#define PN_RANDOM_BATCH 32
 #define PN_PLAIN (8 + PN_DATA)
 #define PN_DATA_FRAGMENTS 687
 #define PN_LANES 3
@@ -81,19 +91,24 @@ struct piv_native {
  u64 hidden_bytes, records;
  bool ready, failed, ab;
  unsigned int views;
+ /* A/B flush skipping (pn_ab_flush). Per block hash: the owner's
+  * writes_done count after the newest hidden write (max over colliding
+  * blocks, so collisions only cost a flush). @since: writes_done when this
+  * state was created, covering writes of earlier setups.
+  */
+ atomic64_t recent[PN_RECENT];
+ s64 since;
 };
-static struct workqueue_struct *pn_wq;
 
 #include "piv-rs.inc"
 
 static int pn_hash(struct crypto_shash *tfm, const void *data, size_t len, u8 out[32])
 {
-	struct shash_desc *d = kmalloc(sizeof(*d) + crypto_shash_descsize(tfm), GFP_NOIO);
+	SHASH_DESC_ON_STACK(d, tfm);
 	int r;
-	if (!d) return -ENOMEM;
 	d->tfm = tfm;
 	r = crypto_shash_digest(d, data, len, out);
-	kfree_sensitive(d);
+	shash_desc_zero(d);
 	return r;
 }
 
@@ -130,6 +145,7 @@ static void pn_encode(const struct pn_lrw *k, u64 sector, const u8 value[16], u8
 	aes_encrypt(&k->prp, iv, block);
 	crypto_xor(iv, mask, 16);
 	memzero_explicit(block, sizeof(block));
+	memzero_explicit(mask, sizeof(mask));
 }
 
 static void pn_decode(const struct pn_lrw *k, u64 sector, const u8 iv[16], u8 value[16])
@@ -140,6 +156,7 @@ static void pn_decode(const struct pn_lrw *k, u64 sector, const u8 iv[16], u8 va
 	aes_decrypt(&k->prp, value, block);
 	crypto_xor(value, mask, 16);
 	memzero_explicit(block, sizeof(block));
+	memzero_explicit(mask, sizeof(mask));
 }
 
 static int pn_lrw_init(struct pn_lrw *k, const u8 tweak[32], const u8 prp[32])
@@ -159,29 +176,32 @@ static int pn_lrw_init(struct pn_lrw *k, const u8 tweak[32], const u8 prp[32])
 static int pn_tag(struct piv_native *n, const u8 mac[32], const u8 *context, size_t context_length,
 		  const char *label, u64 id, const u8 *plain, size_t plain_length, u8 tag[16])
 {
-	size_t label_length = strlen(label), length = context_length + label_length + 8 + plain_length;
 	struct crypto_shash *tfm = mac == n->mac_key ? n->rec_hmac : n->hmac;
-	u8 *buffer = kmalloc(length, GFP_NOIO), digest[32];
-	int r;
-	if (!buffer) return -ENOMEM;
-	memcpy(buffer, context, context_length);
-	memcpy(buffer + context_length, label, label_length);
-	put_unaligned_le64(id, buffer + context_length + label_length);
-	memcpy(buffer + context_length + label_length + 8, plain, plain_length);
-	r = tfm == n->hmac ? crypto_shash_setkey(tfm, mac, 32) : 0;
-	if (!r) r = pn_hash(tfm, buffer, length, digest);
+	SHASH_DESC_ON_STACK(d, tfm);
+	u8 digest[32], le_id[8];
+	int r = tfm == n->hmac ? crypto_shash_setkey(tfm, mac, 32) : 0;
+	/* Incremental: no copy of the plaintext. */
+	put_unaligned_le64(id, le_id);
+	d->tfm = tfm;
+	if (!r) r = crypto_shash_init(d);
+	if (!r) r = crypto_shash_update(d, context, context_length);
+	if (!r) r = crypto_shash_update(d, label, strlen(label));
+	if (!r) r = crypto_shash_update(d, le_id, sizeof(le_id));
+	if (!r) r = crypto_shash_update(d, plain, plain_length);
+	if (!r) r = crypto_shash_final(d, digest);
 	if (!r) memcpy(tag, digest, 16);
+	shash_desc_zero(d);
 	memzero_explicit(digest, sizeof(digest));
-	kfree_sensitive(buffer);
 	return r;
 }
 
 /* ChaCha20(enc, counter 0, nonce = tag[0:12]) keystream XOR over @buffer.
  * The record key (n->enc_key) uses the pre-keyed n->rec_chacha.
- * Callers may pass stack memory, which a
- * scatterlist must never reference (VMAP_STACK: virt_to_page() of a vmalloc
- * address names the wrong page; CONFIG_DEBUG_SG BUG()s). Bounce through the
- * linear heap. Found by the KASAN/DEBUG_SG sanitizer guest (2026-10-21).
+ * Callers may pass stack memory (pn_ks_open), which a scatterlist must never
+ * reference (VMAP_STACK: virt_to_page() of a vmalloc address names the wrong
+ * page; CONFIG_DEBUG_SG BUG()s). Such buffers (and any vmalloc memory) bounce
+ * through the linear heap; kmalloc buffers are used in place. Found by the
+ * KASAN/DEBUG_SG sanitizer guest (2026-10-21).
  */
 static int pn_stream(struct piv_native *n, const u8 enc[32], const u8 tag[16], u8 *buffer, size_t length)
 {
@@ -189,10 +209,11 @@ static int pn_stream(struct piv_native *n, const u8 enc[32], const u8 tag[16], u
 	struct scatterlist sg;
 	DECLARE_CRYPTO_WAIT(wait);
 	struct crypto_skcipher *tfm = enc == n->enc_key ? n->rec_chacha : n->chacha;
-	u8 iv[16] = {}, *bounce;
+	u8 iv[16] = {}, *bounce = buffer;
+	bool linear = !object_is_on_stack(buffer) && !is_vmalloc_addr(buffer) && virt_addr_valid(buffer);
 	int r = tfm == n->chacha ? crypto_skcipher_setkey(tfm, enc, 32) : 0;
 	if (r) return r;
-	bounce = kmemdup(buffer, length, GFP_NOIO);
+	if (!linear) bounce = kmemdup(buffer, length, GFP_NOIO);
 	req = skcipher_request_alloc(tfm, GFP_NOIO);
 	if (!bounce || !req) { r = -ENOMEM; goto out; }
 	memcpy(iv + 4, tag, 12);
@@ -200,10 +221,10 @@ static int pn_stream(struct piv_native *n, const u8 enc[32], const u8 tag[16], u
 	skcipher_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG, crypto_req_done, &wait);
 	skcipher_request_set_crypt(req, &sg, &sg, length, iv);
 	r = crypto_wait_req(crypto_skcipher_encrypt(req), &wait);
-	if (!r) memcpy(buffer, bounce, length);
+	if (!r && !linear) memcpy(buffer, bounce, length);
 out:
 	skcipher_request_free(req);
-	kfree_sensitive(bounce);
+	if (!linear) kfree_sensitive(bounce);
 	return r;
 }
 
@@ -265,7 +286,8 @@ static int pn_siv_seal(struct piv_native *n, const struct pn_lrw *k, const u8 ma
 		       size_t plain_length, u8 *ivs)
 {
 	size_t bytes = count * PN_FRAGMENT;
-	u8 *payload = kzalloc(bytes, GFP_NOIO), value[16];
+	/* Random parts drawn PN_RANDOM_BATCH fragments per CRNG call. */
+	u8 *payload = kzalloc(bytes, GFP_NOIO), randoms[PN_RANDOM_BATCH * PN_RANDOM], value[16];
 	u32 j;
 	int r;
 	if (!payload) return -ENOMEM;
@@ -276,11 +298,14 @@ static int pn_siv_seal(struct piv_native *n, const struct pn_lrw *k, const u8 ma
 	}
 	if (!r && parity) pn_rs_parity(payload, parity, payload + data_fragments * PN_FRAGMENT);
 	for (j = 0; !r && j < count; j++) {
-		get_random_bytes(value, PN_RANDOM);
+		if (j % PN_RANDOM_BATCH == 0)
+			get_random_bytes(randoms, min_t(u32, count - j, PN_RANDOM_BATCH) * PN_RANDOM);
+		memcpy(value, randoms + (j % PN_RANDOM_BATCH) * PN_RANDOM, PN_RANDOM);
 		memcpy(value + PN_RANDOM, payload + j * PN_FRAGMENT, PN_FRAGMENT);
 		pn_encode(k, first + j, value, ivs + j * 16);
 	}
 	memzero_explicit(value, sizeof(value));
+	memzero_explicit(randoms, sizeof(randoms));
 	kfree_sensitive(payload);
 	return r;
 }
@@ -431,16 +456,25 @@ static int pn_dir_parse(struct piv_native *n, const u8 *data)
 	return 0;
 }
 
-/* Decoy-write rule: keep the 6 payload bytes of the old IV, refresh the 10 random bytes. */
+/* Decoy-write rule: keep the 6 payload bytes of the old IV, refresh the 10
+ * random bytes (pn_decode then pn_encode, computing the sector's mask once).
+ */
 static void pn_refresh(const struct pn_lrw *k, u64 sector, const u8 old[16], u8 iv[16])
 {
-	u8 value[16];
+	u8 mask[16], block[16], value[16];
+	pn_mask(k, sector, mask);
+	crypto_xor_cpy(block, old, mask, 16);
+	aes_decrypt(&k->prp, value, block);
+	crypto_xor(value, mask, 16);
 	do {
-		pn_decode(k, sector, old, value);
 		get_random_bytes(value, PN_RANDOM);
-		pn_encode(k, sector, value, iv);
+		crypto_xor_cpy(block, value, mask, 16);
+		aes_encrypt(&k->prp, iv, block);
+		crypto_xor(iv, mask, 16);
 	} while (!memcmp(iv, old, 16));
 	memzero_explicit(value, sizeof(value));
+	memzero_explicit(block, sizeof(block));
+	memzero_explicit(mask, sizeof(mask));
 }
 
 /* New IV for a decoy-written sector: fragment refresh where a keyslot (known
@@ -475,22 +509,21 @@ static int pn_range_ivs(struct piv_control *p, u64 index, u32 count, u8 *ivs, bo
  u32 j, iv = p->profile.iv_size;
  int r;
  /* Tolerant: failing sectors give raw IVs; with @erased they are marked. */
- r = piv_read_range(p, index, count, NULL, ivs, tolerant ? (erased ? erased : scratch) : NULL, erased ? at : 0);
+ r = piv_read_range(p, index, count, NULL, 0, 0, ivs, tolerant ? (erased ? erased : scratch) : NULL,
+		    erased ? at : 0);
  if (!tolerant || !r || !erased || r == -ENOMEM || r == -EINVAL) return r;
- /* A read error with parity: find the unreadable sectors one by one. */
+ /* A read error with parity: find the unreadable sectors one by one
+  * (tolerant one-sector reads mark sectors failing authentication).
+  */
  for (j = 0; j < count; j++) {
-  struct piv_sector *s = NULL;
-  r = piv_load_mode(p->cc, index + j, &s, true);
-  if (r && erased && r != -ENOMEM) {
+  r = piv_read_range(p, index + j, 1, NULL, 0, 0, ivs + j * iv, erased, at + j);
+  if (r && r != -ENOMEM && r != -EINVAL) {
    memset(ivs + j * iv, 0, iv);
    __set_bit(at + j, erased);
    (*unreadable)++;
    continue;
   }
   if (r) return r;
-  memcpy(ivs + j * iv, s->original + PIV_IV_AT(p->cc), iv);
-  if (s->bad && erased) __set_bit(at + j, erased);
-  piv_sector_free(p->cc, s);
  }
  return 0;
 }
@@ -697,6 +730,29 @@ static int pn_ks_write(struct piv_control *p, u32 slot, const u8 *kek, struct pn
  return r;
 }
 
+/* A/B flush skipping. pn_ab_wrote runs after every hidden write of block
+ * @index that may have reached the lower device (under the block's range
+ * lock) and records the owner's writes_done count, which already includes
+ * that write's batches. pn_ab_flush, before the next write of the block,
+ * flushes unless a successful flush started after that count (p->flushed),
+ * i.e. unless the block's earlier write is already durable.
+ */
+static void pn_ab_wrote(struct piv_control *p, u64 index)
+{
+ atomic64_t *slot = &p->native->recent[hash_64(index, ilog2(PN_RECENT))];
+ s64 seq = atomic64_read(&p->writes_done), old = atomic64_read(slot);
+ while (old < seq && !atomic64_try_cmpxchg(slot, &old, seq))
+  ;
+}
+
+static int pn_ab_flush(struct piv_control *p, u64 index)
+{
+ struct piv_native *n = p->native;
+ s64 last = max(atomic64_read(&n->recent[hash_64(index, ilog2(PN_RECENT))]), n->since);
+ if (last <= atomic64_read(&p->flushed)) return 0;
+ return piv_flush(p);
+}
+
 /* The primary sectors of block @index's record group(s): both slots with A/B
  * (adjacent groups), so one range lock covers every access to the block.
  */
@@ -747,14 +803,17 @@ static int pn_write_blocks(struct piv_control *p, bool hidden, u64 offset, const
     * durable before the other slot is overwritten. Without a completion
     * flush, an earlier write of this block (finished: the range lock
     * serializes them) may still sit in the uncommitted journal, so flush
-    * first. A flush failure stops the owner like any flush error.
+    * first, unless a successful flush started after it completed
+    * (pn_ab_flush). A flush failure stops the owner like any flush error.
     */
    if (!r) {
-    r = blkdev_issue_flush(p->cc->dev->bdev);
+    r = pn_ab_flush(p, index);
     if (r) *mutated = true;
    }
   }
   if (!r) r = pn_write_group(p, pn_group(n, index, slot), generation, data, false, mutated);
+  /* Counted even if the write failed: it may have reached the journal. */
+  if (n->ab && *mutated) pn_ab_wrote(p, index);
   piv_range_unlock(p, &range);
   return r;
  }
@@ -1037,7 +1096,7 @@ static int pn_init_round(struct piv_control *p, const u8 *zero, u64 first, u32 c
   INIT_WORK(&w[i].work, pn_init_worker);
   w[i].p = p; w[i].zero = zero; w[i].index = first + i; w[i].fill = counts;
   w[i].pending = &pending; w[i].done = &done;
-  queue_work(pn_wq, &w[i].work);
+  queue_work(p->wq, &w[i].work);
  }
  if (!atomic_dec_and_test(&pending)) wait_for_completion_io(&done);
  for (i = 0; i < count && !r; i++) r = w[i].result;
@@ -1069,13 +1128,13 @@ static int pn_records(struct piv_control *p, u64 *counts)
   if (READ_ONCE(p->failed)) { r = -EIO; break; }
   i += count;
   if (i % PN_INIT_FLUSH_RECORDS == 0 && (!counts || counts[PN_FILL_WRITTEN] != flushed)) {
-   r = blkdev_issue_flush(p->cc->dev->bdev);
+   r = piv_flush(p);
    if (r) { pn_stop(p); break; }
    if (counts) flushed = counts[PN_FILL_WRITTEN];
   }
  }
  if ((!r || r == -EINTR) && (!counts || counts[PN_FILL_WRITTEN] != flushed)) {
-  int f = blkdev_issue_flush(p->cc->dev->bdev);
+  int f = piv_flush(p);
   if (f) { pn_stop(p); r = f; }
  }
  kfree_sensitive(zero);
@@ -1132,6 +1191,7 @@ static int pn_setup(struct piv_control *p, struct file *controller, struct piv_n
      p->profile.sectors > (u64)MAX_LFS_FILESIZE / p->profile.sector_size ||
      !pn_base_valid(p, s->context, s->context_length)) return -EINVAL;
  n = kzalloc(sizeof(*n), GFP_NOIO); if (!n) return -ENOMEM;
+ n->since = atomic64_read(&p->writes_done);
  memcpy(n->base, s->context, s->context_length);
  n->base_length = s->context_length;
  n->dir_slot = -1;
@@ -1309,14 +1369,14 @@ out:
  * group(s), so a concurrent hidden write is never collected half-done. Decoy
  * reads need none (each sector is whole and authenticated on its own).
  */
-static int pn_read(struct piv_control *p, bool hidden, u64 offset, u8 *data, u32 bytes)
+static int pn_read(struct piv_control *p, bool hidden, u64 offset, struct piv_out *out, u32 bytes)
 {
  u64 unit = hidden ? PN_DATA : p->profile.sector_size, first = offset / unit, last = (offset + bytes - 1) / unit, i;
- size_t carrier = 2 * PN_MAX_GROUP * 16;
- size_t length = hidden ? carrier + PN_DATA : min_t(u64, last - first + 1, PIV_READ_SECTORS) * unit;
- u8 *record = kvmalloc(length, GFP_NOIO);
+ size_t carrier = 2 * PN_MAX_GROUP * 16, length = carrier + PN_DATA;
+ u8 *record = NULL;
  int r = 0;
- if (!record) return -ENOMEM;
+ /* Decoy: authenticated plaintext goes straight into @out. */
+ if (hidden && !(record = kvmalloc(length, GFP_NOIO))) return -ENOMEM;
  for (i = first; i <= last; i++) {
   u64 start = i * unit, lo = max(start, offset), hi = min(start + unit, offset + bytes);
   if (hidden) {
@@ -1325,31 +1385,29 @@ static int pn_read(struct piv_control *p, bool hidden, u64 offset, u8 *data, u32
    r = pn_read_record(p, i, record, record + carrier);
    piv_range_unlock(p, &range);
    if (r) break;
-   memcpy(data + lo - offset, record + carrier + lo - start, hi - lo);
+   piv_out_copy(out, record + carrier + lo - start, hi - lo);
   } else {
    u32 count = min_t(u64, last - i + 1, PIV_READ_SECTORS);
-   r = piv_read_range(p, i, count, record, NULL, NULL, 0); if (r) break;
    hi = min(start + count * unit, offset + bytes);
-   memcpy(data + lo - offset, record + lo - start, hi - lo);
+   r = piv_read_range(p, i, count, out, lo - start, hi - lo, NULL, NULL, 0); if (r) break;
    i += count - 1;
   }
  }
- kvfree_sensitive(record, length); return r;
+ if (record) kvfree_sensitive(record, length);
+ return r;
 }
 
 struct pn_view { struct piv_control *p; struct dm_dev *owner; bool hidden; };
 struct pn_work { struct work_struct work; struct piv_control *p; struct bio *bio; u64 offset; bool hidden; };
 
-static void pn_copy_bio(struct bio *bio, u8 *buffer, bool to_bio)
+static void pn_copy_from_bio(struct bio *bio, u8 *buffer)
 {
 	struct bio_vec vec;
 	struct bvec_iter iter;
 	u32 offset = 0;
 	bio_for_each_segment(vec, bio, iter) {
-		void *at = kmap_local_page(vec.bv_page);
-		if (to_bio) memcpy(at + vec.bv_offset, buffer + offset, vec.bv_len);
-		else memcpy(buffer + offset, at + vec.bv_offset, vec.bv_len);
-		kunmap_local(at); offset += vec.bv_len;
+		memcpy_from_page(buffer + offset, vec.bv_page, vec.bv_offset, vec.bv_len);
+		offset += vec.bv_len;
 	}
 }
 
@@ -1363,75 +1421,97 @@ static noinline void pn_endio(struct bio *bio, blk_status_t status)
 	bio_endio(bio);
 }
 
+/* One attempt at a public bio under p->io (shared). *@mutated: storage may
+ * have changed; *@flushing: a flush is in progress or failed.
+ */
+static int pn_request(struct piv_control *p, struct pn_work *w, bool *mutated, bool *flushing)
+{
+	struct piv_native *n = p->native;
+	struct bio *bio = w->bio;
+	u32 bytes = bio->bi_iter.bi_size;
+	u64 limit;
+	u8 *buffer;
+	int r;
+	if (!p->live || !n || !n->ready || READ_ONCE(n->failed) ||
+	    p->blocked || p->transaction || READ_ONCE(p->failed)) return -EIO;
+	if (!bytes && (bio->bi_opf & REQ_PREFLUSH)) {
+		/* Covers every write completed before this flush was issued. */
+		*flushing = true;
+		return piv_flush(p);
+	}
+	limit = w->hidden ? n->hidden_bytes : p->profile.sectors * p->profile.sector_size;
+	/* Hidden requests are whole aligned 4096-byte blocks (DM splits per block). */
+	if (!bytes || bytes > (w->hidden ? PN_DATA : PIV_IO_BYTES) || (w->offset & 511) ||
+	    (bytes & 511) || (w->hidden && (bytes != PN_DATA || w->offset % PN_DATA)) ||
+	    w->offset > limit || bytes > limit - w->offset) return -EINVAL;
+	if (bio_op(bio) == REQ_OP_READ) {
+		/* Authenticated plaintext goes straight into the bio. */
+		struct piv_out out = { .bio = bio, .iter = bio->bi_iter };
+		return pn_read(p, w->hidden, w->offset, &out, bytes);
+	}
+	if (bio_op(bio) != REQ_OP_WRITE) return -EOPNOTSUPP;
+	buffer = kvmalloc(bytes, GFP_NOIO);
+	if (!buffer) return -ENOMEM;
+	pn_copy_from_bio(bio, buffer);
+	/* Drain earlier journal writes before a WRITE|PREFLUSH payload. */
+	*flushing = bio->bi_opf & REQ_PREFLUSH;
+	r = *flushing ? piv_flush(p) : 0;
+	if (!r) {
+		*flushing = false;
+		r = pn_write(p, w->hidden, w->offset, buffer, bytes, false, mutated);
+	}
+	/* FUA: durable before completion. Plain writes are not flushed, as in
+	 * stock dm-crypt; a later flush or FUA request covers them.
+	 */
+	if (!r && (bio->bi_opf & REQ_FUA)) {
+		*flushing = true;
+		r = piv_flush(p);
+	}
+	kvfree_sensitive(buffer, bytes);
+	return r;
+}
+
 /* One public bio. Workers run concurrently under p->io (shared); owner state
  * changes take it exclusively and so wait for them. Every access to p->native
  * happens before the bio completes, so a view removed after its last
- * completion never races a worker.
+ * completion never races a worker. @w is the bio's per-bio data: unusable
+ * once the bio completes.
+ *
+ * Memory pressure: an attempt failing with -ENOMEM before anything was
+ * written or flushed is retried with back-off (PN_NOMEM_RETRIES, about 28 s
+ * in total) outside p->io, so writeback through the views does not see I/O
+ * errors from transient allocation failures and owner state changes are not
+ * held up by the wait.
  */
 static void pn_worker(struct work_struct *work)
 {
 	struct pn_work *w = container_of(work, struct pn_work, work);
 	struct piv_control *p = w->p;
-	struct piv_native *n;
 	struct bio *bio = w->bio;
-	u32 bytes = bio->bi_iter.bi_size;
-	u8 *buffer = NULL;
-	unsigned int noio;
-	bool mutated = false, flushing = false;
-	int r = -EIO;
-	down_read(&p->io); noio = memalloc_noio_save();
-	n = p->native;
-	if (!p->live || !n || !n->ready || READ_ONCE(n->failed) ||
-	    p->blocked || p->transaction || READ_ONCE(p->failed)) goto done;
-	if (!bytes && (bio_op(bio) == REQ_OP_FLUSH || (bio->bi_opf & REQ_PREFLUSH))) {
-		/* Covers every write completed before this flush was issued. */
-		flushing = true;
-		r = blkdev_issue_flush(p->cc->dev->bdev);
-	} else {
-		u64 limit = w->hidden ? n->hidden_bytes : p->profile.sectors * p->profile.sector_size;
-		/* Hidden requests are whole aligned 4096-byte blocks (DM splits per block). */
-		if (!bytes || bytes > (w->hidden ? PN_DATA : PN_DECOY_BYTES) || (w->offset & 511) ||
-		    (bytes & 511) || (w->hidden && (bytes != PN_DATA || w->offset % PN_DATA)) ||
-		    w->offset > limit || bytes > limit - w->offset) { r = -EINVAL; goto done; }
-		buffer = kvmalloc(bytes, GFP_NOIO);
-		if (!buffer) { r = -ENOMEM; goto done; }
-		if (bio_op(bio) == REQ_OP_READ) {
-			r = pn_read(p, w->hidden, w->offset, buffer, bytes);
-			if (!r) pn_copy_bio(bio, buffer, true);
-		} else if (bio_op(bio) == REQ_OP_WRITE) {
-			pn_copy_bio(bio, buffer, false);
-			/* Drain earlier journal writes before a WRITE|PREFLUSH payload. */
-			flushing = bio->bi_opf & REQ_PREFLUSH;
-			r = flushing ? blkdev_issue_flush(p->cc->dev->bdev) : 0;
-			if (!r) {
-				flushing = false;
-				r = pn_write(p, w->hidden, w->offset, buffer, bytes, false, &mutated);
-			}
-			/* FUA: durable before completion. Plain writes are not flushed,
-			 * as in stock dm-crypt; a later flush or FUA request covers them.
-			 */
-			if (!r && (bio->bi_opf & REQ_FUA)) {
-				flushing = true;
-				r = blkdev_issue_flush(p->cc->dev->bdev);
-			}
-		} else r = -EOPNOTSUPP;
+	unsigned int noio, attempt;
+	bool mutated, flushing;
+	int r;
+	for (attempt = 0;; attempt++) {
+		mutated = flushing = false;
+		down_read(&p->io); noio = memalloc_noio_save();
+		r = pn_request(p, w, &mutated, &flushing);
+		/* Scoped isolation: reads, validation, authentication, allocation,
+		 * nonce and preparation failures change no storage and fail only
+		 * this bio. A failed flush leaves earlier durability unknown, and a
+		 * failure once writing began may have partially written; both still
+		 * stop the shared owner.
+		 */
+		if (r < 0 && (mutated || flushing)) { WRITE_ONCE(p->failed, true); WRITE_ONCE(p->native->failed, true); }
+		/* A write or flush still in flight when a concurrent request stopped
+		 * the owner reports EIO: whether it reached storage is unknown.
+		 */
+		if (!r && bio_op(bio) != REQ_OP_READ && READ_ONCE(p->failed)) r = -EIO;
+		memalloc_noio_restore(noio); up_read(&p->io);
+		if (r != -ENOMEM || mutated || flushing || attempt >= PN_NOMEM_RETRIES) break;
+		msleep(attempt < 20 ? 25 : 125);
 	}
-	/* Scoped isolation: reads, validation, authentication, allocation, nonce
-	 * and preparation failures change no storage and fail only this bio. A
-	 * failed flush leaves earlier durability unknown, and a failure once
-	 * writing began may have partially written; both still stop the shared
-	 * owner.
-	 */
-	if (r < 0 && (mutated || flushing)) { WRITE_ONCE(p->failed, true); WRITE_ONCE(n->failed, true); }
-	/* A write or flush still in flight when a concurrent request stopped the
-	 * owner reports EIO: whether it reached storage is unknown.
-	 */
-	if (!r && bio_op(bio) != REQ_OP_READ && READ_ONCE(p->failed)) r = -EIO;
-done:
-	if (buffer) kvfree_sensitive(buffer, bytes);
-	memalloc_noio_restore(noio); up_read(&p->io);
 	pn_endio(bio, errno_to_blk_status(r > 0 ? -EIO : r));
-	kref_put(&p->refs, piv_free); kfree(w);
+	kref_put(&p->refs, piv_free);
 }
 
 static int pn_map(struct dm_target *ti, struct bio *bio)
@@ -1440,13 +1520,14 @@ static int pn_map(struct dm_target *ti, struct bio *bio)
 	struct pn_work *w;
 	u64 sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
 	if (sector > ((u64)MAX_LFS_FILESIZE >> 9)) return DM_MAPIO_KILL;
-	if (bio_op(bio) != REQ_OP_READ && bio_op(bio) != REQ_OP_WRITE && bio_op(bio) != REQ_OP_FLUSH)
+	/* DM delivers flushes as empty REQ_OP_WRITE | REQ_PREFLUSH bios. */
+	if (bio_op(bio) != REQ_OP_READ && bio_op(bio) != REQ_OP_WRITE)
 		return DM_MAPIO_KILL;
-	w = kmalloc(sizeof(*w), GFP_NOWAIT | __GFP_NOWARN);
-	if (!w) return DM_MAPIO_REQUEUE;
+	/* Per-bio data (ti->per_io_data_size): mapping never allocates. */
+	w = dm_per_bio_data(bio, sizeof(*w));
 	INIT_WORK(&w->work, pn_worker); w->p = v->p; w->bio = bio; w->hidden = v->hidden;
 	w->offset = sector << 9;
-	kref_get(&w->p->refs); queue_work(pn_wq, &w->work);
+	kref_get(&w->p->refs); queue_work(w->p->wq, &w->work);
 	return DM_MAPIO_SUBMITTED;
 }
 
@@ -1464,6 +1545,11 @@ static int pn_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	mutex_unlock(&piv_controls_lock);
 	if (!found) { kfree(v); return -ENODEV; }
 	v->p = found; v->hidden = !strcmp(argv[2], "hidden");
+	/* Target limits first: nothing to undo once the view is published. */
+	ti->num_flush_bios = 1;
+	ti->per_io_data_size = sizeof(struct pn_work);
+	r = dm_set_target_max_io_len(ti, (v->hidden ? PN_DATA : PIV_IO_BYTES) / 512);
+	if (r) goto free_ref;
 	r = dm_get_device(ti, argv[0], BLK_OPEN_READ | BLK_OPEN_WRITE, &v->owner);
 	if (r) goto free_ref;
 	mutex_lock(&found->lock);
@@ -1474,11 +1560,8 @@ static int pn_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	else { found->native->views |= v->hidden ? 2 : 1; r = 0; }
 	mutex_unlock(&found->lock);
 	if (r) { dm_put_device(ti, v->owner); goto free_ref; }
-	ti->private = v; ti->num_flush_bios = 1;
-	r = dm_set_target_max_io_len(ti, (v->hidden ? PN_DATA : PN_DECOY_BYTES) / 512);
-	if (!r) return 0;
-	mutex_lock(&found->lock); found->native->views &= ~(v->hidden ? 2 : 1); mutex_unlock(&found->lock);
-	dm_put_device(ti, v->owner);
+	ti->private = v;
+	return 0;
 free_ref:
 	kref_put(&found->refs, piv_free); kfree(v); return r;
 }

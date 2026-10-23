@@ -1,6 +1,6 @@
 #!/bin/sh
 # initramfs-tools hook for early dm-piv activation (packaging/README.md).
-# Adds pivsetup, cryptsetup, dmsetup, blockdev, the dm-piv module and the
+# Adds pivsetup, cryptsetup, dmsetup, the dm-piv module and the
 # crypto modules of both supported LUKS2 profiles, plus a validated copy of
 # /etc/pivtab. Key files are embedded only for entries with embed-keys.
 set -e
@@ -20,8 +20,16 @@ valid_name() {
     [ "${#1}" -le 44 ]
 }
 
+# Embedded keys need a private image: refuse unless an initramfs-tools
+# configuration sets UMASK=0077 (install.sh installs conf.d/pivsetup).
+private_image() {
+    grep -qsx 'UMASK=0077' "${CONFDIR:-/etc/initramfs-tools}/initramfs.conf" \
+        "${CONFDIR:-/etc/initramfs-tools}"/conf.d/*
+}
+
 embed() {  # embed SOURCE DESTINATION-NAME
     [ -f "$1" ] && [ -r "$1" ] || fail "key file $1 is not a readable regular file"
+    private_image || fail "embed-keys needs UMASK=0077 in an initramfs-tools configuration (conf.d/pivsetup)"
     mkdir -p "${DESTDIR}/etc/pivsetup"
     chmod 0700 "${DESTDIR}/etc/pivsetup"
     (umask 077; cp "$1" "${DESTDIR}/etc/pivsetup/$2")
@@ -80,7 +88,6 @@ pivsetup=$(command -v pivsetup || true)
 copy_exec "$pivsetup" /usr/sbin/pivsetup
 copy_exec /usr/sbin/cryptsetup
 copy_exec /usr/sbin/dmsetup
-copy_exec /usr/sbin/blockdev
 # Used by the local-top script (busybox, when present, provides them too).
 for tool in dd wc sleep; do copy_exec "/usr/bin/$tool"; done
 if [ "$ask" = yes ]; then

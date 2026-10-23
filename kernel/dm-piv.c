@@ -16,6 +16,9 @@
 #include <linux/blk-integrity.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
+#include <linux/delay.h>
+#include <linux/hash.h>
+#include <linux/log2.h>
 #include <linux/scatterlist.h>
 #include <linux/miscdevice.h>
 #include <linux/kref.h>
@@ -59,25 +62,24 @@ enum { PIV_KEY_VALID, PIV_SUSPENDED };
 
 struct piv_control;
 
+/* The table's IV offset and device start are always 0 (the constructor
+ * rejects anything else), so sector arithmetic carries neither.
+ */
 struct piv_crypt {
 	struct dm_dev *dev;
 	struct crypto_aead *tfm;
 	struct piv_control *piv_control;
 	unsigned long flags;
-	sector_t start;
-	u64 iv_offset;
-	unsigned int sector_size, sector_shift, iv_size, integrity_iv_size;
+	unsigned int sector_size, sector_shift, iv_size;
 	unsigned int integrity_tag_size, tuple_size, key_size, mac_key_size;
 	char cipher_string[64];
 	u8 key[128];	/* volume key: encryption key || MAC key (authenc) */
 };
 
-/* Mirrors the dm-crypt fields this code uses for one integrity-backed request. */
-struct piv_io {
-	struct piv_crypt *cc;
-	sector_t sector;		/* 512-byte units relative to the target */
-	u8 *integrity_metadata;		/* tuple_size bytes per encryption sector */
-};
+/* One bound for request sizes: DM split size of owner reads and decoy work
+ * items, and the data per lower bio of a batch.
+ */
+#define PIV_IO_BYTES (128 * 1024)
 
 /*
  * The two supported stock LUKS2 profiles (aegis128-random + aead, aes-xts-random
@@ -128,8 +130,11 @@ static int piv_setkey(struct piv_crypt *cc, const u8 *key)
 
 static struct workqueue_struct *piv_io_wq;
 
-/* Attach the caller's integrity buffer so dm-integrity reads/writes the tuples. */
-static int piv_integrity_alloc(struct piv_io *io, struct bio *bio)
+/* Attach the caller's integrity buffer (@meta: tuple_size bytes per encryption
+ * sector, within one page) so dm-integrity reads/writes the tuples of the bio
+ * starting at 512-byte @sector.
+ */
+static int piv_integrity_alloc(struct piv_crypt *cc, struct bio *bio, sector_t sector, u8 *meta)
 {
 	struct bio_integrity_payload *bip;
 	unsigned int tag_len;
@@ -139,20 +144,21 @@ static int piv_integrity_alloc(struct piv_io *io, struct bio *bio)
 	bip = bio_integrity_alloc(bio, GFP_NOIO, 1);
 	if (IS_ERR(bip))
 		return PTR_ERR(bip);
-	tag_len = io->cc->tuple_size * (bio_sectors(bio) >> io->cc->sector_shift);
-	bip->bip_iter.bi_sector = io->cc->start + io->sector;
-	if (bio_integrity_add_page(bio, virt_to_page(io->integrity_metadata), tag_len,
-				   offset_in_page(io->integrity_metadata)) != tag_len)
+	tag_len = cc->tuple_size * (bio_sectors(bio) >> cc->sector_shift);
+	bip->bip_iter.bi_sector = sector;
+	if (bio_integrity_add_page(bio, virt_to_page(meta), tag_len, offset_in_page(meta)) != tag_len)
 		return -ENOMEM;
 	return 0;
 }
 
 /*
  * One encryption sector, in place, exactly as dm-crypt's AEAD path:
- *   | AAD: LE64(sector512 - iv_offset) | IV | data (sector_size) | tag (16) |
+ *   | AAD: LE64(sector512) | IV | data (sector_size) | tag |
  * Encryption stores the IV after the tag in @tuple and zero-fills any padding;
  * decryption takes the IV from @tuple and fails with -EBADMSG on mismatch.
- * Buffers given to scatterlists are heap memory (never the stack).
+ * The caller owns one request and one heap buffer set (scatterlists must never
+ * reference the stack) and reuses them for every sector of a batch, one sector
+ * at a time. noinline: the profile suite counts calls.
  */
 struct piv_aead_buffers {
 	__le64 sector;
@@ -160,24 +166,17 @@ struct piv_aead_buffers {
 	u8 iv[16];
 };
 
-static int piv_aead(struct piv_crypt *cc, sector_t sector512, struct page *page,
-		    unsigned int offset, u8 *tuple, const u8 *requested_iv, bool encrypt)
+static noinline int piv_aead(struct piv_crypt *cc, struct aead_request *req, struct piv_aead_buffers *b,
+			     sector_t sector512, struct page *page, unsigned int offset, u8 *tuple,
+			     const u8 *requested_iv, bool encrypt)
 {
-	struct piv_aead_buffers *b;
-	struct aead_request *req;
 	struct scatterlist sg[4];
 	DECLARE_CRYPTO_WAIT(wait);
 	int r;
 
 	if (encrypt && !requested_iv)
 		return -EINVAL;	/* The owner never generates IVs itself. */
-	b = kzalloc(sizeof(*b), GFP_NOIO);
-	req = aead_request_alloc(cc->tfm, GFP_NOIO);
-	if (!b || !req) {
-		r = -ENOMEM;
-		goto out;
-	}
-	b->sector = cpu_to_le64(sector512 - cc->iv_offset);
+	b->sector = cpu_to_le64(sector512);
 	if (encrypt) {
 		memcpy(b->org_iv, requested_iv, cc->iv_size);
 		memcpy(tuple + cc->integrity_tag_size, b->org_iv, cc->iv_size);
@@ -197,15 +196,14 @@ static int piv_aead(struct piv_crypt *cc, sector_t sector512, struct page *page,
 	if (!r && encrypt && cc->integrity_tag_size + cc->iv_size != cc->tuple_size)
 		memset(tuple + cc->integrity_tag_size + cc->iv_size, 0,
 		       cc->tuple_size - cc->integrity_tag_size - cc->iv_size);
-out:
-	aead_request_free(req);
-	kfree_sensitive(b);
 	return r;
 }
 
 #include "piv-control.inc"
 
-/* Ordinary owner reads (before native ownership): authenticated, bounded. */
+/* Ordinary owner reads (before native ownership): authenticated, bounded.
+ * Per-bio data (ti->per_io_data_size), so mapping never allocates.
+ */
 struct piv_owner_work {
 	struct work_struct work;
 	struct piv_crypt *cc;
@@ -220,25 +218,18 @@ static void piv_owner_read(struct work_struct *work)
 	struct bio *bio = w->bio;
 	u32 bytes = bio->bi_iter.bi_size;
 	u64 index = bio->bi_iter.bi_sector >> cc->sector_shift;
-	u8 *buffer = NULL;
+	struct piv_out out = { .bio = bio, .iter = bio->bi_iter };
 	unsigned int noio;
 	int r = -EIO;
 
 	mutex_lock(&p->lock);
 	noio = memalloc_noio_save();
-	if (p->live && !p->native && p->cc == cc) {
-		buffer = kvmalloc(bytes, GFP_NOIO);
-		r = buffer ? piv_read_range(p, index, bytes / cc->sector_size, buffer, NULL, NULL, 0) : -ENOMEM;
-		if (!r)
-			pn_copy_bio(bio, buffer, true);
-	}
+	if (p->live && !p->native && p->cc == cc)
+		r = piv_read_range(p, index, bytes / cc->sector_size, &out, 0, bytes, NULL, NULL, 0);
 	memalloc_noio_restore(noio);
 	mutex_unlock(&p->lock);
-	if (buffer)
-		kvfree_sensitive(buffer, bytes);
 	bio->bi_status = errno_to_blk_status(r);
 	bio_endio(bio);
-	kfree(w);
 }
 
 static int piv_crypt_map(struct dm_target *ti, struct bio *bio)
@@ -259,11 +250,9 @@ static int piv_crypt_map(struct dm_target *ti, struct bio *bio)
 	bio->bi_iter.bi_sector = dm_target_offset(ti, bio->bi_iter.bi_sector);
 	if ((bio->bi_iter.bi_sector & ((cc->sector_size >> SECTOR_SHIFT) - 1)) ||
 	    (bio->bi_iter.bi_size & (cc->sector_size - 1)) || !bio->bi_iter.bi_size ||
-	    bio->bi_iter.bi_size > PIV_OWNER_BYTES)
+	    bio->bi_iter.bi_size > PIV_IO_BYTES)
 		return DM_MAPIO_KILL;
-	w = kmalloc(sizeof(*w), GFP_NOWAIT | __GFP_NOWARN);
-	if (!w)
-		return DM_MAPIO_REQUEUE;
+	w = dm_per_bio_data(bio, sizeof(*w));
 	INIT_WORK(&w->work, piv_owner_read);
 	w->cc = cc;
 	w->bio = bio;
@@ -324,17 +313,24 @@ static int piv_crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	ti->private = cc;
 	strscpy(cc->cipher_string, profile->cipher_string, sizeof(cc->cipher_string));
 	cc->mac_key_size = profile->mac_size;
-	cc->iv_size = cc->integrity_iv_size = profile->iv_size;
+	cc->iv_size = profile->iv_size;
 	cc->integrity_tag_size = profile->tag_size;
 	cc->sector_size = 512;
 	r = -EINVAL;
 	cc->key_size = strlen(argv[1]) / 2;
 	if ((cc->key_size != profile->enc_a + profile->mac_size &&
 	     cc->key_size != profile->enc_b + profile->mac_size) ||
-	    strlen(argv[1]) != 2 * cc->key_size || hex2bin(cc->key, argv[1], cc->key_size)) {
+	    strlen(argv[1]) != 2 * cc->key_size || hex2bin(cc->key, argv[1], cc->key_size))
+		r = -EINVAL;
+	else
+		r = 0;
+	/* As dm-crypt (crypt_set_key): wipe the table's hex key string, valid or not. */
+	memset(argv[1], '0', strlen(argv[1]));
+	if (r) {
 		ti->error = "Invalid key (hex keys only)";
 		goto bad;
 	}
+	r = -EINVAL;
 	if (sscanf(argv[2], "%llu%c", &value, &dummy) != 1 || value) {
 		ti->error = "Unsupported IV offset";
 		goto bad;
@@ -402,7 +398,8 @@ static int piv_crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 	set_bit(PIV_KEY_VALID, &cc->flags);
 	ti->num_flush_bios = 1;
-	r = dm_set_target_max_io_len(ti, PIV_OWNER_BYTES >> SECTOR_SHIFT);
+	ti->per_io_data_size = sizeof(struct piv_owner_work);
+	r = dm_set_target_max_io_len(ti, PIV_IO_BYTES >> SECTOR_SHIFT);
 	if (r)
 		goto bad;
 	r = piv_register(cc, ti);
@@ -426,8 +423,7 @@ static void piv_crypt_status(struct dm_target *ti, status_type_t type,
 		break;
 	case STATUSTYPE_TABLE:
 		/* Never emit key material; this table is not meant to be reloaded. */
-		DMEMIT("%s - %llu %s %llu", cc->cipher_string, (unsigned long long)cc->iv_offset,
-		       cc->dev->name, (unsigned long long)cc->start);
+		DMEMIT("%s - 0 %s 0", cc->cipher_string, cc->dev->name);
 		if (cc->sector_size != 512)
 			DMEMIT(" 3 piv_control integrity:%u:aead sector_size:%u",
 			       cc->tuple_size, cc->sector_size);
@@ -485,7 +481,7 @@ static int piv_crypt_iterate(struct dm_target *ti, iterate_devices_callout_fn fn
 {
 	struct piv_crypt *cc = ti->private;
 
-	return fn(ti, cc->dev, cc->start, ti->len, data);
+	return fn(ti, cc->dev, 0, ti->len, data);
 }
 
 static void piv_crypt_hints(struct dm_target *ti, struct queue_limits *limits)
@@ -521,12 +517,11 @@ static int __init piv_module_init(void)
 	int r = -ENOMEM;
 
 	pn_gf_init();
-	/* Unbound and concurrent; requests touching the same sectors or record
-	 * serialize on range locks (piv_range_lock).
+	/* Owner reads before native ownership and deferred owner teardown
+	 * (piv_free). View requests run on per-owner workqueues (piv_register).
 	 */
-	pn_wq = alloc_workqueue("piv-native", WQ_MEM_RECLAIM | WQ_UNBOUND, PN_MAX_ACTIVE);
 	piv_io_wq = alloc_workqueue("kpiv_io", WQ_MEM_RECLAIM | WQ_UNBOUND, 0);
-	if (!pn_wq || !piv_io_wq)
+	if (!piv_io_wq)
 		goto free_wq;
 	r = dm_register_target(&piv_crypt_target);
 	if (r)
@@ -538,8 +533,6 @@ static int __init piv_module_init(void)
 free_wq:
 	if (piv_io_wq)
 		destroy_workqueue(piv_io_wq);
-	if (pn_wq)
-		destroy_workqueue(pn_wq);
 	return r;
 }
 
@@ -547,8 +540,8 @@ static void __exit piv_module_exit(void)
 {
 	dm_unregister_target(&piv_view_target);
 	dm_unregister_target(&piv_crypt_target);
+	/* Drains pending owner teardown (piv_free_work). */
 	destroy_workqueue(piv_io_wq);
-	destroy_workqueue(pn_wq);
 }
 
 module_init(piv_module_init);

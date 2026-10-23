@@ -66,8 +66,10 @@ targets; use it for unrelated volumes and for stock readback after closing.
 The private `piv-crypt` mapping never accepts ordinary writes; before native
 ownership it serves bounded authenticated reads, and while ownership is active
 it rejects all bios. Public `piv-view` map callbacks queue one work item per
-bio to the unbound, reclaim-capable `piv-native` workqueue (at most 16 work
-items run at once, shared by all owners); work runs in NOIO allocation scope.
+bio (held in DM per-bio data, so mapping never allocates or requeues) to the
+owner's own unbound, reclaim-capable `piv-native-<generation>` workqueue (at
+most 16 work items of that owner run at once; a stalled owner does not occupy
+other owners' workers); work runs in NOIO allocation scope.
 Hidden bios are split per 4096-byte block (the hidden view's logical and
 physical block size; the worker refuses anything else), decoy bios at 128 KiB
 power-of-two boundaries (at most 256 primary sectors per work item). The decoy
@@ -108,7 +110,31 @@ owner destruction, which therefore drain in-flight requests first. View
 suspend and removal drain through DM as before (a view's bios complete before
 it suspends or is destroyed; workers touch owner state only before completing
 their bio). The encryption counter is atomic: each request reserves its
-encryptions before encrypting.
+encryptions before encrypting. Exception: while no view exists and the owner
+is suspended, setup and BEGIN/END change the native state under the lifecycle
+mutex alone (no worker can reach it); detach also takes `io` exclusively.
+
+Suspending the private owner (`dmsetup suspend piv-native`) while views are
+active is outside the supported lifecycle: view requests issued while it is
+suspended fail with EIO instead of waiting (the owner's state is "blocked");
+suspend the views instead. A controller that exits between BEGIN and END
+leaves the owner's transaction set: resume stays refused (EBUSY) until another
+controller brackets a setup or the owner is removed (pivsetup's cleanup
+removes it). Range-lock waits are uninterruptible: on a stalled lower device,
+waiting requests (and an owner presuspend waiting for `io`) appear as hung
+tasks rather than failing.
+
+### Memory pressure
+
+Mapping uses per-bio data, so it never fails or requeues for memory. A view
+request that fails with -ENOMEM before writing or flushing anything is retried
+by its worker with back-off (up to 240 times, about 28 s in total) outside the
+`io` lock, so writeback through the views does not see I/O errors from a
+transient allocation failure, and owner state changes are not held up by the
+wait. Allocations are bounded per request (below); order-0 GFP_NOIO page
+allocations do not fail outside OOM-victim context. Each owner's workqueue is
+reclaim-capable (a rescuer thread). An -ENOMEM after writing began stops the
+owner like any other failure once writing began.
 
 - **Decoy write**: authenticated primary-sector read-modify-write. Each written
   sector gets a fresh IV: keyslot (listed in the directory), directory and
@@ -167,7 +193,12 @@ an empty flush flushes the lower device; both cover every write completed
 before they were issued, since a request completes only after its lower writes
 did. An A/B hidden write also flushes before rewriting a slot, so the slot
 holding the newest version is durable before the other one is overwritten
-([journal atomicity](journal-atomicity.md)). Keyslot and directory writes
+([journal atomicity](journal-atomicity.md)), unless that version is already
+durable: the owner counts completed lower write batches and records, at each
+successful flush, the count sampled when the flush started; each hidden write
+records the count after it (per hash of the block index, 1024 buckets, so a
+collision costs only a flush). The pre-write flush is skipped when a
+successful flush started after the block's previous write completed. Keyslot and directory writes
 flush after each write. Initialization flushes every 16 records and before
 returning, also when cancelled. Batches are not atomic writes; the stock
 journal may commit part of a record at any time. No discard or write-zeroes is
@@ -200,7 +231,10 @@ batch code as writes, up to 128 KiB per bio). Every primary sector still passes
 the AEAD check with its own address/IV AAD and tag offset, and nothing
 (plaintext or IVs) is published until the whole range authenticates; hidden
 reads take the raw IVs of failing sectors for SIV-checked decoding only. Public
-reads copy to the bio only on full success; large application reads can span
+decoy and owner reads copy authenticated plaintext straight from the batch
+pages into the bio, only after the whole range authenticates (no intermediate
+buffer); read-only batches allocate no rewrite bookkeeping, and one AEAD request
+and buffer set serves every sector of a batch. Large application reads can span
 several work items and are not whole-request transactions. Private pages and
 metadata are wiped after use. Measurements:
 [read-performance.md](read-performance.md).

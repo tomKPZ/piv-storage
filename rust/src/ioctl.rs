@@ -31,6 +31,15 @@ pub const SETUP_SIZE: usize = 216; // '=IIQII32s128sIIQQQ'
 pub const STATUS_SIZE: usize = 40; // '=QQQIIII' (STATUS version 4)
 pub const KEYSLOT_SIZE: usize = 96; // '=IIQII32s32s2I' (KEYSLOT version 2)
 
+/// Control ABI versions this pivsetup speaks (kernel/piv-control.h); shown by
+/// `pivsetup --version`. A kernel module with other versions is refused.
+pub const QUERY_VERSION: u32 = 2;
+/// BEGIN/END/DETACH request header.
+pub const REQUEST_VERSION: u32 = 2;
+pub const SETUP_VERSION: u32 = 6;
+pub const STATUS_VERSION: u32 = 4;
+pub const KEYSLOT_VERSION: u32 = 2;
+
 /// SETUP ABI 6 (format v5 only): destructive initialization.
 pub const SETUP_INITIALIZE: u32 = 1;
 /// With SETUP_INITIALIZE: A/B record slots.
@@ -80,6 +89,8 @@ pub struct Status {
 
 pub struct KernelDevice {
     fd: libc::c_int,
+    /// Read only by the test hooks.
+    #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
     pub control_path: PathBuf,
     pub owner: PathBuf,
     pub name: String,
@@ -122,7 +133,12 @@ impl KernelDevice {
         let (version, size) = (u32_at(&q, 0), u32_at(&q, 4));
         let (sector, iv, tag, tuple, flags, reserved) =
             (u32_at(&q, 24), u32_at(&q, 28), u32_at(&q, 32), u32_at(&q, 36), u32_at(&q, 40), u32_at(&q, 44));
-        if (version, size, reserved) != (2, 48, 0) || !matches!(tag, 16 | 20 | 32 | 64) || iv != 16
+        if (version, size) != (QUERY_VERSION, QUERY_SIZE as u32) {
+            bail!("dm-piv control ABI mismatch: pivsetup expects QUERY version {QUERY_VERSION} ({QUERY_SIZE} bytes), \
+                   the kernel module reports version {version} ({size} bytes); install matching dm-piv and pivsetup \
+                   builds (pivsetup --version)");
+        }
+        if reserved != 0 || !matches!(tag, 16 | 20 | 32 | 64) || iv != 16
             || tuple != tag + iv
             || !(sector == 512 || sector == 4096) || flags != 0 {
             bail!("Unsupported kernel control/profile");
@@ -162,7 +178,7 @@ impl KernelDevice {
     /// The 48-byte generation-bound request header used by lifecycle commands.
     pub fn request(&self) -> [u8; READ_SIZE] {
         let mut data = [0u8; READ_SIZE];
-        data[0..4].copy_from_slice(&2u32.to_le_bytes());
+        data[0..4].copy_from_slice(&REQUEST_VERSION.to_le_bytes());
         data[4..8].copy_from_slice(&(READ_SIZE as u32).to_le_bytes());
         data[8..16].copy_from_slice(&self.generation.to_le_bytes());
         data
@@ -183,8 +199,13 @@ impl KernelDevice {
             generation: u64_at(&data, 0), hidden_bytes: u64_at(&data, 8), encryptions: u64_at(&data, 16),
             active: u32_at(&data, 24) != 0, views: u32_at(&data, 28), failed: u32_at(&data, 32) != 0,
         };
-        if status.generation != self.generation || u32_at(&data, 36) != 4 {
-            bail!("Unsupported native status ABI");
+        let version = u32_at(&data, 36);
+        if version != STATUS_VERSION {
+            bail!("dm-piv control ABI mismatch: pivsetup expects STATUS version {STATUS_VERSION}, the kernel module \
+                   reports version {version}; install matching dm-piv and pivsetup builds (pivsetup --version)");
+        }
+        if status.generation != self.generation {
+            return Err(Error::os(libc::ESTALE, "Kernel owner changed"));
         }
         Ok(status)
     }
@@ -197,7 +218,7 @@ impl KernelDevice {
             bail!("Invalid native key/context size");
         }
         let mut data = [0u8; SETUP_SIZE];
-        data[0..4].copy_from_slice(&6u32.to_le_bytes());
+        data[0..4].copy_from_slice(&SETUP_VERSION.to_le_bytes());
         data[4..8].copy_from_slice(&(SETUP_SIZE as u32).to_le_bytes());
         data[8..16].copy_from_slice(&self.generation.to_le_bytes());
         data[16..20].copy_from_slice(&flags.to_le_bytes());
@@ -224,7 +245,7 @@ impl KernelDevice {
             bail!("Invalid keyslot request");
         }
         let mut data = [0u8; KEYSLOT_SIZE];
-        data[0..4].copy_from_slice(&2u32.to_le_bytes());
+        data[0..4].copy_from_slice(&KEYSLOT_VERSION.to_le_bytes());
         data[4..8].copy_from_slice(&(KEYSLOT_SIZE as u32).to_le_bytes());
         data[8..16].copy_from_slice(&self.generation.to_le_bytes());
         data[16..20].copy_from_slice(&slot.to_le_bytes());

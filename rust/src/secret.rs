@@ -41,6 +41,13 @@ impl Secret {
         Ok(secret)
     }
 
+    /// Like read_file, for a key or passphrase file: it must be a regular
+    /// file owned by root without group or other permissions (check_key_file).
+    pub fn read_key_file(path: &Path, limit: usize) -> Result<Self> {
+        check_key_file(path)?;
+        Self::read_file(path, limit)
+    }
+
     pub fn truncate(&mut self, len: usize) {
         if len < self.len {
             self.data[len..self.len].zeroize();
@@ -80,6 +87,35 @@ impl Drop for Secret {
     }
 }
 
+/// Why a key file with @mode (st_mode) and owner @uid is unsafe, if it is.
+pub fn key_file_problem(mode: u32, uid: u32) -> Option<&'static str> {
+    if mode & libc::S_IFMT != libc::S_IFREG {
+        Some("is not a regular file")
+    } else if uid != 0 {
+        Some("is not owned by root")
+    } else if mode & 0o077 != 0 {
+        Some("is accessible by group or others (chmod 600)")
+    } else {
+        None
+    }
+}
+
+/// Refuse key, passphrase and LUKS key files that others could read or
+/// replace (symlinks are followed: the target is checked). Guest test builds
+/// may skip this (hooks::lax_key_files) for keys on a 9p share.
+pub fn check_key_file(path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if crate::hooks::lax_key_files() {
+        return Ok(());
+    }
+    let info = std::fs::metadata(path)
+        .map_err(|e| Error::os(e.raw_os_error().unwrap_or(libc::EIO), format!("{}: {e}", path.display())))?;
+    match key_file_problem(info.mode(), info.uid()) {
+        Some(problem) => Err(Error::os(libc::EPERM, format!("Key file {} {problem}", path.display()))),
+        None => Ok(()),
+    }
+}
+
 /// Keep keys out of core dumps and ptrace by non-root peers.
 pub fn harden_process() {
     // SAFETY: plain prctl/setrlimit calls without pointers to Rust memory.
@@ -93,6 +129,18 @@ pub fn harden_process() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_file_permissions() {
+        assert_eq!(key_file_problem(libc::S_IFREG | 0o600, 0), None);
+        assert_eq!(key_file_problem(libc::S_IFREG | 0o400, 0), None);
+        assert!(key_file_problem(libc::S_IFREG | 0o640, 0).is_some());
+        assert!(key_file_problem(libc::S_IFREG | 0o604, 0).is_some());
+        assert!(key_file_problem(libc::S_IFREG | 0o620, 0).is_some());
+        assert!(key_file_problem(libc::S_IFREG | 0o600, 1000).is_some());
+        assert!(key_file_problem(libc::S_IFDIR | 0o700, 0).is_some());
+        assert!(key_file_problem(libc::S_IFCHR | 0o600, 0).is_some());
+    }
 
     #[test]
     fn bounded_read_and_truncate() {

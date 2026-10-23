@@ -47,7 +47,7 @@ random reads per role. All bytes are compared; timings include Python loops,
 system calls and comparisons. Reading must spend zero primary encryptions.
 
 **Call counts (separate pass).** Entry kprobes on module-qualified symbols
-(`piv_load_mode`, `piv_read_range`, the private `piv_aead` helper, `pn_write`,
+(`piv_read_range`, the private `piv_aead` helper, `pn_write`,
 `piv_checkpoint`, `piv_batch_read`, `piv_batch_submit`) resolve the unique non-cold compiler specialization in
 `[dm_piv]`, never the stock copy. `tracing_on=0` keeps no event data; only
 `kprobe_profile` hit counters are used, and any missed hit fails. The SETUP
@@ -57,7 +57,7 @@ batch submission:
 
 | Operation | range reads | primary authentications | other |
 | --- | ---: | ---: | --- |
-| SETUP (keyslot area, directory, checkpoint) | 3 | 112 + 1374 + 1 | 1 checkpoint (one scalar load), 3 submissions, 0 writes |
+| SETUP (keyslot area, directory, checkpoint) | 3 | 112 + 1374 + 1 | 1 checkpoint (one-sector read and rewrite: 2 submissions), 5 submissions, 0 `pn_write` |
 | 512-byte decoy read | 1 | 1 | 1 submission |
 | 16 KiB decoy read | 1 | 16384 / S | 1 submission |
 | 128 KiB decoy read | 1 | 131072 / S | 1 submission |

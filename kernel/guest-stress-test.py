@@ -10,6 +10,8 @@ striped region. Owners read back exact values; other threads read concurrently
 and must see a value the owner has written (old or new), never EIO or a torn
 sector. Phase B: all threads write overlapping decoy ranges and one
 shared hidden block; every unit ends as one of the values written to it.
+Phase M: phase A's workload plus buffered decoy writes while a memory hog
+leaves about 48 MiB available: no I/O errors, no fail-stop, exact oracles.
 Phase C: lower writes start failing while all threads run; every request must
 return, the owner must fail-stop, and after recreation every primary sector is
 whole and each hidden block holds a written value (EIO only for blocks written
@@ -281,6 +283,63 @@ views = open_views()
 verify_all(views)
 print(f'Phase B: overlapping writes settled to written values in {results["phase_b_seconds"]:.1f}s; reopen passed',
       flush=True)
+
+# Phase M: memory pressure. A hog (first OOM victim) fills RAM until about
+# 48 MiB remain available, then phase A's workload runs again and buffered
+# (page-cache writeback) decoy writes are synced. Allocation failures inside
+# the module must not surface as I/O errors (workers retry -ENOMEM before
+# writing) and the owner must not fail-stop.
+HOG = r'''
+import mmap, os, sys, time
+open('/proc/self/oom_score_adj', 'w').write('1000')
+def available():
+    for line in open('/proc/meminfo'):
+        if line.startswith('MemAvailable:'):
+            return int(line.split()[1]) * 1024
+chunks = []
+while available() > 48 << 20:
+    m = mmap.mmap(-1, 16 << 20)
+    for at in range(0, len(m), 4096):
+        m[at] = 1
+    chunks.append(m)
+print(len(chunks) * 16, flush=True)
+time.sleep(3600)
+'''
+
+
+def mem_available():
+    for line in Path('/proc/meminfo').read_text().splitlines():
+        if line.startswith('MemAvailable:'):
+            return int(line.split()[1]) * 1024
+
+
+start = time.monotonic()
+hog = subprocess.Popen(['python3', '-c', HOG], stdout=subprocess.PIPE, text=True)
+try:
+    results['phase_m_hog_mib'] = int(hog.stdout.readline())
+    results['phase_m_available_mib'] = mem_available() >> 20
+    results['phase_m'] = run_threads(phase_a, OPS // 2)
+    # Buffered writes: dirty page cache written back through the decoy view.
+    data = b''.join(value('m', k) for k in range((shared[1] - shared[0]) // UNIT))
+    for k in range(0, len(data), UNIT):
+        decoy_history.add((shared[0] + k) // UNIT, data[k:k + UNIT], bytes(image[shared[0] + k:shared[0] + k + UNIT]))
+    fd = os.open(views['decoy'], os.O_WRONLY)
+    try:
+        assert os.pwrite(fd, data, shared[0]) == len(data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    image[shared[0]:shared[1]] = data
+    results['phase_m_hog_alive'] = hog.poll() is None
+finally:
+    hog.kill()
+    hog.wait()
+results['phase_m_seconds'] = time.monotonic() - start
+assert not status()[0]['failed']
+verify_all(views)
+print(f'Phase M: workload under memory pressure (hog {results["phase_m_hog_mib"]} MiB, '
+      f'{results["phase_m_available_mib"]} MiB available, hog alive at end: {results["phase_m_hog_alive"]}) '
+      f'in {results["phase_m_seconds"]:.1f}s; no I/O errors, oracles passed', flush=True)
 
 # Phase C: lower write errors while every thread writes and reads. Plain
 # writes are not flushed, so even a write that reported success before the
