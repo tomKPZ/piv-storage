@@ -15,7 +15,8 @@ and limits are in README.md and docs/.
   decoy writes, hidden writes flushed before completing and shaped to 4 KiB
   edges, batched 1024-sector authenticated reads).
 - Setup is the static Rust `pivsetup` (open/close, keyslots, migrate, keygen;
-  full or `--quick` initialization and the explicit, destructive `--fill`);
+  full or `--quick` initialization and the explicit, destructive `--fill`;
+  keyless read-only `status` and `scrub` health reports);
   Python keeps only independent read-only diagnostics and guest test
   instrumentation.
 - Tested on the pinned Debian 6.12.113 guest kernel, its KASAN/UBSAN/lockdep
@@ -32,19 +33,7 @@ and limits are in README.md and docs/.
 
 ## Remaining work
 
-1. **`pivsetup status` and a non-destructive hidden scrub.** Today fail-stop
-   is visible only as EIO plus dmesg, and `--fill` is the only whole-volume
-   hidden pass (destructive). Add `pivsetup status` (owner active/failed,
-   encryptions, hidden size, views, via the existing STATUS ioctl; no new
-   control commands) and a read-only scrub that reads every hidden block and
-   reports valid / RS-recovered / unavailable counts without writing (in
-   pivsetup over the hidden view, or as a read-only setup flag if
-   RS-recovered blocks need kernel reporting). Exit: devices/v5 suites cover
-   status on healthy and failed owners and scrub counts on damaged blocks
-   (with and without parity); docs (README before-production section,
-   configuration.md) updated.
-
-2. **Investigate storing the tooling inside the LUKS2 header** (research
+1. **Investigate storing the tooling inside the LUKS2 header** (research
    first; implement only after a design the user approves). The installed
    pivsetup, dm-piv.ko, pivtab, initramfs hook and key files on the root
    filesystem or /boot reveal that a hidden volume exists. For users who want

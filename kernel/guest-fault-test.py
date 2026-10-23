@@ -43,6 +43,11 @@ def blocks_touched(device, first, last):
 NO_JOURNAL = os.environ.get('PIV_NO_JOURNAL') == '1'
 
 
+def scrub_sectors(runs):
+    """Sectors of pivsetup scrub (first, count) runs."""
+    return {first + i for first, count in runs for i in range(count)}
+
+
 def unreadable(path, unit, sectors, chunk=65536):
     """Primary sectors whose decoy reads fail (O_DIRECT, per-sector on error)."""
     bad, fd = [], os.open(path, os.O_RDONLY | os.O_DIRECT)
@@ -213,6 +218,11 @@ print('Setup phase failures and unrelated-name protection passed', flush=True)
 
 # Existing bare owners are not silently adopted or destroyed by a failed open.
 existing = owner(); existing.close()
+# pivsetup status (no key): a bare owner without native state is idle (exit
+# 3); scrub refuses it.
+code, report = blocks.health('status', device=SOURCE)
+assert code == 3 and report['state'] == 'idle' and not report['active'] and not report['failed'], report
+assert rejected(lambda: blocks.health('scrub', device=SOURCE)).errno == errno.ENOENT
 before = {n: mapping_identity(n) for n in NAMES}
 rejected(open_views, FileExistsError)
 assert before == {n: mapping_identity(n) for n in NAMES}
@@ -265,6 +275,11 @@ for role in ('decoy', 'hidden'):
             # The write bios reached the failing device: storage may be partial, so the
             # shared owner still fails stop.
             assert status['failed'] and spent > 0
+            # pivsetup status and scrub report the fail-stop (exit 2).
+            code, report = blocks.health('status', device=SOURCE)
+            assert code == 2 and report['state'] == 'failed' and report['failed'] and report['active'], report
+            code, report = blocks.health('scrub', device=SOURCE)
+            assert code == 2 and report['state'] == 'failed', report
             fault()
             # Removing the fault does not clear the shared owner's fail-stop.
             for other in ('decoy', 'hidden'):
@@ -277,6 +292,16 @@ for role in ('decoy', 'hidden'):
             assert handle.device.generation != generation and not blocks.native_status(handle.device)['failed']
             handle.close()
             torn = unreadable(v['decoy'], unit, sectors)
+            # Scrub after the failed write (read-only): unavailable blocks lie
+            # in the request, and --decoy lists exactly the torn sectors; the
+            # carrier EIO it lists per unavailable block are torn sectors.
+            scrub_code, scrub = blocks.health('scrub', device=SOURCE, decoy=True)
+            assert scrub['complete'] and scrub['encryptions_during_scrub'] == 0, scrub
+            assert scrub_code == (5 if torn or scrub['unavailable'] else 0), (scrub_code, scrub)
+            assert {b['block'] for b in scrub['unavailable_blocks']} <= set(affected), scrub
+            assert scrub_sectors((r['first'], r['count']) for r in scrub['decoy_eio']) == set(torn), (scrub, torn)
+            for item in scrub['unavailable_blocks']:
+                assert scrub_sectors(item['decoy_eio']) <= set(torn), item
             if NO_JOURNAL:
                 # Without the journal a failed lower write may leave sectors
                 # torn (EIO). They must lie within the request's primary
@@ -290,6 +315,10 @@ for role in ('decoy', 'hidden'):
                 # The journal keeps every primary sector whole across the failed write.
                 assert not torn, torn
             repaired = verify(v, unavailable=affected)
+            # After restoring the torn decoy sectors and rewriting the
+            # unavailable blocks, the scrub is clean.
+            scrub_code, after = blocks.health('scrub', device=SOURCE, decoy=True)
+            assert scrub_code == 0 and after['valid'] == after['blocks'] and not after['decoy_eio'], after
         else:
             # Nothing was mutated: only the request fails. A write needing the
             # same carrier also fails while collecting it, before any encryption.
@@ -312,6 +341,7 @@ for role in ('decoy', 'hidden'):
                             failed_both_views=mode == 'writes', recreated=mode == 'writes',
                             same_owner_continued=mode == 'reads', repaired=repaired,
                             torn_primary_sectors=torn if mode == 'writes' else [],
+                            scrub_unavailable=[b['block'] for b in scrub['unavailable_blocks']] if mode == 'writes' else [],
                             no_journal=NO_JOURNAL, prepared_encryptions=spent))
         print(f'{role} lower {mode}: ' + ('fail-stop, teardown, replay and recreation passed' if mode == 'writes'
               else 'local EIO, no encryption, same-owner continuation passed'), flush=True)

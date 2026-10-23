@@ -83,6 +83,78 @@ authentication says nothing about hidden filesystem consistency or rollback.
 All fault suites run per profile through `scripts/suite.py`; executed runs are
 recorded in commit messages.
 
+## Status, scrub and repair
+
+Two read-only, keyless pivsetup commands make failures visible beyond EIO and
+dmesg. Both need root and bind the owner's control device (STATUS only);
+`--device D` optionally checks that the owner belongs to that LUKS volume.
+
+- **`pivsetup status [--name N]`** prints the owner state as JSON: `state`
+  `active`, `failed` (the sticky fail-stop above, also after a failed setup),
+  `idle` (a bare owner without native state) or `absent`, plus views, hidden
+  size and blocks, parity, A/B, encryptions since setup and
+  `rs_corrected_reads` (hidden-view block reads that authenticated only after
+  RS correction). Exit 0 active, 2 failed, 3 absent or idle.
+- **`pivsetup scrub [--name N] [--limit L] [--decoy]`** reads every hidden
+  block once through the hidden view (one 4096-byte O_DIRECT read per block,
+  so the kernel authenticates each record as for any read) and counts it as
+  `valid`, `recovered` (its chosen record authenticated only after RS
+  correction, attributed by the STATUS counter around each read) or
+  `unavailable` (EIO). It lists up to L (default 64) recovered and unavailable
+  block indices and, for each listed unavailable block, the decoy sectors of
+  its record's shaped carrier (both slots with A/B) that read EIO. `--decoy`
+  also reads the whole decoy view and lists every run of EIO sectors with the
+  hidden blocks whose shaped carrier it intersects. Exit 0 clean, 4 recovered
+  blocks only, 5 unavailable blocks or decoy EIO, 2 owner failed, 3 inactive,
+  130 cancelled (SIGINT/SIGTERM stop it between blocks; the partial report has
+  `complete: false`).
+
+The scrub writes nothing: no encryption, no lower write (the v5 suite checks
+both through STATUS and the lower device's block statistics), and its reads
+follow the ordinary failure scope (a failing block fails only its read). It
+runs on active, possibly mounted views. Limits: a concurrent reader of an
+RS-corrected block can make a valid block count as recovered (never the other
+way; `unavailable` is exact EIO), and concurrent writers can change blocks
+after they were read (`encryptions_during_scrub` shows writes during the
+scan). With A/B a damaged newest slot whose older slot authenticates reads as
+valid (the older version), exactly as the hidden view returns it. It reads one
+block at a time, at about the hidden read speed
+([configuration.md](configuration.md#monitoring-and-repair-status-and-scrub)).
+
+**Repair after damage** (a tear on a no-journal volume, media errors, a stock
+read-write open):
+
+1. `pivsetup status`. If the owner failed (exit 2), unmount both views, run
+   `close-blocks`, correct the cause and reopen; a failed owner refuses all I/O.
+2. `pivsetup scrub --decoy`. Decoy sectors that read EIO lost their plaintext
+   (a torn sector cannot be read back). Restore them with whole-sector writes
+   through the decoy view: restore the decoy files that own them, or, for
+   sectors no decoy file uses, write any whole sectors there. A whole-sector
+   decoy write replaces a failing sector (the documented exception) and keeps
+   its hidden fragment, so it never changes which hidden blocks authenticate.
+3. Rewrite each unavailable hidden block with a complete 4096-byte write (from
+   a backup, or let the hidden filesystem's fsck rewrite what it needs). A
+   hidden write needs every sector of the block's shaped carrier to
+   authenticate, so step 2 must cover the sectors listed for that block first.
+   Never use `--fill` for this: it turns unavailable blocks into zeros.
+4. Recovered blocks still decode but have used part of their parity margin;
+   rewriting a block with its own contents (read 4096 bytes, write them back)
+   re-encodes all G carrier sectors once its carrier authenticates.
+5. Run `pivsetup scrub --decoy` again; exit 0 means every hidden block reads
+   without correction and no decoy sector reads EIO.
+
+The faults suite checks this on journaled and no-journal fixtures: after a
+lower write failure (fail-stop; `status` and `scrub` exit 2) and recreation,
+`scrub --decoy` lists exactly the torn sectors, only blocks of the failed
+request are unavailable and their listed carrier sectors are torn ones; after
+restoring the sectors and rewriting the blocks the scrub is clean. The v5
+suite covers quick-initialized blocks (unavailable, no decoy EIO), a stock
+rewrite (unavailable, no decoy EIO), parity erasures and errors (recovered,
+exit 4), erasures beyond the bound (unavailable, the unreadable sectors
+listed) and A/B; devices covers loop, dm-linear and partition volumes and
+the `--device` ownership check; cancel interrupts a scrub over a slowed
+lower device.
+
 ## Partial-record interruption (`power` suite)
 
 scripts/guest-stateless-power.sh with kernel/guest-stateless-power.py

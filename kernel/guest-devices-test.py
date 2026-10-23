@@ -225,6 +225,13 @@ class Volume:
         run('sh', '-c', 'echo 3 > /proc/sys/vm/drop_caches')
         assert run('sha256sum', views['decoy']).stdout.split()[0] == self.primary, self.label
         assert Path(views['hidden']).read_bytes() == self.hidden, self.label
+        # pivsetup status and a clean read-only scrub (no key) on this device.
+        code, status = blocks.health('status', name=self.name, device=self.device)
+        assert code == 0 and status['state'] == 'active', (self.label, status)
+        assert status['hidden_blocks'] * 4096 == len(self.hidden), (self.label, status)
+        code, report = blocks.health('scrub', name=self.name, device=self.device)
+        assert code == 0 and report['complete'] and report['valid'] == len(self.hidden) // 4096, (self.label, report)
+        assert report['encryptions_during_scrub'] == 0, (self.label, report)
 
     def stock_check(self):
         run('cryptsetup', 'open', '--readonly', '--key-file', self.key, self.device, f'stock-{self.label}')
@@ -261,6 +268,17 @@ disk_views = disk.initialize_and_fill()
 loop_views = loop.initialize_and_fill()
 disk.verify(disk_views)
 loop.verify(loop_views)
+# status/scrub --device must name the owner's own LUKS volume.
+for action in ('status', 'scrub'):
+    try:
+        blocks.health(action, name='piv-disk', device=loop_device)
+    except ValueError as error:
+        assert 'does not belong' in str(error), error
+    else:
+        raise AssertionError(f'{action} accepted another volume\'s owner')
+code, report = blocks.health('status', name='piv-absent')
+assert code == 3 and report['state'] == 'absent', report
+results['safety'].append('status/scrub owner-volume check')
 # Busy-device protection on an active owner's backing device.
 refused('second owner on an owned device', errno.EBUSY,
         lambda: blocks.open_blocks('/dev/vdc', disk.key, disk.hidden_key, name='piv-other'), name='piv-other')

@@ -29,7 +29,7 @@ test "$file_type" = '177ELF'
 /usr/local/sbin/pivsetup --version > pivsetup-version.txt
 grep -qx "pivsetup $(cat "$P/VERSION")" pivsetup-version.txt || fail "pivsetup version"
 grep -qx 'test hooks: no' pivsetup-version.txt || fail "release build has test hooks"
-grep -q '^control ABI: QUERY 2, request 2, SETUP 6, STATUS 4, KEYSLOT 2$' pivsetup-version.txt || fail "ABI versions"
+grep -q '^control ABI: QUERY 2, request 2, SETUP 6, STATUS 5, KEYSLOT 2$' pivsetup-version.txt || fail "ABI versions"
 version=$(cat "$P/VERSION")
 
 # DKMS: build, install and sign (DKMS generates a throwaway MOK key pair in

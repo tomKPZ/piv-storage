@@ -316,6 +316,40 @@ That is roughly 0.5–3 GiB/s of audit speed on this cached test disk
 volumes. Use it after a suspected corruption or before trusting a copied
 image, not on every boot.
 
+## Monitoring and repair (`status`, `scrub`)
+
+Both commands are read-only, need root but no key, and work on active views
+(also while mounted):
+
+```sh
+pivsetup status                  # owner state; exit 0 active, 2 failed, 3 absent/idle
+pivsetup scrub --decoy           # every hidden block plus the whole decoy view
+```
+
+`status` shows whether the shared owner has failed (fail-stop after a lower
+write or flush error: both views then return EIO until closed and reopened),
+the hidden size, parity, A/B, encryptions since setup and how many hidden reads
+needed Reed–Solomon correction. `scrub` reads every hidden block and reports
+valid, RS-recovered and unavailable counts, the unavailable blocks with the
+decoy sectors that block their repair, and (`--decoy`) every decoy sector that
+reads EIO. Exit 0 means clean, 4 that parity recovered some blocks, 5 that some
+block or decoy sector is unavailable. The repair procedure is in
+[native-faults.md](native-faults.md#status-scrub-and-repair).
+
+A scrub costs one hidden read of the whole hidden view, one 4 KiB block at a
+time, and `--decoy` one read of the decoy view. On the 128 MiB test disks
+(suite-149, guest, host-cached disk) a clean scrub took 0.07 s for 38 blocks
+(AEGIS-128, 4096-byte sectors, about 2 MiB/s of hidden data) and 0.37 s for
+297 blocks (AES-XTS + HMAC-SHA256, 512, no journal, about 3 MiB/s); every
+block authenticates its whole carrier, so expect roughly the volume's raw
+read time on real disks (hours on multi-TB volumes).
+
+**Recommendation.** Scrub after any crash or power cut on a no-journal volume
+(before writing to the hidden view), after a stock tool may have opened the
+volume read-write, and periodically (e.g. monthly) to find unreadable media
+early, especially with `--parity`. `--fill` is not a scrub: it turns every
+unavailable block into zeros.
+
 ## Other format-time settings
 
 - **LUKS keyslot KDF.** Keep cryptsetup's default Argon2id. The test fixtures

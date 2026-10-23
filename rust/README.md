@@ -44,6 +44,8 @@ pivsetup migrate --source D --source-key-file F (--source-hidden-key-file F | --
                  (--target-hidden-key-file F | --target-hidden-passphrase-file F)
                  [--ab] [--parity 4|8|16]
                  [--source-kdf-cost 1-4] [--target-kdf-cost 1-4]
+pivsetup status [--name piv-native] [--device D]
+pivsetup scrub [--name piv-native] [--device D] [--limit 64] [--decoy]
 pivsetup keygen --output F
 ```
 
@@ -79,6 +81,22 @@ view creation ([native-blocks.md](../docs/native-blocks.md)). Failed-attempt
 cleanup is limited to its own identity-checked mappings; close validates both
 views. `keyslot` uses NATIVE_KEYSLOT (version 2) on the active owner,
 authorized by the current hidden key or passphrase of a listed keyslot.
+
+`status` and `scrub` (src/health.rs) read no key and write nothing. They need
+root, find the owner mapping by name (a `piv-crypt` table whose DM UUID is
+`CRYPT-LUKS2-<uuid>-<name>`; with `--device`, the UUID of that LUKS volume) and
+its one bound control device, and take no /run lock (they can run beside a
+busy owner; while a scrub holds the views open, `close-blocks` fails as busy). `status` prints
+NATIVE_STATUS (version 5) as JSON and exits 0 (active), 2 (failed) or 3
+(absent or idle). `scrub` checks both view tables against the owner and
+generation, reads every hidden block with O_DIRECT, attributes RS-recovered
+blocks with a STATUS call around each read, probes the shaped carriers of the
+listed unavailable blocks (and with `--decoy` the whole decoy view) for EIO
+sectors, and prints counts, capped lists (`--limit`, default 64) and
+`encryptions_during_scrub`; exit 0, 4 (recovered only), 5 (unavailable or
+decoy EIO), 2 (failed), 3 (inactive) or 130 (cancelled, partial report).
+Semantics and the repair procedure:
+[native-faults.md](../docs/native-faults.md#status-scrub-and-repair).
 
 `migrate` (src/migrate.rs) is the offline rekey/resize/sector-size-change path
 (live resize and rekey are unsupported): it refuses a target that is the

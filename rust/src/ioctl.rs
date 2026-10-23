@@ -28,7 +28,7 @@ pub fn command(number: u64, size: u64, direction: u64) -> u64 {
 pub const QUERY_SIZE: usize = 48; // '=IIQQIIIIII'
 pub const READ_SIZE: usize = 48; // '=IIQQ16sII'
 pub const SETUP_SIZE: usize = 216; // '=IIQII32s128sIIQQQ'
-pub const STATUS_SIZE: usize = 40; // '=QQQIIII' (STATUS version 4)
+pub const STATUS_SIZE: usize = 56; // '=QQQIIIIQII' (STATUS version 5)
 pub const KEYSLOT_SIZE: usize = 96; // '=IIQII32s32s2I' (KEYSLOT version 2)
 
 /// Control ABI versions this pivsetup speaks (kernel/piv-control.h); shown by
@@ -37,7 +37,7 @@ pub const QUERY_VERSION: u32 = 2;
 /// BEGIN/END/DETACH request header.
 pub const REQUEST_VERSION: u32 = 2;
 pub const SETUP_VERSION: u32 = 6;
-pub const STATUS_VERSION: u32 = 4;
+pub const STATUS_VERSION: u32 = 5;
 pub const KEYSLOT_VERSION: u32 = 2;
 
 /// SETUP ABI 6 (format v5 only): destructive initialization.
@@ -85,6 +85,12 @@ pub struct Status {
     pub active: bool,
     pub views: u32,
     pub failed: bool,
+    /// Hidden-view block reads that authenticated only after RS correction
+    /// (volatile, since setup; zero without an active native state).
+    pub corrected: u64,
+    /// The keyslot's RS parity per lane and A/B flag (zero when inactive).
+    pub parity: u32,
+    pub ab: bool,
 }
 
 pub struct KernelDevice {
@@ -198,6 +204,7 @@ impl KernelDevice {
         let status = Status {
             generation: u64_at(&data, 0), hidden_bytes: u64_at(&data, 8), encryptions: u64_at(&data, 16),
             active: u32_at(&data, 24) != 0, views: u32_at(&data, 28), failed: u32_at(&data, 32) != 0,
+            corrected: u64_at(&data, 40), parity: u32_at(&data, 48), ab: u32_at(&data, 52) != 0,
         };
         let version = u32_at(&data, 36);
         if version != STATUS_VERSION {
@@ -296,6 +303,7 @@ mod tests {
         // pivstore.kernel_api.command(number, size, direction)
         assert_eq!(command(12, 216, 3), 0xc0d8_500c);
         assert_eq!(command(14, 48, 2), 0x8030_500e);
+        assert_eq!(command(14, STATUS_SIZE as u64, 2), 0x8038_500e);
         assert_eq!(command(0, 48, 2), 0x8030_5000);
         assert_eq!(command(15, 96, 1), 0x4060_500f);
     }

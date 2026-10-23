@@ -58,13 +58,19 @@ struct piv_native_setup {
   */
  __u64 valid, written, failed;
 };
-/* STATUS version 4 (2026-10-22): the always-zero v3 invalidations field was
- * removed. @failed reports the sticky owner fail-stop, also after a failed
- * setup that already freed the native state (active = 0).
+/* STATUS version 5 (2026-10-23, 56 bytes): version 4 plus @corrected,
+ * @parity and @ab (for pivsetup status/scrub). @failed reports the sticky
+ * owner fail-stop, also after a failed setup that already freed the native
+ * state (active = 0). With an active native state: @corrected counts hidden
+ * view block reads whose record authenticated only after Reed-Solomon
+ * correction (volatile, since setup); @parity (RS parity fragments per lane)
+ * and @ab are the keyslot's layout parameters. All three are zero otherwise.
  */
 struct piv_native_status {
  __u64 generation, hidden_bytes, encryptions;
  __u32 active, views, failed, version;
+ __u64 corrected;
+ __u32 parity, ab;
 };
 /* Destructively initialize: new master key, keyslot 0 under the KEK (with
  * the A/B flag and the parity), the directory, then authenticated zeros in

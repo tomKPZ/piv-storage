@@ -354,10 +354,15 @@ numbers return ENOTTY.
   reserved[2]. The last keyslot cannot be removed; the owner's keyslot state
   changes only with the directory write; failures after a lower write
   fail-stop the owner.
-- NATIVE_STATUS (version 4): generation, hidden_bytes, encryptions (u64);
-  active, views, failed, version (u32). `failed` is the sticky owner fail-stop
-  (also after a failed setup, when active = 0). Counters are volatile, not
-  lifetime history.
+- NATIVE_STATUS (version 5, 56 bytes, 2026-10-23): generation, hidden_bytes,
+  encryptions (u64); active, views, failed, version (u32); corrected (u64);
+  parity, ab (u32). `failed` is the sticky owner fail-stop (also after a
+  failed setup, when active = 0). With active native state, `corrected`
+  counts hidden-view block reads whose chosen record authenticated only after
+  Reed–Solomon correction, and `parity`/`ab` are the keyslot's layout
+  parameters (all zero otherwise); `pivsetup status` and `pivsetup scrub` use
+  them. Counters are volatile, not lifetime history. Version 5 added the last
+  three fields (the 40-byte version 4 request now returns ENOTTY).
 
 No user paths or file descriptors enter the persistence path.
 

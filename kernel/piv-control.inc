@@ -682,13 +682,15 @@ static long piv_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	if (!p->live)
 		ret = -ENODEV;
 	else if (cmd == PIV_NATIVE_STATUS) {
-		status.generation = p->profile.generation; status.version = 4;
+		status.generation = p->profile.generation; status.version = 5;
 		status.encryptions = atomic64_read(&p->encryptions);
 		status.failed = READ_ONCE(p->failed);
 		if (p->native) {
 			status.active = 1; status.views = p->native->views;
 			status.failed |= READ_ONCE(p->native->failed);
 			status.hidden_bytes = p->native->hidden_bytes;
+			status.corrected = atomic64_read(&p->native->corrected);
+			status.parity = p->native->parity; status.ab = p->native->ab;
 		}
 	} else if (cmd == PIV_NATIVE_SETUP)
 		ret = pn_setup(p, file, setup);

@@ -13,7 +13,7 @@ import re
 import subprocess
 
 from pivstore import rs
-from pivstore.blocks import open_blocks, close_blocks, keyslot, native_status
+from pivstore.blocks import open_blocks, close_blocks, health, keyslot, native_status
 from pivstore.kernel_api import dm
 from pivstore.kernel_owner import GuestOwner
 from pivstore.format import base_context
@@ -53,6 +53,28 @@ def status(source='/dev/vdb', **kw):
         return native_status(owner.device), owner.device.sector_size, owner.device.sectors
     finally:
         owner.close()
+
+
+def owner_lower_writes():
+    """Writes the owner submitted to its lower dm-integrity device (block stat)."""
+    rdev = os.stat('/dev/mapper/piv-native_dif').st_rdev
+    return int(Path(f'/sys/dev/block/{os.major(rdev)}:{os.minor(rdev)}/stat').read_text().split()[4])
+
+
+def scrubbed(code, source='/dev/vdb', **kw):
+    """pivsetup scrub (no key): exit @code, a complete report, and nothing
+    written (no encryption, no lower write)."""
+    before = owner_lower_writes()
+    exit_code, report = health('scrub', device=source, **kw)
+    assert exit_code == code, (exit_code, report)
+    assert report['complete'] and not report['owner_failed'] and report['encryptions_during_scrub'] == 0, report
+    assert report['scanned'] == report['blocks'] == report['valid'] + report['recovered'] + report['unavailable']
+    assert owner_lower_writes() == before
+    return report
+
+
+def eio_sectors(runs):
+    return {first + i for first, count in runs for i in range(count)}
 
 
 def rejected(fn):
@@ -538,6 +560,12 @@ for kw in (dict(quick=True), dict(initialize=True, fill=True)):    # usage error
 v = opened()
 assert readable(v['hidden'], 0) is None and readable(v['hidden'], records - 1) is None
 assert direct(v['hidden'], BLOCK, BLOCK) == quick[1]
+# Scrub: never-written blocks are unavailable (their carriers authenticate, so
+# no decoy sector is listed); the list is capped, the counts are not.
+report = scrubbed(5, limit=4)
+assert (report['valid'], report['recovered'], report['unavailable']) == (3, 0, records - 3), report
+assert report['unavailable_blocks'] == [dict(block=i, decoy_eio=[]) for i in (0, 2, 4, 5)], report
+results['scrub_quick'] = dict(valid=3, unavailable=records - 3, listed=4)
 close_blocks('/dev/vdb', KEY)
 damage(RESERVED + 3 * GROUP + 100)                   # one fragment of block 3's record
 v = opened(fill=True)
@@ -574,6 +602,9 @@ direct(v['hidden'], BLOCK, BLOCK, quick[3])                 # second version: sl
 expected_ab = bytearray(ab_records * BLOCK)
 expected_ab[BLOCK:2 * BLOCK] = quick[3]
 assert Path(v['hidden']).read_bytes() == expected_ab
+report = scrubbed(0)
+assert report['ab'] and report['valid'] == ab_records, report
+assert health('status')[1]['ab']
 close_blocks('/dev/vdb', KEY)
 results['quick_fill_ab'] = dict(records=ab_records, fill=dict(valid=1, written=ab_records - 1, failed=0))
 
@@ -582,6 +613,16 @@ st, unit, sectors = status()
 assert v['hidden_bytes'] == st['hidden_bytes'] == records * BLOCK, (v, records)
 assert Path(v['hidden']).read_bytes() == bytes(records * BLOCK)
 results['records'] = records
+# pivsetup status (no key) on a healthy owner, and a clean scrub.
+code, report = health('status', device='/dev/vdb')
+assert code == 0 and report['state'] == 'active' and not report['failed'], report
+assert (report['hidden_blocks'], report['parity'], report['ab'], report['rs_corrected_reads']) == (records, 0, False, 0)
+assert report['encryptions'] == st['encryptions']
+report = scrubbed(0)
+assert report['valid'] == records and not report['unavailable_blocks'] and not report['recovered_blocks'], report
+assert status()[0]['encryptions'] == st['encryptions']
+results['scrub_healthy'] = dict(status='active', valid=records, encryptions=0, lower_writes=0,
+                               seconds=report['seconds'])
 
 # Hidden writes re-encode exactly one 687-fragment record per 4096-byte block,
 # shaped to 4 KiB edges (the neighbouring sectors get decoy-write IVs).
@@ -637,6 +678,10 @@ close_blocks('/dev/vdb', KEY)
 target = RESERVED
 damage(target)
 v = opened()
+# Scrub lists the block; its carrier sectors all authenticate (a stock
+# rewrite destroys the fragment, not the sector), so no decoy EIO.
+report = scrubbed(5)
+assert report['unavailable'] == 1 and report['unavailable_blocks'] == [dict(block=0, decoy_eio=[])], report
 assert rejected(lambda: direct(v['hidden'], 0, BLOCK)).errno == errno.EIO
 assert direct(v['hidden'], BLOCK, BLOCK) == pattern[1]
 block = direct(v['decoy'], target * unit, unit)
@@ -646,8 +691,12 @@ assert not status()[0]['failed']
 direct(v['hidden'], 0, BLOCK, pattern[0])
 assert Path(v['hidden']).read_bytes() == hidden_before
 assert subprocess.check_output(['sha256sum', v['decoy']], text=True).split()[0] == primary_after
+assert scrubbed(0)['valid'] == records
 close_blocks('/dev/vdb', KEY)
-results['damage'] = dict(local_eio=True, preserved_by_decoy_write=True, repaired_by_hidden_write=True)
+code, report = health('status', device='/dev/vdb')
+assert code == 3 and report == dict(name='piv-native', owner=None, state='absent'), (code, report)
+results['damage'] = dict(local_eio=True, preserved_by_decoy_write=True, repaired_by_hidden_write=True,
+                         scrub_listed=True, scrub_clean_after_repair=True, status_absent_after_close=True)
 
 # ---- Reed–Solomon parity (p = 8, G = 711) on a dm test stack over /dev/vdb ----
 P = 8
@@ -727,6 +776,19 @@ for lane in range(3):
 assert any(j >= DATA_FRAGMENTS for j in lost)
 restack([group_first(1) + j for j in lost])
 v = rs_open()
+# Scrub counts block 1 as RS-recovered (exit 4); with --decoy it also lists
+# exactly the unreadable sectors, each touching block 1's carrier (exit 5).
+# STATUS counts corrected reads (udev probes of the new view may add some).
+corrected = health('status', device=STACK)[1]['rs_corrected_reads']
+report = scrubbed(4, STACK)
+assert (report['valid'], report['recovered'], report['unavailable']) == (rs_records - 1, 1, 0), report
+assert report['recovered_blocks'] == [1] and report['parity'] == P, report
+report = scrubbed(5, STACK, decoy=True)
+assert report['recovered_blocks'] == [1] and report['decoy_eio_runs'] == len(report['decoy_eio']), report
+assert eio_sectors((r['first'], r['count']) for r in report['decoy_eio']) == {group_first(1) + j for j in lost}
+assert all(1 in r['blocks'] for r in report['decoy_eio']), report
+code, st = health('status', device=STACK)
+assert code == 0 and st['rs_corrected_reads'] - corrected == 2 and st['parity'] == P, st
 assert direct(v['hidden'], BLOCK, BLOCK) == rs_pattern[1]
 assert direct(v['hidden'], 0, BLOCK) == rs_pattern[0]
 assert rejected(lambda: direct(v['decoy'], (group_first(1) + lost[0]) * unit, unit)).errno == errno.EIO
@@ -764,6 +826,9 @@ results['rs']['unreadable_neighbour_refuses_shaped_write'] = neighbour_blocks
 too_many = [3 * i for i in range(P + 1)]          # p + 1 erasures in lane 0
 restack([group_first(1) + j for j in too_many])
 v = rs_open()
+report = scrubbed(5, STACK)
+assert report['unavailable'] == 1 and report['unavailable_blocks'][0]['block'] == 1, report
+assert eio_sectors(report['unavailable_blocks'][0]['decoy_eio']) == {group_first(1) + j for j in too_many}, report
 assert rejected(lambda: direct(v['hidden'], BLOCK, BLOCK)).errno == errno.EIO
 assert direct(v['hidden'], 2 * BLOCK, BLOCK) == rs_pattern[2]
 assert not rs_status()['failed']
@@ -791,11 +856,15 @@ for lane in range(3):
     errors += rng.sample([j for j in range(DATA_FRAGMENTS) if j % 3 == lane], P // 2)
 stock_rewrite(STACK, [group_first(2) + j for j in errors])
 v = rs_open()
+assert scrubbed(4, STACK)['recovered_blocks'] == [2]
 assert direct(v['hidden'], 2 * BLOCK, BLOCK) == rs_pattern[2]
 # Repair: a hidden write re-encodes all G sectors (they all authenticate).
 direct(v['hidden'], 2 * BLOCK, BLOCK, rs_pattern[2])
+assert scrubbed(0, STACK)['valid'] == rs_records
 rs_close()
-results['rs']['errors'] = dict(corrected_per_lane=P // 2, total=len(errors), repaired_by_hidden_write=True)
+results['rs']['errors'] = dict(corrected_per_lane=P // 2, total=len(errors), repaired_by_hidden_write=True,
+                               scrub_recovered_then_clean=True)
+results['rs']['scrub'] = dict(erasures_recovered=1, decoy_eio_listed=len(lost), beyond_bound_unavailable=1)
 
 # Mixed versions (an interrupted rewrite): restore the raw old tuples of some
 # carrier sectors after a hidden rewrite. They authenticate and carry the old

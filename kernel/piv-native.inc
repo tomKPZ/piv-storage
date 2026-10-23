@@ -90,6 +90,10 @@ struct piv_native {
  u64 hidden_bytes, records;
  bool ready, failed, ab;
  unsigned int views;
+ /* Hidden view block reads whose record authenticated only after RS
+  * correction (STATUS @corrected; pivsetup scrub attributes them).
+  */
+ atomic64_t corrected;
  /* A/B flush skipping (pn_ab_flush). Per block hash: the owner's
   * writes_done count after the newest hidden write (max over colliding
   * blocks, so collisions only cost a flush). @since: writes_done when this
@@ -328,10 +332,11 @@ static u64 pn_area_end(struct piv_native *n)
 /* Open one record group from its n->group IVs. Fast path: SIV over the data
  * fragments. With parity, a failing tag triggers RS errors-and-erasures
  * decoding (@erased: carrier offsets that failed authentication or could not
- * be read) and a second SIV check; only a valid tag accepts.
+ * be read) and a second SIV check; only a valid tag accepts. *@corrected
+ * (optional) is set when the record authenticated only after RS correction.
  */
 static int pn_unpack(struct piv_native *n, u64 group, const u8 *ivs, const unsigned long *erased,
-		     u8 *data, u64 *generation)
+		     u8 *data, u64 *generation, bool *corrected)
 {
 	size_t bytes = PN_DATA_FRAGMENTS * PN_FRAGMENT;
 	u8 *plain = kmalloc(PN_PLAIN, GFP_NOIO), *fragments = kmalloc(n->group * PN_FRAGMENT, GFP_NOIO);
@@ -344,6 +349,7 @@ static int pn_unpack(struct piv_native *n, u64 group, const u8 *ivs, const unsig
 		r = pn_rs_correct(fragments, n->parity, erased) ? PN_UNAVAILABLE : 0;
 		if (!r) r = pn_payload_open(n, n->mac_key, n->enc_key, n->context, n->context_length, "/record/",
 					    group, fragments, bytes, plain, PN_PLAIN);
+		if (!r && corrected) *corrected = true;
 	}
 	if (!r) memcpy(data, plain + 8, PN_DATA);
 	if (!r && generation) *generation = get_unaligned_le64(plain);
@@ -550,48 +556,54 @@ static int pn_carrier_mode(struct piv_control *p, u64 first, u32 group, u8 *carr
  * authenticate returns -EIO (a medium error is never mere unavailability, so
  * A/B never falls back over it); otherwise PN_UNAVAILABLE.
  */
-static int pn_read_group(struct piv_control *p, u64 group, u8 *carrier, u8 *data, u64 *generation)
+static int pn_read_group(struct piv_control *p, u64 group, u8 *carrier, u8 *data, u64 *generation,
+			 bool *corrected)
 {
  struct piv_native *n = p->native;
  unsigned long erased[BITS_TO_LONGS(PN_MAX_GROUP)] = {};
  u32 unreadable = 0;
  int r = pn_carrier_mode(p, pn_group_first(n, group), n->group, carrier, true,
 			 n->parity ? erased : NULL, &unreadable);
- if (!r) r = pn_unpack(n, group, carrier, erased, data, generation);
+ if (!r) r = pn_unpack(n, group, carrier, erased, data, generation, corrected);
  if (r == PN_UNAVAILABLE && unreadable) r = -EIO;
  return r;
 }
 
 /* Read block i's record(s). With A/B, *slot returns the newest valid slot (or
  * -1 if none) and *generation its generation; @carrier needs 2 * n->group * 16
- * bytes. Returns PN_UNAVAILABLE when no slot authenticates.
+ * bytes. *@corrected (optional): the chosen slot's record needed RS
+ * correction. Returns PN_UNAVAILABLE when no slot authenticates.
  */
-static int pn_read_slots(struct piv_control *p, u64 index, u8 *carrier, u8 *data, int *slot, u64 *generation)
+static int pn_read_slots(struct piv_control *p, u64 index, u8 *carrier, u8 *data, int *slot, u64 *generation,
+			 bool *corrected)
 {
  struct piv_native *n = p->native;
  u32 i, slots = n->ab ? 2 : 1;
  u64 best = 0, found;
  int r, chosen = -1;
+ bool fixed, chosen_fixed = false;
  u8 *candidate = kmalloc(PN_DATA, GFP_NOIO);
  if (!candidate) return -ENOMEM;
  for (i = 0; i < slots; i++) {
   /* Hidden decoding only needs the IVs; the record's SIV tag decides. */
-  r = pn_read_group(p, pn_group(n, index, i), carrier + i * n->group * 16, candidate, &found);
+  fixed = false;
+  r = pn_read_group(p, pn_group(n, index, i), carrier + i * n->group * 16, candidate, &found, &fixed);
   /* A primary sector failing authentication makes only this slot unavailable. */
   if (r == PN_UNAVAILABLE || r == -EBADMSG) continue;
   if (r) goto out;
-  if (chosen < 0 || found > best) { chosen = i; best = found; memcpy(data, candidate, PN_DATA); }
+  if (chosen < 0 || found > best) { chosen = i; best = found; chosen_fixed = fixed; memcpy(data, candidate, PN_DATA); }
  }
  r = chosen < 0 ? PN_UNAVAILABLE : 0;
  if (slot) *slot = chosen;
  if (generation) *generation = best;
+ if (corrected) *corrected = chosen >= 0 && chosen_fixed;
 out:
  kfree_sensitive(candidate);
  return r;
 }
-static int pn_read_record(struct piv_control *p, u64 index, u8 *carrier, u8 *data)
+static int pn_read_record(struct piv_control *p, u64 index, u8 *carrier, u8 *data, bool *corrected)
 {
- return pn_read_slots(p, index, carrier, data, NULL, NULL);
+ return pn_read_slots(p, index, carrier, data, NULL, NULL, corrected);
 }
 static void pn_free(struct piv_native *n)
 {
@@ -852,7 +864,7 @@ static int pn_write_blocks(struct piv_control *p, bool hidden, u64 offset, const
   } else if (n->ab) {
    size_t length = 2 * n->group * 16 + PN_DATA;
    scratch = kvmalloc(length, GFP_NOIO);
-   r = scratch ? pn_read_slots(p, index, scratch, scratch + 2 * n->group * 16, &slot, &generation) : -ENOMEM;
+   r = scratch ? pn_read_slots(p, index, scratch, scratch + 2 * n->group * 16, &slot, &generation, NULL) : -ENOMEM;
    if (scratch) kvfree_sensitive(scratch, length);
    if (r == PN_UNAVAILABLE || !r) {
     slot = (r || slot < 0) ? 0 : !slot;
@@ -1030,7 +1042,7 @@ static int pn_dir_load(struct piv_control *p)
  data = carrier + n->group * 16;
  best = data + PN_DATA;
  for (slot = 0; slot < 2; slot++) {
-  r = pn_read_group(p, slot, carrier, data, &generation);
+  r = pn_read_group(p, slot, carrier, data, &generation, NULL);
   if (r == PN_UNAVAILABLE || r == -EBADMSG) { r = 0; continue; }
   if (r) goto out;
   if (n->dir_slot < 0 || generation > n->dir_generation) {
@@ -1092,7 +1104,7 @@ static int pn_fill_block(struct piv_control *p, u64 index, const u8 *zero, int *
  int r;
  if (!scratch) return -ENOMEM;
  pn_block_lock(p, &range, index, false);
- r = pn_read_slots(p, index, scratch, scratch + 2 * n->group * 16, NULL, NULL);
+ r = pn_read_slots(p, index, scratch, scratch + 2 * n->group * 16, NULL, NULL, NULL);
  piv_range_unlock(p, &range);
  kvfree_sensitive(scratch, length);
  if (!r) { *outcome = PN_FILL_VALID; return 0; }
@@ -1455,10 +1467,12 @@ static int pn_read(struct piv_control *p, bool hidden, u64 offset, struct piv_ou
   u64 start = i * unit, lo = max(start, offset), hi = min(start + unit, offset + bytes);
   if (hidden) {
    struct piv_range range;
+   bool corrected = false;
    pn_block_lock(p, &range, i, false);
-   r = pn_read_record(p, i, record, record + carrier);
+   r = pn_read_record(p, i, record, record + carrier, &corrected);
    piv_range_unlock(p, &range);
    if (r) break;
+   if (corrected) atomic64_inc(&p->native->corrected);
    piv_out_copy(out, record + carrier + lo - start, hi - lo);
   } else {
    u32 count = min_t(u64, last - i + 1, PIV_READ_SECTORS);

@@ -49,7 +49,7 @@ libc.ioctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_void_p]
 # number: (size, direction) from kernel/piv-control.h (1 = write, 2 = read).
 COMMANDS = {0: (48, 2), 1: (48, 3), 2: (48, 3), 3: (4176, 3), 4: (4176, 1), 5: (48, 1), 6: (48, 1),
             7: (16, 2), 8: (48, 1), 9: (4176, 3), 10: (4176, 3), 11: (4176, 1), 12: (216, 3),
-            13: (48, 1), 14: (40, 2), 15: (96, 1)}
+            13: (48, 1), 14: (56, 2), 15: (96, 1)}
 REMOVED = {1, 2, 3, 4, 8, 9, 10, 11}  # former userspace IV/tuple controls: ENOTTY
 SETUP_SCANS = 16  # template-valid SETUPs scan the whole primary; keep them rare
 

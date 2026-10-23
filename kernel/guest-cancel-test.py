@@ -359,8 +359,40 @@ finally:
 v = open_views(initialize=True)
 expected[:] = bytes(len(expected))
 verify(v)
+# Scrub cancellation: with slow lower reads, SIGINT while pivsetup scrub waits
+# in a hidden-view pread stops it between blocks with a partial report
+# (complete false, exit 130) and nothing written; an uninterrupted scrub then
+# reads every block.
+reload(read_ms=25)
+scrub = subprocess.Popen([blocks.binary(), 'scrub', '--device', SOURCE], stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True)
+
+
+def in_pread():
+    """The scrub waits in pread64 (x86-64 syscall 17) on a view."""
+    assert scrub.poll() is None, scrub.communicate()
+    try:
+        fields = Path(f'/proc/{scrub.pid}/syscall').read_text().split()
+        target = os.readlink(f'/proc/{scrub.pid}/fd/{int(fields[1], 0)}')
+        return fields[0] == '17' and (target.endswith('-hidden') or Path(target).name.startswith('dm-'))
+    except (FileNotFoundError, ValueError, IndexError):
+        return False
+
+
+wait_until(in_pread)
+scrub.send_signal(signal.SIGINT)
+out, err = scrub.communicate(timeout=20)
+assert scrub.returncode == 130, (scrub.returncode, out, err)
+partial = json.loads(out)
+assert not partial['complete'] and partial['scanned'] < partial['blocks'] == len(expected) // BLOCK, partial
+assert partial['encryptions_during_scrub'] == 0 and partial['unavailable'] == 0, partial
+reload()
+code, report = blocks.health('scrub', device=SOURCE)
+assert code == 0 and report['complete'] and report['valid'] == len(expected) // BLOCK, report
 blocks.close_blocks(SOURCE, KEY)
 results.append(dict(phase='normal-initialization', complete_oracles=True))
+results.append(dict(phase='scrub', interrupted_scanned=partial['scanned'], blocks=partial['blocks'],
+                    encryptions=0, full_scrub_after=True))
 absent()
 dm('remove', '--retry', 'piv-test-delay')
 subprocess.run(['rmmod', 'dm_piv'], check=True)

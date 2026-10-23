@@ -29,7 +29,7 @@ SETUP = struct.Struct('=IIQII32s128sIIQQQ')
 # counts (valid, written, failed; zero on input).
 SETUP_VERSION = 6
 SETUP_INITIALIZE, SETUP_AB, SETUP_VERIFY, SETUP_QUICK, SETUP_FILL = 1, 8, 16, 32, 64
-STATUS = struct.Struct('=QQQIIII')  # STATUS version 4
+STATUS = struct.Struct('=QQQIIIIQII')  # STATUS version 5 (adds corrected, parity, ab)
 KEYSLOT = struct.Struct('=IIQII32s32s2I')  # KEYSLOT version 2: slot, op, new KEK, authorizing KEK
 # Passphrase KEK cost tiers (--kdf-cost, docs/format-v5.md); must equal
 # rust/src/blocks.rs. Argon2id v1.3, 4 lanes, 32-byte output: tier ->
@@ -166,15 +166,29 @@ def keyslot(source, key_file, slot, kek=None, *, hidden_key=None, hidden_passphr
             run(args + [option, path])
 
 
+def health(action, *, name='piv-native', device=None, limit=None, decoy=False, ok=(0, 2, 3, 4, 5)):
+    """pivsetup status or scrub (no key): (exit code, parsed JSON report).
+    Exit codes: 0 healthy/clean, 2 owner failed, 3 absent/idle, 4 RS-recovered
+    blocks only, 5 unavailable blocks (or decoy EIO); others raise."""
+    args = [action, '--name', name]
+    if device is not None: args += ['--device', device]
+    if limit is not None: args += ['--limit', limit]
+    if decoy: args.append('--decoy')
+    result = subprocess.run([binary(), *map(str, args)], capture_output=True, text=True)
+    if result.returncode not in ok:
+        raise error_from(result.returncode, result.stderr)
+    return result.returncode, json.loads(result.stdout)
+
+
 def native_status(device):
     """Test instrumentation: volatile kernel status of a bound control."""
     data = bytearray(STATUS.size)
     fcntl.ioctl(device.fd, command(14, STATUS.size, 2), data, True)
-    generation, hidden, encryptions, active, views, failed, version = STATUS.unpack(data)
-    if generation != device.generation or version != 4:
+    generation, hidden, encryptions, active, views, failed, version, corrected, parity, ab = STATUS.unpack(data)
+    if generation != device.generation or version != 5:
         raise ValueError('Unsupported native status ABI')
     return dict(active=bool(active), views=views, failed=bool(failed),
-                hidden_bytes=hidden, encryptions=encryptions)
+                hidden_bytes=hidden, encryptions=encryptions, corrected=corrected, parity=parity, ab=bool(ab))
 
 
 def base_identity(owner):

@@ -5,6 +5,7 @@
 mod blocks;
 mod cmd;
 mod error;
+mod health;
 mod hooks;
 mod ioctl;
 mod json;
@@ -37,6 +38,8 @@ usage: pivsetup open-blocks --device D --key-file F (--hidden-key-file F | --hid
                         (--target-hidden-key-file F | --target-hidden-passphrase-file F)
                         [--ab] [--parity 4|8|16]
                         [--source-kdf-cost 1-4] [--target-kdf-cost 1-4]
+       pivsetup status [--name piv-native] [--device D]
+       pivsetup scrub [--name piv-native] [--device D] [--limit 64] [--decoy]
        pivsetup keygen --output F
        pivsetup --version
 
@@ -64,7 +67,12 @@ O(volume) time). Passphrase KEKs use Argon2id at cost tier --kdf-cost
 (1: 64 MiB, 2: 256 MiB, 3: 1 GiB (default), 4: 2 GiB; 4 lanes). The tier is not
 recorded: give the same tier on every open. migrate copies both views of
 an opened source into a freshly luksFormatted supported target that it initializes
-(rekey, resize or sector-size change), then re-reads and compares both views.";
+(rekey, resize or sector-size change), then re-reads and compares both views. status (no key) reports the owner state as JSON (exit 0 active,
+2 failed, 3 absent or idle). scrub (no key, read-only) reads every hidden block of active views and
+counts valid, RS-recovered and unavailable blocks, listing up to --limit of each with the decoy
+sectors of unavailable blocks' carriers that read EIO; --decoy also reads the whole decoy view
+(exit 0 clean, 4 recovered only, 5 unavailable or decoy EIO, 2 failed, 3 inactive, 130 cancelled).
+--device optionally checks that the owner belongs to that LUKS volume.";
 
 const MAX_PASSPHRASE: usize = 4096;
 
@@ -84,8 +92,8 @@ impl Args {
                       "--source", "--source-key-file", "--source-hidden-key-file",
                       "--source-hidden-passphrase-file", "--target", "--target-key-file",
                       "--target-hidden-key-file", "--target-hidden-passphrase-file", "--parity",
-                      "--kdf-cost", "--new-kdf-cost", "--source-kdf-cost", "--target-kdf-cost"];
-        let switches = ["--initialize", "--quick", "--fill", "--ab", "--verify"];
+                      "--kdf-cost", "--new-kdf-cost", "--source-kdf-cost", "--target-kdf-cost", "--limit"];
+        let switches = ["--initialize", "--quick", "--fill", "--ab", "--verify", "--decoy"];
         while let Some(word) = argv.next() {
             let (key, inline) = match word.split_once('=') {
                 Some((k, v)) if k.starts_with("--") => (k.to_string(), Some(v.to_string())),
@@ -201,11 +209,32 @@ fn fill_random(buffer: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
-fn run(args: Args) -> Result<()> {
+/// Exit status of a successful command: 0, or the status/scrub health codes.
+fn run(args: Args) -> Result<i32> {
     let name = args.value("--name").unwrap_or("piv-native").to_string();
-    if matches!(args.action.as_str(), "open-blocks" | "close-blocks" | "keyslot" | "migrate") {
+    if matches!(args.action.as_str(), "open-blocks" | "close-blocks" | "keyslot" | "migrate" | "status" | "scrub") {
         owner::require_root()?;
     }
+    match args.action.as_str() {
+        "status" => {
+            args.only(&["--name", "--device"])?;
+            health::status(&name, args.path("--device").as_deref())
+        }
+        "scrub" => {
+            args.only(&["--name", "--device", "--limit", "--decoy"])?;
+            let limit = match args.value("--limit") {
+                None => 64,
+                Some(text) => text.parse::<usize>().ok().filter(|&l| l <= 1 << 20)
+                    .ok_or_else(|| Error::new("--limit must be a number from 0 to 1048576"))?,
+            };
+            health::scrub(&name, args.path("--device").as_deref(), &health::ScrubOptions { limit, decoy: args.flag("--decoy") })
+        }
+        _ => run_setup(&name, &args).map(|()| 0),
+    }
+}
+
+fn run_setup(name: &str, args: &Args) -> Result<()> {
+    let name = name.to_string();
     match args.action.as_str() {
         "open-blocks" => {
             args.only(&["--device", "--key-file", "--name", "--hidden-key-file", "--hidden-passphrase-file",
@@ -325,7 +354,7 @@ fn main() {
         std::process::exit(0);
     }
     let code = match Args::parse(std::env::args().skip(1)).and_then(run) {
-        Ok(()) => 0,
+        Ok(code) => code,
         Err(error) => {
             // Python-compatible "[Errno N]" lets wrappers rebuild OSError subclasses.
             match error.errno {

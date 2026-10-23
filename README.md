@@ -193,7 +193,10 @@ revokes every earlier keyslot. `pivsetup migrate` copies both views into a fresh
 volume, initializes it and compares both copies; it is the offline path for
 primary rekey, resize or sector-size change, since live resize/rekey is
 unsupported (stock cryptsetup refuses reencrypt and resize on integrity
-volumes). See [rust/README.md](rust/README.md).
+volumes). `pivsetup status` and `pivsetup scrub` (read-only, no key) report the
+owner state and every hidden block's health
+([repair](docs/native-faults.md#status-scrub-and-repair)). See
+[rust/README.md](rust/README.md).
 
 The hidden payload fraction is about 4096/(687·S) of primary capacity for
 sector size S: 0.146% at 4096 bytes, 1.16% at 512 (half with `--ab`, 3p/687
@@ -349,9 +352,12 @@ Read this list before trusting real data to the prototype.
   edges): their decoy plaintext is lost, and that hidden block (or its
   neighbour, whose write also authenticates the edge sectors) cannot be
   rewritten until those decoy sectors are rewritten (restore the affected
-  decoy files). Failures show only as EIO and dmesg
-  messages; there is no status command or non-destructive hidden scrub
-  (`--fill` is destructive). See [native-faults.md](docs/native-faults.md).
+  decoy files). Check with `pivsetup status` (owner fail-stop) and the
+  read-only `pivsetup scrub --decoy` (valid, RS-recovered and unavailable
+  hidden blocks, and the decoy sectors to restore) after any crash and
+  periodically; follow the [repair
+  procedure](docs/native-faults.md#status-scrub-and-repair). Never repair
+  with `--fill` (it turns unavailable blocks into zeros).
 - **Kernel upgrades.** Only Debian 6.12.113 and 7.2.9 are tested. A failed DKMS
   build makes `update-initramfs` fail for the new kernel; keep the previous
   kernel bootable. The safe fallback without dm-piv is a stock read-only open

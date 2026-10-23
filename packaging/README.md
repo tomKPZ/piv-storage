@@ -140,6 +140,14 @@ in use by another mapping, and a volume whose owner lock in /run is held.
 Close with `pivsetup close-blocks --device ... --key-file ...` after unmounting
 both views.
 
+Health checks need no key: `sudo pivsetup status` (exit 2 when the owner has
+failed) and `sudo pivsetup scrub --decoy` (read-only; exit 4 or 5 when parity
+recovered blocks or blocks/decoy sectors are unavailable). Run the scrub after
+a crash and periodically, e.g. a monthly root cron job or systemd timer that
+mails non-zero exits; a scheduled job naming pivsetup is itself an installed
+artifact like pivsetup ([README](../README.md#before-production-use)). Repair
+steps: [native-faults.md](../docs/native-faults.md#status-scrub-and-repair).
+
 **Never open the same volume with stock cryptsetup for writing** (for example
 from `/etc/crypttab` or a desktop auto-unlock): stock writes do not refresh the
 hidden records they overwrite, so they destroy hidden data. Keep the volume out
