@@ -112,6 +112,15 @@ pivsetup_fails(['open-blocks', '--device', '/dev/vdb', '--name', 'native', '--ke
                 '--hidden-key-file', W / 'hidden.key'], 'Invalid experimental mapping name')
 results['safety'].append('mapping name')
 
+# Journal size: stock luksFormat has no option to choose the integrity journal
+# size (docs/configuration.md#journal-size-and-history), so a smaller journal
+# is not available as a journal-history mitigation. The option is rejected
+# while parsing, before any device is opened.
+journal = run('cryptsetup', 'luksFormat', '--batch-mode', '--type', 'luks2', '--integrity', INTEGRITY,
+              '--journal-size', '1048576', '/dev/piv-missing', check=False, stdin=subprocess.DEVNULL)
+assert journal.returncode != 0 and 'journal-size' in journal.stdout + journal.stderr, journal
+results['luksformat_journal_size_option'] = 'rejected: ' + (journal.stderr or journal.stdout).strip().splitlines()[0][:120]
+
 # An independent stock mapping (a holder) and an exclusive opener: EBUSY.
 run('cryptsetup', 'open', '--readonly', '--key-file', KEY, '/dev/vdb', 'stock-holder')
 holder = mapping_identity('stock-holder')

@@ -18,7 +18,8 @@ Debian-style system; run it as root from a checkout.
 ## Requirements
 
 - Linux with dm-integrity, dm-crypt and the crypto of the chosen profile:
-  `aegis128` (default) or `authenc`, `xts`, `aes`, `hmac` and `sha256`; format
+  `authenc`, `xts`, `aes`, `hmac` and `sha256` (recommended profile) or
+  `aegis128`; format
   v5 also needs `chacha20` and `hmac(sha256)`. Tested only on Debian 13's
   6.12.113 and trixie-backports 7.2.9 kernels.
 - cryptsetup and dmsetup (tested with cryptsetup 2.7.5) in /usr/sbin, /usr/bin,
@@ -114,12 +115,18 @@ Format with stock cryptsetup ([configuration.md](../docs/configuration.md)
 explains the choices), then initialize the hidden volume once:
 
 ```sh
-sudo cryptsetup luksFormat --type luks2 --cipher aegis128-random --key-size 128 \
-  --integrity aead --sector-size 4096 /dev/disk/by-partuuid/XXXX
+sudo cryptsetup luksFormat --type luks2 --cipher aes-xts-random --key-size 512 \
+  --integrity hmac-sha256 --sector-size 512 /dev/disk/by-partuuid/XXXX
 pivsetup keygen --output /root/hidden.key
 sudo pivsetup open-blocks --device /dev/disk/by-partuuid/XXXX --key-file /root/luks.key \
-  --hidden-key-file /root/hidden.key --initialize
+  --hidden-key-file /root/hidden.key --initialize --ab
 ```
+
+This is the recommended configuration: AES-XTS + HMAC-SHA256, 512-byte
+sectors (use 4096 on drives with 4096-byte logical sectors) and `--ab` for a
+filesystem on the hidden view (a raw key store can omit it for twice the
+capacity). AEGIS-128 (`--cipher aegis128-random --key-size 128 --integrity
+aead`) remains supported.
 
 `--device` is required (there is no default), may be any block device or
 partition holding the LUKS2 volume, and may be a symlink. pivsetup refuses

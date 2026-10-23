@@ -47,14 +47,17 @@ integration).
 
 | Cipher | Integrity | Tag | Metadata tuple |
 | --- | --- | ---: | ---: |
-| `aegis128-random` (default; original AEGIS-128, **not AEGIS-128L**) | `aead` | 16 | 32 |
-| `aes-xts-random` | `hmac-sha256` | 32 | 48 |
+| `aes-xts-random` (recommended; 512-bit XTS key) | `hmac-sha256` | 32 | 48 |
+| `aegis128-random` (original AEGIS-128, **not AEGIS-128L**) | `aead` | 16 | 32 |
 
-512- or 4096-byte encryption sectors, integrity v4 fixed padding and the stock
+512- or 4096-byte encryption sectors (512 recommended; 4096 on 4Kn drives),
+integrity v4 fixed padding and the stock
 journaled dm-integrity mode. AES-XTS uses dm-crypt's authenc key encoding: a
 32- or 64-byte XTS key followed by the 32-byte HMAC key. Under XTS + HMAC a
 repeated IV reveals only equal plaintext at that sector (HMAC still prevents
-forgery); under AEGIS-128 it is a key compromise (see the
+forgery); under AEGIS-128 it is a key compromise, and dm-piv decoy rewrites
+draw only 80 fresh IV bits, so XTS + HMAC is the recommended profile (see
+[configuration.md](docs/configuration.md#primary-cipher-profile) and the
 [security review](docs/security-review.md)). The cipher is visible in LUKS
 metadata; compare detectability against a matched ordinary volume of the same
 profile.
@@ -71,14 +74,16 @@ Choose the primary cipher, sector size and A/B with
 performance). Install `pivsetup` and the module (DKMS) as described in
 [packaging/README.md](packaging/README.md); [development.md](docs/development.md)
 covers the VM test harness and [native-blocks.md](docs/native-blocks.md) the
-module. Format the volume with stock cryptsetup, then, as root:
+module. Format the volume with stock cryptsetup (the recommended
+configuration: AES-XTS + HMAC-SHA256, 512-byte sectors, `--ab` for a hidden
+filesystem), then, as root:
 
 ```sh
-cryptsetup luksFormat --type luks2 --cipher aegis128-random --key-size 128 \
-  --integrity aead --sector-size 4096 --key-file /root/luks.key /dev/sdX2
+cryptsetup luksFormat --type luks2 --cipher aes-xts-random --key-size 512 \
+  --integrity hmac-sha256 --sector-size 512 --key-file /root/luks.key /dev/sdX2
 pivsetup keygen --output /root/hidden.key
 pivsetup open-blocks --device /dev/sdX2 --key-file /root/luks.key \
-  --hidden-key-file /root/hidden.key --initialize
+  --hidden-key-file /root/hidden.key --initialize --ab
 # ... use /dev/mapper/piv-native-decoy and /dev/mapper/piv-native-hidden ...
 pivsetup close-blocks --device /dev/sdX2 --key-file /root/luks.key
 ```
@@ -109,7 +114,8 @@ Options of `open-blocks`:
   implicitly. The JSON output adds `"fill": {"valid", "written", "failed"}`
   block counts; failed blocks (carrier unreadable or failing authentication)
   are left as they were.
-- `--ab` (with `--initialize`): two record slots per block, so an interrupted
+- `--ab` (with `--initialize`; off by default, recommended for a filesystem on
+  the hidden view): two record slots per block, so a crash or interrupted
   hidden write leaves the previous version readable, at half capacity.
 - `--parity 4|8|16` (with `--initialize`; off by default): Reed–Solomon parity
   fragments per record lane, so a hidden block survives up to that many
@@ -136,19 +142,12 @@ primary rekey, resize or sector-size change, since live resize/rekey is
 unsupported (stock cryptsetup refuses reencrypt and resize on integrity
 volumes). See [rust/README.md](rust/README.md).
 
-Capacity on the 128 MiB fixtures (AEGIS-128; XTS + HMAC-SHA256 tuples are
-larger, so slightly fewer sectors):
-
-| Sector bytes | Decoy bytes | Hidden bytes | with `--ab` | with `--parity 8` |
-| ---: | ---: | ---: | ---: | ---: |
-| 4096 | 115,572,736 | 155,648 | 77,824 | 151,552 |
-| 512 | 109,060,096 | 1,257,472 | 626,688 | 1,216,512 |
-
 The hidden payload fraction is about 4096/(687·S) of primary capacity for
 sector size S: 0.146% at 4096 bytes, 1.16% at 512 (half with `--ab`, 3p/687
 less with parity), minus a fixed 112 + 2G sectors for keyslots and the
-directory. The 38 hidden blocks of a 128 MiB 4096-byte-sector volume are too
-few for mke2fs (about 55 blocks of 4 KiB minimum). Setup never creates
+directory; measured capacities, performance and initialization times are in
+[configuration.md](docs/configuration.md). A 128 MiB 4096-byte-sector volume
+has too few hidden blocks for mke2fs. Setup never creates
 filesystems. Unmount both filesystems before `close-blocks`. Larger geometry
 uses checked kernel bounds ([large-volumes.md](docs/large-volumes.md)); the
 largest tested volumes are 3 GiB (4096-byte sectors) and 2 GiB (512).
@@ -201,7 +200,7 @@ hidden write re-encodes its whole G-sector record with a fresh generation.
   unreadable; with `--ab` the previous version stays readable. No cross-block
   ordering, rollback protection or hidden filesystem recovery is promised.
   Whole-record rollback is accepted.
-- SIGINT/SIGTERM [cancel setup](docs/cancellation.md) between authenticated
+- SIGINT/SIGTERM [cancel setup](docs/native-faults.md#cancelling-activation-initialization-and-fill-cancel-suite) between authenticated
   ranges and rounds of initialization or fill records. Completed records stay;
   an interrupted `--initialize` leaves later blocks unavailable until `--fill`
   completes it. Cleanup removes only the
@@ -265,14 +264,60 @@ success. `extract-ivs` performs no primary verification. Offline diagnostics
 reject a dirty journal; native activation lets Linux replay it. Keys belong in
 private files, never command arguments or commits.
 
+## Before production use
+
+Read this list before trusting real data to the prototype.
+
+- **No external cryptographic review** ([Nonces and
+  limitations](#nonces-and-limitations)); treat every security claim as
+  unreviewed.
+- **Never open the volume read-write with stock tools.** Keep it out of
+  `/etc/crypttab`, and disable udisks/desktop auto-unlock and
+  systemd-gpt-auto-generator for it: a stock read-write open destroys hidden
+  data. There is no decoy-only dm-piv mode, so daily use needs the hidden key,
+  and boot activation reveals that a hidden volume is configured (/etc/pivtab
+  and the initramfs; [packaging/README.md](packaging/README.md)).
+- **Journal history.** Real volumes of 8 GiB or more get a 64 MiB integrity
+  journal that keeps recent writes (roughly the last 190 hidden-block writes at
+  512-byte sectors) and removed keyslots visible to a decoy-key holder with one
+  raw image. Write more than a journal's worth of decoy data after hidden use
+  ([configuration.md](docs/configuration.md#journal-size-and-history)).
+- **Crashes.** Without `--ab`, any hidden block written since the last flush
+  may read EIO after a crash or power cut, which can break a hidden
+  filesystem; use `--ab` for filesystems. Failures show only as EIO and dmesg
+  messages; there is no status command or non-destructive hidden scrub
+  (`--fill` is destructive). See [native-faults.md](docs/native-faults.md).
+- **Kernel upgrades.** Only Debian 6.12.113 and 7.2.9 are tested. A failed DKMS
+  build makes `update-initramfs` fail for the new kernel; keep the previous
+  kernel bootable. The safe fallback without dm-piv is a stock read-only open
+  of the decoy (`cryptsetup open --readonly`).
+- **Version lockstep.** Install pivsetup and the module from the same release
+  (packaging/VERSION); a control-ABI mismatch is refused with both versions
+  named (`pivsetup --version`).
+- **Capacity planning.** There is no resize, rekey or cipher change except the
+  offline `pivsetup migrate`, which needs a second device and is not
+  resumable. Choose the size and options up front.
+- **Backups.** Back up plaintext copied from the hidden view (and the decoy).
+  Raw images carry journal history, and restoring a VM snapshot or image clone
+  reuses RNG state and nonce budget.
+- **Memory.** Passphrase tier 3 needs about 1 GiB of free RAM, also in the
+  initramfs; pivsetup refuses early when less is available.
+- **Scale.** Tested up to 3 GiB volumes on a host-cached virtual disk; times
+  for larger disks are extrapolations (initialization on real disks runs at
+  roughly disk bandwidth / 3). There is no discard/TRIM support.
+
 ## Further reading
 
 [configuration.md](docs/configuration.md) (choosing options, performance),
 [packaging/README.md](packaging/README.md) (installation, DKMS, signing, boot),
 [ROADMAP.md](ROADMAP.md) (remaining work), [development.md](docs/development.md)
-(harness and tests), [native-blocks.md](docs/native-blocks.md),
-[native-faults.md](docs/native-faults.md),
-[read-performance.md](docs/read-performance.md),
-[observed-layout.md](docs/observed-layout.md) (source evidence),
-[sanitizer.md](docs/sanitizer.md), [kernel-port.md](docs/kernel-port.md).
+(harness, test suites, sanitizer and newer-kernel guests),
+[native-blocks.md](docs/native-blocks.md) (module, I/O path, bounded reads),
+[native-faults.md](docs/native-faults.md) (failure scope, fault and
+cancellation tests), [format-v5.md](docs/format-v5.md) (hidden format),
+[security-review.md](docs/security-review.md) (threat model, limits),
+[journal-atomicity.md](docs/journal-atomicity.md),
+[large-volumes.md](docs/large-volumes.md),
+[detectability.md](docs/detectability.md) (matched controls),
+[observed-layout.md](docs/observed-layout.md) (source evidence).
 Executed test runs are recorded in commit messages.

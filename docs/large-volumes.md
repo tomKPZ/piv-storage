@@ -39,7 +39,7 @@ Kernel per-request memory is bounded independently of volume size. Default
 setup scans only the keyslot area, so reopening is constant time; `--verify`,
 `--initialize` and `--fill` do work proportional to volume size while holding
 the setup lifecycle lock (`--initialize --quick` is constant time).
-[Cooperative cancellation](cancellation.md) checks pending signals between
+[Cooperative cancellation](native-faults.md#cancelling-activation-initialization-and-fill-cancel-suite) checks pending signals between
 read ranges and rounds of complete initialization or fill records; it does not
 interrupt stalled lower I/O or roll back records already written. Host
 diagnostic image decoding and IV scans use memory proportional to image
@@ -61,7 +61,9 @@ so there is no in-place conversion either. Offline `pivsetup migrate` copies
 both views into a freshly formatted volume of any supported size, profile or
 sector size and verifies both.
 
-scripts/probe-stock-reencrypt.sh (run with vm.py, 2026-10-22) checked pinned
+A one-off probe (scripts/probe-stock-reencrypt.sh, run with vm.py on
+2026-10-22; the script was removed after recording this result and remains in
+git history) checked pinned
 cryptsetup 2.7.5 on LUKS2 volumes with an integrity profile (aegis128-random/aead
 and aes-xts-random/hmac-sha256, 4096-byte sectors):
 
@@ -77,10 +79,10 @@ volumes; any live variant would have to be implemented here.
 
 ## Large-geometry guest test
 
-scripts/guest-large.sh (default AEGIS-128/4096) and scripts/guest-large-512.sh
-(AEGIS-128/512) format a fresh guest-owned 512 MiB blank disk (or, with
-`PIV_LARGE_DEVICE=/dev/vdc`, vm.py's arbitrary-size second disk) with stock
-cryptsetup, write deterministic primary plaintext, generate a synthetic hidden
+The explicit `large` suite of scripts/suite.py (scripts/guest-large.sh) formats
+a fresh guest-owned 512 MiB blank disk with the profile under test (or, with
+`PIV_LARGE_MIB=N` in the host environment, an N MiB second disk /dev/vdc) with
+stock cryptsetup, writes deterministic primary plaintext, generates a synthetic hidden
 key and run kernel/guest-large-test.py:
 
 - Full initialization with the exact expected encryption count
@@ -102,22 +104,26 @@ key and run kernel/guest-large-test.py:
   write (every block valid), custom unload and stock full-primary
   authentication. `large-results.json` records geometry and timings.
 
-Last recorded timings (2026-10-22, KVM, large-4096-011 and large-512-011):
-quick initialization 1.9 s (4096) / 1.6 s (512); fill of every block 8.5 s /
-22.3 s; full initialization 6.6 s / 15.2 s; reopen 1.7 s / 1.7 s; fill with
-nothing to write 4.1 s / 9.1 s. Earlier (large-4096-009 and large-512-009):
-reopen 1.6 s / 1.6 s; initialization 6.9 s / 15.7 s. The host was about 3× slower in that session than for large-*-007
-(batched writes, 2.6 s / 3.4 s, reopen 0.33 s / 0.26 s): the previous module
-rerun in the same session (large-*-010-oldmodule) took 10.1 s / 27.1 s to
-initialize and 2.2 s / 1.7 s to reopen. Format v4 with the per-sector write
-path (2026-10-21) took 27.8 s / 168.5 s.
+Recorded timings (2026-10-22, KVM): the 512 MiB quick-initialization, fill
+and full-initialization times of large-4096-011 and large-512-011, and the
+large-*-009 initialization comparison against the previous module, are in
+[configuration.md](configuration.md#large-volumes-and-initialization-time).
+Not repeated there: reopen took 1.7 s / 1.7 s (4096/512) in -011 and
+1.6 s / 1.6 s in -009. The host was about 3× slower in the -009 session than
+for large-*-007 (batched writes: initialization 2.6 s / 3.4 s, reopen
+0.33 s / 0.26 s); the previous module rerun in that session
+(large-*-010-oldmodule) took 2.2 s / 1.7 s to reopen. Format v4 with the
+per-sector write path (2026-10-21) took 27.8 s / 168.5 s to initialize.
 
 Host tests (tests/test_profile.py) check integrity layout arithmetic above
 32-bit byte offsets with synthetic 8 GiB metadata for both sector sizes,
 including truncated-extent rejection; this does not mean the module has run on
-an 8 GiB disk. Device-check tests (tests/test_device_checks.py, the Rust unit
-tests and the `devices` suite) accept any size and path but reject non-block
-paths, partitioned whole disks, busy devices and unprivileged activation.
+an 8 GiB disk. Device-check tests (the Rust unit tests in rust/src/owner.rs:
+`any_sector_multiple_size_is_accepted`, `root_is_required`,
+`non_block_devices_are_refused`, `claimed_device_reports_busy`,
+`partitioned_whole_disks_are_detected`; and the `devices` suite) accept any
+size and path but reject non-block paths, partitioned whole disks, busy
+devices and unprivileged activation.
 
 Beyond 512 MiB (2026-10-22, KVM, AEGIS-128, `--second-blank-mib`, the
 3 GiB and 2 GiB disks on /dev/vdc, all cases above including both high-address
@@ -135,33 +141,18 @@ ahead of the superblock read); large-3g-013 repeated the 3 GiB run with the
 final pivsetup 4f5ace03 while a 16-VM suite matrix shared the host (hence the
 slower times).
 
-This test is not part of suite.py; run it directly (fresh run directories;
-generated disks and keys stay in ignored artifacts/). For a larger disk, add
-`--blank-mib 128 --second-blank-mib 3072` and run a task that exports
-`PIV_LARGE_DEVICE=/dev/vdc` before `bash /mnt/piv-work/guest-large.sh`
-(sharing guest-large.sh), then host-check the run's `second.img` instead of
-`share/large-final.img`:
+Run it with the native module of a suite matrix (fresh prefix; generated disks
+and keys stay in ignored artifacts/):
 
 ```sh
-python3 scripts/build_pivsetup.py
-python3 scripts/vm.py run --code --script scripts/guest-large.sh \
-  --blank-mib 512 --run-dir artifacts/large-4096-next \
-  --share-file scripts/guest-control.sh \
-  --share-file artifacts/stage-next/scaffold.tar \
-  --share-file kernel/check-config.py --share-file kernel/guest-large-test.py \
-  --share-file rust/target/x86_64-unknown-linux-gnu/release/pivsetup \
-  --timeout 1800
-python3 scripts/vm.py run --code --script scripts/guest-large-512.sh \
-  --blank-mib 512 --run-dir artifacts/large-512-next \
-  --share-file scripts/guest-large.sh --share-file scripts/guest-control.sh \
-  --share-file artifacts/large-4096-next/share/experimental-dm-piv.ko \
-  --share-file kernel/guest-large-test.py \
-  --share-file rust/target/x86_64-unknown-linux-gnu/release/pivsetup \
-  --timeout 1800
+python3 scripts/suite.py --prefix artifacts/large-next \
+  --control artifacts/suite-016/aegis-512-control \
+  --scaffold artifacts/part2-input-002/scaffold.tar --suites large
+PIV_LARGE_MIB=3072 python3 scripts/suite.py --prefix artifacts/large-3g-next ...
 ```
 
-Verify each `share/large-final.img` with scripts/check_stateless.py using that
-run's `share/volume.key`, `hidden.key`, `expected-primary.sha256` and
-`expected-hidden-volume`. Original AEGIS-128 host verification needs the
+suite.py host-checks the run's `share/large-final.img` (or vm.py's
+`second.img` for a second disk) with scripts/check_stateless.py using that
+run's own keys and oracles. Original AEGIS-128 host verification needs the
 optional reference library from [development.md](development.md); the module
 and pivsetup do not.

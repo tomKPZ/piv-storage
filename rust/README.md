@@ -92,7 +92,7 @@ HMAC-SHA256 for the aes-sha256 profiles) into a rekeyed, larger,
 
 Keys are read from files only and live in mlocked, zeroized buffers; they never
 reach argv. The process is non-dumpable. SIGINT and SIGTERM are cooperative
-(exit 130 after cleanup; see [cancellation.md](../docs/cancellation.md)).
+(exit 130 after cleanup; see [native-faults.md](../docs/native-faults.md#cancelling-activation-initialization-and-fill-cancel-suite)).
 Errors print `pivsetup: [Errno N] message`; EKEYREJECTED adds a hint about the
 key/passphrase and `--kdf-cost` tier. Tiers 2–4 check `MemAvailable` before
 Argon2id. cryptsetup and dmsetup run with a cleared environment, `LC_ALL=C`

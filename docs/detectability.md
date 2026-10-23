@@ -77,49 +77,16 @@ changed plaintext sectors and 1 same-plaintext reencryption at 4096-byte
 sectors; 42 / 41 / 1 at 512), both arms authenticated every primary sector and
 ended with the same primary hash, and the native hidden zeros survived. The
 byte statistics and live-I/O counts are in each run's `analysis.json` (not
-committed); the caveats below apply unchanged.
+committed); the interpretation below applies.
 
-## Earlier results (format v4, original AEGIS-128)
+## Interpretation
 
-Measured on the 128 MiB `aegis-4096` and `aegis-512` fixtures (pinned Debian
-6.12.113 guest, run `artifacts/suite-061` on 2026-10-22, before the AES-XTS +
-HMAC-SHA256 profiles were added; artifacts are not committed). The AES-XTS +
-HMAC-SHA256 profiles have not been measured with
-this experiment; the decoy-write rule is profile-independent, but no result is
-claimed for them.
-
-| Profile / arm | Changed primary IVs | Changed plaintext sectors | Same-plaintext reencryption | Changed journal / metadata / data 512 B units (closed) |
-| --- | ---: | ---: | ---: | --- |
-| AEGIS 4096 / stock | 7 | 6 | 1 | 1,848 / 4 / 56 |
-| AEGIS 4096 / native | 7 | 6 | 1 | 1,848 / 4 / 56 |
-| AEGIS 512 / stock | 42 | 41 | 1 | 2,024 / 6 / 42 |
-| AEGIS 512 / native | 42 | 41 | 1 | 2,024 / 6 / 42 |
-
-In both profiles the native changed-IV positions equal the stock ones exactly:
-a v4 decoy write changes only the IVs of the sectors it writes (v5 keeps the
-same decoy-write rule). Both arms
-authenticated every sector (28,216 / 213,008), ended with the same primary hash,
-had no duplicate current IVs, and the native hidden contents (158,720 /
-1,209,856 bytes) remained zero.
-
-| Profile / arm | One-bit fraction | Byte entropy | Byte chi-square | zlib ratio |
-| --- | ---: | ---: | ---: | ---: |
-| AEGIS 4096 / stock | 0.499687 | 7.999631 | 231.60 | 1.000323 |
-| AEGIS 4096 / native | 0.499990 | 7.999634 | 229.37 | 1.000323 |
-| AEGIS 512 / stock | 0.500143 | 7.999943 | 268.06 | 1.000307 |
-| AEGIS 512 / native | 0.499754 | 7.999947 | 251.23 | 1.000307 |
-
-Live I/O still differs. Queued journal bytes were 540,672 (stock) / 540,672
-(native) at 4096-byte sectors and 180,224 / 225,280 at 512. Submission counts
-differ in shape: the stock arm shows read-ahead reads (92 and 94 events), the
-native owner bounded synchronous range reads (36 and 171 events). Live journal
-samples held 7 / 8 and 42 / 43 entries. These counts depend on timing, flushes
-and earlier journal contents; they identify the use of the native stack to an
-I/O observer, not hidden data.
-
-Interpretation: for decoy writes, the closed-snapshot footprint (changed IVs,
-plaintext and physical units) matched stock in this run. That does not make the
-native stack indistinguishable: live I/O traces differ, initialization and
+For decoy writes, the closed-snapshot footprint (changed IVs and plaintext
+sectors) matched stock. That does not make the native stack
+indistinguishable: live I/O traces can differ (the native owner issues its own
+bounded authenticated range reads instead of the stock read path; the counts
+depend on timing, flushes and earlier journal contents and identify the use of
+the native stack to an I/O observer, not hidden data), initialization and
 hidden writes rewrite carriers with unchanged plaintext, and there is no basis
 here for a multi-snapshot or workload-observing deniability claim.
 

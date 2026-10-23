@@ -64,6 +64,11 @@ pub fn require_root() -> Result<()> {
 /// that changes during setup (udev by-* links) cannot switch devices.
 pub fn check_device(source: &Path) -> Result<(u64, PathBuf)> {
     require_root()?;
+    check_block_device(source)
+}
+
+/// check_device after the root check (unit-testable as an ordinary user).
+fn check_block_device(source: &Path) -> Result<(u64, PathBuf)> {
     let info = fs::metadata(source)
         .map_err(|e| Error::new(format!("Cannot access {}: {e}", source.display())))?;
     if !info.file_type().is_block_device() {
@@ -72,14 +77,20 @@ pub fn check_device(source: &Path) -> Result<(u64, PathBuf)> {
     let node = kernel_node(info.rdev())
         .map_err(|e| Error::new(format!("Cannot resolve the device node of {}: {}", source.display(), e.message)))?;
     let size = device_size(&node, info.rdev())?;
-    if size == 0 || size % 512 != 0 {
-        bail!("Unsupported block device size {size}");
-    }
+    check_size(size)?;
     let (major, minor) = (libc::major(info.rdev()), libc::minor(info.rdev()));
     if has_partitions(major, minor)? {
         bail!("{} has a partition table in use; give the partition that holds the LUKS volume", source.display());
     }
     Ok((size, node))
+}
+
+/// Any nonzero whole number of 512-byte sectors (no size confinement).
+fn check_size(size: u64) -> Result<()> {
+    if size == 0 || size % 512 != 0 {
+        bail!("Unsupported block device size {size}");
+    }
+    Ok(())
 }
 
 /// /dev/DEVNAME of block device @rdev (sysfs uevent), which must itself be a
@@ -147,11 +158,15 @@ fn partitions_listed(base: &Path) -> Result<bool> {
 fn check_unclaimed(source: &Path) -> Result<()> {
     match fs::OpenOptions::new().read(true).custom_flags(libc::O_EXCL | libc::O_CLOEXEC).open(source) {
         Ok(_) => Ok(()),
-        Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
-            Err(Error::os(libc::EBUSY, format!("{} is in use (mounted, mapped or open exclusively)", source.display())))
-        }
-        Err(e) => Err(e.into()),
+        Err(e) => Err(claim_error(e, source)),
     }
+}
+
+fn claim_error(e: std::io::Error, source: &Path) -> Error {
+    if e.raw_os_error() == Some(libc::EBUSY) {
+        return Error::os(libc::EBUSY, format!("{} is in use (mounted, mapped or open exclusively)", source.display()));
+    }
+    e.into()
 }
 
 pub fn path_str(path: &Path) -> Result<&str> {
@@ -482,5 +497,56 @@ mod tests {
         assert_eq!(canonical_uuid("0F1E2D3C-4B5A-4978-8695-A4B3C2D1E0F0").unwrap(),
                    "0f1e2d3c-4b5a-4978-8695-a4b3c2d1e0f0");
         assert!(canonical_uuid("not-a-uuid").is_err());
+    }
+
+    // Device checks (moved from the Python mirror's tests/test_device_checks.py
+    // so they exercise the shipped code). No size or path confinement: any
+    // nonzero multiple of 512 bytes is accepted.
+    #[test]
+    fn any_sector_multiple_size_is_accepted() {
+        for size in [512u64, 128 << 20, 300 << 20, 3 << 30, 8 << 40] {
+            assert!(check_size(size).is_ok(), "{size}");
+        }
+        for size in [0u64, 511, (128 << 20) + 1] {
+            assert!(check_size(size).is_err(), "{size}");
+        }
+    }
+
+    #[test]
+    fn root_is_required() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // Only meaningful for an ordinary user (host unit tests).
+        }
+        let error = check_device(Path::new("/dev/null")).unwrap_err();
+        assert_eq!(error.errno, Some(libc::EPERM));
+    }
+
+    #[test]
+    fn non_block_devices_are_refused() {
+        let base = std::env::temp_dir().join(format!("pivsetup-nonblock-{}", std::process::id()));
+        fs::create_dir_all(&base).unwrap();
+        let file = base.join("file");
+        fs::write(&file, [0u8; 4096]).unwrap();
+        let fifo = base.join("fifo");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: mkfifo reads a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        for path in [file.as_path(), fifo.as_path(), base.as_path(), Path::new("/dev/null")] {
+            let error = check_block_device(path).unwrap_err();
+            assert!(error.message.contains("not a block device"), "{}: {}", path.display(), error.message);
+        }
+        assert!(check_block_device(&base.join("missing")).unwrap_err().message.contains("Cannot access"));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn claimed_device_reports_busy() {
+        let path = Path::new("/dev/sdb1");
+        let error = claim_error(std::io::Error::from_raw_os_error(libc::EBUSY), path);
+        assert_eq!(error.errno, Some(libc::EBUSY));
+        assert!(error.message.contains("in use"));
+        let error = claim_error(std::io::Error::from_raw_os_error(libc::ENOENT), path);
+        assert_eq!(error.errno, Some(libc::ENOENT));
     }
 }

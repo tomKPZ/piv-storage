@@ -4,8 +4,8 @@ import struct
 
 # (LUKS encryption, LUKS integrity type) -> (exact dm-crypt cipher spec, tag bytes).
 # The two supported stock profiles whose random 16-byte IVs live in
-# dm-integrity metadata, as format v5 requires: AEGIS-128 (default) and AES-XTS
-# + HMAC-SHA256 (user decision 2026-10-22).
+# dm-integrity metadata, as format v5 requires: AEGIS-128 and AES-XTS
+# + HMAC-SHA256 (recommended; user decision 2026-10-22).
 PRIMARY_PROFILES = {
     ('aegis128-random', 'aead'): ('capi:aegis128-random', 16),
     ('aes-xts-random', 'hmac(sha256)'): ('capi:authenc(hmac(sha256),xts(aes))-random', 32),

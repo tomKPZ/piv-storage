@@ -1,6 +1,6 @@
 //! Cooperative cancellation. SIGINT and SIGTERM set a flag without SA_RESTART,
 //! so the kernel's interruptible SETUP returns EINTR; the frontend then unwinds
-//! and removes only the mappings this attempt created (docs/cancellation.md).
+//! and removes only the mappings this attempt created (docs/native-faults.md, cancellation section).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

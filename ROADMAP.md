@@ -4,12 +4,12 @@ What remains. History lives in git (the previous long-form roadmap with every
 session handoff is in commits up to 2026-10-22); current behaviour, evidence
 and limits are in README.md and docs/.
 
-## Current state (2026-10-22)
+## Current state (2026-10-23)
 
 - One coordinated native owner (`kernel/dm-piv.c`, standalone, no dm-crypt fork)
   exposes paired writable decoy/hidden block devices over a stock LUKS2 +
-  dm-integrity volume with 16-byte random IVs (AEGIS-128 default, or AES-XTS + HMAC-SHA256
-  authenc). Hidden format v5 (4 KiB records, keyslot parameters, Argon2id
+  dm-integrity volume with 16-byte random IVs (AES-XTS + HMAC-SHA256 authenc,
+  the recommended profile, or AEGIS-128). Hidden format v5 (4 KiB records, keyslot parameters, Argon2id
   cost tiers, optional Reed–Solomon parity) is the only format. View bios run
   concurrently (range locks per sector range/record, stock flush semantics,
   batched 1024-sector authenticated reads).
@@ -40,8 +40,9 @@ only with a concrete need; each needs a disposable-guest test first):
 ## Standing decisions (binding for autonomous sessions)
 
 - One hidden format at a time: v5 (it replaced v4 without migration; a future
-  format would do the same unless the user decides otherwise). Primary profiles: AEGIS-128 (default) and aes-xts-random +
-  hmac-sha256. v3, the 12-byte-IV profiles, Serpent/Twofish-XTS and
+  format would do the same unless the user decides otherwise). Primary profiles: aes-xts-random +
+  hmac-sha256 (recommended since 2026-10-23, with 512-byte sectors and `--ab`
+  for hidden filesystems) and AEGIS-128. v3, the 12-byte-IV profiles, Serpent/Twofish-XTS and
   HMAC-SHA1/SHA512 stay removed (the last four by user decision 2026-10-22,
   for maintenance).
 - Format v5 is frozen (2026-10-22, after the final-review format fixes; see

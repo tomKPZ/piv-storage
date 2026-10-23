@@ -19,10 +19,11 @@ security specification. Respect tool/sandbox approval requirements.
 ## Start and finish each session
 
 1. Read README.md, ROADMAP.md, applicable nested instructions, and existing design
-   notes (especially docs/development.md, docs/observed-layout.md and
-   docs/format-v5.md, docs/native-blocks.md, docs/native-faults.md and
-   docs/security-review.md, docs/journal-atomicity.md, docs/read-performance.md,
-   docs/large-volumes.md, docs/cancellation.md and packaging/README.md). Inspect
+   notes (especially docs/development.md, docs/configuration.md,
+   docs/observed-layout.md and docs/format-v5.md, docs/native-blocks.md,
+   docs/native-faults.md and docs/security-review.md,
+   docs/journal-atomicity.md, docs/large-volumes.md, docs/detectability.md and
+   packaging/README.md). Inspect
    git status and relevant code before changing anything.
 2. Determine what is actually implemented and tested. Recheck environmental
    assumptions as needed (the current host has KVM; see docs/development.md).
@@ -142,9 +143,12 @@ resolved from context/evidence, not for routine implementation decisions.
   install host modules or touch real disks. scripts/fetch_kernel.py (or
   kernel/prepare.py) stages the complete module source.
 - Supported profiles (stock, 16-byte random IVs): LUKS2 original
-  aegis128-random (integrity aead; not AEGIS-128L; default) and aes-xts-random
+  aegis128-random (integrity aead; not AEGIS-128L) and aes-xts-random
   with integrity hmac-sha256 (dm-crypt authenc; 32- or 64-byte XTS key plus
-  the 32-byte HMAC key; 32-byte tags), 512/4096-byte sectors. Integrity v4
+  the 32-byte HMAC key; 32-byte tags), 512/4096-byte sectors. Recommended
+  (user decision 2026-10-23): aes-xts-random + hmac-sha256 with a 512-bit XTS
+  key, 512-byte sectors and `--ab` for hidden filesystems (pivsetup keeps A/B
+  off by default). Integrity v4
   fixed padding and the ordinary journal are required. Validate geometry,
   AAD, extents and arithmetic. Offline diagnostics reject dirty journals; native
   setup delegates replay to Linux before authenticated access.

@@ -44,15 +44,18 @@ D is the block device (or partition) holding the LUKS2 volume; there is no
 default. Research prototype without external cryptographic review. Key,
 passphrase and LUKS key files must be regular files owned by root and not
 accessible by group or others (chmod 600).
-LUKS2 volumes with 16-byte random IVs (aegis128-random + aead, or aes-xts-random
-+ hmac-sha256), the journaled integrity layer, and hidden format v5 (4096-byte
-hidden blocks). --initialize destroys all existing hidden contents and writes
+LUKS2 volumes with 16-byte random IVs (aes-xts-random + hmac-sha256, the
+recommended profile, or aegis128-random + aead), the journaled integrity layer,
+and hidden format v5 (4096-byte hidden blocks); 512-byte encryption sectors are
+recommended (4096 on 4Kn drives). --initialize destroys all existing hidden contents and writes
 zeros into every hidden block; with --quick it writes only the keyslot and
 directory, and every hidden block reads EIO until first written (tools that
 read unwritten blocks fail). --fill (on an existing volume, destructive) writes
 zeros into every hidden block whose record does not authenticate, skipping
 valid ones: it completes a quick or interrupted --initialize, resumes itself,
-and turns damaged blocks into zeros. --parity
+and turns damaged blocks into zeros. --ab (off by default; recommended for a
+filesystem on the hidden view) keeps the previous version of a block after an
+interrupted write, at half capacity. --parity
 adds Reed-Solomon parity fragments per lane (off by default). Keys are read
 from files only. Setup authenticates only the keyslot area; --verify first
 authenticates every primary sector and refuses on any failure (a full audit,

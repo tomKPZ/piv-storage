@@ -13,12 +13,12 @@ resize are not supported.
 
 ## Summary
 
-| Option | Chosen at | Default | Alternatives | Main trade-off |
+| Option | Chosen at | Recommended | Alternatives | Main trade-off |
 | --- | --- | --- | --- | --- |
-| [Primary cipher](#primary-cipher-profile) | `luksFormat` | `aegis128-random` + `aead` | `aes-xts-random` + `hmac-sha256` | AEGIS is fastest; XTS + HMAC tolerates an IV repeat far better |
-| [Sector size](#sector-size) | `luksFormat` | none from pivsetup; the test fixtures use 4096 | 512 | 512 gives 8× hidden capacity, about 3× faster hidden reads and 8× faster hidden writes; 4096 gives 5–7% more decoy space |
+| [Primary cipher](#primary-cipher-profile) | `luksFormat` | `aes-xts-random` + `hmac-sha256`, 512-bit XTS key | `aegis128-random` + `aead` | An IV repeat under XTS + HMAC leaks only block equality (under AEGIS it is a key compromise); AEGIS reads 25–45% faster |
+| [Sector size](#sector-size) | `luksFormat` | 512 (4096 on 4Kn drives); pivsetup has no default | 4096 | 512 gives 8× hidden capacity, about 2–3.5× faster hidden reads and 7–8× faster hidden writes; 4096 gives 5–9% more decoy space and slightly faster decoy writes |
 | [Integrity journal](#integrity-journal) | first `cryptsetup open` | journal on (required) | none | No-journal volumes are refused |
-| [A/B record slots](#ab-record-slots) | `--initialize` | off | `--ab` | A/B keeps the previous hidden block after an interrupted write, at half capacity and up to half hidden-read speed |
+| [A/B record slots](#ab-record-slots) | `--initialize` | `--ab` for a filesystem on the hidden view (pivsetup default: off) | single slot | A/B keeps the previous hidden block after a crash or interrupted write, at half capacity and up to half hidden-read speed |
 | [Reed–Solomon parity](#reedsolomon-parity) | `--initialize` | off | `--parity 4`, `8`, `16` | Survives up to p unreadable or damaged carrier sectors per lane, for 1.7–7% of hidden capacity |
 | [Hidden key type](#hidden-key-file-or-passphrase) | `--initialize` and keyslot add | key file | `--hidden-passphrase-file` (Argon2id) | A key file cannot be guessed; a passphrase relies on the KDF cost |
 | [Passphrase cost](#hidden-key-file-or-passphrase) | every passphrase open and keyslot add | `--kdf-cost 3` (1 GiB) | 1, 2, 4 | Higher tiers slow guessing and every open, and need more RAM; the tier is not recorded |
@@ -33,8 +33,8 @@ recorded in plaintext in the LUKS2 header.
 
 | Profile | luksFormat options | Tag bytes per sector |
 | --- | --- | ---: |
-| AEGIS-128 (default) | `--cipher aegis128-random --key-size 128 --integrity aead` | 16 |
-| AES-XTS + HMAC-SHA256 | `--cipher aes-xts-random --key-size 512 --integrity hmac-sha256` | 32 |
+| AES-XTS + HMAC-SHA256 (recommended) | `--cipher aes-xts-random --key-size 512 --integrity hmac-sha256` | 32 |
+| AEGIS-128 | `--cipher aegis128-random --key-size 128 --integrity aead` | 16 |
 
 `aegis128-random` is the original AEGIS-128, not AEGIS-128L. For XTS,
 `--key-size` is the XTS key only (512 bits = AES-256-XTS; 256 is also
@@ -58,20 +58,30 @@ cloned disk images and cloned RNG state make repeats far more likely; XTS +
 HMAC fails much more gracefully there. See the
 [security review](security-review.md) for the full nonce budget.
 
-**Performance (4096-byte sectors).** AEGIS-128 is the fastest. AES-XTS + HMAC
-costs about 0.08 s more per open, about half the hidden-read speed (each hidden
-block read authenticates 687 sectors, so the cipher dominates) and similar
-decoy and hidden write speed (writes are limited by the integrity journal).
-Its larger tag also costs some space (see [Storage overhead](#storage-overhead)).
+**Performance.** AEGIS-128 is the fastest. AES-XTS + HMAC costs about
+0.06–0.08 s more per open, about 25–30% of decoy sequential read speed and
+30–47% of hidden read speed (each hidden block read authenticates 687 sectors,
+so the cipher dominates), with similar decoy and hidden write speed (suite-094;
+see [Throughput](#throughput)). Its larger tag also costs some space (see
+[Storage overhead](#storage-overhead)).
 
 **Detectability.** The cipher name is visible to anyone who reads the LUKS2
 header. Compare a dm-piv volume only against ordinary volumes of the same
 profile. This project does not know which profile is more common in practice;
 both are uncommon compared with unauthenticated `aes-xts-plain64`.
 
-**Recommendation.** `aes-xts-random` + `hmac-sha256` is the conservative choice
-if you worry about RNG state being duplicated (VMs, cloned images). AEGIS-128
-is fine on a physical machine with a healthy RNG and is the faster default.
+**Recommendation.** Use `aes-xts-random` + `hmac-sha256` with a 512-bit XTS
+key. Stock dm-crypt draws 128 fresh random bits per sector write, but a dm-piv
+decoy rewrite draws only 80 (the other 48 carry the hidden fragment), so IV
+repeats are far likelier than on a stock volume. Repeats concentrate on hot
+sectors: the 112-sector keyslot area sits at the start of the volume, where a
+decoy filesystem keeps its superblock and group descriptors and rewrites them
+constantly. An AEGIS-128 repeat is a key compromise for the affected sectors;
+an XTS + HMAC repeat leaks only which 16-byte blocks of one sector are equal
+across two versions. Since batched writes, XTS writes as fast as AEGIS; it
+costs read speed (above). AEGIS-128 remains supported and fully tested, for
+example where hidden read speed matters and the RNG is known to be healthy
+and never cloned.
 
 ## Sector size
 
@@ -99,12 +109,16 @@ disk the 38 hidden blocks are too few for mke2fs (it needs about 55 blocks of
 to authenticate and journal per decoy byte (decoy writes measured about 10%
 slower at 512).
 
-**Recommendation.** Use **512** if hidden capacity matters, which is usually
-the point of this tool: 4096-byte sectors leave only about 0.14% of the volume
-for hidden data. Use 4096 if the decoy is a heavily written filesystem and
-hidden needs are small (keys, a few documents). Initialization time is
-proportional to hidden capacity, so 512-byte volumes take longer to
-initialize (see [Large volumes](#large-volumes-and-initialization-time)).
+**Recommendation.** Use **512** (the hidden volume is usually the point of
+this tool): 4096-byte sectors leave only about 0.14% of the volume for hidden
+data, and hidden writes are 7–8× and hidden reads 2–3.5× faster at 512. The
+costs are 6–9% less decoy capacity (metadata takes 5.9% of the raw space
+instead of 0.8% for AEGIS-128, 8.6% instead of 1.2% for XTS + HMAC) and about
+13% slower decoy sequential writes. Drives with 4096-byte logical sectors (4Kn)
+cannot use 512-byte encryption sectors; use 4096 there. Initialization rewrites
+almost every primary sector either way; at 512 it took about the same time on
+128 MiB disks and up to 2.3× longer on 512 MiB disks (see [Large
+volumes](#large-volumes-and-initialization-time)).
 
 ## Integrity journal
 
@@ -118,6 +132,22 @@ because it barely helped dm-piv: in suite-072 (AEGIS-128, 4096-byte sectors) it
 raised decoy writes by at most about 17% (5.8 → 6.8 MiB/s), and at 512-byte
 sectors no dm-piv write test was faster. dm-piv's own write path, not the
 journal, was the bottleneck (measured before batched writes; not re-measured).
+
+### Journal size and history
+
+cryptsetup sizes the journal itself (it has no
+`--journal-size` option for LUKS2 integrity; cryptsetup 2.8.8 rejects it and
+the devices suite checks the guest's 2.7.5): on the 128 MiB test disks it is
+about 1 MiB, and on real volumes of 8 GiB or more it is 64 MiB. The journal
+keeps recently written sectors, so a single raw image shows the decoy-key
+holder recent writes ([security
+review](security-review.md#journal-history-and-the-decoy-key-holder)). A
+64 MiB journal holds roughly the last 23 hidden-block writes at 4096-byte
+sectors or about 190 at 512, and removed keyslots stay testable until the
+journal wraps. Mitigation: after hidden use, write more than a journal's worth
+(over 64 MiB) of ordinary decoy data. A smaller journal cannot be created with
+stock cryptsetup, and a non-default journal size would itself distinguish the
+volume from stock ones.
 
 ## A/B record slots
 
@@ -144,9 +174,18 @@ single-slot speed (90–105%; 40–50% before suite-094). One 4 KiB hidden block
 block is either all old or all new after an interruption. Initialization is faster because it writes only one
 slot per block (without reading either).
 
-**Recommendation.** Keep A/B off by default for capacity. Turn it on for
-small, valuable hidden data where losing a block to a power cut is worse than
-halving capacity.
+**Recommendation.** Use `--ab` when the hidden view holds a filesystem. Plain
+hidden writes are not flushed per request (stock semantics), so after a crash
+any single-slot block written since the last flush can read EIO instead of
+returning its old or new contents, which a filesystem's journal replay does
+not expect. In 16 simulated power cuts with ext4 on the hidden view, A/B never
+showed an EIO block; single-slot showed one (in a block ext4 did not need, so
+replay and fsck stayed clean), which shows the mechanism but not its odds
+([ext4 power-cut test](native-faults.md#ext4-on-the-hidden-view-ext4power-suite)).
+A/B costs half the capacity and up to half the hidden read speed, not write
+speed. A raw key store or another consumer that tolerates a lost block (and
+rewrites it) can stay single-slot for twice the capacity; pivsetup's default
+remains single-slot.
 
 ## Reed–Solomon parity
 
@@ -341,9 +380,11 @@ What to expect:
   durability comes from fsync/FUA. Either difference is visible to anyone
   timing writes on the running system.
 - **Hidden writes** run at about 160–180 KiB/s at 4096-byte sectors (about 45
-  blocks of 4 KiB per second, limited by the integrity journal: each block
-  rewrites 2.7 MiB of primary data) and 1.3 MiB/s at 512 (344 KiB per block).
-  The hidden volume suits small, rarely changed data.
+  blocks of 4 KiB per second) and 1.3 MiB/s at 512. They are bound by the G×
+  write amplification, not by the journal: each 4 KiB block rewrites G = 687
+  primary sectors (2.7 MiB at 4096, 344 KiB at 512), which comes to about
+  110 MiB/s of rewritten primary data at either sector size, the same rate as
+  decoy sequential writes. The hidden volume suits small, rarely changed data.
 - **Hidden reads** authenticate 687 sectors per 4 KiB block regardless of
   request size; concurrent requests overlap: about 1.7–3.2 MiB/s at 4096-byte
   sectors and 6–8.5 MiB/s at 512 for 64 KiB requests (suite-094).
@@ -382,11 +423,12 @@ writes 8 records concurrently; on the 128 MiB test disk this was within noise
 of the serial version, and on 512 MiB disks (large-*-009 against the previous
 module in the same, slower host session) it took 6.9 s instead of 10.1 s at
 4096-byte sectors and 15.7 s instead of 27.1 s at 512. The test disk
-is cached by the host; on real storage initialization approaches the disk's
-bandwidth limit (every carrier sector is read once and written twice through
-the journal). Initialization can be cancelled with SIGINT/SIGTERM; blocks not yet written
+is cached by the host; on a real disk every carrier sector is read once and
+written twice (journal, then in place), so expect initialization at roughly
+**the disk's bandwidth divided by 3** (for example about 5–6 hours per TiB at
+150 MiB/s), whichever limit is lower. Initialization can be cancelled with SIGINT/SIGTERM; blocks not yet written
 stay unavailable until a `--fill` (or a new `--initialize`) completes them
-([cancellation.md](cancellation.md)). A fill costs the same per written block
+([native-faults.md](native-faults.md#cancelling-activation-initialization-and-fill-cancel-suite)). A fill costs the same per written block
 plus one authenticated read per block.
 
 The per-owner limit of 2^40 primary encryptions (raised from 2^32, which a
@@ -426,15 +468,16 @@ python3 scripts/suite.py --prefix artifacts/bench-next \
 
 ## Example
 
-A 512-byte-sector AES-XTS + HMAC-SHA256 volume with a journaled integrity
-layer and a hidden key file:
+The recommended configuration: a 512-byte-sector AES-XTS + HMAC-SHA256 volume
+with a journaled integrity layer, a hidden key file and A/B slots for a hidden
+filesystem:
 
 ```sh
 cryptsetup luksFormat --type luks2 --cipher aes-xts-random --key-size 512 \
   --integrity hmac-sha256 --sector-size 512 --key-file passphrase.key /dev/sdX2
 pivsetup keygen --output hidden.key
 pivsetup open-blocks --device /dev/sdX2 --key-file passphrase.key \
-  --hidden-key-file hidden.key --initialize
+  --hidden-key-file hidden.key --initialize --ab
 ```
 
 Later opens omit `--initialize`, which would destroy the hidden contents.

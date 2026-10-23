@@ -43,7 +43,7 @@ installation: [packaging/README.md](../packaging/README.md)). It:
 There is no uninitialized-carrier mode. Hidden availability of individual
 records never gates the decoy. Runtime locks use /run, which may be tmpfs.
 Setup polls SIGINT/SIGTERM between authenticated ranges and rounds of
-initialization or fill records ([cancellation.md](cancellation.md)).
+initialization or fill records ([cancellation](native-faults.md#cancelling-activation-initialization-and-fill-cancel-suite)).
 
 Setup tracks mappings created by its attempt, including commands that fail
 after kernel creation. Failed setup removes matching view UUIDs, then the newly
@@ -224,20 +224,42 @@ cancellation between rounds, when every record written so far is complete.
 
 ### Bounded authenticated reads
 
-Setup scans, decoy reads, hidden-read carrier collection and private owner
-reads use `piv_read_range`: at most 1024 primary sectors per call (a whole
-record), read as one batch of multi-sector bios in flight together (the same
-batch code as writes, up to 128 KiB per bio). Every primary sector still passes
-the AEAD check with its own address/IV AAD and tag offset, and nothing
-(plaintext or IVs) is published until the whole range authenticates; hidden
-reads take the raw IVs of failing sectors for SIV-checked decoding only. Public
-decoy and owner reads copy authenticated plaintext straight from the batch
-pages into the bio, only after the whole range authenticates (no intermediate
-buffer); read-only batches allocate no rewrite bookkeeping, and one AEAD request
-and buffer set serves every sector of a batch. Large application reads can span
-several work items and are not whole-request transactions. Private pages and
-metadata are wiped after use. Measurements:
-[read-performance.md](read-performance.md).
+Setup's keyslot/directory scan (and the `--verify` full audit), decoy reads,
+hidden-read carrier collection and private owner reads use `piv_read_range`:
+at most 1024 primary sectors per call (a whole record; 4 MiB at 4096-byte
+sectors, 512 KiB at 512) plus their tag/IV metadata, read as one batch of
+multi-sector bios to dm-integrity in flight together (the same batch code as
+writes, up to 128 KiB of data and one page of tuples per bio). Writes read
+their sectors through the batch path ([write path](#write-path)). The
+per-sector AEAD helper (`piv_aead`) runs once per sector, advancing the sector
+AAD (address/IV) and tag offset, so per-sector authentication is identical to
+stock dm-crypt, and nothing (plaintext or IVs) is published until the whole
+range authenticates; hidden reads take the raw IVs of failing sectors for
+SIV-checked decoding only. Public decoy and owner reads copy authenticated
+plaintext straight from the batch pages into the bio, only after the whole
+range authenticates (no intermediate buffer); read-only batches allocate no
+rewrite bookkeeping, and one AEAD request and buffer set serves every sector of
+a batch. Private pages and metadata are bounded and wiped on release, including
+after a partial authentication failure.
+
+There is no persistent cache, lazy verification or cross-bio accumulation: DM
+splits decoy bios at 128 KiB and hidden bios per 4096-byte block, and one
+hidden block read authenticates its whole carrier (G = 687 + 3p sectors) with
+one range call, so hidden reads cost 687 primary authentications per 4096-byte
+block regardless of request size (without parity; RS decoding runs only after
+a failed tag). Concurrent requests overlap their reads
+([concurrency](#concurrency)). Large application reads can span several work
+items and are not whole-request transactions.
+
+One range call submits one batch of reads to dm-integrity; the lower target may
+split them or serve them from its journal/cache, so call counts are not
+physical-media read counts. Fewer submissions must never skip a per-sector
+check; the `profile` suite asserts exact call and authentication counts
+([development.md](development.md#profile-suite)) and the `faults` suite the
+late-sector corruption/no-output regression
+([native-faults.md](native-faults.md#lower-device-errors-and-setup-cleanup-faults-suite)).
+User-facing read/write/activation numbers are in
+[configuration.md](configuration.md).
 
 ## Control ABI (kernel/piv-control.h)
 
@@ -349,7 +371,8 @@ stock-encrypted ext4 filesystem on a guest-root-backed loop image; it stays
 mounted and is checked writable after dm-piv teardown (coexistence-result.txt,
 loaded-targets.txt). The stock module is never unloaded or replaced.
 
-The batch suite (scripts/guest-batch.sh, kernel/guest-batch-test.py) checks the
+The `profile` suite also runs kernel/guest-batch-test.py (formerly the separate
+`batch` suite; both images are host-verified), which checks the
 128 KiB split contract on a closed native image: exact primary encryption counts
 and O_DSYNC write timings for 4 KiB to 1 MiB, unaligned, record-boundary and
 tail requests, followed by full verification, reopen, stock readback and unload.

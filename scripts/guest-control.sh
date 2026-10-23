@@ -21,15 +21,17 @@ apt-get -o Acquire::Retries=2 update
 apt-get -y --no-install-recommends install \
     cryptsetup-bin=2:2.7.5-2 libcryptsetup12=2:2.7.5-2 python3
 test "$(uname -r)" = 6.12.113+deb13-amd64
-PIV_SECTOR_SIZE=${PIV_SECTOR_SIZE:-4096}
+# Defaults follow the recommended configuration (docs/configuration.md):
+# 512-byte sectors and AES-XTS + HMAC-SHA256; suite.py always sets both.
+PIV_SECTOR_SIZE=${PIV_SECTOR_SIZE:-512}
 case "$PIV_SECTOR_SIZE" in 512|4096) ;; *) exit 1;; esac
-# The two supported stock profiles with random 16-byte IVs (format v4):
-# AEGIS-128 (default) or AES-XTS + HMAC-SHA256 (PIV_INTEGRITY=hmac-sha256).
-PIV_PRIMARY_CIPHER=${PIV_PRIMARY_CIPHER:-aegis128-random}
+# The two supported stock profiles with random 16-byte IVs: AES-XTS +
+# HMAC-SHA256 (default) or AEGIS-128 (PIV_PRIMARY_CIPHER=aegis128-random).
+PIV_PRIMARY_CIPHER=${PIV_PRIMARY_CIPHER:-aes-xts-random}
 case "$PIV_PRIMARY_CIPHER" in
     aegis128-random) primary_integrity=aead; primary_key_bytes=16 ;;
     aes-xts-random)
-        primary_integrity=${PIV_INTEGRITY:?XTS profiles need PIV_INTEGRITY}
+        primary_integrity=${PIV_INTEGRITY:-hmac-sha256}
         test "$primary_integrity" = hmac-sha256 || exit 1
         primary_key_bytes=64 ;;  # XTS encryption key; cryptsetup appends the HMAC key
     *) exit 1 ;;

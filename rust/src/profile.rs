@@ -8,8 +8,8 @@ use crate::json::Value;
 
 /// (LUKS encryption, LUKS integrity type, exact dm-crypt cipher spec, tag bytes).
 /// The two supported stock profiles whose random 16-byte IVs live in
-/// dm-integrity metadata, as format v5 requires: AEGIS-128 (default) and
-/// AES-XTS + HMAC-SHA256 (user decision 2026-10-22; other XTS ciphers and HMACs
+/// dm-integrity metadata, as format v5 requires: AEGIS-128 and
+/// AES-XTS + HMAC-SHA256 (recommended; user decision 2026-10-22; other XTS ciphers and HMACs
 /// were dropped to reduce maintenance).
 pub const PRIMARY_PROFILES: [(&str, &str, &str, u64); 2] = [
     ("aegis128-random", "aead", "capi:aegis128-random", 16),

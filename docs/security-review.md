@@ -229,7 +229,11 @@ sector number) until wraparound. The 128 MiB fixtures have about 1 MiB of journa
 (1,848–2,048 journal sectors depending on profile), so only a few recent hidden
 writes (687 primary sectors each without parity, 2.7 MiB of data at 4096-byte
 sectors) can remain; at 4096-byte sectors the journal holds less than one
-record write. A single raw image therefore carries a short write history even though
+record write. Real volumes have far larger journals: cryptsetup sizes the
+journal itself (no `--journal-size` option for LUKS2), reaching 64 MiB on
+volumes of 8 GiB or more, which retains roughly the last 23 hidden-block writes
+at 4096-byte sectors or about 190 at 512 ([configuration.md](configuration.md#journal-size-and-history)).
+A single raw image therefore carries a write history even though
 multi-snapshot observers are out of scope.
 
 | Observer | What retained journal entries can show |

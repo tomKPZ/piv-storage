@@ -5,7 +5,7 @@ piv-native.inc and piv-rs.inc; no dm-crypt fork or patch) registering `piv-crypt
 paired `piv-view` targets. dm-piv.c implements only the per-sector AEAD path
 over stock dm-integrity, reproducing the Linux LUKS2 layout (AAD =
 LE64(512-byte sector) ‖ IV, tuple = tag ‖ IV) for the supported stock profiles:
-original AEGIS-128 (default) or AES-XTS + HMAC-SHA256 authenc, always with stored random
+AES-XTS + HMAC-SHA256 authenc (recommended) or original AEGIS-128, always with stored random
 16-byte IVs, 512- or 4096-byte sectors, hidden format v5 (4096-byte hidden
 blocks, optional Reed–Solomon parity in `piv-rs.inc`). It coexists with
 unmodified dm-crypt and never requires unloading it, even while an ordinary
@@ -18,8 +18,8 @@ encrypted filesystem is busy. Interfaces and tests:
   disposable guests, never on the development host or real disks. Source,
   headers, config and symbol versions must match; never force-load.
   Unsigned-module taint is expected there. Tested kernels are the pinned
-  Debian 6.12.113, its sanitizer build ([sanitizer.md](../docs/sanitizer.md))
-  and the 7.2.9 port ([kernel-port.md](../docs/kernel-port.md)).
+  Debian 6.12.113, its sanitizer build ([development.md](../docs/development.md#sanitizer-kernel))
+  and the 7.2.9 port ([development.md](../docs/development.md#newer-kernel-port)).
 - Installation on a real system (research prototype, no external review):
   DKMS (`packaging/dkms/dkms.conf`, `packaging/install.sh dkms`), module
   signing for Secure Boot and the initramfs-tools hook are described in

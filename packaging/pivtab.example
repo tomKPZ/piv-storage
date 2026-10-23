@@ -1,5 +1,8 @@
 # /etc/pivtab: dm-piv views opened by the initramfs (packaging/README.md).
 # Research prototype without external cryptographic review.
+# Entries only open volumes initialized beforehand; the recommended format is
+# AES-XTS + HMAC-SHA256 with 512-byte sectors, initialized with --ab when the
+# hidden view holds a filesystem (packaging/README.md).
 #
 # NAME        DEVICE                      LUKS-KEY   HIDDEN-SECRET  OPTIONS
 # NAME          mapping name (piv-...); views appear as /dev/mapper/NAME-decoy

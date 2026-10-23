@@ -37,22 +37,26 @@ PROFILES = {
     'aes-sha256-4096': dict(PIV_PRIMARY_CIPHER='aes-xts-random', PIV_INTEGRITY='hmac-sha256', PIV_SECTOR_SIZE='4096'),
     'aes-sha256-512': dict(PIV_PRIMARY_CIPHER='aes-xts-random', PIV_INTEGRITY='hmac-sha256', PIV_SECTOR_SIZE='512'),
 }
-SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'stress', 'early', 'power', 'controls', 'v5', 'migrate',
-          'devices', 'deploy', 'fuzz', 'bench')
+SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'stress', 'early', 'power', 'controls', 'v5', 'migrate',
+          'devices', 'deploy', 'fuzz', 'ext4power', 'bench', 'large')
 # Routine tier: run after kernel or pivsetup changes. The opt-in remainder is for
 # changes in its own area: controls (descriptive write-pattern statistics),
 # migrate (pivsetup migrate), devices (activation on arbitrary block devices
 # and the remaining safety checks; a 300 MiB second disk), deploy (packaging/:
 # DKMS build and signature, installed activation and an initramfs-tools boot
-# that opens the views) and
-# fuzz (control ioctls and table constructors; most useful on the sanitizer).
-# bench (docs/configuration.md numbers) is explicit only and should run with
-# --jobs 1; 'all' excludes it.
-DEFAULT_SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'batch', 'stress', 'early', 'power', 'v5')
+# that opens the views),
+# fuzz (control ioctls and table constructors; most useful on the sanitizer)
+# and ext4power (ext4 on single-slot and A/B hidden views across a power cut;
+# two 2 GiB volumes on a 4 GiB second disk).
+# Explicit only ('all' excludes them): bench (docs/configuration.md numbers;
+# run with --jobs 1) and large (a fresh 512 MiB volume of the profile, or
+# PIV_LARGE_MIB=N for an N MiB second disk; docs/large-volumes.md).
+DEFAULT_SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'stress', 'early', 'power', 'v5')
+EXPLICIT_SUITES = ('bench', 'large')
 # Guest RAM floors (MiB): Argon2id tier 3 (1 GiB, the default --kdf-cost) runs
 # in pivsetup and in the Python cross-check; bench also measures tier 4 (2 GiB).
 SUITE_MEMORY_MIB = {'v5': 3072, 'bench': 3584}
-SUITE_SETS = {'routine': DEFAULT_SUITES, 'all': tuple(s for s in SUITES if s != 'bench')}
+SUITE_SETS = {'routine': DEFAULT_SUITES, 'all': tuple(s for s in SUITES if s not in EXPLICIT_SUITES)}
 lock = threading.Lock()
 
 
@@ -76,7 +80,7 @@ def kernel_reports(run_dir):
 def kmemleak_objects(path):
     """Suspected leaks from guest_record's forced kmemleak scan. Boot-time objects
     (swapper/0 in start_kernel, e.g. 6.12's execmem retpoline thunks) predate our
-    module and are a known kernel-internal false positive (docs/sanitizer.md)."""
+    module and are a known kernel-internal false positive (docs/development.md, "Sanitizer kernel")."""
     if not path.exists():
         return []
     found = []
@@ -182,16 +186,14 @@ class Matrix:
             'faults': (ROOT / 'scripts/guest-faults.sh', final,
                        [ko, ROOT / 'kernel/guest-fault-test.py', *keys, *oracles], 'fault-final.img'),
             'profile': (ROOT / 'scripts/guest-profile.sh', final,
-                        [ko, ROOT / 'kernel/guest-profile-test.py', *keys, *oracles], 'profile-final.img'),
+                        [ko, ROOT / 'kernel/guest-profile-test.py', ROOT / 'kernel/guest-batch-test.py',
+                         *keys, *oracles], 'profile-final.img'),
             'cancel': (ROOT / 'scripts/guest-cancel.sh', final,
                        [ko, ROOT / 'kernel/check-config.py', ROOT / 'kernel/guest-cancel-test.py', *keys, *oracles],
                        'cancel-final.img'),
             'lifecycle': (ROOT / 'scripts/guest-lifecycle.sh', final,
                           [ko, ROOT / 'kernel/piv-io-test.c', ROOT / 'kernel/guest-lifecycle-test.py',
                            ROOT / 'kernel/lifecycle_trace.py', *keys, *oracles], 'lifecycle-final.img'),
-            'batch': (ROOT / 'scripts/guest-batch.sh', final,
-                      [ko, ROOT / 'kernel/check-config.py', ROOT / 'kernel/guest-batch-test.py', *keys, *oracles],
-                      'batch-final.img'),
             'stress': (ROOT / 'scripts/guest-stress.sh', final,
                        [ko, ROOT / 'kernel/guest-stress-test.py', *keys, *oracles], 'stress-final.img'),
             'power': (ROOT / 'scripts/guest-stateless-power.sh', control / 'control.img',
@@ -213,6 +215,12 @@ class Matrix:
             'controls': (ROOT / 'scripts/guest-controls.sh', control / 'control.img',
                          [ko, ROOT / 'kernel/guest-controls-test.py', ROOT / 'scripts/control_metrics.py', *keys],
                          None),
+            # Own fresh volumes on the second disk (vdb is an unused blank).
+            'ext4power': (ROOT / 'scripts/guest-ext4-power.sh', None,
+                          [ko, ROOT / 'kernel/guest-ext4-power.py'], None),
+            'large': (self.large_task(profile) if 'large' in suites else None, None,
+                      [ko, ROOT / 'scripts/guest-large.sh', ROOT / 'scripts/guest-control.sh',
+                       ROOT / 'kernel/guest-large-test.py'], None),
         }
 
         def suite(name):
@@ -246,6 +254,12 @@ class Matrix:
                 extra += ['--second-blank-mib', '300']
             if name == 'deploy':
                 extra += ['--power-cut-script', str(ROOT / 'scripts/guest-deploy-boot.sh')]
+            if name == 'ext4power':
+                extra += ['--blank-mib', '128', '--second-blank-mib', '4096',
+                          '--power-cut-script', str(ROOT / 'scripts/guest-ext4-recover.sh')]
+            if name == 'large':
+                extra += (['--blank-mib', '128', '--second-blank-mib', str(self.args.large_mib)]
+                          if self.args.large_mib else ['--blank-mib', '512'])
             if not self.vm(key, script, run_dir, data=data, shares=files, extra=extra,
                            memory_mib=SUITE_MEMORY_MIB.get(name)):
                 return
@@ -268,6 +282,14 @@ class Matrix:
                 self.host_check(key, out / output, control, primary, hidden)
                 # The disk after systemd-shutdown detached the still-active views.
                 self.host_check(f'{key}/after-shutdown', run_dir / 'control.img', control, primary, hidden)
+            elif name == 'profile':
+                self.host_check(key, out / output, control, primary, hidden)
+                self.host_check(f'{key}/batch', out / 'batch-final.img', control, primary, hidden)
+            elif name == 'large':
+                # The run's own fresh volume and keys; a second disk is checked in place.
+                image = run_dir / 'second.img' if self.args.large_mib else out / 'large-final.img'
+                self.host_check(key, image, control, out / 'expected-primary.sha256', out / 'expected-hidden-volume',
+                                keys=(out / 'volume.key', out / 'hidden.key'))
             elif name in ('v5', 'stress'):
                 self.host_check(key, out / output, control, out / 'expected-primary.sha256',
                                 out / 'expected-hidden-volume')
@@ -277,6 +299,19 @@ class Matrix:
         if suites:
             with ThreadPoolExecutor(max_workers=len(suites)) as pool:
                 list(pool.map(suite, suites))
+
+    def large_task(self, profile):
+        """Task script for the large suite: the profile's stock luksFormat
+        environment (--control directories are named PROFILE-control)."""
+        name = profile.removesuffix('-control')
+        task = self.args.prefix / f'{profile}-large-task.sh'
+        env = dict(PROFILES.get(name, {}))
+        if self.args.large_mib:
+            env['PIV_LARGE_DEVICE'] = '/dev/vdc'
+        settings = ' '.join(f'{k}={v}' for k, v in env.items())
+        check = '' if name in PROFILES else f'echo "Unknown fixture profile {name}" >&2; exit 1\n'
+        task.write_text(f'#!/bin/bash\nset -euo pipefail\n{check}{settings} bash /mnt/piv-work/guest-large.sh\n')
+        return task
 
     def suites_for(self, profile):
         for prefix, names in self.args.suites_for:
@@ -335,6 +370,10 @@ def main():
     parser.add_argument('--accel', choices=('tcg', 'kvm'), default='kvm' if kvm else 'tcg',
                         help='QEMU accelerator for every VM (default: kvm when /dev/kvm is usable)')
     args = parser.parse_args()
+    # Large suite on an N MiB second disk instead of the 512 MiB /dev/vdb.
+    args.large_mib = int(os.environ.get('PIV_LARGE_MIB', '0'))
+    if args.large_mib and not 16 <= args.large_mib <= 16384:
+        parser.error('PIV_LARGE_MIB must be 16-16384')
     args.suites = list(SUITE_SETS.get(args.suites, [s for s in args.suites.split(',') if s]))
     if not set(args.suites) <= set(SUITES):
         parser.error('Unknown suite')

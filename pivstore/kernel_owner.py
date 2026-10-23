@@ -1,6 +1,9 @@
-"""Python mirror of pivsetup's owner lifecycle (owner.rs), kept as guest test
-instrumentation: device checks, LUKS/integrity validation, exclusive /run lock,
-ordinary cryptsetup open, reload as piv-crypt, control binding, identity checks."""
+"""Private-owner instrumentation for guest tests (piv-crypt without public
+views, for ioctl fuzzing, fault injection and owner/lifecycle checks). It
+follows pivsetup's owner lifecycle (owner.rs): LUKS/integrity validation,
+exclusive /run lock, ordinary cryptsetup open, reload as piv-crypt, control
+binding and identity checks. The shipped user-protecting device checks live
+and are unit-tested in owner.rs; this copy keeps only a minimal guard."""
 import errno
 import fcntl
 import glob
@@ -17,30 +20,16 @@ from .kernel_api import KernelDevice, dm, check_activation_flags, mapping_identi
 from .profile import parse_superblock, validate_segment
 
 
-def has_partitions(rdev):
-    """A whole disk whose kernel partition table lists partitions (they can be
-    in use without appearing as holders of the disk itself)."""
-    base = Path(f'/sys/dev/block/{os.major(rdev)}:{os.minor(rdev)}')
-    if (base / 'partition').exists():
-        return False
-    return any((entry / 'partition').exists() for entry in base.iterdir())
-
-
 def check_device(source):
-    """Activation preconditions that protect the caller (no test confinement):
-    root, an existing block device (symlinks followed) of a nonzero whole
-    number of 512-byte sectors that is not a partitioned whole disk. Mirrors
-    pivsetup's owner::check_device."""
+    """Root and a block device of a whole number of 512-byte sectors (test
+    instrumentation; pivsetup's owner::check_device is the shipped check)."""
     if os.geteuid() != 0:
         raise PermissionError('Kernel setup requires root')
-    info = Path(source).stat()
-    if not stat.S_ISBLK(info.st_mode):
+    if not stat.S_ISBLK(Path(source).stat().st_mode):
         raise ValueError(f'{source} is not a block device')
     size = int(subprocess.check_output(['blockdev', '--getsize64', str(source)], text=True))
     if size <= 0 or size % 512:
         raise ValueError(f'Unsupported block device size {size}')
-    if has_partitions(info.st_rdev):
-        raise ValueError(f'{source} has a partition table in use; give the partition that holds the LUKS volume')
     return size
 
 

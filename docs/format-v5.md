@@ -49,8 +49,8 @@ sectors, journaled dm-integrity):
 
 | LUKS2 encryption | Integrity | Volume key | Tag | Tuple (tag ‖ IV) |
 | --- | --- | --- | ---: | ---: |
-| `aegis128-random` (original AEGIS-128, default) | `aead` | 16 bytes | 16 | 32 |
-| `aes-xts-random` | `hmac-sha256` | XTS key (32 or 64) ‖ HMAC key (32) | 32 | 48 |
+| `aegis128-random` (original AEGIS-128) | `aead` | 16 bytes | 16 | 32 |
+| `aes-xts-random` (recommended) | `hmac-sha256` | XTS key (32 or 64) ‖ HMAC key (32) | 32 | 48 |
 
 Primary authentication is unchanged Linux: AEGIS-128 uses AAD
 `LE64(sector × S/512) ‖ IV`; AES-XTS + HMAC-SHA256 uses the IV as XTS tweak and
@@ -217,12 +217,15 @@ output) over the passphrase, computed by pivsetup:
 salt = base ‖ "/kek/argon2id/" ‖ ASCII tier digit
 ```
 
-| Tier (`--kdf-cost`) | Memory | Passes | Intended use | Added open time (suite-112 guests) |
-| ---: | ---: | ---: | --- | ---: |
-| 1 | 64 MiB | 3 | low-memory systems (v4's cost) | 0.10–0.16 s |
-| 2 | 256 MiB | 3 | small systems | 0.46–0.55 s |
-| 3 (default) | 1 GiB | 3 | cryptsetup's LUKS2 default memory cap and lanes | 2.10–2.15 s |
-| 4 | 2 GiB | 6 | high-value passphrases on large-memory hosts | 8.1–8.3 s |
+| Tier (`--kdf-cost`) | Memory | Passes | Intended use |
+| ---: | ---: | ---: | --- |
+| 1 | 64 MiB | 3 | low-memory systems (v4's cost) |
+| 2 | 256 MiB | 3 | small systems |
+| 3 (default) | 1 GiB | 3 | cryptsetup's LUKS2 default memory cap and lanes |
+| 4 | 2 GiB | 6 | high-value passphrases on large-memory hosts |
+
+Measured open times per tier are in
+[configuration.md](configuration.md#hidden-key-file-or-passphrase).
 
 The default matches cryptsetup's LUKS2 Argon2id defaults (user decision
 2026-10-22): 1 GiB of memory and 4 lanes. cryptsetup also calibrates passes to
