@@ -138,8 +138,8 @@ blocks.
 
 A/B reads both slots, so hidden reads take up to about twice as long. A write
 rewrites the same 687 sectors but first reads both slots to find the older one
-and flushes the journal (so the newest slot is durable before the other is
-overwritten); with concurrent requests A/B writes now run at about the
+and flushes the journal unless that version is already durable (so the
+newest slot is durable before the other is overwritten); with concurrent requests A/B writes now run at about the
 single-slot speed (90–105%; 40–50% before suite-094). One 4 KiB hidden block is one record, so with A/B a
 block is either all old or all new after an interruption. Initialization is faster because it writes only one
 slot per block (without reading either).
@@ -313,6 +313,22 @@ within noise at 4096) and A/B hidden writes 2–3×. Initialization of the
 128 MiB disk did not change beyond noise; on 512 MiB disks it was 1.5–1.7×
 faster than the previous module in the same session (see below).
 
+Queue depth 16 (suite-120, 2026-10-23: the same number of random 4 KiB O_DIRECT
+writes from 16 threads, then one fsync): decoy 14,750 / 13,070 / 14,830 /
+10,210 IOPS (AEGIS-128 4096 / 512, AES-XTS + HMAC-SHA256 4096 / 512) against
+stock 15,220 / 13,630 / 16,850 / 14,630, so concurrent decoy writes reach
+70–97% of stock (40–63% at depth 1 in the same run). Hidden writes gain little from depth:
+38–56 blocks/s at 4096-byte sectors and 250–330 at 512, single slot or A/B,
+because each block rewrites a whole record through the journal. The review
+fixes of suite-120 (per-batch AEAD requests, direct-to-bio reads, fewer
+allocations, A/B flush skipping) compared with suite-113 (previous module, same
+bench) changed nothing beyond the ±15% noise band except A/B hidden random
+writes at queue depth 1 on 512-byte sectors, +26–34% (the pre-write flush is
+skipped when the block's previous write is already durable; reproduced in a
+second run). AEGIS-128 decoy random reads measured 13–20% lower in both runs
+while stock rows in the same session were 2–10% lower (still at stock speed);
+treat it as unresolved noise.
+
 What to expect:
 
 - **Decoy reads** are close to stock: random reads at stock speed, large
@@ -383,7 +399,8 @@ volumes (3 GiB and 2 GiB; [large-volumes.md](large-volumes.md)).
 
 - `bench` suite (scripts/guest-bench.sh, kernel/guest-bench-test.py) run
   sequentially (`--jobs 1`) in suite-094 (format v5, concurrent requests,
-  2026-10-22; KDF tier rows from suite-077, matched within 0.6 s) on the pinned
+  2026-10-22; KDF tier rows from suite-077, matched within 0.6 s; queue-depth-16
+  rows from suite-120, with suite-113 as the previous-module baseline) on the pinned
   Debian 6.12.113 guest: 2 vCPUs, `-cpu max` under KVM on an Intel Xeon @
   2.60 GHz host, 3.5 GiB guest RAM (for the 2 GiB Argon2id tier), 128 MiB raw
   virtio disk image.
@@ -404,7 +421,7 @@ Reproduce (results land in `PREFIX/*-bench/share/bench-results.json`):
 ```sh
 python3 scripts/suite.py --prefix artifacts/bench-next \
   --control artifacts/suite-016/aegis-4096-control \
-  --scaffold artifacts/conc-input-002/scaffold.tar --suites bench --jobs 1
+  --scaffold artifacts/part2-input-002/scaffold.tar --suites bench --jobs 1
 ```
 
 ## Example
