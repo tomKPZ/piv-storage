@@ -30,8 +30,29 @@ and limits are in README.md and docs/.
 
 ## Remaining work
 
-No implementation items remain. Open, unverified deployment areas (pick up
-only with a concrete need; each needs a disposable-guest test first):
+1. **Parallel Argon2 lanes** (pivsetup). Tiers use 4 lanes, but the vendored
+   `argon2` 0.5.3 computes them sequentially (no `parallel` feature; its
+   block-filling routine is private), so an attacker gains up to ~4× in time
+   per guess versus the defender's open time. Thread the lanes (argon2 ≥ 0.6
+   with rayon, or a small in-tree lane scheduler on maintained primitives),
+   keeping outputs byte-identical (existing KEK vectors in rust/tests must
+   still match; no format change). Then decide whether to raise tier passes so
+   tier 3 stays ≈ 2 s. Exit: vectors unchanged, tier timings re-measured with
+   `bench`, docs updated.
+2. **`pivsetup status` and a non-destructive hidden scrub.** Today fail-stop
+   is visible only as EIO plus dmesg, and `--fill` is the only whole-volume
+   hidden pass (destructive). Add `pivsetup status` (owner active/failed,
+   encryptions, hidden size, views, via the existing STATUS ioctl; no new
+   control commands) and a read-only scrub that reads every hidden block and
+   reports valid / RS-recovered / unavailable counts without writing (in
+   pivsetup over the hidden view, or as a read-only setup flag if
+   RS-recovered blocks need kernel reporting). Exit: devices/v5 suites cover
+   status on healthy and failed owners and scrub counts on damaged blocks
+   (with and without parity); docs (README before-production section,
+   configuration.md) updated.
+
+Open, unverified deployment areas (pick up only with a concrete need; each
+needs a disposable-guest test first):
 
 - Boot-time `ask` prompts (initramfs askpass), a root filesystem on a view,
   Secure Boot enrollment/enforcement of the DKMS-signed module, dracut and
