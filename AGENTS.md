@@ -65,10 +65,12 @@ resolved from context/evidence, not for routine implementation decisions.
   A"; they cannot carry v5); do not reintroduce them. The "AEGIS-128 only"
   part of option A was reversed on 2026-10-22.
   To reduce maintenance (user decision 2026-10-22, after the suite-072 bench)
-  stock no-journal volumes (refused: little dm-piv gain, torn decoy sectors on
-  a crash; docs/journal-atomicity.md), the scrypt KDF and the Serpent/Twofish
-  and HMAC-SHA1/SHA512 profiles were removed; do not reintroduce them without
-  a user decision.
+  the scrypt KDF and the Serpent/Twofish and HMAC-SHA1/SHA512 profiles were
+  removed; do not reintroduce them without a user decision. Stock no-journal
+  volumes were removed at the same time, but the user reversed that on
+  2026-10-23 (ROADMAP item 1): the journal retains recent writes after a crash
+  or while active, which breaks deniability against a decoy-key holder, and
+  the project's priorities are deniability > integrity > performance/storage.
   Multi-snapshot observers, rollback resistance and alternative hidden openings
   under coercion are out of scope. Never put host-specific (e.g. corporate
   kernel) identifiers in the repository.

@@ -30,7 +30,41 @@ and limits are in README.md and docs/.
 
 ## Remaining work
 
-1. **Parallel Argon2 lanes** (pivsetup). Tiers use 4 lanes, but the vendored
+1. **No-journal mode for deniability** (user decision 2026-10-23; reverses the
+   2026-10-22 removal). Stock dm-integrity keeps every recent write (target
+   sector, full ciphertext, tag and IV; no journal encryption) in its circular
+   journal while the volume is active and after a crash; only a clean
+   deactivation wipes it (`init_journal()` in postsuspend). A hidden write
+   journals a whole 687-sector record, so a crash or seizure image shows a
+   decoy-key holder recent record-shaped runs re-encrypted with identical
+   plaintext (up to ~190 hidden writes in a 64 MiB journal at 512-byte
+   sectors). Re-add support for stock `--integrity-no-journal --persistent`
+   volumes (direct-mode lower table) in pivsetup, the Python diagnostics,
+   fixtures (`*-nojournal` profiles) and the fault/power/recover tests, and
+   make it the **recommended** mode for deniability; journaled mode stays
+   supported as the integrity-first choice. Re-measure the torn-sector
+   behaviour under v5 and the current batched/concurrent write path (which
+   decoy and carrier sectors a crash can tear; power suite with and without
+   `--ab`; ext4power on no-journal), document the residual single-record tear
+   signature, and recommend `--ab` for hidden data on no-journal volumes.
+   Update configuration.md, journal-atomicity.md, security-review.md, README
+   (before-production section) and AGENTS.md. Exit: all suites pass on
+   journaled and no-journal fixtures (stock and sanitizer), host checks
+   verify, docs updated.
+2. **Shape hidden writes for keyless observers** (kernel, no format change).
+   A hidden write rewrites exactly the record's G sectors starting at
+   `112 + G·g`; at 512-byte sectors that is a 351,744-byte run (not a 4 KiB
+   multiple) at unaligned offsets, a shape ordinary filesystems do not
+   produce and that any address trace (journal, I/O tracing, multiple
+   snapshots) reveals without keys. Extend each record rewrite to 4 KiB
+   (consider larger, e.g. 64 KiB) aligned edges by refreshing the neighbouring
+   sectors' IVs with the decoy-write rule (fragments kept, fresh random bytes,
+   plaintext unchanged, same authentication and collision rules), inside the
+   same range lock. Measure the amplification cost with `bench` and choose
+   the alignment; document what it does not hide (a decoy-key holder still
+   sees unchanged-plaintext rewrites). Exit: profile/v5 counts updated, a test
+   asserting every hidden-write lower bio set is aligned, docs updated.
+3. **Parallel Argon2 lanes** (pivsetup). Tiers use 4 lanes, but the vendored
    `argon2` 0.5.3 computes them sequentially (no `parallel` feature; its
    block-filling routine is private), so an attacker gains up to ~4× in time
    per guess versus the defender's open time. Thread the lanes (argon2 ≥ 0.6
@@ -39,7 +73,7 @@ and limits are in README.md and docs/.
    still match; no format change). Then decide whether to raise tier passes so
    tier 3 stays ≈ 2 s. Exit: vectors unchanged, tier timings re-measured with
    `bench`, docs updated.
-2. **`pivsetup status` and a non-destructive hidden scrub.** Today fail-stop
+4. **`pivsetup status` and a non-destructive hidden scrub.** Today fail-stop
    is visible only as EIO plus dmesg, and `--fill` is the only whole-volume
    hidden pass (destructive). Add `pivsetup status` (owner active/failed,
    encryptions, hidden size, views, via the existing STATUS ioctl; no new
@@ -73,9 +107,11 @@ needs a disposable-guest test first):
 - Setup scans only the keyslot area; `--verify` is the full audit. A decoy write
   covering a whole sector that fails authentication replaces it; raw IVs of such
   sectors feed only SIV-checked decoding (keyslots, directory, hidden reads).
-- Journaled dm-integrity is required; stock no-journal volumes are refused
-  (user decision 2026-10-22: little dm-piv gain, torn decoy sectors on a
-  crash). Hidden passphrases use Argon2id only (scrypt removed).
+- Priorities (user, 2026-10-23): deniability > integrity > performance and
+  storage overhead.
+- Stock no-journal volumes are currently refused, but the user decided on
+  2026-10-23 to re-add them as the recommended deniability mode (item 1).
+  Hidden passphrases use Argon2id only (scrypt removed).
 - No persistent counter, history, WAL or ledger. Multi-snapshot observers,
   rollback resistance and coercion-resistant alternative openings are out of
   scope.
