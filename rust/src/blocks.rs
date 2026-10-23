@@ -10,11 +10,12 @@ use crate::owner::{mapping_identity, remove_mapping, Owner};
 use crate::profile::base_context;
 use crate::secret::Secret;
 use crate::{hooks, signals};
+use zeroize::Zeroize;
 
 /// Argon2id cost tiers (`--kdf-cost`, docs/format-v5.md): (memory KiB,
 /// passes), 4 lanes. Nothing is stored in clear, so the tier must be given on
 /// every open (pivstore.blocks.ARGON2ID_TIERS).
-const ARGON2_TIERS: [(u32, u32); 4] = [(64 * 1024, 3), (256 * 1024, 3), (1024 * 1024, 3), (2048 * 1024, 6)];
+const ARGON2_TIERS: [(u32, u32); 4] = [(64 * 1024, 10), (256 * 1024, 10), (1024 * 1024, 10), (2048 * 1024, 22)];
 const ARGON2_P: u32 = 4;
 /// Default tier: cryptsetup's LUKS2 Argon2id memory and lanes (user decision 2026-10-22).
 pub const DEFAULT_KDF_COST: u8 = 3;
@@ -93,10 +94,45 @@ pub fn passphrase_kek(passphrase: &[u8], base_context: &[u8], tier: u8) -> Resul
     kek.push(&[0u8; 32])?;
     let params = argon2::Params::new(memory, passes, ARGON2_P, Some(32))
         .map_err(|e| Error::new(e.to_string()))?;
-    argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
-        .hash_password_into(passphrase, &salt, &mut kek)
-        .map_err(|e| Error::new(e.to_string()))?;
+    let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+    // The working memory is allocated here (exactly m KiB, shared by all
+    // lanes) so that it can be zeroized afterwards; the crate's own
+    // allocation is freed without zeroizing.
+    let mut blocks: Vec<argon2::Block> = Vec::new();
+    blocks.try_reserve_exact(argon2.params().block_count())
+        .map_err(|_| Error::os(libc::ENOMEM, "Out of memory for the Argon2id working memory"))?;
+    blocks.resize(argon2.params().block_count(), argon2::Block::default());
+    let pool = kdf_thread_pool()?;
+    let result = pool.install(|| argon2.hash_password_into_with_memory(passphrase, &salt, &mut kek, &mut blocks[..]));
+    blocks.zeroize();
+    result.map_err(|e| Error::new(e.to_string()))?;
     Ok(kek)
+}
+
+/// Private pool with one thread per Argon2id lane (argon2's `parallel`
+/// feature runs each slice's lanes through rayon). SIGINT and SIGTERM stay
+/// blocked in the workers so that cancellation keeps reaching the main thread,
+/// whose later SETUP ioctl must return EINTR (signals.rs). The pool's threads
+/// exit when it is dropped.
+fn kdf_thread_pool() -> Result<rayon::ThreadPool> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(ARGON2_P as usize)
+        .thread_name(|i| format!("pivsetup-kdf{i}"))
+        .start_handler(|_| block_cancel_signals())
+        .build()
+        .map_err(|e| Error::new(format!("Cannot start the Argon2id lane threads: {e}")))
+}
+
+fn block_cancel_signals() {
+    // SAFETY: a zeroed sigset initialized by sigemptyset/sigaddset and
+    // pthread_sigmask on the calling thread only.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
 }
 
 /// MemAvailable of /proc/meminfo in KiB (None if unreadable).
@@ -404,6 +440,23 @@ mod tests {
         assert_eq!(hex(&kek), include_str!("../tests/argon2id-pw-ctx-tier3.hex").trim());
         assert!(passphrase_kek(b"", b"ctx", 1).is_err());
         assert!(passphrase_kek(b"pw", b"ctx", 0).is_err() && passphrase_kek(b"pw", b"ctx", 5).is_err());
+    }
+
+    /// The KDF pool has one thread per lane and keeps SIGINT/SIGTERM blocked
+    /// in every worker (cancellation must reach the main thread).
+    #[test]
+    fn kdf_pool_blocks_cancel_signals() {
+        let pool = kdf_thread_pool().unwrap();
+        assert_eq!(pool.current_num_threads(), ARGON2_P as usize);
+        let blocked = pool.broadcast(|_| {
+            // SAFETY: queries the calling thread's signal mask only.
+            unsafe {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut set);
+                libc::sigismember(&set, libc::SIGINT) == 1 && libc::sigismember(&set, libc::SIGTERM) == 1
+            }
+        });
+        assert!(blocked.len() == ARGON2_P as usize && blocked.iter().all(|b| *b));
     }
 
     /// Timing of every tier (release build): cargo test --release -- --ignored tier_timing --nocapture

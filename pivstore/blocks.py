@@ -34,7 +34,7 @@ KEYSLOT = struct.Struct('=IIQII32s32s2I')  # KEYSLOT version 2: slot, op, new KE
 # Passphrase KEK cost tiers (--kdf-cost, docs/format-v5.md); must equal
 # rust/src/blocks.rs. Argon2id v1.3, 4 lanes, 32-byte output: tier ->
 # (memory KiB, passes). The tier is recorded nowhere and is part of the salt.
-ARGON2ID_TIERS = {1: (64 * 1024, 3), 2: (256 * 1024, 3), 3: (1024 * 1024, 3), 4: (2048 * 1024, 6)}
+ARGON2ID_TIERS = {1: (64 * 1024, 10), 2: (256 * 1024, 10), 3: (1024 * 1024, 10), 4: (2048 * 1024, 22)}
 DEFAULT_KDF_COST = 3
 ERROR = re.compile(r'^pivsetup: (?:\[Errno (\d+)\] )?(.*)$')
 

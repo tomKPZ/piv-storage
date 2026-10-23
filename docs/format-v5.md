@@ -219,10 +219,10 @@ salt = base ‖ "/kek/argon2id/" ‖ ASCII tier digit
 
 | Tier (`--kdf-cost`) | Memory | Passes | Intended use |
 | ---: | ---: | ---: | --- |
-| 1 | 64 MiB | 3 | low-memory systems (v4's cost) |
-| 2 | 256 MiB | 3 | small systems |
-| 3 (default) | 1 GiB | 3 | cryptsetup's LUKS2 default memory cap and lanes |
-| 4 | 2 GiB | 6 | high-value passphrases on large-memory hosts |
+| 1 | 64 MiB | 10 | low-memory systems |
+| 2 | 256 MiB | 10 | small systems |
+| 3 (default) | 1 GiB | 10 | cryptsetup's LUKS2 default memory cap and lanes, about 2 s |
+| 4 | 2 GiB | 22 | high-value passphrases on large-memory hosts |
 
 Measured open times per tier are in
 [configuration.md](configuration.md#hidden-key-file-or-passphrase).
@@ -230,28 +230,32 @@ Measured open times per tier are in
 The default matches cryptsetup's LUKS2 Argon2id defaults (user decision
 2026-10-22): 1 GiB of memory and 4 lanes. cryptsetup also calibrates passes to
 about 2 seconds and records them in its header; v5 records nothing, so passes
-are fixed per tier. Tier 3 was measured with pivsetup's Argon2id (RustCrypto
-`argon2`, release build, lanes computed sequentially) on the bench host before
-fixing its passes: 1.95 s at 3 passes and 2.61 s at 4 passes, so tier 3 uses 3
-passes (2026-10-22; tiers 1, 2 and 4 took 0.12, 0.50 and 7.7 s). In the
-suite-112 bench guests (2026-10-22) tier 3 added 2.10–2.15 s to an open (open
-time minus a key-file open, all four profiles; see
-[configuration.md](configuration.md)).
-The other tiers' passes are the design targets.
+are fixed per tier.
 
-**Lanes are computed sequentially (decided before freezing, 2026-10-22).** The
-pinned RustCrypto `argon2` 0.5.3 has no `parallel` feature (it arrived with
-rayon in the 0.6 line, which is not vendored and would add about six crates)
-and its block-filling routine is private, so pivsetup cannot hand the four
-lanes to threads without reimplementing Argon2's core, which the project
-avoids (maintained primitives only). An attacker can run the four lanes in
-parallel, so for the same wall time on a 4-core defender the tiers buy about a
-quarter of the work a parallel implementation could; memory hardness (the
-dominant cost for guessing hardware) is unaffected. Argon2id's output does not
-depend on threading, so a later parallel implementation keeps every existing
-KEK (the Python reference already agrees); the tier parameters themselves are
-frozen by the salt, and a stronger tier can be added later as tier 5 without a
-format change.
+**Lanes run in parallel (2026-10-23).** pivsetup computes the four lanes of
+each Argon2id slice on four threads (RustCrypto `argon2` 0.6 with its
+`parallel` feature, rayon, in a private four-thread pool), so the defender
+gets the same per-guess work an attacker's parallel implementation does. The
+lanes share the single m-KiB working memory (no per-thread copy), which
+pivsetup allocates itself and zeroizes after use. Argon2id's output does not
+depend on threading.
+
+**Passes were raised with the switch (2026-10-23, before any production
+data).** The earlier sequential implementation (argon2 0.5.3, no `parallel`
+feature) fixed tiers 1–4 at t = 3, 3, 3, 6 (1.95 s for tier 3 on the bench
+host). With parallel lanes those passes took 0.06, 0.18, 0.83 and 2.7 s on the
+same host (release build, `tier_timing`), so the tiers would have bought about
+40% of the intended defender time. Passes were raised to keep each tier's
+wall time on a ≥ 4-core host: 10, 10, 10 and 22 measured 0.10–0.15,
+0.44–0.54, 1.80–2.11 and 7.3–8.5 s with all host CPUs or four of them, and
+0.19, 0.83, 3.3 and 14.0 s restricted to two (`taskset`; guest numbers in
+configuration.md). This changes every passphrase KEK (a format change for
+passphrase keyslots only; key-file keyslots and everything else are
+unchanged); the Rust/Python KEK vectors in rust/tests were regenerated with
+the OpenSSL Argon2id of pivstore/blocks.py. Two-core systems (and initramfs
+environments on them) pay about 1.6× the four-core time; one core about 3×.
+The tier parameters are frozen by the salt from here on; a stronger tier can
+be added later as tier 5 without changing tiers 1–4.
 
 The tier is deliberately not recorded anywhere: nothing can be decrypted before
 the KEK exists, and a clear-text parameter would be public magic. The user
@@ -504,7 +508,8 @@ Hot hidden blocks raise the rewrite count of their carrier sectors.
 - **No public magic.** The version, layout, parity and A/B flag are only inside
   encrypted keyslots. The cost tier is recorded nowhere.
 - **Offline guessing.** Keyslots are a fast key-check oracle; passphrases are
-  only as strong as the KDF cost. The default tier is 16× v4's memory cost,
+  only as strong as the KDF cost. The default tier is 16× v4's memory cost
+  (and about 3× its passes),
   comparable to cryptsetup's own keyslots. Key files remain the high-entropy
   option.
 - **Context binding.** The context binds UUID, primary size, sector size and

@@ -13,7 +13,10 @@ path = "src/main.rs"
 [dependencies]
 libc = "0.2"
 zeroize = "1"
-argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize", "parallel"] }
+# Already required by argon2's `parallel` feature; used directly for a
+# private 4-thread pool (src/blocks.rs, passphrase_kek).
+rayon = "1"
 
 [profile.release]
 panic = "abort"

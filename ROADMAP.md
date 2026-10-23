@@ -32,16 +32,7 @@ and limits are in README.md and docs/.
 
 ## Remaining work
 
-1. **Parallel Argon2 lanes** (pivsetup). Tiers use 4 lanes, but the vendored
-   `argon2` 0.5.3 computes them sequentially (no `parallel` feature; its
-   block-filling routine is private), so an attacker gains up to ~4× in time
-   per guess versus the defender's open time. Thread the lanes (argon2 ≥ 0.6
-   with rayon, or a small in-tree lane scheduler on maintained primitives),
-   keeping outputs byte-identical (existing KEK vectors in rust/tests must
-   still match; no format change). Then decide whether to raise tier passes so
-   tier 3 stays ≈ 2 s. Exit: vectors unchanged, tier timings re-measured with
-   `bench`, docs updated.
-2. **`pivsetup status` and a non-destructive hidden scrub.** Today fail-stop
+1. **`pivsetup status` and a non-destructive hidden scrub.** Today fail-stop
    is visible only as EIO plus dmesg, and `--fill` is the only whole-volume
    hidden pass (destructive). Add `pivsetup status` (owner active/failed,
    encryptions, hidden size, views, via the existing STATUS ioctl; no new
@@ -53,7 +44,7 @@ and limits are in README.md and docs/.
    (with and without parity); docs (README before-production section,
    configuration.md) updated.
 
-3. **Investigate storing the tooling inside the LUKS2 header** (research
+2. **Investigate storing the tooling inside the LUKS2 header** (research
    first; implement only after a design the user approves). The installed
    pivsetup, dm-piv.ko, pivtab, initramfs hook and key files on the root
    filesystem or /boot reveal that a hidden volume exists. For users who want

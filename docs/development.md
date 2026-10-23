@@ -99,6 +99,9 @@ runs the selected suites concurrently, one fresh VM per suite.
   (default kvm when usable, else tcg). Guest RAM defaults to 1 GiB; the v5
   and bench suites raise it to 3 and 3.5 GiB (Argon2id tiers 3 and 4 need 1
   and 2 GiB); `--memory-mib` can only raise these floors.
+  `--smp N` sets every guest's vCPUs (vm.py default 2; the early VM keeps
+  its own); the Argon2id lanes run on four threads, so KDF timings depend on
+  it (bench was measured at 2 and 4).
 - The v5 suite also compiles `kernel/piv-rs.inc` unchanged into the
   freestanding harness `kernel/piv-rs-test.c` (guest gcc, loaded with ctypes;
   the guest has no libc headers) and compares RS parity and corrections with

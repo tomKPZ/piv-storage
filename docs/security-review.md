@@ -52,10 +52,12 @@ over the master key (or a keyslot KEK) with the public v5 context (records: base
 plus the whole 32-byte keyslot parameter block) as salt and `"pivstore/v5/" ‖ label` as info
 (`pn_hkdf`, cross-checked against the Python decoder). A KEK is a 32-byte key
 file or a passphrase through Argon2id at a user-chosen cost tier (1–4; default
-tier 3: m = 1 GiB, t = 3, p = 4; the tier is part of the salt and recorded
-nowhere). pivsetup computes the four lanes sequentially (the pinned argon2
-crate has no parallel mode), so an attacker running them in parallel gains up
-to 4× in time over the defender's measured cost, not in memory
+tier 3: m = 1 GiB, t = 10, p = 4; the tier is part of the salt and recorded
+nowhere). pivsetup computes the four lanes in parallel (argon2 0.6 `parallel`,
+four threads), so an attacker's parallel implementation gains no time over
+the defender's measured cost on a ≥ 4-core host; a defender with fewer cores
+pays more wall time (about 1.6× on two) for the same work. Passes were raised
+with the switch so tier 3 stays about 2 s
 ([format-v5.md](format-v5.md#passphrase-cost-tiers)).
 
 Each hidden 4096-byte block is a deterministic SIV record: a 16-byte

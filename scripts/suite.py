@@ -119,6 +119,8 @@ class Matrix:
         memory = max(self.args.memory_mib or 0, memory_mib or 0)
         if memory:
             command += ['--memory-mib', str(memory)]
+        if self.args.smp:
+            command += ['--smp', str(self.args.smp)]
         if data:
             command += ['--data-image', str(data)]
         for path in (*shares, self.args.pivsetup):
@@ -388,6 +390,8 @@ def main():
     parser.add_argument('--base-image', type=Path,
                         help='Read-only derived guest image, e.g. the sanitizer kernel (build_debug_kernel.py)')
     parser.add_argument('--memory-mib', type=int, help='Guest RAM (sanitizer kernels need more than 1024)')
+    parser.add_argument('--smp', type=int, choices=range(1, 65), metavar='1-64',
+                        help='Guest vCPUs for every VM (vm.py default: 2), e.g. 4 for bench KDF timing')
     kvm = os.access('/dev/kvm', os.R_OK | os.W_OK)
     parser.add_argument('--accel', choices=('tcg', 'kvm'), default='kvm' if kvm else 'tcg',
                         help='QEMU accelerator for every VM (default: kvm when /dev/kvm is usable)')

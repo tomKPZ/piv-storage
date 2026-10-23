@@ -13,8 +13,11 @@ python3 scripts/build_pivsetup.py --test-hooks   # guest-test build (below)
 The build uses the system rustc/cargo, a project-local `CARGO_HOME` under the
 ignored `downloads/cargo`, the committed `Cargo.lock` (`--locked`, offline after
 the first fetch) and static glibc (`-C target-feature=+crt-static`). Crates:
-`libc`, `zeroize` and RustCrypto `argon2` only (no clap/serde; a
-minimal strict JSON reader parses `cryptsetup luksDump`). The version
+`libc`, `zeroize`, RustCrypto `argon2` 0.6 (its `parallel` feature) and
+`rayon` (the four Argon2id lanes on a private four-thread pool) only (no
+clap/serde; a minimal strict JSON reader parses `cryptsetup luksDump`).
+Including transitive crates the lock has 21 dependencies; rayon brings
+rayon-core, crossbeam-{deque,epoch,utils} and either. The version
 (`pivsetup --version`, with the control ABI versions and whether test hooks
 are compiled in) equals packaging/VERSION, the DKMS package version; a unit
 test checks this. Host tests: `cargo test` with and without
@@ -47,7 +50,8 @@ pivsetup keygen --output F
 `--key-file` is the stock LUKS passphrase file; hidden key files hold 32 bytes
 (`keygen` writes one). Option semantics are in the [README](../README.md#usage).
 Passphrase KEKs use Argon2id (p = 4) at cost tier `--kdf-cost` (1: 64 MiB,
-t = 3; 2: 256 MiB, t = 3; 3, the default: 1 GiB, t = 3; 4: 2 GiB, t = 6), with
+t = 10; 2: 256 MiB, t = 10; 3, the default: 1 GiB, t = 10; 4: 2 GiB, t = 22;
+lanes computed in parallel, working memory zeroized after use), with
 salt = base context ‖ "/kek/argon2id/" ‖ tier digit; a `*-kdf-cost` option is
 refused without the matching passphrase option. Rust/Python KEK vectors for
 tiers 1 and 3 live in `rust/tests/`. Only the two

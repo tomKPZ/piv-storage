@@ -261,18 +261,27 @@ guessing by anyone with a copy of the disk, so a passphrase is only as strong
 as its entropy times the KDF cost. Passphrases use Argon2id (4 lanes) at the
 cost tier `--kdf-cost`:
 
-| Hidden key type | Added open time (measured) | Parameters |
-| --- | ---: | --- |
-| Key file | none | 256-bit random key |
-| Passphrase, `--kdf-cost 1` | 0.10–0.16 s | 64 MiB, t = 3 |
-| Passphrase, `--kdf-cost 2` | 0.46–0.55 s | 256 MiB, t = 3 |
-| Passphrase, `--kdf-cost 3` (default) | 2.10–2.15 s | 1 GiB, t = 3 |
-| Passphrase, `--kdf-cost 4` | 8.1–8.3 s | 2 GiB, t = 6 |
+| Hidden key type | Added open time, 4 vCPUs | 2 vCPUs | Parameters |
+| --- | ---: | ---: | --- |
+| Key file | none | none | 256-bit random key |
+| Passphrase, `--kdf-cost 1` | 0.12–0.15 s | 0.20–0.30 s | 64 MiB, t = 10 |
+| Passphrase, `--kdf-cost 2` | 0.52–0.58 s | 0.89–1.09 s | 256 MiB, t = 10 |
+| Passphrase, `--kdf-cost 3` (default) | 2.30–2.33 s | 3.57–4.12 s | 1 GiB, t = 10 |
+| Passphrase, `--kdf-cost 4` | 8.8–9.0 s | 15.0–16.6 s | 2 GiB, t = 22 |
 
-Added open time is the passphrase open minus the median key-file open in
-suite-112 (2026-10-22, all four profiles; guest, pivsetup's Argon2id with the
-four lanes computed sequentially; suite-077 measured 0.13–0.19, 0.52–0.56,
-2.1–2.5 and 7.9–9.2 s). Tier 3 matches cryptsetup's own
+Added open time is the passphrase open minus the key-file open of the same
+bench run (2026-10-23, aes-sha256-512-nojournal and aegis-4096; guest,
+pivsetup's Argon2id with the four lanes on four threads): suite-147 with
+`--smp 4` and suite-146 with the default 2 vCPUs. The lanes run in parallel,
+so the time depends on the core count: about 1.6× the four-core time on two
+cores and about 3× on one, for the same work. Before the switch (sequential
+lanes, t = 3, 3, 3, 6; suite-112, 2 vCPUs) the tiers added 0.10–0.16,
+0.46–0.55, 2.10–2.15 and 8.1–8.3 s; passes were raised so that each tier
+keeps about its wall time on a four-core system
+([format-v5.md](format-v5.md#passphrase-cost-tiers)). On a two-core
+system (including its initramfs) the default tier takes about 4 s; tier 2
+there costs about what tier 3 used to, with a quarter of the memory.
+Tier 3 matches cryptsetup's own
 LUKS2 keyslot defaults (1 GiB, 4 lanes, about 2 s), so the hidden keyslot is
 no longer the cheaper guessing target at the default. The tier is recorded
 nowhere: pass the same `--kdf-cost` on every open (a wrong tier is rejected
@@ -509,7 +518,7 @@ volumes (3 GiB at 4096-byte and 8 GiB at 512-byte sectors; [large-volumes.md](la
 - `bench` suite (scripts/guest-bench.sh, kernel/guest-bench-test.py) run
   sequentially (`--jobs 1`) in suite-094 (the no-journal, shaping and
   hidden-flush rows in suite-133/135/136) (format v5, concurrent requests,
-  2026-10-22; KDF tier rows from suite-077, matched within 0.6 s; queue-depth-16
+  2026-10-22; KDF tier rows from suite-146/147 (2026-10-23, 2 and 4 vCPUs); queue-depth-16
   rows from suite-120, with suite-113 as the previous-module baseline) on the pinned
   Debian 6.12.113 guest: 2 vCPUs, `-cpu max` under KVM on an Intel Xeon @
   2.60 GHz host, 3.5 GiB guest RAM (for the 2 GiB Argon2id tier), 128 MiB raw
