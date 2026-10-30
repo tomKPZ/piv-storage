@@ -1,13 +1,12 @@
 #!/bin/bash
-# Install the dm-piv deployment pieces on a Debian-style system with
-# initramfs-tools. Research prototype without external cryptographic review;
-# see packaging/README.md before using it on anything but disposable storage.
+# Install pivsetup and the DKMS dm-piv module on a Debian-style system.
+# Research prototype without external cryptographic review; see
+# packaging/README.md before using it on anything but disposable storage.
 #
 #   install.sh pivsetup BINARY   static pivsetup -> /usr/local/sbin/pivsetup
 #   install.sh dkms [SRC]        module sources (default: kernel/ of this tree)
 #                                -> /usr/src/dm-piv-VERSION, dkms add/build/install
 #   install.sh dkms-remove       dkms remove --all and delete the sources
-#   install.sh initramfs         initramfs-tools hook and local-top script
 #
 # The DKMS package version is packaging/VERSION (pivsetup's version, checked by
 # its unit tests); PIV_DKMS_VERSION overrides it.
@@ -60,19 +59,8 @@ case "${1:-}" in
         dkms remove -m dm-piv -v "$version" --all || true
         rm -rf "/usr/src/dm-piv-$version"
         ;;
-    initramfs)
-        need_root
-        test -d /etc/initramfs-tools || { echo "initramfs-tools is not installed" >&2; exit 1; }
-        install -D -m 0755 "$here/initramfs-tools/hooks/pivsetup" /etc/initramfs-tools/hooks/pivsetup
-        install -D -m 0755 "$here/initramfs-tools/scripts/local-top/pivsetup" \
-            /etc/initramfs-tools/scripts/local-top/pivsetup
-        # Keep the generated initramfs private (it may embed keys).
-        install -D -m 0644 "$here/initramfs-tools/conf.d/pivsetup" /etc/initramfs-tools/conf.d/pivsetup
-        install -D -m 0644 "$here/pivtab.example" /etc/pivtab.example
-        echo "Installed the initramfs hook. Create /etc/pivtab (see /etc/pivtab.example), then run update-initramfs -u."
-        ;;
     *)
-        sed -n '2,13p' "$0" >&2
+        sed -n '2,12p' "$0" >&2
         exit 2
         ;;
 esac

@@ -83,9 +83,9 @@ file**: only ordinary LUKS2/dm-integrity structures and encrypted records inside
 IVs. Volatile ownership locks live in /run. Activation needs only `pivsetup`,
 cryptsetup/dmsetup, the keys and the matching module, on any block device or
 partition holding the LUKS2 volume; it has been tested from a Python-free
-RAM-root initramfs and from a stock initramfs-tools boot
-([packaging/README.md](packaging/README.md): DKMS, module signing, boot
-integration).
+RAM-root initramfs ([packaging/README.md](packaging/README.md): DKMS and module
+signing; boot integration, full-system hiding and LUKS2-header stashing are out
+of scope).
 
 ## Supported primary profiles
 
@@ -334,9 +334,10 @@ Read this list before trusting real data to the prototype.
 - **Never open the volume read-write with stock tools.** Keep it out of
   `/etc/crypttab`, and disable udisks/desktop auto-unlock and
   systemd-gpt-auto-generator for it: a stock read-write open destroys hidden
-  data. There is no decoy-only dm-piv mode, so daily use needs the hidden key,
-  and boot activation reveals that a hidden volume is configured (/etc/pivtab
-  and the initramfs; [packaging/README.md](packaging/README.md) and
+  data. There is no decoy-only dm-piv mode, and mounting hidden data inside a
+  persistent decoy OS leaks traces into decoy logs and caches; for deniability,
+  use a secondary or external volume opened from a clean RAM-only live
+  environment ([packaging/README.md](packaging/README.md) and
   [header-stash.md](docs/header-stash.md)).
 - **Integrity journal.** Use stock no-journal mode (`cryptsetup open
   --integrity-no-journal --persistent` once after luksFormat). On journaled
@@ -360,9 +361,9 @@ Read this list before trusting real data to the prototype.
   procedure](docs/native-faults.md#status-scrub-and-repair). Never repair
   with `--fill` (it turns unavailable blocks into zeros).
 - **Kernel upgrades.** Only Debian 6.12.113 and 7.2.9 are tested. A failed DKMS
-  build makes `update-initramfs` fail for the new kernel; keep the previous
-  kernel bootable. The safe fallback without dm-piv is a stock read-only open
-  of the decoy (`cryptsetup open --readonly`).
+  build leaves the new kernel without dm-piv; keep the previous kernel
+  bootable. The safe fallback without dm-piv is a stock read-only open of the
+  decoy (`cryptsetup open --readonly`).
 - **Version lockstep.** Install pivsetup and the module from the same release
   (packaging/VERSION); a control-ABI mismatch is refused with both versions
   named (`pivsetup --version`).
@@ -381,7 +382,7 @@ Read this list before trusting real data to the prototype.
 ## Further reading
 
 [configuration.md](docs/configuration.md) (choosing options, performance),
-[packaging/README.md](packaging/README.md) (installation, DKMS, signing, boot),
+[packaging/README.md](packaging/README.md) (installation, DKMS, signing),
 [ROADMAP.md](ROADMAP.md) (remaining work), [development.md](docs/development.md)
 (harness, test suites, sanitizer and newer-kernel guests),
 [native-blocks.md](docs/native-blocks.md) (module, I/O path, bounded reads),

@@ -26,8 +26,8 @@ and a sparse raw data disk exposed as /dev/vdb: 128 MiB by default,
 or `--data-image` to attach a private copy of an existing 128/512 MiB image.
 `--second-blank-mib N` (16–16384) adds a sparse /dev/vdc of any size
 (migration, arbitrary-device and large-volume tests), `--power-cut-script`
-reboots the same disks after a simulated power cut (also used for the deploy
-suite's boot test), and `--code` exports the package source read-only. vm.py
+reboots the same disks after a simulated power cut, and `--code` exports the
+package source read-only. vm.py
 freezes scripts/guest-common.sh (harness guards, package setup, module
 build/load, provenance) into every run; reuse it rather than duplicating
 guards.
@@ -70,16 +70,15 @@ runs the selected suites concurrently, one fresh VM per suite.
 - `--suites routine` (default): faults, profile (including the decoy
   write-batching counts of kernel/guest-batch-test.py, formerly the `batch`
   suite), cancel, lifecycle, stress (concurrent I/O oracles and a fault under
-  load), early, power, powerab (the power cut with `--ab`), v5. `early` (Python-free RAM-root initramfs from the
-  native run) overlaps `deploy` (stock initramfs-tools boot) in proving
-  initramfs activation; it stays routine because it is cheap and needs no
-  package installation. `--suites all` adds controls, migrate (second 512 MiB disk),
+  load), early, power, powerab (the power cut with `--ab`), v5. `early` boots a
+  Python-free RAM-root initramfs from the native run with no OS disk.
+  `--suites all` adds controls, migrate (second 512 MiB disk),
   devices (activation on a 300 MiB second disk, a loop device, a dm-linear
   offset and a GPT partition, plus the remaining safety refusals and the
   absence of a luksFormat journal-size option; the loop and
-  partition images are host-verified), deploy (packaging/install.sh: DKMS
-  build and signature check, installed activation, initramfs-tools hook
-  validation and a reboot whose initramfs opens the views),
+  partition images are host-verified), deploy (packaging/install.sh: release
+  pivsetup check, DKMS build/remove/reinstall and PKCS#7 signature check,
+  installed activation and clean systemd-shutdown detach),
   fuzz (seeded control-ioctl fuzzing with `PIV_FUZZ_STEPS`/`PIV_FUZZ_SEED`,
   plus dm table/constructor fuzzing; best on the sanitizer image) and
   ext4power (ext4 on a single-slot and an A/B hidden view, 512-byte sectors,

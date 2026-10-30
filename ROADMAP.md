@@ -4,7 +4,7 @@ What remains. History lives in git (the previous long-form roadmap with every
 session handoff is in commits up to 2026-10-22); current behaviour, evidence
 and limits are in README.md and docs/.
 
-## Current state (2026-10-23)
+## Current state (2026-10-30)
 
 - One coordinated native owner (`kernel/dm-piv.c`, standalone, no dm-crypt fork)
   exposes paired writable decoy/hidden block devices over a stock LUKS2 +
@@ -27,26 +27,27 @@ and limits are in README.md and docs/.
   docs/development.md.
 - Activation is no longer confined to the test guest (user approval
   2026-10-22): `--device` is required and any block device or partition is
-  accepted, with the user-protecting checks kept. packaging/ provides DKMS,
-  install.sh and an initramfs-tools hook, verified by the `deploy` suite
+  accepted, with the user-protecting checks kept. packaging/ provides DKMS and
+  install.sh for `dm-piv.ko` and `pivsetup`, verified by the `deploy` suite
   (packaging/README.md).
 
 ## Remaining work
 
-No active items. Open, unverified deployment areas (pick up only with a
+No active items. Open, unverified packaging areas (pick up only with a
 concrete need; each needs a disposable-guest test first):
 
-- Boot-time `ask` prompts (initramfs askpass), a root filesystem on a view,
-  Secure Boot enrollment/enforcement of the DKMS-signed module, dracut and
-  non-Debian distributions (packaging/README.md lists what was verified).
-- Optional helper commands for storing the tooling inside the unreachable
-  upper tail (`[14 MiB, 16 MiB)`) of a default LUKS2 header (`docs/header-stash.md`
-  records the disposable-guest measurements, stock `cryptsetup` behaviour
-  table, active-keyslot AF-stripe proof and why the unallocated tail or
-  removable media is preferred; implement only if the user approves a design).
+- Secure Boot enrollment/enforcement of the DKMS-signed module and non-Debian
+  DKMS distributions (packaging/README.md lists what was verified).
 
 ## Standing decisions (binding for autonomous sessions)
 
+- Scope stays at the block layer (user decision 2026-10-30): maintain only
+  `dm-piv.ko`, `pivsetup`, minimal DKMS/binary installation (`packaging/`), and
+  the read-only `pivstore` verifier. Boot/initramfs hooks (`/etc/pivtab`
+  removed), root-filesystem or full-system hiding, and LUKS2 header-stash
+  wrapper commands are out of scope (`docs/header-stash.md` records the manual
+  recipes, disposable-guest header measurements, and whole-OS boundary
+  trade-offs).
 - One hidden format at a time: v5 (it replaced v4 without migration; a future
   format would do the same unless the user decides otherwise). Primary profiles: aes-xts-random +
   hmac-sha256 (recommended since 2026-10-23, with 512-byte sectors and `--ab`

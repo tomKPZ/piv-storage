@@ -50,8 +50,7 @@ SUITES = ('faults', 'profile', 'cancel', 'lifecycle', 'stress', 'early', 'power'
 # changes in its own area: controls (descriptive write-pattern statistics),
 # migrate (pivsetup migrate), devices (activation on arbitrary block devices
 # and the remaining safety checks; a 300 MiB second disk), deploy (packaging/:
-# DKMS build and signature, installed activation and an initramfs-tools boot
-# that opens the views),
+# DKMS build/remove and signature, installed activation and clean shutdown),
 # fuzz (control ioctls and table constructors; most useful on the sanitizer)
 # and ext4power (ext4 on single-slot and A/B hidden views across a power cut;
 # two 2 GiB volumes on a 4 GiB second disk).
@@ -265,8 +264,6 @@ class Matrix:
                 extra += ['--second-blank-mib', '512']
             if name == 'devices':
                 extra += ['--second-blank-mib', '300']
-            if name == 'deploy':
-                extra += ['--power-cut-script', str(ROOT / 'scripts/guest-deploy-boot.sh')]
             if name == 'ext4power':
                 extra += ['--blank-mib', '128', '--second-blank-mib', '4096',
                           '--power-cut-script', str(ROOT / 'scripts/guest-ext4-recover.sh')]
@@ -432,7 +429,7 @@ def main():
     shutil.copy(build(quiet=True, test_hooks=True), args.pivsetup)
     args.pivsetup_release = args.prefix / 'pivsetup-release'
     shutil.copy(build(quiet=True), args.pivsetup_release)
-    # packaging/ (install.sh, DKMS and initramfs-tools files) for the deploy suite.
+    # packaging/ (install.sh and DKMS files) for the deploy suite.
     args.packaging = args.prefix / 'packaging.tar'
     with tarfile.open(args.packaging, 'x') as archive:
         archive.add(ROOT / 'packaging', arcname='packaging')

@@ -423,12 +423,12 @@ mounts only RAM/pseudo filesystems. early_vm.py copies the data image and
 attaches a blank first disk so that the data disk stays /dev/vdb, the device
 the test script opens.
 
-The `deploy` suite (scripts/guest-deploy.sh, scripts/guest-deploy-boot.sh)
-covers the installable boot path instead: packaging/install.sh installs
-pivsetup, the DKMS-built and DKMS-signed module and the initramfs-tools hook;
-after a reboot of the same disks, the stock initramfs-tools boot must have
-loaded dm-piv before mounting root and opened both views from an
-`embed-keys` /etc/pivtab entry ([packaging/README.md](../packaging/README.md)).
+The `deploy` suite (scripts/guest-deploy.sh) covers the installable packaging
+pieces: packaging/install.sh installs the release pivsetup binary and the
+DKMS-built and DKMS-signed module (checking dkms-remove and PKCS#7 signature
+verification), activates and exercises hidden I/O from the installed pieces,
+and leaves unmounted views active so systemd-shutdown detaches them cleanly at
+power-off ([packaging/README.md](../packaging/README.md)).
 
 The `devices` suite (scripts/guest-devices.sh, kernel/guest-devices-test.py)
 activates volumes on a 300 MiB second disk, a loop device over a guest-root

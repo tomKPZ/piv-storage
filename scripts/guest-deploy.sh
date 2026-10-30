@@ -1,10 +1,10 @@
 #!/bin/bash
-# Deployment test, phase 1 (scripts/suite.py "deploy"): install pivsetup, the
-# DKMS module and the initramfs-tools integration with packaging/install.sh,
-# check the DKMS signature, activate from the installed pieces, build an
-# initramfs that opens the views at boot (embed-keys, synthetic test keys
-# only), then request a reboot of the same disks (scripts/guest-deploy-boot.sh).
-# /dev/vdb is the closed native fixture.
+# Deployment test (scripts/suite.py "deploy"): install the release pivsetup
+# binary and the DKMS dm-piv module with packaging/install.sh, verify DKMS
+# removal and re-installation, check the appended PKCS#7 module signature,
+# activate and exercise hidden I/O from the installed pieces, verify stock
+# read-only access, and leave unmounted views active so systemd-shutdown
+# detaches them cleanly at power-off. /dev/vdb is the closed native fixture.
 source /mnt/piv-work/guest-common.sh
 guest_packages linux-headers-6.12.113+deb13-amd64=6.12.113-1 gcc-14 make dkms=3.2.2-1~deb13u1
 guest_code
@@ -22,6 +22,9 @@ if bash "$P/install.sh" pivsetup /mnt/piv-work/pivsetup 2> install-hooks.err; th
     fail "install.sh accepted the test-hooks build"
 fi
 grep -q 'not a release build' install-hooks.err || { cat install-hooks.err; fail "test-hooks refusal message"; }
+if bash "$P/install.sh" initramfs 2> install-unknown.err; then
+    fail "install.sh accepted removed initramfs subcommand"
+fi
 bash "$P/install.sh" pivsetup /mnt/piv-work/pivsetup-release
 cmp /usr/local/sbin/pivsetup /mnt/piv-work/pivsetup-release
 file_type=$(od -An -c -N4 /usr/local/sbin/pivsetup | tr -d ' ')
@@ -32,9 +35,13 @@ grep -qx 'test hooks: no' pivsetup-version.txt || fail "release build has test h
 grep -q '^control ABI: QUERY 2, request 2, SETUP 6, STATUS 5, KEYSLOT 2$' pivsetup-version.txt || fail "ABI versions"
 version=$(cat "$P/VERSION")
 
-# DKMS: build, install and sign (DKMS generates a throwaway MOK key pair in
-# /var/lib/dkms inside this disposable guest).
+# DKMS: build, install, remove and reinstall; DKMS generates a throwaway MOK
+# key pair in /var/lib/dkms inside this disposable guest.
 bash "$P/install.sh" dkms /root/piv-src > dkms-install.log 2>&1 || { cat dkms-install.log; fail dkms; }
+bash "$P/install.sh" dkms-remove > dkms-remove.log 2>&1 || { cat dkms-remove.log; fail dkms-remove; }
+test ! -e "/usr/src/dm-piv-$version" || fail "dkms-remove left sources behind"
+test -z "$(dkms status -m dm-piv)" || fail "dkms-remove left module registered"
+bash "$P/install.sh" dkms /root/piv-src > dkms-install.log 2>&1 || { cat dkms-install.log; fail "dkms reinstall"; }
 dkms status > dkms-status.txt
 grep -q "^dm-piv/$version, $release, x86_64: installed" dkms-status.txt || fail "dkms status"
 module=$(modinfo -n dm-piv)
@@ -97,50 +104,28 @@ PIVSETUP_TEST_FAIL=before-setup /usr/local/sbin/pivsetup open-blocks --device /d
     --key-file /etc/piv/passphrase.key --hidden-key-file /etc/piv/hidden.key > deploy-open.json
 cmp /dev/mapper/piv-native-hidden expected-hidden-volume
 test "$(sha256sum /dev/mapper/piv-native-decoy | cut -d ' ' -f 1)" = "$(cat expected-primary.sha256)"
-/usr/local/sbin/pivsetup close-blocks --device /dev/vdb --key-file /etc/piv/passphrase.key
 
-# initramfs-tools integration.
-bash "$P/install.sh" initramfs
-# Invalid configurations make mkinitramfs fail with the hook's message.
-negative() {
-    printf '%s\n' "$1" > /etc/pivtab
-    if mkinitramfs -o /var/tmp/piv-negative.img "$release" 2> /var/tmp/piv-negative.err; then
-        fail "accepted invalid pivtab: $1"
-    fi
-    grep -q "E: pivsetup hook: .*$2" /var/tmp/piv-negative.err || { cat /var/tmp/piv-negative.err; fail "message for: $1"; }
-    rm -f /var/tmp/piv-negative.img
-}
-negative 'piv-native /dev/vdb /etc/piv/passphrase.key /etc/piv/hidden.key -' 'would not exist at boot'
-negative 'piv-native /dev/vdb ask ask -' 'cannot be typed'
-negative 'native /dev/vdb ask ask hidden-passphrase' 'invalid mapping name'
-negative 'piv-native /dev/vdb ask ask hidden-passphrase,bogus' 'unknown option'
-negative 'piv-native vdb ask ask hidden-passphrase' 'must be a /dev path'
-negative 'piv-native /dev/vdb /etc/piv/missing.key /etc/piv/hidden.key embed-keys' 'not a readable regular file'
-# embed-keys needs the private-image configuration (UMASK=0077).
-mv /etc/initramfs-tools/conf.d/pivsetup /var/tmp/piv-conf
-negative 'piv-native /dev/vdb /etc/piv/passphrase.key /etc/piv/hidden.key embed-keys' 'embed-keys needs UMASK=0077'
-mv /var/tmp/piv-conf /etc/initramfs-tools/conf.d/pivsetup
-printf 'piv-native /dev/vdb /etc/piv/passphrase.key /etc/piv/hidden.key embed-keys\n' > /etc/pivtab
-update-initramfs -u -k "$release" > update-initramfs.log 2>&1 || { cat update-initramfs.log; fail update-initramfs; }
-initrd=/boot/initrd.img-$release
-test "$(stat -c %a "$initrd")" = 600 || fail "initramfs mode $(stat -c %a "$initrd")"
-lsinitramfs "$initrd" > initramfs-list.txt
-for entry in usr/sbin/pivsetup etc/pivtab etc/pivsetup/piv-native.luks etc/pivsetup/piv-native.hidden \
-             scripts/local-top/pivsetup usr/sbin/cryptsetup usr/sbin/dmsetup; do
-    grep -qx "$entry" initramfs-list.txt || fail "initramfs lacks $entry"
-done
-grep -q "updates/dkms/dm-piv.ko" initramfs-list.txt || fail "initramfs lacks the DKMS module"
-mkdir /var/tmp/piv-initrd
-unmkinitramfs "$initrd" /var/tmp/piv-initrd
-root=/var/tmp/piv-initrd/main
-test -d "$root" || root=/var/tmp/piv-initrd
-cmp "$root/etc/pivsetup/piv-native.luks" passphrase.key
-cmp "$root/etc/pivsetup/piv-native.hidden" hidden.key
-cmp "$root/usr/sbin/pivsetup" /usr/local/sbin/pivsetup
-grep -qx 'piv-native /dev/vdb /etc/pivsetup/piv-native.luks /etc/pivsetup/piv-native.hidden -' "$root/etc/pivtab"
-rm -rf /var/tmp/piv-initrd
-printf 'phase 1 passed\n' > deploy-phase1.txt
+# One hidden block write/readback/restore through the installed views.
+head -c 4096 /dev/urandom > /run/piv-block
+dd if=/run/piv-block of=/dev/mapper/piv-native-hidden bs=4096 count=1 oflag=direct conv=notrunc status=none
+dd if=/dev/mapper/piv-native-hidden bs=4096 count=1 iflag=direct status=none | cmp - /run/piv-block
+dd if=expected-hidden-volume of=/dev/mapper/piv-native-hidden bs=4096 count=1 oflag=direct conv=notrunc status=none
+/usr/local/sbin/pivsetup close-blocks --device /dev/vdb --key-file /etc/piv/passphrase.key
+test ! -e /dev/mapper/piv-native
+modprobe -r dm-piv
+
+cryptsetup open --readonly --key-file passphrase.key /dev/vdb piv-stock
+test "$(sha256sum /dev/mapper/piv-stock | cut -d ' ' -f 1)" = "$(cat expected-primary.sha256)"
+cryptsetup close piv-stock
+dd if=/dev/vdb of=deploy-final.img bs=1M status=none
+
+# Leave freshly opened (unmounted) views active for systemd-shutdown, which
+# detaches every DM device; the suite host-checks the disk after power-off.
+modprobe dm-piv
+/usr/local/sbin/pivsetup open-blocks --device /dev/vdb --key-file /etc/piv/passphrase.key \
+    --hidden-key-file /etc/piv/hidden.key > /dev/null
+dmsetup ls > active-at-shutdown.txt
+grep -q '^piv-native-hidden' active-at-shutdown.txt
 guest_record
+printf 'DKMS install/remove/reinstall and signature, installed activation and stock verification passed\n' > result.txt
 sync
-echo PIV_POWER_CUT
-sleep 600

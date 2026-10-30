@@ -2,23 +2,28 @@
 
 Design note and disposable-guest measurements (`scripts/probe-luks2-header.sh`,
 run `artifacts/header-stash-probe-003` on Debian 13 kernel `6.12.113+deb13-amd64`
-with `cryptsetup` `2:2.7.5-2`). **Research only; no implementation is included
-without user approval.**
+with `cryptsetup` `2:2.7.5-2`). **Reference note only: header-stash helpers,
+boot hooks, and full-system hiding are out of scope for `piv-storage` (user
+decision 2026-10-30), which provides only the block-layer module `dm-piv.ko`,
+`pivsetup`, and read-only diagnostics.**
 
 ## Problem statement
 
 Format v5 keeps all hidden-volume data and metadata inside the 16-byte random
-IVs of a stock LUKS2 + `dm-integrity` carrier. However, an installation on the
-host root filesystem or `/boot` (`/usr/local/sbin/pivsetup`,
-`/lib/modules/.../dm-piv.ko`, `/etc/pivtab`, the `initramfs-tools` hook, and
-key files; see [packaging/README.md](../packaging/README.md)) reveals that the
-machine is configured to open a hidden volume.
+IVs of a stock LUKS2 + `dm-integrity` carrier. However, installing
+`/usr/local/sbin/pivsetup`, `/lib/modules/.../dm-piv.ko`, or key files on a
+persistent host filesystem (see [packaging/README.md](../packaging/README.md))
+reveals that the machine has hidden-volume software installed—and once a
+deniable-storage repository is public, the presence of its tooling shows
+capability even when absence of a hidden volume cannot be proven.
 
-For users who prioritize deniability over convenience, the question is whether
-`dm-piv.ko`, `pivsetup`, an unlock script, and optional key files can be stored
-inside the LUKS2 header itself as ciphertext indistinguishable from bytes that
-stock `cryptsetup` already writes, and unlocked manually from a stock initramfs
-before mounting the root filesystem.
+For users who prioritize deniability over convenience, this note examines:
+1. Where `dm-piv.ko`, `pivsetup`, an unlock script, and optional key files can
+   live off the decoy filesystem—either on removable RAM-booted live media or
+   inside the LUKS2 header itself as ciphertext indistinguishable from bytes
+   that stock `cryptsetup` already writes.
+2. Why `piv-storage` carriers should be secondary or external data volumes
+   opened from a clean RAM-only OS rather than root/boot filesystems.
 
 ---
 
@@ -71,7 +76,7 @@ keyslot's JSON `area.size` is `round_up(4000 * key_size, 4096)`. Even if all 32
 keyslots are simultaneously populated, the highest byte offset that stock
 `LUKS2_find_area_gap` can ever allocate is:
 
-- **96-byte volume key** (`385,024` B/slot): $32{,}768 + 32 \times 385{,}024 = 12{,}353{,}536$ B (`11.78` MiB), leaving **`4,423,680` B (`4.22` MiB)** at `[12353536, 16777216)` permanently unreachable.
+- **96-byte volume key** (`385,024` B/slot, sector `24,128` max): $32{,}768 + 32 \times 385{,}024 = 12{,}353{,}536$ B (`11.78` MiB), leaving **`4,423,680` B (`4.22` MiB)** at `[12353536, 16777216)` permanently unreachable.
 - **64-byte volume key** (`258,048` B/slot): $32{,}768 + 32 \times 258{,}048 = 8{,}290{,}304$ B (`7.91` MiB), leaving **`8,486,912` B (`8.09` MiB)** unreachable.
 - **16-byte volume key** (`65,536` B/slot): $32{,}768 + 32 \times 65{,}536 = 2{,}129{,}920$ B (`2.03` MiB), leaving **`14,647,296` B (`13.97` MiB)** unreachable.
 
@@ -102,7 +107,7 @@ header across each stock `cryptsetup` `2:2.7.5-2` operation:
 | `cryptsetup luksKillSlot 1` | `[0, 8192)`, `[16384, 24576)`, `[417792, 802816)` | Slot 0: `32768` / `385024` | Yes | Random-wipes `[417792, 802816)` (`CRYPT_WIPE_SPECIAL` $\to$ `CRYPT_WIPE_RANDOM` on non-rotational media) |
 | `cryptsetup luksChangeKey` (slot 0, 1st call) | `[0, 8192)`, `[16384, 24576)`, `[32768, 802816)` | **Slot 0: `417792` / `385024`** | Yes | Allocates new area at `417792`, swaps slot IDs, and random-wipes old area `[32768, 417792)` (`setup.c:4549`) |
 | `cryptsetup luksChangeKey` (slot 0, 2nd call) | `[0, 8192)`, `[16384, 24576)`, `[32768, 802816)` | **Slot 0: `32768` / `385024`** | Yes | Allocates free gap `[32768, 417792)`, swaps slot IDs, and random-wipes `[417792, 802816)` |
-| `cryptsetup luksConvertKey` (slot 0) | `[0, 8192)`, `[16384, 24576)`, `[32768, 802816)` | **Slot 0: `417792` / `385024`** | Yes | Calls `crypt_keyslot_change_by_passphrase`; same area ping-pong and wipe as `luksChangeKey` |
+| `cryptsetup luksConvertKey` (slot 0) | `[0, 8192)`, `[16384, 802816)` | **Slot 0: `417792` / `385024`** | Yes | Calls `crypt_keyslot_change_by_passphrase`; same area ping-pong and wipe as `luksChangeKey` |
 | `cryptsetup luksHeaderBackup` | None (reads `[0, 16777216)`) | Slot 0: `32768` / `385024` | Yes (in `16,777,216` B backup file) | `LUKS2_hdr_backup` copies the entire `16,777,216` B header + keyslots area (`luks2_json_metadata.c:1341`) |
 | `cryptsetup luksHeaderRestore` | Restores any modified pages in `[0, 16777216)` | Slot 0: `32768` / `385024` | Yes (restored from backup) | `LUKS2_hdr_restore` writes the full `16,777,216` B backup back to `[0, 16777216)` |
 | `cryptsetup reencrypt` | Refused (`rc = 1`) | Unchanged | Yes | `"Reencryption of device with integrity profile is not supported."` |
@@ -166,11 +171,11 @@ of the `/dev/vdb` `aes-xts-random` + `hmac-sha256` volume:
 
 ### Why the unallocated keyslot tail is strictly preferable to active AF stripes
 
-| Property | Active keyslot AF stripes (`0..3998`) | Unallocated keyslot tail (`[14 MiB, 16 MiB)`) |
+| Property | Active keyslot AF stripes (`0..3998`) | Unallocated keyslot tail (`[12.35 MiB, 16 MiB)`) |
 | --- | --- | --- |
 | Usable capacity (96 B / 64 B / 16 B VK) | `383,904` B / `255,936` B / `63,984` B per active slot | Up to `4,423,680` B (`4.22` MiB) on any profile |
-| Fits unmodified static `pivsetup` + `dm-piv.ko` (`679,740` B `.tar.xz`)? | **No** (needs 2 active slots on 96 B VK, 3 on 64 B VK, or a separate custom binary) | **Yes** (~33% of a 2 MiB slice, ~15% of the 4.22 MiB unreachable tail) |
-| Survives `luksChangeKey` / `luksConvertKey` on slot 0? | **No** — `cryptsetup` swaps slot 0 to `417,792` and random-wipes `[32768, 417792)` | **Yes** — `LUKS2_find_area_gap` never reaches above `12.35` MiB |
+| Fits unmodified static `pivsetup` + `dm-piv.ko` (`679,740` B `.tar.xz`)? | **No** (needs 2 active slots on 96 B VK, 3 on 64 B VK, or a separate custom binary) | **Yes** (~15% of the 4.22 MiB unreachable tail) |
+| Survives `luksChangeKey` / `luksConvertKey` on slot 0? | **No** — `cryptsetup` swaps slot 0 to `417,792` and random-wipes `[32768, 417792)` | **Yes** — `LUKS2_find_area_gap` never reaches above `11.78` MiB (sector `24,128`) |
 | Survives `luksAddKey` / `luksKillSlot`? | Survives on slot 0, destroyed if that slot is killed | **Yes** across all 32 possible keyslots |
 | Preserved by `luksHeaderBackup` / `luksHeaderRestore`? | Yes | **Yes** (`LUKS2_hdr_backup` copies all 16 MiB) |
 | Requires LUKS passphrase / VK when updating `dm-piv.ko` on kernel upgrade? | **Yes** (must recompute $d_{3999}$ for the new payload) | **No** (only needs the stash key) |
@@ -189,200 +194,188 @@ release `pivsetup`):
 | `dm-piv.ko` (`strip --strip-debug`) | `182,056` | `53,497` | `41,480` | Removes debug sections |
 | `dm-piv.ko` (`strip --strip-unneeded`) | `174,688` | `51,197` | **`39,924`** | Verified to load cleanly with `insmod` and unload with `rmmod` in guest |
 | `pivsetup` (release static binary) | `1,900,552` | `847,948` | `691,044` | `rust/target/x86_64-unknown-linux-gnu/release/pivsetup` |
-| `pivsetup` (`strip --strip-all`) | `1,693,048` | `786,012` | **`640,692`** | Static musl/glibc-independent Rust binary |
+| `pivsetup` (`strip --strip-all`) | `1,693,048` | `786,012` | **`640,692`** | Static runtime-independent Rust binary |
 | **Combined bundle** (`pivsetup` + `dm-piv.ko` + `luks.key` + `hidden.key` + `unlock.sh`) | `1,873,920` (`.tar`) | — | **`679,740`** (`.tar.xz`) | `679,936` B (`664` KiB) padded to 512 B sectors |
 
-The complete unmodified userland and kernel payload (`664` KiB compressed) fits
-more than **3×** inside a 2 MiB slice at `[14 MiB, 16 MiB)` (`[14680064, 16777216)`),
-leaving the lower 14 MiB of the LUKS2 header untouched for up to 35 normal
-keyslots.
+---
+
+## 5. Whole-OS boundary vs root-filesystem carriers
+
+A core lesson from whole-OS deniable systems is **strict OS-boundary
+separation**: hidden data must never be mounted inside a persistent decoy OS,
+because decoy `journald`, `dmesg`, file indexers (`plocate`/`updatedb`), desktop
+`recently-used.xbel` and thumbnail caches, shell history, and swap inevitably
+record traces of hidden files onto the decoy disk.
+
+Using `piv-storage` on a **root/boot filesystem** creates a structural catch-22:
+
+1. **Routine decoy boots require the hidden key**: `dm-piv` has no decoy-only
+   mode, because preserving a 687-IV hidden record across decoy writes requires
+   the hidden key. Putting a decoy root filesystem on `piv-storage` means every
+   routine decoy boot would have to stop at `break=premount`, load `dm-piv.ko`
+   (leaving `dm_piv` visible in `/proc/modules` and `*-hidden` visible to
+   `udev`/`lsblk`), and prompt for *both* decoy and hidden credentials.
+2. **Coercion vs contamination**: Booting a root decoy OS normally under
+   coercion (through stock `dm-crypt`) mounts the decoy read-write and corrupts
+   whichever hidden records decoy boot logs and journals overwrite. Conversely,
+   mounting `*-hidden` inside the running decoy OS leaks traces into decoy logs
+   and caches, while booting a full hidden OS *inside* `*-hidden` runs into
+   `piv-storage`'s 0.58%–1.16% capacity ratio and ~86×–172× write amplification
+   (687 sectors rewritten per 4 KiB hidden block).
+
+By contrast, `piv-storage` fits **secondary data partitions and external
+encrypted drives unlocked from a RAM-only live environment** (such as Tails or
+Debian Live):
+
+- Every sector on the carrier has a valid `dm-integrity` tag under the decoy
+  key, and hidden ciphertext lives inside IVs that stock Linux defines as fresh
+  CSPRNG output—no unauthenticated "pre-randomized free space" alibi and no
+  copy-on-write pool metadata residue.
+- Neither decoy OS logs nor host kernel upgrades touch the volume when hidden
+  data is accessed only from a clean RAM-only live OS.
 
 ---
 
-## 5. Candidate boot and unlock procedures
+## 6. Manual unlock recipes
 
-### What a stock Debian 13 initramfs provides
+### Candidate A: Removable media + RAM-only live OS (preferred)
 
-When a system uses stock LUKS for its decoy root or swap (`cryptsetup-initramfs`
-installed, which is expected on any encrypted Linux installation), the stock
-initramfs already includes:
+Keep `pivsetup`, `dm-piv.ko` (built for the pinned live ISO kernel), and
+optional key files on an encrypted USB drive, or build/load them inside a
+RAM-only live session:
 
-- `/sbin/cryptsetup` and `/sbin/dmsetup`
-- `/bin/busybox` (providing `sh`, `dd`, `tar`, `xz` / `unxz`, `mount`, `umount`, `mkdir`, `rm`, `insmod`, `modprobe`)
-- Kernel modules `dm-mod`, `dm-crypt`, `dm-integrity`, `xts`, `aes`, `hmac`, `sha256`, `authenc`, `chacha20`
+1. The carrier disk contains **only** the stock LUKS2 + `dm-integrity` volume;
+   even the unallocated LUKS2 keyslots tail remains untouched after `luksFormat`.
+2. Boot a RAM-only live environment (with `init_on_free=1` on the kernel command
+   line so freed RAM pages are zeroed), load `dm-piv.ko`, run `pivsetup
+   open-blocks`, do work on the hidden view, unmount and `close-blocks`, and
+   power off.
 
-No custom hook, `/etc/pivtab`, or extra KDF binary exists in `/boot/initrd.img-*`
-if `cryptsetup open --type plain` is used directly.
+### Candidate B: Single-disk stash in the unreachable LUKS2 keyslot tail
 
-### Candidate A: Unallocated keyslot tail `[14 MiB, 16 MiB)` via `cryptsetup --type plain`
+When a self-contained single drive is wanted (for example, an external drive
+carrying `pivsetup` + `dm-piv.ko` built against a pinned Debian Live or Tails
+kernel, so any stock copy of that live ISO can open it from memory):
 
-#### One-time embedding (or after a kernel upgrade)
+#### Memorable round offset
 
-1. Build `pivsetup` (`strip --strip-all`) and `dm-piv.ko` (`strip --strip-unneeded`,
-   plus `sign-file` if Secure Boot is enabled) for the target kernel, and place
-   them with an `unlock.sh` script (and optional key files) into a `.tar.xz`
-   archive `bundle.tar.xz` (~664 KiB).
-2. Open the 2 MiB slice `[14 MiB, 16 MiB)` (512-byte sectors `28672`..`32768`,
-   length `4096` sectors) with `cryptsetup --type plain` using a high-entropy
-   stash passphrase (or a 64-byte key file; note that in `cryptsetup` `plain`
-   mode, stdin passphrases pass through `--hash sha512`, whereas `--key-file`
-   reads 64 raw key bytes directly without hashing):
-   ```sh
-   cryptsetup open --type plain --offset 28672 --size 4096 \
-     --cipher aes-xts-plain64 --key-size 512 --hash sha512 \
-     /dev/disk/by-partuuid/XXXX piv-stash
-   dd if=bundle.tar.xz of=/dev/mapper/piv-stash bs=4096 conv=fsync
-   cryptsetup close piv-stash
-   ```
-   Because `[14 MiB, 16 MiB)` was already filled with CSPRNG bytes by
-   `luksFormat`, the sectors beyond `bundle.tar.xz` remain uniform random bytes
-   on disk (`7.999909` bits/byte, $\chi^2 = 265.26$ measured in the guest).
-   Alternatively, formatting `/dev/mapper/piv-stash` with `mkfs.ext4 -O ^has_journal -b 1024 -m 0`
-   and copying `pivsetup.xz`, `dm-piv.ko.xz`, and `unlock.sh` into it uses 36%
-   of the 2 MiB slice and produces `7.999906` bits/byte ($\chi^2 = 274.03$) on
-   disk (`aes-xts-plain64` produces distinct sector/block tweaks across zeroed
-   filesystem blocks).
+Because anyone who knows LUKS2 geometry knows the unreachable `[11.78 MiB, 16 MiB)`
+tail (512-byte sectors `24,128..32,768`), the stash offset is **not a secret**.
+Writing the offset down is a physical tell, so pick a round sector offset easy
+to type from memory, such as **`--offset 30000 --size 2000`** (`[14.65 MiB, 15.63 MiB)`,
+`1,024,000` bytes — ~1.5× the `664 KiB` bundle; the guest probe measured
+`--offset 28672 --size 4096`, `[14 MiB, 16 MiB)`, with `7.999909` bits/byte
+entropy and $\chi^2 = 265.26$).
 
-#### Manual unlock at boot (from stock initramfs shell)
+#### Argon2id key derivation with stock OpenSSL $\ge$ 3.2 (no extra binaries)
 
-1. Boot with `break=premount` on the kernel command line (edited interactively
-   in GRUB/systemd-boot for that boot only, never persisted in `/boot/grub/grub.cfg`).
-2. At the `(initramfs)` shell, open the `[14 MiB, 16 MiB)` slice read-only,
-   extract the bundle into RAM (`/run/piv-stash`), and **immediately close
-   `piv-stash` before running `pivsetup open-blocks`** (because `pivsetup`
-   refuses to open a device that has active device-mapper holders):
-   ```sh
-   mkdir -p /run/piv-stash
-   cryptsetup open --readonly --type plain --offset 28672 --size 4096 \
-     --cipher aes-xts-plain64 --key-size 512 --hash sha512 \
-     /dev/disk/by-partuuid/XXXX piv-stash
-   xz --single-stream -dc /dev/mapper/piv-stash | tar -xf - -C /run/piv-stash
-   cryptsetup close piv-stash
-   ```
-   (If `busybox xz` in the target initramfs lacks `--single-stream`, storing the
-   files inside the 2 MiB `ext4` image on `/dev/mapper/piv-stash` and mounting it
-   read-only avoids any trailing-garbage framing issue.)
-3. Run `/run/piv-stash/unlock.sh /dev/disk/by-partuuid/XXXX` (which runs
-   `insmod /run/piv-stash/dm-piv.ko` and `/run/piv-stash/pivsetup open-blocks ...`),
-   then wipe `/run/piv-stash` from tmpfs before exiting the initramfs shell to
-   resume boot:
-   ```sh
-   /run/piv-stash/unlock.sh /dev/disk/by-partuuid/XXXX
-   rm -rf /run/piv-stash
-   exit
-   ```
+Stock live ISOs (Debian Live 13, Tails 7, Fedora, Ubuntu 25.04+) ship OpenSSL
+$\ge$ 3.2, whose built-in `kdf ... ARGON2ID` derives a 64-byte raw XTS key
+without installing `/usr/bin/argon2`. Using `cryptsetup luksUUID` (or the
+32-byte header salt at bytes `[236, 268)`) supplies a per-volume random salt
+with nothing extra to store or memorize, and `iter:1, memcost:1048576, lanes:4`
+maximizes memory-hardness (1 GiB) per guess:
 
-#### Optional Argon2id KDF for the stash key
+> [!IMPORTANT]
+> In `cryptsetup --type plain`, `--key-file=-` (stdin) treats the input as a
+> passphrase and **hashes it** unless `--hash plain` is also passed, whereas
+> `--key-file=/proc/self/fd/N` (`<(...)` process substitution in `bash`) or a
+> file path in `/run` uses the raw 64 bytes directly without hashing.
 
-Because `cryptsetup open --type plain --hash sha512` hashes a typed passphrase
-with a single un-salted SHA-512 pass, a weak passphrase can be brute-forced
-offline by an attacker who guesses that `[14 MiB, 16 MiB)` holds a `dm-plain`
-container and tests candidate decryptions for an `xz` header (`\xfd7zXZ\x00`) or
-`ext4` superblock magic (`0xef53` at byte `1080`).
+Embedding `bundle.tar.xz` from a throwaway RAM-only environment:
 
-To get Argon2id protection for the stash without storing a visible salt:
-- The LUKS2 primary binary header already contains a 32-byte random salt at
-  bytes `[236, 268)` (`hdr_disk.salt`, generated by `luksFormat`).
-- An `argon2` KDF invocation can read those 32 bytes (`dd if=/dev/... bs=1 skip=236 count=32`)
-  as its salt and derive a 64-byte raw key piped to `cryptsetup open --type plain --key-file -`.
-- **Catch**: a stock Debian initramfs does **not** ship `/usr/bin/argon2`. Adding
-  `argon2` (or an initramfs hook that copies it) into `/boot/initrd.img-*`
-  creates a visible artifact in `/boot`. Thus, on a stock initramfs without
-  removable media, the user must use a high-entropy passphrase (e.g. 6+ random
-  Diceware words, $\ge 77$ bits of entropy) with `--hash sha512`.
+```sh
+DEV=/dev/disk/by-partuuid/XXXX
+read -rs P; echo
+cryptsetup open --type plain --offset 30000 --size 2000 \
+  --cipher aes-xts-plain64 --key-size 512 \
+  --key-file <(openssl kdf -binary -keylen 64 \
+    -kdfopt "pass:$P" -kdfopt "salt:$(cryptsetup luksUUID "$DEV")" \
+    -kdfopt iter:1 -kdfopt memcost:1048576 -kdfopt lanes:4 ARGON2ID) \
+  "$DEV" piv-stash
+unset P
+dd if=bundle.tar.xz of=/dev/mapper/piv-stash bs=4096 conv=fsync
+cryptsetup close piv-stash
+```
 
-### Candidate B: Removable media (USB boot / unlock stick)
+Unlocking from a stock live ISO (always open `piv-stash` `--readonly` and close
+it before `pivsetup open-blocks`, which refuses devices with active DM holders):
 
-Instead of embedding binaries inside the LUKS2 header, keep `pivsetup`,
-`dm-piv.ko` (for the installed kernel versions), and optional key files on an
-external encrypted USB drive (or a live/initramfs USB stick):
+```sh
+DEV=/dev/disk/by-partuuid/XXXX
+mkdir -p /run/piv-stash && chmod 700 /run/piv-stash
+read -rs P; echo
+cryptsetup open --readonly --type plain --offset 30000 --size 2000 \
+  --cipher aes-xts-plain64 --key-size 512 \
+  --key-file <(openssl kdf -binary -keylen 64 \
+    -kdfopt "pass:$P" -kdfopt "salt:$(cryptsetup luksUUID "$DEV")" \
+    -kdfopt iter:1 -kdfopt memcost:1048576 -kdfopt lanes:4 ARGON2ID) \
+  "$DEV" piv-stash
+unset P
+xz --single-stream -dc /dev/mapper/piv-stash | tar -xf - -C /run/piv-stash
+cryptsetup close piv-stash
 
-1. The internal disk contains **only** the stock LUKS2 + `dm-integrity` volume
-   and an ordinary decoy installation (or no bootloader at all if booting from
-   USB). Neither `/boot`, the initramfs, nor the unallocated LUKS2 keyslots area
-   on the internal disk is modified after `luksFormat`.
-2. When opening the hidden volume (either at `break=premount` in the stock
-   initramfs or after booting a live/decoy environment), unlock the USB stick,
-   load `dm-piv.ko` and run `pivsetup open-blocks` from RAM, then unmount and
-   unplug the USB stick.
+/run/piv-stash/unlock.sh "$DEV"
+shred -u /run/piv-stash/* 2>/dev/null || true
+rm -rf /run/piv-stash
+```
 
----
+### Operational notes and edge cases
 
-## 6. Operational considerations and residual tells
-
-1. **Forgetting to add `break=premount` at boot**:
-   On a system where the LUKS2 volume is listed in `/etc/crypttab` (e.g., as the
-   root filesystem), a normal un-intercepted boot runs `scripts/local-top/cryptroot`
-   and halts synchronously at the `Please unlock disk ...:` passphrase prompt.
-   **No writes occur to the LUKS2 header or data area before or during that
-   prompt** (`cryptsetup` only opens the device `O_RDONLY` to parse the header).
-   If the user sees the stock prompt and realizes they forgot `break=premount`,
-   rebooting (`Ctrl-Alt-Del`) or powering off at the prompt leaves the hidden
-   volume completely untouched. Damage only occurs if the user enters the LUKS
-   passphrase into the stock prompt, which opens the volume through stock
-   `dm-crypt` and mounts the decoy filesystem read-write.
-   (`break=premount` runs in `initramfs-tools` *before* `scripts/local-top/cryptroot`;
-   if `unlock.sh` creates `/dev/mapper/<cryptroot-target>` via `dm-piv` before
-   exiting the `break=premount` shell, `cryptroot` sees the target already
-   active and skips `cryptsetup open`.)
-2. **Initial build and kernel upgrades (`vermagic` lockstep)**:
-   The kernel loads `dm-piv.ko` only if its `vermagic` and `Module.symvers` CRCs
-   match `uname -r` exactly.
-   - **Initial setup**: Perform the initial `dm-piv.ko` build, `pivsetup`
-     initialization, and `[14 MiB, 16 MiB)` stash write from an ephemeral live
-     environment in RAM (such as Tails or Debian Live) so no `dm-piv` sources or
-     build artifacts ever touch the decoy filesystem.
-   - **Kernel upgrades**: Keep the `dm-piv` module sources, signing key (if
-     any), and stash-update script **inside the hidden volume**, and only
-     rebuild `dm-piv.ko` while `dm-piv.ko` is already loaded and the hidden
-     volume is mounted. When the decoy OS installs a new `linux-image-X.Y.Z`
-     and `linux-headers-X.Y.Z` (ordinary packages on a Linux workstation),
-     build `dm-piv.ko` against `/lib/modules/X.Y.Z/build` from the hidden
-     mount (`M=/mnt/hidden/dm-piv/kernel`) and re-embed the stash before
-     rebooting into the new kernel. Because each stripped `.ko.xz` is only
-     `~40 KiB`, the 2 MiB stash can carry `dm-piv-$(uname -r).ko` for both the
-     current and new kernels simultaneously so the previous kernel remains
-     bootable.
-3. **UEFI Secure Boot and MOK enrollment**:
-   A stock Debian/Ubuntu/Fedora Secure Boot chain does **not** use a user-enrolled
-   MOK in UEFI NVRAM: the UEFI firmware's factory Microsoft 3rd-Party CA verifies
-   `shimx64.efi`, `shim` embeds the distro's CA certificate inside its own binary
-   to verify `grubx64.efi` and `vmlinuz`, and `vmlinuz` embeds the distro kernel
-   key to verify in-tree modules. Thus, on a stock install with no out-of-tree
-   (DKMS) modules, `mokutil --list-enrolled` is empty.
-   - Enrolling a MOK dedicated to `dm-piv` (or having a MOK enrolled when the
-     decoy OS has no out-of-tree modules) is visible via `mokutil --list-enrolled`.
-   - To avoid that tell, either disable Secure Boot, or (if the decoy OS
-     already installs an ordinary DKMS package such as `nvidia-driver` or
-     `v4l2loopback-dkms`) sign `dm-piv.ko` with that existing
-     `/var/lib/dkms/mok.key` so `MokList` contains only the standard DKMS key
-     expected for the decoy OS.
+1. **Read-only block mappings and dirty-log replay**:
+   Mounting `ext4` or `btrfs` with `-o ro` on a writable block device still
+   replays a dirty journal/log and writes to disk (and `ext4` updates
+   `s_last_mounted` when writable). If a filesystem image is used inside
+   `piv-stash` instead of `.tar.xz`, format it without a journal (`mkfs.ext4 -O
+   ^has_journal -b 1024 -m 0`, measured at `7.999906` bits/byte, $\chi^2 = 274.03$)
+   and always open `piv-stash` with `cryptsetup open --readonly` (`mount -o ro,noload`).
+2. **Stock `initramfs` (`break=premount`) limitations**:
+   - A stock Debian `cryptsetup-initramfs` image includes `/sbin/cryptsetup` and
+     `busybox` (`dd`, `tar`, `xz`, `insmod`), **not** `/usr/bin/openssl` or
+     `/usr/bin/argon2`; unlocking inside an unmodified `break=premount` shell
+     therefore falls back to `--hash sha512` and requires a high-entropy
+     passphrase (e.g. 6+ random Diceware words, $\ge 77$ bits).
+   - If a system has the LUKS2 volume in `/etc/crypttab` and boots without
+     `break=premount`, `scripts/local-top/cryptroot` halts synchronously at the
+     passphrase prompt after opening the header `O_RDONLY` (**no writes occur
+     before or during that prompt**; rebooting at the prompt leaves hidden
+     records untouched). Entering the passphrase into the stock prompt, however,
+     mounts the decoy read-write through stock `dm-crypt` and destroys hidden
+     records—one of the reasons root-filesystem carriers are discouraged (§5).
+3. **Initial build, kernel `vermagic` lockstep, and UEFI NVRAM**:
+   - Perform initial setup and module builds only from an ephemeral RAM-only
+     environment so no `dm-piv` sources, compiler artifacts, or mounted UUID
+     logs ever touch a persistent decoy OS. Check `efibootmgr` if UEFI firmware
+     records a `Boot####` NVRAM entry for a boot USB.
+   - `dm-piv.ko` loads only when its `vermagic` and `Module.symvers` CRCs match
+     `uname -r`. Pinning to a known live ISO kernel avoids host-kernel churn;
+     if rebuilding for a newer kernel, keep the module sources inside the
+     hidden volume and rebuild only while `dm-piv` is active in a clean
+     environment. Each stripped `.ko.xz` is `~40 KiB`, so multiple kernel builds
+     fit easily in a 1–2 MiB stash.
+4. **UEFI Secure Boot and MOK enrollment**:
+   Stock Debian/Ubuntu/Fedora Secure Boot chains verify `shimx64.efi` via the
+   firmware's Microsoft 3rd-Party CA and verify `grubx64.efi`, `vmlinuz`, and
+   in-tree modules via distro keys embedded in `shim`/`vmlinuz`, leaving
+   `mokutil --list-enrolled` empty unless out-of-tree DKMS modules are
+   installed. Enrolling a custom MOK solely for `dm-piv` is visible in UEFI
+   NVRAM; boot the unlock environment with Secure Boot off or reuse an existing
+   host DKMS key only when the host already runs ordinary DKMS packages.
 
 ---
 
-## 7. Recommendation
+## 7. Scope decision
 
-1. **Recommend removable media (Candidate B) first** in user-facing
-   documentation for high-deniability deployments: keeping `pivsetup`,
-   `dm-piv.ko`, and keys off the internal disk avoids modifying the LUKS2
-   header after `luksFormat`, avoids any KDF/initramfs compromise, and makes
-   kernel-module updates trivial on a separate machine.
-2. **If a self-contained single-disk stash is desired, use Candidate A
-   (unallocated keyslot tail `[14 MiB, 16 MiB)` with `cryptsetup --type plain`),
-   not active-keyslot AF stripes**:
-   - The upper 4.22 MiB of a default 16 MiB LUKS2 header (`[12,353,536, 16,777,216)`)
-     is filled with CSPRNG bytes by `luksFormat`, is unreachable by all 32
-     stock LUKS2 keyslots (`luksAddKey`, `luksChangeKey`, `luksConvertKey`), is
-     automatically preserved by `luksHeaderBackup`/`luksHeaderRestore`, fits the
-     unmodified static `pivsetup` + stripped `dm-piv.ko` (`664` KiB `.tar.xz`)
-     with >3× headroom in a 2 MiB slice at `[14 MiB, 16 MiB)`, and can be
-     unlocked using only binaries already in a stock `cryptsetup-initramfs`
-     image (`cryptsetup`, `xz`, `tar`, `insmod`).
-   - Do **not** implement the active-keyslot AF-stripe trick: while proven
-     feasible (`383,904` B in a 96-byte-key keyslot), it is too small for the
-     static `pivsetup` binary without spanning multiple visible keyslots or
-     maintaining a second minimal C unlock binary, and it is wiped whenever
-     `luksChangeKey` or `luksConvertKey` is run on that keyslot.
-   - No code changes to `dm-piv` or `pivsetup` are required to use Candidate A
-     today (it uses stock `cryptsetup --type plain`, `dd`, `tar`, and `xz`).
-     Do not add wrapper subcommands to `pivsetup` unless requested by the user.
+1. **Out of scope for `piv-storage` code**: `piv-storage` implements only the
+   paired block-layer views (`dm-piv.ko`), `pivsetup`, and read-only
+   diagnostics. Boot/initramfs hooks, full-system hiding, and `pivsetup`
+   header-stash wrappers are intentionally omitted: Candidate B already works
+   with stock `cryptsetup`, `openssl`, `tar`, and `xz`, while custom wrapper
+   subcommands or boot hooks add maintenance surface and recognizable tool
+   artifacts.
+2. **Recommended deployment pattern**: Keep the LUKS2 + `dm-integrity` carrier
+   on a secondary partition or external drive, open it from a clean RAM-only
+   live environment (`init_on_free=1`), and keep `pivsetup` + `dm-piv.ko` either
+   on removable media (Candidate A) or in the unreachable LUKS2 keyslot tail
+   `--offset 30000 --size 2000` (Candidate B), never in active keyslot AF
+   stripes.
