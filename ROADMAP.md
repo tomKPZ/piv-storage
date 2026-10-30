@@ -4,7 +4,7 @@ What remains. History lives in git (the previous long-form roadmap with every
 session handoff is in commits up to 2026-10-22); current behaviour, evidence
 and limits are in README.md and docs/.
 
-## Current state (2026-10-30)
+## Current state
 
 - One coordinated native owner (`kernel/dm-piv.c`, standalone, no dm-crypt fork)
   exposes paired writable decoy/hidden block devices over a stock LUKS2 +
